@@ -3041,6 +3041,7 @@ impl NativeThreadEnvironment {
     pub(crate) fn create_subagent_thread(
         &self,
         label: String,
+        profile: Option<agent_settings::AgentProfileId>,
         cx: &mut App,
     ) -> Result<Rc<dyn SubagentHandle>> {
         let Some(parent_thread_entity) = self.thread.upgrade() else {
@@ -3051,14 +3052,14 @@ impl NativeThreadEnvironment {
         let parent_session_id = parent_thread.id().clone();
 
         if current_depth >= MAX_SUBAGENT_DEPTH {
-            return Err(anyhow!(
+            return Err(anyhow::anyhow!(
                 "Maximum subagent depth ({}) reached",
                 MAX_SUBAGENT_DEPTH
             ));
         }
 
         let subagent_thread: Entity<Thread> = cx.new(|cx| {
-            let mut thread = Thread::new_subagent(&parent_thread_entity, cx);
+            let mut thread = Thread::new_subagent(&parent_thread_entity, profile, cx);
             thread.set_title(label.into(), cx);
             thread
         });
@@ -3092,6 +3093,7 @@ impl NativeThreadEnvironment {
     pub(crate) fn resume_subagent_thread(
         &self,
         session_id: acp::SessionId,
+        profile: Option<agent_settings::AgentProfileId>,
         cx: &mut App,
     ) -> Result<Rc<dyn SubagentHandle>> {
         let (subagent_thread, acp_thread) = self.agent.update(cx, |agent, _cx| {
@@ -3101,6 +3103,12 @@ impl NativeThreadEnvironment {
                 .ok_or_else(|| anyhow!("No subagent session found with id {session_id}"))?;
             anyhow::Ok((session.thread.clone(), session.acp_thread.clone()))
         })??;
+
+        if let Some(profile) = profile {
+            subagent_thread.update(cx, |thread, cx| {
+                thread.apply_explicit_profile(profile, cx);
+            });
+        }
 
         let depth = subagent_thread.read(cx).depth();
 
@@ -3240,16 +3248,22 @@ impl ThreadEnvironment for NativeThreadEnvironment {
         })
     }
 
-    fn create_subagent(&self, label: String, cx: &mut App) -> Result<Rc<dyn SubagentHandle>> {
-        self.create_subagent_thread(label, cx)
+    fn create_subagent(
+        &self,
+        label: String,
+        profile: Option<agent_settings::AgentProfileId>,
+        cx: &mut App,
+    ) -> Result<Rc<dyn SubagentHandle>> {
+        self.create_subagent_thread(label, profile, cx)
     }
 
     fn resume_subagent(
         &self,
         session_id: acp::SessionId,
+        profile: Option<agent_settings::AgentProfileId>,
         cx: &mut App,
     ) -> Result<Rc<dyn SubagentHandle>> {
-        self.resume_subagent_thread(session_id, cx)
+        self.resume_subagent_thread(session_id, profile, cx)
     }
 
     fn create_sibling_thread(
@@ -5019,7 +5033,8 @@ mod internal_tests {
 
         // Build the subagent thread the same way
         // `NativeThreadEnvironment::create_subagent_thread` does.
-        let subagent_thread = cx.update(|cx| cx.new(|cx| Thread::new_subagent(&parent_thread, cx)));
+        let subagent_thread =
+            cx.update(|cx| cx.new(|cx| Thread::new_subagent(&parent_thread, None, cx)));
 
         // Run the subagent through the production registration path.
         // This is what installs the `SkillTool` on the thread.

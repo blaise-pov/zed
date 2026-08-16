@@ -227,7 +227,12 @@ impl crate::ThreadEnvironment for FakeThreadEnvironment {
         Task::ready(Ok(handle as Rc<dyn crate::TerminalHandle>))
     }
 
-    fn create_subagent(&self, _label: String, _cx: &mut App) -> Result<Rc<dyn SubagentHandle>> {
+    fn create_subagent(
+        &self,
+        _label: String,
+        _profile: Option<agent_settings::AgentProfileId>,
+        _cx: &mut App,
+    ) -> Result<Rc<dyn SubagentHandle>> {
         Ok(self
             .subagent_handle
             .clone()
@@ -268,7 +273,12 @@ impl crate::ThreadEnvironment for MultiTerminalEnvironment {
         Task::ready(Ok(handle as Rc<dyn crate::TerminalHandle>))
     }
 
-    fn create_subagent(&self, _label: String, _cx: &mut App) -> Result<Rc<dyn SubagentHandle>> {
+    fn create_subagent(
+        &self,
+        _label: String,
+        _profile: Option<agent_settings::AgentProfileId>,
+        _cx: &mut App,
+    ) -> Result<Rc<dyn SubagentHandle>> {
         unimplemented!()
     }
 }
@@ -279,6 +289,30 @@ fn always_allow_tools(cx: &mut TestAppContext) {
         settings.tool_permissions.default = settings::ToolPermissionMode::Allow;
         agent_settings::AgentSettings::override_global(settings, cx);
     });
+}
+
+/// Inserts a profile whose `tools` map enables exactly the given tools, so
+/// tests can assert that profile gating (and not some default) picks the
+/// toolset.
+fn insert_profile(
+    cx: &mut App,
+    profile_id: &str,
+    tools: &[&str],
+    default_model: Option<LanguageModelSelection>,
+) {
+    let mut settings = agent_settings::AgentSettings::get_global(cx).clone();
+    settings.profiles.insert(
+        AgentProfileId(profile_id.into()),
+        agent_settings::AgentProfileSettings {
+            name: profile_id.into(),
+            tools: tools.iter().map(|tool| (Arc::from(*tool), true)).collect(),
+            enable_all_context_servers: false,
+            context_servers: IndexMap::default(),
+            default_model,
+            custom_prompt: None,
+        },
+    );
+    agent_settings::AgentSettings::override_global(settings, cx);
 }
 
 /// Turns terminal sandboxing off so the non-sandboxed `TerminalTool` is the
@@ -5550,6 +5584,7 @@ async fn test_subagent_tool_call_end_to_end(cx: &mut TestAppContext) {
         label: "label".to_string(),
         message: "subagent task prompt".to_string(),
         session_id: None,
+        profile: None,
     };
     let subagent_tool_use = LanguageModelToolUse {
         id: "subagent_1".into(),
@@ -5686,6 +5721,7 @@ async fn test_subagent_tool_output_does_not_include_thinking(cx: &mut TestAppCon
         label: "label".to_string(),
         message: "subagent task prompt".to_string(),
         session_id: None,
+        profile: None,
     };
     let subagent_tool_use = LanguageModelToolUse {
         id: "subagent_1".into(),
@@ -5835,6 +5871,7 @@ async fn test_subagent_tool_call_cancellation_during_task_prompt(cx: &mut TestAp
         label: "label".to_string(),
         message: "subagent task prompt".to_string(),
         session_id: None,
+        profile: None,
     };
     let subagent_tool_use = LanguageModelToolUse {
         id: "subagent_1".into(),
@@ -5966,6 +6003,7 @@ async fn test_subagent_tool_resume_session(cx: &mut TestAppContext) {
         label: "initial task".to_string(),
         message: "do the first task".to_string(),
         session_id: None,
+        profile: None,
     };
     let subagent_tool_use = LanguageModelToolUse {
         id: "subagent_1".into(),
@@ -6029,6 +6067,7 @@ async fn test_subagent_tool_resume_session(cx: &mut TestAppContext) {
         label: "follow-up task".to_string(),
         message: "do the follow-up task".to_string(),
         session_id: Some(subagent_session_id.clone()),
+        profile: None,
     };
     let resume_tool_use = LanguageModelToolUse {
         id: "subagent_2".into(),
@@ -6124,7 +6163,7 @@ async fn test_subagent_thread_inherits_parent_thread_properties(cx: &mut TestApp
         )
     });
 
-    let subagent_thread = cx.new(|cx| Thread::new_subagent(&parent_thread, cx));
+    let subagent_thread = cx.new(|cx| Thread::new_subagent(&parent_thread, None, cx));
     subagent_thread.read_with(cx, |subagent_thread, cx| {
         assert!(subagent_thread.is_subagent());
         assert_eq!(subagent_thread.depth(), 1);
@@ -6199,7 +6238,7 @@ async fn test_subagent_thread_uses_configured_subagent_model(cx: &mut TestAppCon
         )
     });
 
-    let subagent_thread = cx.new(|cx| Thread::new_subagent(&parent_thread, cx));
+    let subagent_thread = cx.new(|cx| Thread::new_subagent(&parent_thread, None, cx));
     subagent_thread.read_with(cx, |subagent_thread, _cx| {
         assert_eq!(
             subagent_thread.model().map(|model| model.id()),
@@ -6225,6 +6264,231 @@ async fn test_subagent_thread_uses_configured_subagent_model(cx: &mut TestAppCon
         );
         assert!(subagent_thread.thinking_enabled());
         assert_eq!(subagent_thread.thinking_effort(), Some(&"high".to_string()));
+    });
+}
+
+#[gpui::test]
+async fn test_subagent_with_explicit_profile_uses_profile_tools(cx: &mut TestAppContext) {
+    init_test(cx);
+
+    cx.update(|cx| insert_profile(cx, "research", &["read_file", "grep"], None));
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(path!("/test"), json!({})).await;
+    let project = Project::test(fs, [path!("/test").as_ref()], cx).await;
+    let project_context = cx.new(|_cx| ProjectContext::default());
+    let context_server_store = project.read_with(cx, |project, _| project.context_server_store());
+    let context_server_registry =
+        cx.new(|cx| ContextServerRegistry::new(context_server_store.clone(), cx));
+    let model = Arc::new(FakeLanguageModel::default());
+
+    let environment: Rc<dyn crate::ThreadEnvironment> = Rc::new(FakeThreadEnvironment::default());
+    let parent_thread = cx.new(|cx| {
+        let mut thread = Thread::new(
+            project.clone(),
+            project_context,
+            context_server_registry,
+            Templates::new(),
+            Some(model.clone()),
+            cx,
+        );
+        thread.add_default_tools(environment.clone(), cx);
+        thread
+    });
+    let subagent_thread = cx.new(|cx| {
+        let mut thread =
+            Thread::new_subagent(&parent_thread, Some(AgentProfileId("research".into())), cx);
+        thread.add_default_tools(environment.clone(), cx);
+        thread
+    });
+
+    // The parent runs the default `write` profile, which enables write tools.
+    parent_thread.read_with(cx, |thread, cx| {
+        let tool_names = thread.enabled_tool_names(cx);
+        assert!(tool_names.iter().any(|name| name.as_ref() == "edit_file"));
+        assert!(tool_names.iter().any(|name| name.as_ref() == "read_file"));
+    });
+
+    // The subagent only gets the tools enabled by its explicit profile.
+    subagent_thread.read_with(cx, |thread, cx| {
+        assert_eq!(thread.profile().as_str(), "research");
+        let tool_names = thread.enabled_tool_names(cx);
+        assert!(tool_names.iter().any(|name| name.as_ref() == "read_file"));
+        assert!(tool_names.iter().any(|name| name.as_ref() == "grep"));
+        for disabled in [
+            "edit_file",
+            "write_file",
+            "terminal",
+            "fetch",
+            "delete_path",
+        ] {
+            assert!(
+                !tool_names.iter().any(|name| name.as_ref() == disabled),
+                "`{disabled}` should be disabled by the research profile, got: {tool_names:?}"
+            );
+        }
+    });
+}
+
+#[gpui::test]
+async fn test_subagent_with_explicit_profile_keeps_profile_when_parent_switches(
+    cx: &mut TestAppContext,
+) {
+    init_test(cx);
+
+    cx.update(|cx| insert_profile(cx, "research", &["read_file", "grep"], None));
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(path!("/test"), json!({})).await;
+    let project = Project::test(fs, [path!("/test").as_ref()], cx).await;
+    let project_context = cx.new(|_cx| ProjectContext::default());
+    let context_server_store = project.read_with(cx, |project, _| project.context_server_store());
+    let context_server_registry =
+        cx.new(|cx| ContextServerRegistry::new(context_server_store.clone(), cx));
+    let model = Arc::new(FakeLanguageModel::default());
+
+    let parent_thread = cx.new(|cx| {
+        Thread::new(
+            project.clone(),
+            project_context,
+            context_server_registry,
+            Templates::new(),
+            Some(model.clone()),
+            cx,
+        )
+    });
+
+    let pinned_thread = cx.new(|cx| {
+        Thread::new_subagent(&parent_thread, Some(AgentProfileId("research".into())), cx)
+    });
+    let unpinned_thread = cx.new(|cx| Thread::new_subagent(&parent_thread, None, cx));
+
+    assert_eq!(
+        pinned_thread.read_with(cx, |thread, _| thread.profile().as_str().to_string()),
+        "research"
+    );
+    assert_eq!(
+        unpinned_thread.read_with(cx, |thread, _| thread.profile().as_str().to_string()),
+        "write"
+    );
+
+    parent_thread.update(cx, |parent_thread, cx| {
+        parent_thread.register_running_subagent(pinned_thread.downgrade());
+        parent_thread.register_running_subagent(unpinned_thread.downgrade());
+        parent_thread.set_profile(AgentProfileId("ask".into()), cx);
+    });
+
+    // The pinned subagent keeps its explicit profile; the regular one follows
+    // the parent.
+    assert_eq!(
+        pinned_thread.read_with(cx, |thread, _| thread.profile().as_str().to_string()),
+        "research"
+    );
+    assert_eq!(
+        unpinned_thread.read_with(cx, |thread, _| thread.profile().as_str().to_string()),
+        "ask"
+    );
+}
+
+#[gpui::test]
+async fn test_subagent_with_explicit_profile_model_not_overridden_by_parent(
+    cx: &mut TestAppContext,
+) {
+    init_test(cx);
+
+    let profile_model = Arc::new(FakeLanguageModel::with_id_and_thinking(
+        "fake-corp",
+        "profile-model",
+        "Profile Model",
+        true,
+    ));
+    cx.update(|cx| {
+        LanguageModelRegistry::test(cx);
+
+        let provider = Arc::new(
+            FakeLanguageModelProvider::new(
+                LanguageModelProviderId::from("fake-corp".to_string()),
+                LanguageModelProviderName::from("Fake Corp".to_string()),
+            )
+            .with_models(vec![profile_model.clone()]),
+        );
+        LanguageModelRegistry::global(cx).update(cx, |registry, cx| {
+            registry.register_provider(provider, cx);
+        });
+
+        insert_profile(
+            cx,
+            "research",
+            &["read_file", "grep"],
+            Some(LanguageModelSelection {
+                provider: LanguageModelProviderSetting("fake-corp".to_string()),
+                model: "profile-model".to_string(),
+                enable_thinking: true,
+                effort: Some("high".to_string()),
+                speed: None,
+            }),
+        );
+    });
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(path!("/test"), json!({})).await;
+    let project = Project::test(fs, [path!("/test").as_ref()], cx).await;
+    let project_context = cx.new(|_cx| ProjectContext::default());
+    let context_server_store = project.read_with(cx, |project, _| project.context_server_store());
+    let context_server_registry =
+        cx.new(|cx| ContextServerRegistry::new(context_server_store.clone(), cx));
+    let parent_model = Arc::new(FakeLanguageModel::default());
+
+    let parent_thread = cx.new(|cx| {
+        Thread::new(
+            project.clone(),
+            project_context,
+            context_server_registry,
+            Templates::new(),
+            Some(parent_model.clone()),
+            cx,
+        )
+    });
+
+    let subagent_thread = cx.new(|cx| {
+        Thread::new_subagent(&parent_thread, Some(AgentProfileId("research".into())), cx)
+    });
+
+    // The profile's model wins over the parent's model.
+    subagent_thread.read_with(cx, |thread, _cx| {
+        assert_eq!(
+            thread.model().map(|model| model.id()),
+            Some(profile_model.id())
+        );
+    });
+
+    parent_thread.update(cx, |parent_thread, _cx| {
+        parent_thread.register_running_subagent(subagent_thread.downgrade());
+    });
+    parent_thread.update(cx, |parent_thread, cx| {
+        parent_thread.set_model(parent_model.clone(), cx);
+    });
+
+    // The subagent keeps the profile's model even after the parent switches.
+    subagent_thread.read_with(cx, |thread, _cx| {
+        assert_eq!(
+            thread.model().map(|model| model.id()),
+            Some(profile_model.id())
+        );
+    });
+
+    // The resume path (`spawn_agent` with session_id + profile) switches the
+    // pinned profile and its model.
+    subagent_thread.update(cx, |thread, cx| {
+        thread.apply_explicit_profile(AgentProfileId("ask".into()), cx);
+    });
+    subagent_thread.read_with(cx, |thread, _cx| {
+        assert_eq!(thread.profile().as_str(), "ask");
+        // `ask` has no default model, so the model is left as-is.
+        assert_eq!(
+            thread.model().map(|model| model.id()),
+            Some(profile_model.id())
+        );
     });
 }
 
@@ -6260,11 +6524,12 @@ async fn test_max_subagent_depth_prevents_tool_registration(cx: &mut TestAppCont
         thread.set_subagent_context(SubagentContext {
             parent_thread_id: acp::SessionId::new("parent-id"),
             depth: MAX_SUBAGENT_DEPTH - 1,
+            explicit_profile: None,
         });
         thread
     });
     let deep_subagent_thread = cx.new(|cx| {
-        let mut thread = Thread::new_subagent(&deep_parent_thread, cx);
+        let mut thread = Thread::new_subagent(&deep_parent_thread, None, cx);
         thread.add_default_tools(environment, cx);
         thread
     });
@@ -6535,7 +6800,7 @@ async fn test_parent_cancel_stops_subagent(cx: &mut TestAppContext) {
         )
     });
 
-    let subagent = cx.new(|cx| Thread::new_subagent(&parent, cx));
+    let subagent = cx.new(|cx| Thread::new_subagent(&parent, None, cx));
 
     parent.update(cx, |thread, _cx| {
         thread.register_running_subagent(subagent.downgrade());
@@ -6617,6 +6882,7 @@ async fn test_subagent_context_window_warning(cx: &mut TestAppContext) {
         label: "label".to_string(),
         message: "subagent task prompt".to_string(),
         session_id: None,
+        profile: None,
     };
     let subagent_tool_use = LanguageModelToolUse {
         id: "subagent_1".into(),
@@ -6744,6 +7010,7 @@ async fn test_subagent_no_context_window_warning_when_already_at_warning(cx: &mu
         label: "initial task".to_string(),
         message: "do the first task".to_string(),
         session_id: None,
+        profile: None,
     };
     let subagent_tool_use = LanguageModelToolUse {
         id: "subagent_1".into(),
@@ -6812,6 +7079,7 @@ async fn test_subagent_no_context_window_warning_when_already_at_warning(cx: &mu
         label: "follow-up task".to_string(),
         message: "do the follow-up task".to_string(),
         session_id: Some(subagent_session_id.clone()),
+        profile: None,
     };
     let resume_tool_use = LanguageModelToolUse {
         id: "subagent_2".into(),
@@ -6921,6 +7189,7 @@ async fn test_subagent_error_propagation(cx: &mut TestAppContext) {
         label: "label".to_string(),
         message: "subagent task prompt".to_string(),
         session_id: None,
+        profile: None,
     };
     let subagent_tool_use = LanguageModelToolUse {
         id: "subagent_1".into(),

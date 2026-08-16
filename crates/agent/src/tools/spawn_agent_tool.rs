@@ -9,6 +9,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use crate::{AgentTool, ThreadEnvironment, ToolCallEventStream, ToolInput};
+use settings::Settings as _;
 
 /// Spawn a sub-agent for a well-scoped task.
 ///
@@ -44,6 +45,10 @@ pub struct SpawnAgentToolInput {
     /// Session ID of an existing agent session to continue instead of creating a new one. Omit to create a new agent.
     #[serde(default, deserialize_with = "deserialize_session_id")]
     pub session_id: Option<acp::SessionId>,
+    /// Optional profile ID to use for this subagent. If not specified, the subagent will use the default profile.
+    /// The profile controls which tools are available and can specify a default model.
+    #[serde(default)]
+    pub profile: Option<agent_settings::AgentProfileId>,
 }
 
 fn deserialize_session_id<'de, D>(deserializer: D) -> Result<Option<acp::SessionId>, D::Error>
@@ -64,6 +69,28 @@ where
     serde_json::from_value(value)
         .map(Some)
         .map_err(serde::de::Error::custom)
+}
+
+/// Ensures the profile requested via `spawn_agent` exists, so a subagent is
+/// never silently spawned with an empty toolset (`enabled_tools` fails closed
+/// for unknown profiles). Returns a model-facing error message on failure.
+fn validate_profile(profile: Option<&agent_settings::AgentProfileId>, cx: &App) -> Option<String> {
+    let profile = profile?;
+    let settings = agent_settings::AgentSettings::get_global(cx);
+    if settings.profiles.contains_key(profile) {
+        return None;
+    }
+    let available_profiles = settings
+        .profiles
+        .keys()
+        .map(|id| id.as_str().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(format!(
+        "Unknown profile '{}'. Available profiles: {}",
+        profile.as_str(),
+        available_profiles
+    ))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -162,10 +189,19 @@ impl AgentTool for SpawnAgentTool {
                 })?;
 
             let (subagent, mut session_info) = cx.update(|cx| {
+                if let Some(error) = validate_profile(input.profile.as_ref(), cx) {
+                    return Err(SpawnAgentToolOutput::Error {
+                        session_id: input.session_id.clone(),
+                        error,
+                        session_info: None,
+                    });
+                }
                 let subagent = if let Some(session_id) = input.session_id {
-                    self.environment.resume_subagent(session_id, cx)
+                    self.environment
+                        .resume_subagent(session_id, input.profile.clone(), cx)
                 } else {
-                    self.environment.create_subagent(input.label, cx)
+                    self.environment
+                        .create_subagent(input.label, input.profile, cx)
                 };
                 let subagent = subagent.map_err(|err| SpawnAgentToolOutput::Error {
                     session_id: None,
@@ -307,5 +343,27 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(input.session_id.unwrap().to_string(), "existing-session");
+    }
+
+    #[gpui::test]
+    fn validates_profile_against_configured_profiles(cx: &mut gpui::App) {
+        let store = settings::SettingsStore::test(cx);
+        cx.set_global(store);
+
+        assert_eq!(validate_profile(None, cx), None);
+        assert_eq!(
+            validate_profile(Some(&agent_settings::AgentProfileId("write".into())), cx),
+            None
+        );
+
+        let error = validate_profile(
+            Some(&agent_settings::AgentProfileId("nonexistent".into())),
+            cx,
+        )
+        .expect("unknown profile should be rejected");
+        assert!(
+            error.starts_with("Unknown profile 'nonexistent'."),
+            "unexpected error: {error}"
+        );
     }
 }

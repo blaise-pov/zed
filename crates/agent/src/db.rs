@@ -1059,6 +1059,7 @@ mod tests {
         child_thread.subagent_context = Some(crate::SubagentContext {
             parent_thread_id: parent_id.clone(),
             depth: 1,
+            explicit_profile: None,
         });
 
         let mut grandchild_thread = make_thread(
@@ -1068,6 +1069,7 @@ mod tests {
         grandchild_thread.subagent_context = Some(crate::SubagentContext {
             parent_thread_id: child_id.clone(),
             depth: 2,
+            explicit_profile: None,
         });
 
         let unrelated_thread = make_thread(
@@ -1108,6 +1110,7 @@ mod tests {
         child_thread.subagent_context = Some(crate::SubagentContext {
             parent_thread_id: parent_id.clone(),
             depth: 2,
+            explicit_profile: Some(agent_settings::AgentProfileId("research".into())),
         });
 
         database
@@ -1126,6 +1129,10 @@ mod tests {
             .expect("subagent_context should be restored");
         assert_eq!(context.parent_thread_id, parent_id);
         assert_eq!(context.depth, 2);
+        assert_eq!(
+            context.explicit_profile,
+            Some(agent_settings::AgentProfileId("research".into()))
+        );
     }
 
     #[gpui::test]

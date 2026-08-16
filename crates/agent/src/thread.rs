@@ -146,6 +146,13 @@ pub struct SubagentContext {
 
     /// Current depth level (0 = root agent, 1 = first-level subagent, etc.)
     pub depth: u8,
+
+    /// The profile explicitly requested when this subagent was spawned via
+    /// `spawn_agent`. While set, the subagent keeps this profile even when the
+    /// parent thread switches profiles, because the profile gates the tools,
+    /// context servers and model available to the subagent.
+    #[serde(default)]
+    pub explicit_profile: Option<AgentProfileId>,
 }
 
 /// The ID of the user prompt that initiated a request.
@@ -764,11 +771,17 @@ pub trait ThreadEnvironment {
         cx: &mut AsyncApp,
     ) -> Task<Result<Rc<dyn TerminalHandle>>>;
 
-    fn create_subagent(&self, label: String, cx: &mut App) -> Result<Rc<dyn SubagentHandle>>;
+    fn create_subagent(
+        &self,
+        label: String,
+        profile: Option<agent_settings::AgentProfileId>,
+        cx: &mut App,
+    ) -> Result<Rc<dyn SubagentHandle>>;
 
     fn resume_subagent(
         &self,
         _session_id: acp::SessionId,
+        _profile: Option<agent_settings::AgentProfileId>,
         _cx: &mut App,
     ) -> Result<Rc<dyn SubagentHandle>> {
         Err(anyhow::anyhow!(
@@ -1296,7 +1309,11 @@ impl Thread {
             .embedded_context(true)
     }
 
-    pub fn new_subagent(parent_thread: &Entity<Thread>, cx: &mut Context<Self>) -> Self {
+    pub fn new_subagent(
+        parent_thread: &Entity<Thread>,
+        profile: Option<AgentProfileId>,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let project = parent_thread.read(cx).project.clone();
         let project_context = parent_thread.read(cx).project_context.clone();
         let context_server_registry = parent_thread.read(cx).context_server_registry.clone();
@@ -1312,14 +1329,22 @@ impl Thread {
             templates,
             model,
             action_log,
+            profile.clone(),
             cx,
         );
         thread.subagent_context = Some(SubagentContext {
             parent_thread_id: parent_thread.read(cx).id().clone(),
             depth: parent_thread.read(cx).depth() + 1,
+            explicit_profile: profile,
         });
         thread.inherit_parent_settings(parent_thread, cx);
-        if let Some(subagent_model) = AgentSettings::get_global(cx).subagent_model.clone() {
+        // A subagent pinned to a profile that specifies its own model keeps that
+        // model even when the parent's model changes later.
+        if thread.pinned_profile().is_some()
+            && Self::profile_specifies_model(&thread.profile_id, cx)
+        {
+            thread.inherits_parent_model_settings = false;
+        } else if let Some(subagent_model) = AgentSettings::get_global(cx).subagent_model.clone() {
             thread.inherits_parent_model_settings = false;
             thread.apply_model_selection(&subagent_model, cx);
         }
@@ -1341,6 +1366,7 @@ impl Thread {
             templates,
             model,
             cx.new(|_cx| ActionLog::new(project)),
+            None,
             cx,
         )
     }
@@ -1352,22 +1378,46 @@ impl Thread {
         templates: Arc<Templates>,
         model: Option<Arc<dyn LanguageModel>>,
         action_log: Entity<ActionLog>,
+        profile: Option<AgentProfileId>,
         cx: &mut Context<Self>,
     ) -> Self {
         let settings = AgentSettings::get_global(cx);
+        // Honor an explicitly requested profile (e.g. one passed via `spawn_agent`),
+        // then apply the restricted-workspace downgrade so a subagent spawned into a
+        // partially-trusted project lands on the minimal profile when appropriate.
+        let requested_profile = profile.unwrap_or_else(|| settings.default_profile.clone());
         let (profile_id, profile_downgraded_for_restricted_workspace) =
-            Self::profile_for_restricted_workspace(settings.default_profile.clone(), &project, cx);
-        let enable_thinking = settings
-            .default_model
+            Self::profile_for_restricted_workspace(requested_profile, &project, cx);
+        let default_profile = settings.default_profile.clone();
+
+        // Get profile settings before resolving model (to avoid borrow conflicts)
+        let profile_settings = settings.profiles.get(&profile_id).cloned();
+        let global_default_model = settings.default_model.clone();
+
+        // Resolve model from the requested profile when it differs from the
+        // default, falling back to the model passed in by the caller.
+        let model = if profile_id != default_profile {
+            // A specific profile was requested, try to use its model
+            Self::resolve_profile_model(&profile_id, cx).or(model)
+        } else {
+            model
+        };
+
+        // Get thinking settings from the profile's default model if available
+        let enable_thinking = profile_settings
             .as_ref()
+            .and_then(|p| p.default_model.as_ref())
+            .or(global_default_model.as_ref())
             .is_some_and(|model| model.enable_thinking);
-        let thinking_effort = settings
-            .default_model
+        let thinking_effort = profile_settings
             .as_ref()
+            .and_then(|p| p.default_model.as_ref())
+            .or(global_default_model.as_ref())
             .and_then(|model| model.effort.clone());
-        let speed = settings
-            .default_model
+        let speed = profile_settings
             .as_ref()
+            .and_then(|p| p.default_model.as_ref())
+            .or(global_default_model.as_ref())
             .and_then(|model| model.speed);
         let (prompt_capabilities_tx, prompt_capabilities_rx) =
             watch::channel(Self::prompt_capabilities(model.as_deref()));
@@ -1435,9 +1485,32 @@ impl Thread {
         self.thinking_enabled = parent.thinking_enabled;
         self.thinking_effort = parent.thinking_effort.clone();
         self.summarization_model = parent.summarization_model.clone();
-        self.profile_id = parent.profile_id.clone();
-        self.profile_downgraded_for_restricted_workspace =
-            parent.profile_downgraded_for_restricted_workspace;
+        // A subagent spawned with an explicit profile keeps it: the profile
+        // determines which tools, context servers and model are available to
+        // it, so the parent's profile must not take precedence.
+        if self.pinned_profile().is_none() {
+            self.profile_id = parent.profile_id.clone();
+            self.profile_downgraded_for_restricted_workspace =
+                parent.profile_downgraded_for_restricted_workspace;
+        }
+    }
+
+    /// The profile explicitly requested via `spawn_agent` when this subagent
+    /// was spawned, if any. While set, the subagent keeps this profile even
+    /// when the parent thread's profile changes.
+    fn pinned_profile(&self) -> Option<AgentProfileId> {
+        self.subagent_context
+            .as_ref()
+            .and_then(|context| context.explicit_profile.clone())
+    }
+
+    /// Whether the given profile configures its own default model, meaning
+    /// parent model changes must not propagate to a subagent using it.
+    fn profile_specifies_model(profile_id: &AgentProfileId, cx: &App) -> bool {
+        AgentSettings::get_global(cx)
+            .profiles
+            .get(profile_id)
+            .is_some_and(|profile| profile.default_model.is_some())
     }
 
     fn apply_model_selection(
@@ -2193,6 +2266,11 @@ impl Thread {
         self.tools.remove(name).is_some()
     }
 
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn enabled_tool_names(&self, cx: &App) -> Vec<SharedString> {
+        self.enabled_tools(cx).keys().cloned().collect()
+    }
+
     pub fn profile(&self) -> &AgentProfileId {
         &self.profile_id
     }
@@ -2248,9 +2326,33 @@ impl Thread {
 
         for subagent in &self.running_subagents {
             subagent
-                .update(cx, |thread, cx| thread.set_profile(profile_id.clone(), cx))
+                .update(cx, |thread, cx| {
+                    // Subagents spawned with an explicit profile via
+                    // `spawn_agent` keep that profile.
+                    if thread.pinned_profile().is_none() {
+                        thread.set_profile(profile_id.clone(), cx);
+                    }
+                })
                 .ok();
         }
+    }
+
+    /// Activates a profile explicitly requested via `spawn_agent`, e.g. when
+    /// resuming an existing subagent session with a profile. Pins the
+    /// subagent to the profile so the parent's later profile changes no
+    /// longer propagate to it.
+    pub fn apply_explicit_profile(&mut self, profile_id: AgentProfileId, cx: &mut Context<Self>) {
+        let is_subagent = self.subagent_context.is_some();
+        let (profile_id, _) = Self::profile_for_restricted_workspace(profile_id, &self.project, cx);
+        if is_subagent {
+            if let Some(context) = self.subagent_context.as_mut() {
+                context.explicit_profile = Some(profile_id.clone());
+            }
+            if Self::profile_specifies_model(&profile_id, cx) {
+                self.inherits_parent_model_settings = false;
+            }
+        }
+        self.set_profile(profile_id, cx);
     }
 
     pub fn cancel(&mut self, cx: &mut Context<Self>) -> Task<()> {
@@ -8008,7 +8110,7 @@ mod tests {
         cx.update(|cx| {
             let mut subagents = Vec::new();
             for _ in 0..count {
-                let subagent = cx.new(|cx| Thread::new_subagent(parent, cx));
+                let subagent = cx.new(|cx| Thread::new_subagent(parent, None, cx));
                 parent.update(cx, |thread, _cx| {
                     thread.register_running_subagent(subagent.downgrade());
                 });
