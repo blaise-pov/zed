@@ -311,8 +311,9 @@ impl PickerDelegate for ToolPickerDelegate {
                                 )
                             })
                             .collect(),
-                        default_model: default_profile.default_model.clone(),
-                    });
+                            default_model: default_profile.default_model.clone(),
+                            custom_prompt: default_profile.custom_prompt.clone().map(|s| s.into()),
+                        });
 
                 if let Some(server_id) = server_id {
                     let preset = profile.context_servers.entry(server_id).or_default();

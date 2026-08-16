@@ -58,6 +58,8 @@ pub struct SystemPromptTemplate<'a> {
     pub is_linux: bool,
     /// Whether sandboxed terminal commands run through WSL on Windows.
     pub is_windows: bool,
+    /// Custom instructions from the active agent profile.
+    pub custom_instructions: Option<String>,
 }
 
 impl Template for SystemPromptTemplate<'_> {
@@ -105,6 +107,7 @@ mod tests {
             sandboxing: false,
             is_linux: false,
             is_windows: false,
+            custom_instructions: None,
         };
         let templates = Templates::new();
         let rendered = template.render(&templates).unwrap();
@@ -138,6 +141,7 @@ mod tests {
             sandboxing: false,
             is_linux: false,
             is_windows: false,
+            custom_instructions: None,
         };
         let templates = Templates::new();
         let rendered = template.render(&templates).unwrap();
@@ -167,6 +171,7 @@ mod tests {
             sandboxing: false,
             is_linux: false,
             is_windows: false,
+            custom_instructions: None,
         };
         let templates = Templates::new();
         let rendered = template.render(&templates).unwrap();
@@ -200,6 +205,7 @@ mod tests {
             sandboxing: true,
             is_linux: false,
             is_windows: false,
+            custom_instructions: None,
         };
         let templates = Templates::new();
         let rendered = template.render(&templates).unwrap();
@@ -243,6 +249,7 @@ mod tests {
             sandboxing: true,
             is_linux: true,
             is_windows: false,
+            custom_instructions: None,
         };
         let templates = Templates::new();
         let rendered = template.render(&templates).unwrap();
@@ -276,6 +283,7 @@ mod tests {
             sandboxing: true,
             is_linux: false,
             is_windows: true,
+            custom_instructions: None,
         };
         let templates = Templates::new();
         let rendered = template.render(&templates).unwrap();
@@ -306,6 +314,7 @@ mod tests {
             sandboxing: true,
             is_linux: false,
             is_windows: false,
+            custom_instructions: None,
         };
         let templates = Templates::new();
         let rendered = template.render(&templates).unwrap();
@@ -328,6 +337,7 @@ mod tests {
             sandboxing: true,
             is_linux: false,
             is_windows: false,
+            custom_instructions: None,
         };
         let templates = Templates::new();
         let rendered = template.render(&templates).unwrap();
@@ -348,6 +358,7 @@ mod tests {
             sandboxing: false,
             is_linux: false,
             is_windows: false,
+            custom_instructions: None,
         };
         let templates = Templates::new();
         let rendered = template.render(&templates).unwrap();
@@ -366,6 +377,7 @@ mod tests {
             sandboxing: false,
             is_linux: false,
             is_windows: false,
+            custom_instructions: None,
         };
         let templates = Templates::new();
         let rendered = template.render(&templates).unwrap();

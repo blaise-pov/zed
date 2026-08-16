@@ -4293,6 +4293,12 @@ impl Thread {
         log::trace!("Building request messages from {} thread messages", end_ix);
 
         let user_agents_md = UserAgentsMd::global(cx).and_then(|s| s.content().cloned());
+        // Custom instructions from the active agent profile, if any.
+        let custom_instructions = AgentSettings::get_global(cx)
+            .profiles
+            .get(&self.profile_id)
+            .and_then(|profile| profile.custom_prompt.as_ref())
+            .map(|prompt| prompt.to_string());
         let system_prompt = SystemPromptTemplate {
             project: self.project_context.read(cx),
             available_tools,
@@ -4305,6 +4311,7 @@ impl Thread {
             ),
             is_linux: cfg!(target_os = "linux"),
             is_windows: cfg!(target_os = "windows"),
+            custom_instructions,
         }
         .render(&self.templates)
         .context("failed to build system prompt")
