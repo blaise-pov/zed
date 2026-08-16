@@ -4675,7 +4675,8 @@ impl Thread {
             | PermissionError { .. }
             | NoApiKey { .. }
             | ApiEndpointNotFound { .. }
-            | PromptTooLarge { .. } => None,
+            | PromptTooLarge { .. }
+            | InvalidEncryptedContent { .. } => None,
             // These errors might be transient, so retry them
             SerializeRequest { .. } | BuildRequestBody { .. } | StreamEndedUnexpectedly { .. } => {
                 Some(RetryStrategy::Fixed {
