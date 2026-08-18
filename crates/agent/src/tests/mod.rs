@@ -6492,6 +6492,18 @@ async fn test_subagent_with_explicit_profile_model_not_overridden_by_parent(
     });
 }
 
+/// Sets `agent.nested_sub_agents` for tests that exercise depth/concurrency
+/// gating.
+fn set_nested_sub_agent_settings(cx: &mut App, enabled: bool, max_depth: u8, max_concurrent: u32) {
+    let mut settings = agent_settings::AgentSettings::get_global(cx).clone();
+    settings.nested_sub_agents = agent_settings::NestedSubAgentsSettings {
+        enabled,
+        max_depth,
+        max_concurrent,
+    };
+    agent_settings::AgentSettings::override_global(settings, cx);
+}
+
 #[gpui::test]
 async fn test_max_subagent_depth_prevents_tool_registration(cx: &mut TestAppContext) {
     init_test(cx);
@@ -6523,7 +6535,7 @@ async fn test_max_subagent_depth_prevents_tool_registration(cx: &mut TestAppCont
         );
         thread.set_subagent_context(SubagentContext {
             parent_thread_id: acp::SessionId::new("parent-id"),
-            depth: MAX_SUBAGENT_DEPTH - 1,
+            depth: 0,
             explicit_profile: None,
         });
         thread
@@ -6534,12 +6546,192 @@ async fn test_max_subagent_depth_prevents_tool_registration(cx: &mut TestAppCont
         thread
     });
 
-    deep_subagent_thread.read_with(cx, |thread, _| {
-        assert_eq!(thread.depth(), MAX_SUBAGENT_DEPTH);
+    deep_subagent_thread.read_with(cx, |thread, cx| {
+        assert_eq!(thread.depth(), 1);
+        // The tool stays registered but is invisible to the model at the
+        // default depth limit of 1, matching the pre-nesting behavior.
+        assert!(thread.has_registered_tool(SpawnAgentTool::NAME));
         assert!(
-            !thread.has_registered_tool(SpawnAgentTool::NAME),
-            "subagent tool should not be present at max depth"
+            !thread
+                .enabled_tool_names(cx)
+                .contains(&SharedString::from(SpawnAgentTool::NAME))
         );
+        assert_eq!(thread.subagent_delegation_note(cx), None);
+    });
+}
+
+#[gpui::test]
+async fn test_spawn_agent_gated_by_depth_across_boundaries(cx: &mut TestAppContext) {
+    init_test(cx);
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(path!("/test"), json!({})).await;
+    let project = Project::test(fs, [path!("/test").as_ref()], cx).await;
+    let project_context = cx.new(|_cx| ProjectContext::default());
+    let context_server_store = project.read_with(cx, |project, _| project.context_server_store());
+    let context_server_registry =
+        cx.new(|cx| ContextServerRegistry::new(context_server_store.clone(), cx));
+    let model = Arc::new(FakeLanguageModel::default());
+    let environment = Rc::new(cx.update(|cx| {
+        FakeThreadEnvironment::default().with_terminal(FakeTerminalHandle::new_never_exits(cx))
+    }));
+
+    cx.update(|cx| set_nested_sub_agent_settings(cx, true, 3, 16));
+
+    let root = cx.new(|cx| {
+        let mut thread = Thread::new(
+            project.clone(),
+            project_context,
+            context_server_registry,
+            Templates::new(),
+            Some(model.clone()),
+            cx,
+        );
+        thread.add_default_tools(environment.clone(), cx);
+        thread
+    });
+    let spawn_agent = SharedString::from(SpawnAgentTool::NAME);
+    let assert_has_spawn_agent = |thread: &Entity<Thread>, cx: &TestAppContext, expected: bool| {
+        thread.read_with(cx, |thread, cx| {
+            assert_eq!(
+                thread.enabled_tool_names(cx).contains(&spawn_agent),
+                expected,
+                "depth {} should {} spawn_agent",
+                thread.depth(),
+                if expected { "have" } else { "lack" }
+            );
+        });
+    };
+
+    // Depth 0 (root) and every level below the limit keep the tool.
+    assert_has_spawn_agent(&root, cx, true);
+    let depth_one = cx.new(|cx| {
+        let mut thread = Thread::new_subagent(&root, None, cx);
+        thread.add_default_tools(environment.clone(), cx);
+        thread
+    });
+    assert_has_spawn_agent(&depth_one, cx, true);
+    let depth_two = cx.new(|cx| {
+        let mut thread = Thread::new_subagent(&depth_one, None, cx);
+        thread.add_default_tools(environment.clone(), cx);
+        thread
+    });
+    assert_has_spawn_agent(&depth_two, cx, true);
+
+    // At the limit the tool disappears and the system note appears.
+    let depth_three = cx.new(|cx| {
+        let mut thread = Thread::new_subagent(&depth_two, None, cx);
+        thread.add_default_tools(environment.clone(), cx);
+        thread
+    });
+    assert_has_spawn_agent(&depth_three, cx, false);
+    depth_three.read_with(cx, |thread, cx| {
+        assert!(thread.subagent_delegation_note(cx).is_some());
+    });
+
+    // Beyond the limit (e.g. after the setting was lowered) stays without.
+    let depth_four = cx.new(|cx| {
+        let mut thread = Thread::new_subagent(&depth_three, None, cx);
+        thread.add_default_tools(environment, cx);
+        thread
+    });
+    assert_has_spawn_agent(&depth_four, cx, false);
+
+    // The whole tree shares one concurrency pool.
+    root.read_with(cx, |root, _| {
+        let pool = root.subagent_slot_pool();
+        for thread in [&depth_one, &depth_two, &depth_three, &depth_four] {
+            thread.read_with(cx, |thread, _| {
+                assert!(Arc::ptr_eq(&pool, &thread.subagent_slot_pool()));
+            });
+        }
+    });
+}
+
+#[gpui::test]
+async fn test_spawn_agent_absent_when_nesting_disabled_or_profile_lacks_it(
+    cx: &mut TestAppContext,
+) {
+    init_test(cx);
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(path!("/test"), json!({})).await;
+    let project = Project::test(fs, [path!("/test").as_ref()], cx).await;
+    let project_context = cx.new(|_cx| ProjectContext::default());
+    let context_server_store = project.read_with(cx, |project, _| project.context_server_store());
+    let context_server_registry =
+        cx.new(|cx| ContextServerRegistry::new(context_server_store.clone(), cx));
+    let model = Arc::new(FakeLanguageModel::default());
+    let environment = Rc::new(cx.update(|cx| {
+        FakeThreadEnvironment::default().with_terminal(FakeTerminalHandle::new_never_exits(cx))
+    }));
+
+    let root = cx.new(|cx| {
+        let mut thread = Thread::new(
+            project.clone(),
+            project_context,
+            context_server_registry,
+            Templates::new(),
+            Some(model.clone()),
+            cx,
+        );
+        thread.add_default_tools(environment.clone(), cx);
+        thread
+    });
+
+    // Nesting disabled: sub-agents never see the tool, and no note is added
+    // (the tool is absent because of the setting, not the depth limit).
+    cx.update(|cx| set_nested_sub_agent_settings(cx, false, 3, 16));
+    let subagent = cx.new(|cx| {
+        let mut thread = Thread::new_subagent(&root, None, cx);
+        thread.add_default_tools(environment.clone(), cx);
+        thread
+    });
+    subagent.read_with(cx, |thread, cx| {
+        assert!(
+            !thread
+                .enabled_tool_names(cx)
+                .contains(&SharedString::from(SpawnAgentTool::NAME))
+        );
+        assert_eq!(thread.subagent_delegation_note(cx), None);
+    });
+
+    // A profile without `spawn_agent` hides the tool without a note too,
+    // even at the depth limit.
+    cx.update(|cx| {
+        set_nested_sub_agent_settings(cx, true, 3, 16);
+        insert_profile(cx, "no_spawn", &["read_file"], None);
+    });
+    let limited = cx.new(|cx| {
+        let mut thread =
+            Thread::new_subagent(&subagent, Some(AgentProfileId("no_spawn".into())), cx);
+        thread.add_default_tools(environment.clone(), cx);
+        thread
+    });
+    limited.read_with(cx, |thread, cx| {
+        assert!(
+            !thread
+                .enabled_tool_names(cx)
+                .contains(&SharedString::from(SpawnAgentTool::NAME))
+        );
+        assert_eq!(thread.subagent_delegation_note(cx), None);
+    });
+
+    // At the default depth of 1 a profile that explicitly enables the tool
+    // still doesn't get it: depth wins over the profile.
+    cx.update(|cx| set_nested_sub_agent_settings(cx, true, 1, 16));
+    let spawned = cx.new(|cx| {
+        let mut thread = Thread::new_subagent(&root, None, cx);
+        thread.add_default_tools(environment, cx);
+        thread
+    });
+    spawned.read_with(cx, |thread, cx| {
+        assert!(
+            !thread
+                .enabled_tool_names(cx)
+                .contains(&SharedString::from(SpawnAgentTool::NAME))
+        );
+        assert_eq!(thread.subagent_delegation_note(cx), None);
     });
 }
 

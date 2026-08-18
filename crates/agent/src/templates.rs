@@ -60,6 +60,11 @@ pub struct SystemPromptTemplate<'a> {
     pub is_windows: bool,
     /// Custom instructions from the active agent profile.
     pub custom_instructions: Option<String>,
+    /// A note for sub-agents that just hit the nesting depth limit, telling
+    /// them to complete the task themselves. Only set when the `spawn_agent`
+    /// tool was withheld because of the depth limit (see
+    /// `Thread::subagent_delegation_note`).
+    pub subagent_delegation_note: Option<&'static str>,
 }
 
 impl Template for SystemPromptTemplate<'_> {
@@ -108,6 +113,7 @@ mod tests {
             is_linux: false,
             is_windows: false,
             custom_instructions: None,
+            subagent_delegation_note: None,
         };
         let templates = Templates::new();
         let rendered = template.render(&templates).unwrap();
@@ -115,6 +121,41 @@ mod tests {
         assert!(rendered.contains("Today's Date: 2026-01-01"));
         assert!(rendered.contains("## Fixing Diagnostics"));
         assert!(rendered.contains("test-model"));
+    }
+
+    #[test]
+    fn test_system_prompt_renders_subagent_delegation_note() {
+        let project = prompt_store::ProjectContext::default();
+        let base = SystemPromptTemplate {
+            project: &project,
+            available_tools: vec!["read_file".into()],
+            model_name: Some("test-model".to_string()),
+            date: "2026-01-01".to_string(),
+            user_agents_md: None,
+            sandboxing: false,
+            is_linux: false,
+            is_windows: false,
+            custom_instructions: None,
+            subagent_delegation_note: None,
+        };
+        let templates = Templates::new();
+        let without_note = base.render(&templates).unwrap();
+        assert!(!without_note.contains("Delegation is unavailable"));
+
+        let with_note = SystemPromptTemplate {
+            subagent_delegation_note: Some(
+                "Delegation is unavailable: the maximum sub-agent depth has been reached.",
+            ),
+            ..base
+        };
+        let rendered = with_note.render(&templates).unwrap();
+        assert!(
+            rendered.contains(
+                "Delegation is unavailable: the maximum sub-agent depth has been reached."
+            )
+        );
+        // The delegation section itself is absent without the tool.
+        assert!(!rendered.contains("## Multi-agent delegation"));
     }
 
     #[test]
@@ -142,6 +183,7 @@ mod tests {
             is_linux: false,
             is_windows: false,
             custom_instructions: None,
+            subagent_delegation_note: None,
         };
         let templates = Templates::new();
         let rendered = template.render(&templates).unwrap();
@@ -172,6 +214,7 @@ mod tests {
             is_linux: false,
             is_windows: false,
             custom_instructions: None,
+            subagent_delegation_note: None,
         };
         let templates = Templates::new();
         let rendered = template.render(&templates).unwrap();
@@ -206,6 +249,7 @@ mod tests {
             is_linux: false,
             is_windows: false,
             custom_instructions: None,
+            subagent_delegation_note: None,
         };
         let templates = Templates::new();
         let rendered = template.render(&templates).unwrap();
@@ -250,6 +294,7 @@ mod tests {
             is_linux: true,
             is_windows: false,
             custom_instructions: None,
+            subagent_delegation_note: None,
         };
         let templates = Templates::new();
         let rendered = template.render(&templates).unwrap();
@@ -284,6 +329,7 @@ mod tests {
             is_linux: false,
             is_windows: true,
             custom_instructions: None,
+            subagent_delegation_note: None,
         };
         let templates = Templates::new();
         let rendered = template.render(&templates).unwrap();
@@ -315,6 +361,7 @@ mod tests {
             is_linux: false,
             is_windows: false,
             custom_instructions: None,
+            subagent_delegation_note: None,
         };
         let templates = Templates::new();
         let rendered = template.render(&templates).unwrap();
@@ -338,6 +385,7 @@ mod tests {
             is_linux: false,
             is_windows: false,
             custom_instructions: None,
+            subagent_delegation_note: None,
         };
         let templates = Templates::new();
         let rendered = template.render(&templates).unwrap();
@@ -359,6 +407,7 @@ mod tests {
             is_linux: false,
             is_windows: false,
             custom_instructions: None,
+            subagent_delegation_note: None,
         };
         let templates = Templates::new();
         let rendered = template.render(&templates).unwrap();
@@ -378,6 +427,7 @@ mod tests {
             is_linux: false,
             is_windows: false,
             custom_instructions: None,
+            subagent_delegation_note: None,
         };
         let templates = Templates::new();
         let rendered = template.render(&templates).unwrap();

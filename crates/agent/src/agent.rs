@@ -3047,20 +3047,46 @@ impl NativeThreadEnvironment {
         let Some(parent_thread_entity) = self.thread.upgrade() else {
             anyhow::bail!("Parent thread no longer exists".to_string());
         };
-        let parent_thread = parent_thread_entity.read(cx);
-        let current_depth = parent_thread.depth();
-        let parent_session_id = parent_thread.id().clone();
+        let nested = agent_settings::AgentSettings::get_global(cx).nested_sub_agents;
+        let (current_depth, parent_session_id, slot_pool) = {
+            let parent_thread = parent_thread_entity.read(cx);
+            (
+                parent_thread.depth(),
+                parent_thread.id().clone(),
+                parent_thread.subagent_slot_pool(),
+            )
+        };
 
-        if current_depth >= MAX_SUBAGENT_DEPTH {
-            return Err(anyhow::anyhow!(
-                "Maximum subagent depth ({}) reached",
-                MAX_SUBAGENT_DEPTH
-            ));
+        // The tool is hidden from agents at or beyond the depth limit; this
+        // also rejects direct (hallucinated) calls that bypass the tool list.
+        // The root agent (depth 0) always passes.
+        if !nested.spawn_agent_enabled_for_depth(current_depth) {
+            if !nested.enabled && current_depth > 0 {
+                anyhow::bail!("Nested sub-agents are disabled. Complete the task yourself.");
+            }
+            anyhow::bail!(
+                "Maximum sub-agent depth ({}) reached. Complete the task yourself instead of delegating.",
+                nested.max_depth
+            );
         }
 
+        if !slot_pool.try_acquire(nested.max_concurrent) {
+            anyhow::bail!(
+                "Concurrent sub-agent limit reached. Do not retry immediately; \
+                 wait for running agents to finish."
+            );
+        }
+        let slot_guard = SubagentSlotGuard::new(slot_pool);
+
+        let depth = current_depth + 1;
         let subagent_thread: Entity<Thread> = cx.new(|cx| {
             let mut thread = Thread::new_subagent(&parent_thread_entity, profile, cx);
-            thread.set_title(label.into(), cx);
+            let title = if depth > 1 {
+                format!("[d{depth}] {label}")
+            } else {
+                label.clone()
+            };
+            thread.set_title(title.into(), cx);
             thread
         });
 
@@ -3077,7 +3103,35 @@ impl NativeThreadEnvironment {
                 Ok(agent.register_session(subagent_thread.clone(), project_id, 1, cx))
             })??;
 
-        let depth = current_depth + 1;
+        // Refuse to spawn an agent whose profile leaves it with no usable
+        // tools, so the model gets an actionable error instead of a sub-agent
+        // that can only report failures.
+        if subagent_thread.read(cx).enabled_tool_names(cx).is_empty() {
+            let profile_id = subagent_thread.read(cx).profile().clone();
+            let requested = agent_settings::AgentSettings::get_global(cx)
+                .profiles
+                .get(&profile_id)
+                .map(|profile| {
+                    profile
+                        .tools
+                        .iter()
+                        .filter(|(_, enabled)| **enabled)
+                        .map(|(name, _)| name.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .unwrap_or_default();
+            anyhow::bail!(
+                "Profile '{}' leaves the sub-agent with no available tools{}. \
+                 Spawn with a different profile or enable tools for this one.",
+                profile_id.as_str(),
+                if requested.is_empty() {
+                    String::new()
+                } else {
+                    format!(" (enabled by profile: {requested})")
+                }
+            );
+        }
 
         telemetry::event!(
             "Subagent Started",
@@ -3087,7 +3141,7 @@ impl NativeThreadEnvironment {
             is_resumed = false,
         );
 
-        self.prompt_subagent(session_id, subagent_thread, acp_thread)
+        self.prompt_subagent(session_id, subagent_thread, acp_thread, slot_guard)
     }
 
     pub(crate) fn resume_subagent_thread(
@@ -3103,6 +3157,18 @@ impl NativeThreadEnvironment {
                 .ok_or_else(|| anyhow!("No subagent session found with id {session_id}"))?;
             anyhow::Ok((session.thread.clone(), session.acp_thread.clone()))
         })??;
+
+        // A follow-up keeps running the resumed agent, so it holds a
+        // concurrency slot for as long as the tool call is in flight.
+        let nested = agent_settings::AgentSettings::get_global(cx).nested_sub_agents;
+        let slot_pool = subagent_thread.read(cx).subagent_slot_pool();
+        if !slot_pool.try_acquire(nested.max_concurrent) {
+            anyhow::bail!(
+                "Concurrent sub-agent limit reached. Do not retry immediately; \
+                 wait for running agents to finish."
+            );
+        }
+        let slot_guard = SubagentSlotGuard::new(slot_pool);
 
         if let Some(profile) = profile {
             subagent_thread.update(cx, |thread, cx| {
@@ -3122,7 +3188,7 @@ impl NativeThreadEnvironment {
             );
         }
 
-        self.prompt_subagent(session_id, subagent_thread, acp_thread)
+        self.prompt_subagent(session_id, subagent_thread, acp_thread, slot_guard)
     }
 
     fn prompt_subagent(
@@ -3130,6 +3196,7 @@ impl NativeThreadEnvironment {
         session_id: acp::SessionId,
         subagent_thread: Entity<Thread>,
         acp_thread: Entity<acp_thread::AcpThread>,
+        slot_guard: SubagentSlotGuard,
     ) -> Result<Rc<dyn SubagentHandle>> {
         let Some(parent_thread_entity) = self.thread.upgrade() else {
             anyhow::bail!("Parent thread no longer exists".to_string());
@@ -3139,6 +3206,7 @@ impl NativeThreadEnvironment {
             subagent_thread,
             acp_thread,
             parent_thread_entity,
+            slot_guard,
         )) as _)
     }
 }
@@ -3314,6 +3382,9 @@ pub struct NativeSubagentHandle {
     parent_thread: WeakEntity<Thread>,
     subagent_thread: Entity<Thread>,
     acp_thread: Entity<acp_thread::AcpThread>,
+    /// Releases the sub-agent's concurrency slot when this handle is dropped,
+    /// i.e. when the spawning tool call finishes or is cancelled.
+    _slot_guard: SubagentSlotGuard,
 }
 
 impl NativeSubagentHandle {
@@ -3322,12 +3393,14 @@ impl NativeSubagentHandle {
         subagent_thread: Entity<Thread>,
         acp_thread: Entity<acp_thread::AcpThread>,
         parent_thread_entity: Entity<Thread>,
+        slot_guard: SubagentSlotGuard,
     ) -> Self {
         NativeSubagentHandle {
             session_id,
             subagent_thread,
             parent_thread: parent_thread_entity.downgrade(),
             acp_thread,
+            _slot_guard: slot_guard,
         }
     }
 }

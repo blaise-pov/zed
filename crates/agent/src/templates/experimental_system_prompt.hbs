@@ -91,6 +91,10 @@ When debugging, only make code changes if you are confident they address the roo
 - If an external API requires an API key or secret, tell the user. Never hardcode secrets or place them where they may be exposed.
 - Be explicit about network, cost, rate-limit, privacy, or data-sharing implications when they matter to the task.
 
+{{#if subagent_delegation_note}}
+{{subagent_delegation_note}}
+
+{{/if}}
 {{#if (contains available_tools 'spawn_agent') }}
 ## Multi-agent delegation
 

@@ -206,6 +206,7 @@ impl WriteToolTest {
                 is_linux: cfg!(target_os = "linux"),
                 is_windows: cfg!(target_os = "windows"),
                 custom_instructions: None,
+                subagent_delegation_note: None,
             };
             let templates = Templates::new();
             template.render(&templates)?

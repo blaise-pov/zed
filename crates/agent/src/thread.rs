@@ -64,6 +64,7 @@ use std::{
     path::{Path, PathBuf},
     rc::Rc,
     sync::Arc,
+    sync::atomic::{AtomicUsize, Ordering},
     time::{Duration, Instant},
 };
 use util::{ResultExt, debug_panic, markdown::MarkdownCodeBlock, paths::PathStyle};
@@ -74,7 +75,6 @@ const TOOL_CALL_INTERRUPTED_BY_FOLLOW_UP_MESSAGE: &str =
     "Permission denied: user sent a follow-up message instead of approving the tool call.";
 pub(crate) const FOLLOW_UP_PERMISSION_DENIED_OPTION_ID: &str = "follow_up_permission_denied";
 pub const MAX_TOOL_NAME_LENGTH: usize = 64;
-pub const MAX_SUBAGENT_DEPTH: u8 = 1;
 
 pub(crate) fn provider_compatible_tool_name(tool_name: &str) -> String {
     let mut sanitized = String::new();
@@ -153,6 +153,58 @@ pub struct SubagentContext {
     /// context servers and model available to the subagent.
     #[serde(default)]
     pub explicit_profile: Option<AgentProfileId>,
+}
+
+/// Counts sub-agents that are currently running within one session tree.
+/// The pool is created by the root thread and inherited (via `Arc`) by every
+/// sub-agent, so the `agent.nested_sub_agents.max_concurrent` limit applies
+/// across the whole tree rather than per level.
+#[derive(Default)]
+pub struct SubagentSlotPool {
+    running: AtomicUsize,
+}
+
+impl SubagentSlotPool {
+    /// Atomically reserves one slot if `limit` allows it, returning whether
+    /// the slot was acquired.
+    pub fn try_acquire(&self, limit: u32) -> bool {
+        let mut current = self.running.load(Ordering::Relaxed);
+        loop {
+            if current >= limit as usize {
+                return false;
+            }
+            match self.running.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    fn release(&self) {
+        self.running.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// Releases a sub-agent concurrency slot when dropped. It is held by the
+/// sub-agent handle for as long as the spawned agent may still be running, so
+/// slots are freed even when the parent's tool call is cancelled mid-flight.
+pub struct SubagentSlotGuard(Arc<SubagentSlotPool>);
+
+impl SubagentSlotGuard {
+    pub(crate) fn new(pool: Arc<SubagentSlotPool>) -> Self {
+        Self(pool)
+    }
+}
+
+impl Drop for SubagentSlotGuard {
+    fn drop(&mut self) {
+        self.0.release();
+    }
 }
 
 /// The ID of the user prompt that initiated a request.
@@ -1287,6 +1339,9 @@ pub struct Thread {
     pub(crate) action_log: Entity<ActionLog>,
     /// If this is a subagent thread, contains context about the parent
     subagent_context: Option<SubagentContext>,
+    /// Concurrency slots shared by this thread's whole sub-agent tree. The
+    /// root thread creates the pool; sub-agents inherit it in `new_subagent`.
+    subagent_slot_pool: Arc<SubagentSlotPool>,
     /// The user's unsent prompt text, persisted so it can be restored when reloading the thread.
     draft_prompt: Option<Vec<acp::ContentBlock>>,
     ui_scroll_position: Option<gpui::ListOffset>,
@@ -1337,6 +1392,7 @@ impl Thread {
             depth: parent_thread.read(cx).depth() + 1,
             explicit_profile: profile,
         });
+        thread.subagent_slot_pool = parent_thread.read(cx).subagent_slot_pool.clone();
         thread.inherit_parent_settings(parent_thread, cx);
         // A subagent pinned to a profile that specifies its own model keeps that
         // model even when the parent's model changes later.
@@ -1466,6 +1522,7 @@ impl Thread {
             project,
             action_log,
             subagent_context: None,
+            subagent_slot_pool: Arc::new(SubagentSlotPool::default()),
             draft_prompt: None,
             ui_scroll_position: None,
             running_subagents: Vec::new(),
@@ -1868,6 +1925,7 @@ impl Thread {
             prompt_capabilities_tx,
             prompt_capabilities_rx,
             subagent_context: db_thread.subagent_context,
+            subagent_slot_pool: Arc::new(SubagentSlotPool::default()),
             draft_prompt: db_thread.draft_prompt,
             ui_scroll_position: db_thread.ui_scroll_position.map(|sp| gpui::ListOffset {
                 item_ix: sp.item_ix,
@@ -2239,9 +2297,11 @@ impl Thread {
         self.add_tool(GoToDefinitionTool::new(self.project.clone()));
         self.add_tool(RenameTool::new(self.project.clone()));
 
-        if self.depth() < MAX_SUBAGENT_DEPTH {
-            self.add_tool(SpawnAgentTool::new(environment.clone()));
-        }
+        // `spawn_agent` is registered on every thread; `enabled_tools` hides
+        // it from the model when `agent.nested_sub_agents` doesn't allow
+        // spawning at this thread's depth. Keeping registration unconditional
+        // means the depth limit can respond to settings changes mid-session.
+        self.add_tool(SpawnAgentTool::new(environment.clone()));
 
         // Sibling-thread tools are exposed at every depth: a subagent should
         // still be able to kick off independent sibling work on behalf of the
@@ -2266,7 +2326,6 @@ impl Thread {
         self.tools.remove(name).is_some()
     }
 
-    #[cfg(any(test, feature = "test-support"))]
     pub fn enabled_tool_names(&self, cx: &App) -> Vec<SharedString> {
         self.enabled_tools(cx).keys().cloned().collect()
     }
@@ -4259,6 +4318,12 @@ impl Thread {
                 }
             })
             .filter(|(tool_name, _)| crate::tools::tool_feature_flag_enabled(tool_name, cx))
+            .filter(|(tool_name, _)| {
+                tool_name.as_ref() != SpawnAgentTool::NAME
+                    || AgentSettings::get_global(cx)
+                        .nested_sub_agents
+                        .spawn_agent_enabled_for_depth(self.depth())
+            })
             .collect::<BTreeMap<_, _>>();
 
         let mut context_server_tools = Vec::new();
@@ -4361,6 +4426,37 @@ impl Thread {
         self.subagent_context.as_ref().map(|c| c.depth).unwrap_or(0)
     }
 
+    /// The concurrency pool shared by this thread's whole sub-agent tree.
+    pub(crate) fn subagent_slot_pool(&self) -> Arc<SubagentSlotPool> {
+        self.subagent_slot_pool.clone()
+    }
+
+    /// A system-prompt note for sub-agents that just hit the nesting depth
+    /// limit, telling them to complete the task themselves. Only added when
+    /// the `spawn_agent` tool was withheld because of the depth limit: not
+    /// when nesting is disabled, not when `max_depth` is left at the default
+    /// of 1 (which matches the historical no-nesting behavior, so nothing was
+    /// "taken away"), and not when the active profile doesn't enable the tool
+    /// anyway.
+    pub(crate) fn subagent_delegation_note(&self, cx: &App) -> Option<&'static str> {
+        let settings = AgentSettings::get_global(cx);
+        let nested = settings.nested_sub_agents;
+        if !nested.enabled
+            || nested.max_depth <= 1
+            || u32::from(self.depth()) < u32::from(nested.max_depth)
+        {
+            return None;
+        }
+        let profile = settings.profiles.get(&self.profile_id)?;
+        if !profile.is_tool_enabled(SpawnAgentTool::NAME) {
+            return None;
+        }
+        Some(
+            "Delegation is unavailable: the maximum sub-agent depth has been \
+             reached. Complete the task yourself instead of delegating further.",
+        )
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     pub fn set_subagent_context(&mut self, context: SubagentContext) {
         self.subagent_context = Some(context);
@@ -4414,6 +4510,7 @@ impl Thread {
             is_linux: cfg!(target_os = "linux"),
             is_windows: cfg!(target_os = "windows"),
             custom_instructions,
+            subagent_delegation_note: self.subagent_delegation_note(cx),
         }
         .render(&self.templates)
         .context("failed to build system prompt")
@@ -8119,6 +8216,76 @@ mod tests {
             }
             subagents
         })
+    }
+
+    #[test]
+    fn test_subagent_slot_pool_enforces_limit_and_releases_on_drop() {
+        let pool = Arc::new(SubagentSlotPool::default());
+        assert!(pool.try_acquire(2));
+        assert!(pool.try_acquire(2));
+        // At the limit the next acquisition fails.
+        assert!(!pool.try_acquire(2));
+        assert!(!pool.try_acquire(2));
+
+        // Dropping a guard frees its slot.
+        let guard = SubagentSlotGuard::new(pool.clone());
+        drop(guard);
+        assert!(pool.try_acquire(2));
+
+        // A limit of zero rejects everything.
+        let empty_pool = SubagentSlotPool::default();
+        assert!(!empty_pool.try_acquire(0));
+    }
+
+    #[gpui::test]
+    async fn test_cancel_drains_subagent_chain_of_depth_three(cx: &mut TestAppContext) {
+        crate::tests::init_test(cx);
+
+        let fs = fs::FakeFs::new(cx.background_executor.clone());
+        let project = Project::test(fs, [], cx).await;
+        let model = Arc::new(FakeLanguageModel::default());
+
+        let (root, child, grandchild) = cx.update(|cx| {
+            let project_context = cx.new(|_cx| prompt_store::ProjectContext::default());
+            let context_server_store = project.read(cx).context_server_store();
+            let context_server_registry =
+                cx.new(|cx| ContextServerRegistry::new(context_server_store, cx));
+            let root = cx.new(|cx| {
+                Thread::new(
+                    project.clone(),
+                    project_context,
+                    context_server_registry,
+                    Templates::new(),
+                    Some(model),
+                    cx,
+                )
+            });
+            let child = cx.new(|cx| Thread::new_subagent(&root, None, cx));
+            let grandchild = cx.new(|cx| Thread::new_subagent(&child, None, cx));
+            root.update(cx, |thread, _| {
+                thread.register_running_subagent(child.downgrade())
+            });
+            child.update(cx, |thread, _| {
+                thread.register_running_subagent(grandchild.downgrade())
+            });
+            (root, child, grandchild)
+        });
+
+        cx.update(|cx| {
+            assert_eq!(root.read(cx).depth(), 0);
+            assert_eq!(child.read(cx).depth(), 1);
+            assert_eq!(grandchild.read(cx).depth(), 2);
+        });
+
+        root.update(cx, |thread, cx| thread.cancel(cx)).await;
+
+        // Cancelling the root recursively drains the whole subtree's
+        // registration, so no descendant keeps waiting on a cancelled parent.
+        cx.update(|cx| {
+            assert!(root.read(cx).running_subagent_ids(cx).is_empty());
+            assert!(child.read(cx).running_subagent_ids(cx).is_empty());
+            assert!(grandchild.read(cx).running_subagent_ids(cx).is_empty());
+        });
     }
 
     struct ReplayImageTool;
