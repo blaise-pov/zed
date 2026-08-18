@@ -193,6 +193,27 @@ pub struct AutoCompactSettingsContent {
 
 #[with_fallible_options]
 #[derive(Clone, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom, Debug, Default)]
+pub struct NestedSubAgentsSettingsContent {
+    /// Whether sub-agents spawned via `spawn_agent` can themselves spawn
+    /// further sub-agents. When disabled, only the root agent can delegate.
+    ///
+    /// Default: true
+    pub enabled: Option<bool>,
+    /// The maximum number of sub-agent layers below the root agent. With the
+    /// default of 1, sub-agents cannot delegate further (the historical
+    /// behavior). Values are clamped to the range [1, 5].
+    ///
+    /// Default: 1
+    pub max_depth: Option<u32>,
+    /// The maximum number of sub-agents running at the same time across the
+    /// whole session tree. Values are clamped to the range [1, 32].
+    ///
+    /// Default: 16
+    pub max_concurrent: Option<u32>,
+}
+
+#[with_fallible_options]
+#[derive(Clone, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom, Debug, Default)]
 pub struct AgentSettingsContent {
     /// Whether the Agent is enabled.
     ///
@@ -274,6 +295,9 @@ pub struct AgentSettingsContent {
     pub default_profile: Option<Arc<str>>,
     /// The available agent profiles.
     pub profiles: Option<IndexMap<Arc<str>, AgentProfileContent>>,
+    /// Controls whether and how deeply sub-agents can nest further
+    /// sub-agents via `spawn_agent`.
+    pub nested_sub_agents: Option<NestedSubAgentsSettingsContent>,
     /// Where to show a popup notification when the agent is waiting for user input.
     ///
     /// Default: "primary_screen"

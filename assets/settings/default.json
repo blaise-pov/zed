@@ -1237,6 +1237,20 @@
         "tools": {},
       },
     },
+    // Controls whether and how deeply sub-agents spawned via `spawn_agent`
+    // can themselves spawn further sub-agents.
+    "nested_sub_agents": {
+      // Whether sub-agents can spawn their own sub-agents. When disabled,
+      // only the root agent can delegate via `spawn_agent`.
+      "enabled": true,
+      // The maximum number of sub-agent layers below the root agent.
+      // With the default of 1, sub-agents cannot delegate further.
+      // Clamped to the range [1, 5].
+      "max_depth": 1,
+      // The maximum number of sub-agents running at the same time across
+      // the whole session tree. Clamped to the range [1, 32].
+      "max_concurrent": 16,
+    },
     // Where to show notifications when the agent has either completed
     // its response, or else needs confirmation before it can run a
     // tool action.

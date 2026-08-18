@@ -17,9 +17,10 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use settings::{
     DockPosition, DockSide, LanguageModelParameters, LanguageModelSelection,
-    NotifyWhenAgentWaiting, PlaySoundWhenAgentDone, RegisterSetting, Settings, SettingsContent,
-    SettingsStore, SidebarDockPosition, SidebarSide, ThinkingBlockDisplay, ToolPermissionMode,
-    update_settings_file, update_settings_file_with_completion,
+    NestedSubAgentsSettingsContent, NotifyWhenAgentWaiting, PlaySoundWhenAgentDone,
+    RegisterSetting, Settings, SettingsContent, SettingsStore, SidebarDockPosition, SidebarSide,
+    ThinkingBlockDisplay, ToolPermissionMode, update_settings_file,
+    update_settings_file_with_completion,
 };
 use util::ResultExt as _;
 
@@ -172,6 +173,83 @@ pub struct AutoCompactSettings {
     pub threshold: AutoCompactThreshold,
 }
 
+/// Compiled `agent.nested_sub_agents` settings, controlling whether and how
+/// deeply sub-agents can spawn further sub-agents via `spawn_agent`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NestedSubAgentsSettings {
+    pub enabled: bool,
+    pub max_depth: u8,
+    pub max_concurrent: u32,
+}
+
+const MIN_NESTED_MAX_DEPTH: u32 = 1;
+const MAX_NESTED_MAX_DEPTH: u32 = 5;
+const DEFAULT_NESTED_MAX_DEPTH: u32 = 1;
+const MIN_NESTED_MAX_CONCURRENT: u32 = 1;
+const MAX_NESTED_MAX_CONCURRENT: u32 = 32;
+const DEFAULT_NESTED_MAX_CONCURRENT: u32 = 16;
+
+impl Default for NestedSubAgentsSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_depth: DEFAULT_NESTED_MAX_DEPTH as u8,
+            max_concurrent: DEFAULT_NESTED_MAX_CONCURRENT,
+        }
+    }
+}
+
+impl NestedSubAgentsSettings {
+    fn from_content(content: Option<&NestedSubAgentsSettingsContent>) -> Self {
+        let Some(content) = content else {
+            return Self::default();
+        };
+        Self {
+            enabled: content.enabled.unwrap_or(true),
+            max_depth: clamp_nested_setting(
+                content.max_depth,
+                MIN_NESTED_MAX_DEPTH,
+                MAX_NESTED_MAX_DEPTH,
+                DEFAULT_NESTED_MAX_DEPTH,
+                "agent.nested_sub_agents.max_depth",
+            ) as u8,
+            max_concurrent: clamp_nested_setting(
+                content.max_concurrent,
+                MIN_NESTED_MAX_CONCURRENT,
+                MAX_NESTED_MAX_CONCURRENT,
+                DEFAULT_NESTED_MAX_CONCURRENT,
+                "agent.nested_sub_agents.max_concurrent",
+            ),
+        }
+    }
+
+    /// Whether an agent at `depth` (0 = root) may be given the `spawn_agent`
+    /// tool. The root agent always keeps it; sub-agents only while nesting is
+    /// enabled and the depth limit hasn't been reached.
+    pub fn spawn_agent_enabled_for_depth(&self, depth: u8) -> bool {
+        depth == 0 || (self.enabled && u32::from(depth) < u32::from(self.max_depth))
+    }
+}
+
+fn clamp_nested_setting(
+    value: Option<u32>,
+    min: u32,
+    max: u32,
+    default: u32,
+    setting_name: &str,
+) -> u32 {
+    let value = value.unwrap_or(default);
+    if value < min {
+        log::warn!("{setting_name} value {value} is below the minimum; clamping to {min}");
+        min
+    } else if value > max {
+        log::warn!("{setting_name} value {value} is above the maximum; clamping to {max}");
+        max
+    } else {
+        value
+    }
+}
+
 fn parse_auto_compact_threshold(raw: &str) -> anyhow::Result<AutoCompactThreshold> {
     let trimmed = raw.trim();
     if let Some(percent) = trimmed.strip_suffix('%') {
@@ -224,6 +302,7 @@ pub struct AgentSettings {
     pub favorite_models: Vec<LanguageModelSelection>,
     pub default_profile: AgentProfileId,
     pub profiles: IndexMap<AgentProfileId, AgentProfileSettings>,
+    pub nested_sub_agents: NestedSubAgentsSettings,
 
     pub notify_when_agent_waiting: NotifyWhenAgentWaiting,
     pub play_sound_when_agent_done: PlaySoundWhenAgentDone,
@@ -789,6 +868,9 @@ impl Settings for AgentSettings {
                 .into_iter()
                 .map(|(key, val)| (AgentProfileId(key), val.into()))
                 .collect(),
+            nested_sub_agents: NestedSubAgentsSettings::from_content(
+                agent.nested_sub_agents.as_ref(),
+            ),
 
             notify_when_agent_waiting: agent.notify_when_agent_waiting.unwrap(),
             play_sound_when_agent_done: agent.play_sound_when_agent_done.unwrap_or_default(),
@@ -994,6 +1076,68 @@ mod tests {
     use settings::ToolPermissionMode;
     use settings::ToolPermissionsContent;
     use std::path::PathBuf;
+
+    fn nested_from_json(value: serde_json::Value) -> NestedSubAgentsSettings {
+        let content: NestedSubAgentsSettingsContent = serde_json::from_value(value).unwrap();
+        NestedSubAgentsSettings::from_content(Some(&content))
+    }
+
+    #[test]
+    fn test_nested_sub_agents_defaults() {
+        let default = NestedSubAgentsSettings::default();
+        assert!(default.enabled);
+        assert_eq!(default.max_depth, 1);
+        assert_eq!(default.max_concurrent, 16);
+
+        assert_eq!(nested_from_json(json!({})), default);
+        assert_eq!(NestedSubAgentsSettings::from_content(None), default);
+    }
+
+    #[test]
+    fn test_nested_sub_agents_clamps_out_of_range_values() {
+        // max_depth is clamped to [1, 5].
+        assert_eq!(nested_from_json(json!({ "max_depth": 0 })).max_depth, 1);
+        assert_eq!(nested_from_json(json!({ "max_depth": 50 })).max_depth, 5);
+        assert_eq!(nested_from_json(json!({ "max_depth": 3 })).max_depth, 3);
+        assert_eq!(nested_from_json(json!({ "max_depth": 1 })).max_depth, 1);
+        assert_eq!(nested_from_json(json!({ "max_depth": 5 })).max_depth, 5);
+
+        // max_concurrent is clamped to [1, 32].
+        assert_eq!(
+            nested_from_json(json!({ "max_concurrent": 0 })).max_concurrent,
+            1
+        );
+        assert_eq!(
+            nested_from_json(json!({ "max_concurrent": 100 })).max_concurrent,
+            32
+        );
+        assert_eq!(
+            nested_from_json(json!({ "max_concurrent": 8 })).max_concurrent,
+            8
+        );
+    }
+
+    #[test]
+    fn test_spawn_agent_enabled_for_depth() {
+        let nested = NestedSubAgentsSettings {
+            enabled: true,
+            max_depth: 3,
+            max_concurrent: 16,
+        };
+        // The root agent always keeps the tool.
+        assert!(nested.spawn_agent_enabled_for_depth(0));
+        assert!(nested.spawn_agent_enabled_for_depth(2));
+        // At and beyond the limit it is withheld.
+        assert!(!nested.spawn_agent_enabled_for_depth(3));
+        assert!(!nested.spawn_agent_enabled_for_depth(4));
+
+        let disabled = NestedSubAgentsSettings {
+            enabled: false,
+            ..nested
+        };
+        assert!(disabled.spawn_agent_enabled_for_depth(0));
+        assert!(!disabled.spawn_agent_enabled_for_depth(1));
+    }
 
     #[test]
     fn test_parse_auto_compact_threshold() {
