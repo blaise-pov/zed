@@ -1183,7 +1183,17 @@ impl Language {
                     .as_ref()
                     .map(|config| &config.query)
             });
-        Arc::from(flattened_highlight_regions(captures, 0..text.len()))
+        flattened_highlight_regions(captures, 0..text.len())
+            .into_iter()
+            .map(|region| CapturedRange {
+                range: region.range,
+                capture_ids: region
+                    .stack
+                    .iter()
+                    .map(|capture| capture.capture_id)
+                    .collect(),
+            })
+            .collect()
     }
 
     pub fn path_suffixes(&self) -> &[String] {
