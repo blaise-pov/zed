@@ -65,6 +65,11 @@ pub struct SystemPromptTemplate<'a> {
     /// tool was withheld because of the depth limit (see
     /// `Thread::subagent_delegation_note`).
     pub subagent_delegation_note: Option<&'static str>,
+    /// Catalog of agents this profile may delegate to, one line per agent
+    /// (`id — name: description`). Only set when the active profile has a
+    /// `delegation` block; rendered inside the delegation section of the
+    /// system prompt.
+    pub available_agents: Option<String>,
 }
 
 impl Template for SystemPromptTemplate<'_> {
@@ -114,6 +119,7 @@ mod tests {
             is_windows: false,
             custom_instructions: None,
             subagent_delegation_note: None,
+            available_agents: None,
         };
         let templates = Templates::new();
         let rendered = template.render(&templates).unwrap();
@@ -137,6 +143,7 @@ mod tests {
             is_windows: false,
             custom_instructions: None,
             subagent_delegation_note: None,
+            available_agents: None,
         };
         let templates = Templates::new();
         let without_note = base.render(&templates).unwrap();
@@ -184,6 +191,7 @@ mod tests {
             is_windows: false,
             custom_instructions: None,
             subagent_delegation_note: None,
+            available_agents: None,
         };
         let templates = Templates::new();
         let rendered = template.render(&templates).unwrap();
@@ -215,6 +223,7 @@ mod tests {
             is_windows: false,
             custom_instructions: None,
             subagent_delegation_note: None,
+            available_agents: None,
         };
         let templates = Templates::new();
         let rendered = template.render(&templates).unwrap();
@@ -250,6 +259,7 @@ mod tests {
             is_windows: false,
             custom_instructions: None,
             subagent_delegation_note: None,
+            available_agents: None,
         };
         let templates = Templates::new();
         let rendered = template.render(&templates).unwrap();
@@ -295,6 +305,7 @@ mod tests {
             is_windows: false,
             custom_instructions: None,
             subagent_delegation_note: None,
+            available_agents: None,
         };
         let templates = Templates::new();
         let rendered = template.render(&templates).unwrap();
@@ -330,6 +341,7 @@ mod tests {
             is_windows: true,
             custom_instructions: None,
             subagent_delegation_note: None,
+            available_agents: None,
         };
         let templates = Templates::new();
         let rendered = template.render(&templates).unwrap();
@@ -362,6 +374,7 @@ mod tests {
             is_windows: false,
             custom_instructions: None,
             subagent_delegation_note: None,
+            available_agents: None,
         };
         let templates = Templates::new();
         let rendered = template.render(&templates).unwrap();
@@ -386,6 +399,7 @@ mod tests {
             is_windows: false,
             custom_instructions: None,
             subagent_delegation_note: None,
+            available_agents: None,
         };
         let templates = Templates::new();
         let rendered = template.render(&templates).unwrap();
@@ -408,6 +422,7 @@ mod tests {
             is_windows: false,
             custom_instructions: None,
             subagent_delegation_note: None,
+            available_agents: None,
         };
         let templates = Templates::new();
         let rendered = template.render(&templates).unwrap();
@@ -428,6 +443,7 @@ mod tests {
             is_windows: false,
             custom_instructions: None,
             subagent_delegation_note: None,
+            available_agents: None,
         };
         let templates = Templates::new();
         let rendered = template.render(&templates).unwrap();

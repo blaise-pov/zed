@@ -129,6 +129,11 @@ Sub-agents can help you move faster on large tasks when you use them thoughtfull
 When delegating, create concrete, self-contained subtasks and include all context the sub-agent needs. Coordinate the work instead of duplicating it yourself. If multiple agents may edit files, assign disjoint write scopes.
 
 Use this feature wisely. For simple or straightforward tasks, prefer doing the work directly.
+{{#if available_agents}}
+You may only delegate to the profiles listed below. Pass the profile id via the `profile` argument of `spawn_agent`.
+
+{{available_agents}}
+{{/if}}
 
 {{/if}}
 ## Final Message

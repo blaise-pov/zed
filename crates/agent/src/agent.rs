@@ -795,6 +795,7 @@ impl NativeAgent {
         let weak_thread = thread_handle.downgrade();
         thread_handle.update(cx, |thread, cx| {
             thread.set_summarization_model(summarization_model, cx);
+            let skills_thread = weak_thread.clone();
             thread.add_default_tools(
                 Rc::new(NativeThreadEnvironment {
                     acp_thread: acp_thread.downgrade(),
@@ -809,7 +810,7 @@ impl NativeAgent {
             // model — without this, the catalog and tool would drift out
             // of sync until the session was reopened.
             thread.add_tool(SkillTool::with_body_resolver(
-                skills_resolver_for_project(weak.clone(), project_id),
+                skills_resolver_for_thread(weak.clone(), skills_thread, project_id),
                 skill_body_resolver_for_project(project.clone(), self.fs.clone()),
             ));
         });
@@ -2107,17 +2108,25 @@ impl NativeAgentConnection {
         session_id: &acp::SessionId,
         cx: &App,
     ) -> Vec<NativeAvailableSkill> {
-        self.0
-            .read(cx)
-            .session_project_state(session_id)
-            .map(|state| {
-                state
-                    .skills
-                    .iter()
-                    .map(NativeAvailableSkill::from)
-                    .collect()
+        let agent = self.0.read(cx);
+        let Some(state) = agent.session_project_state(session_id) else {
+            return Vec::new();
+        };
+        // A profile with a `skills` filter only sees the listed skills.
+        let filter = agent
+            .sessions
+            .get(session_id)
+            .map(|session| thread_skill_filter(&session.thread, cx))
+            .unwrap_or(None);
+        state
+            .skills
+            .iter()
+            .filter(|skill| match filter.as_ref() {
+                Some(filter) => filter.contains(skill.name.as_str()),
+                None => true,
             })
-            .unwrap_or_default()
+            .map(NativeAvailableSkill::from)
+            .collect()
     }
 
     pub fn load_thread(
@@ -3121,6 +3130,29 @@ impl NativeThreadEnvironment {
         }
         let slot_guard = SubagentSlotGuard::new(slot_pool);
 
+        // Per-profile delegation rules of the calling agent's profile: which
+        // profiles it may spawn and how deeply. Profiles without a
+        // `delegation` block are solo agents and cannot spawn at all.
+        {
+            let (parent_profile_id, parent_profile) = {
+                let parent_thread = parent_thread_entity.read(cx);
+                let profile_id = parent_thread.profile().clone();
+                let profile = agent_settings::AgentSettings::get_global(cx)
+                    .profiles
+                    .get(&profile_id)
+                    .cloned();
+                (profile_id, profile)
+            };
+            if let Some(error) = agent_settings::check_delegation(
+                &parent_profile_id,
+                parent_profile.as_ref(),
+                current_depth,
+                profile.as_ref(),
+            ) {
+                anyhow::bail!(error);
+            }
+        }
+
         let depth = current_depth + 1;
         let subagent_thread: Entity<Thread> = cx.new(|cx| {
             let mut thread = Thread::new_subagent(&parent_thread_entity, profile, cx);
@@ -3214,6 +3246,26 @@ impl NativeThreadEnvironment {
         let slot_guard = SubagentSlotGuard::new(slot_pool);
 
         if let Some(profile) = profile {
+            // Switching a resumed sub-agent to a different profile is itself a
+            // delegation decision, so it must pass the parent's rules too.
+            if let Some(parent_thread_entity) = self.thread.upgrade() {
+                let (parent_profile_id, parent_depth) = {
+                    let parent_thread = parent_thread_entity.read(cx);
+                    (parent_thread.profile().clone(), parent_thread.depth())
+                };
+                let parent_profile = agent_settings::AgentSettings::get_global(cx)
+                    .profiles
+                    .get(&parent_profile_id)
+                    .cloned();
+                if let Some(error) = agent_settings::check_delegation(
+                    &parent_profile_id,
+                    parent_profile.as_ref(),
+                    parent_depth,
+                    Some(&profile),
+                ) {
+                    anyhow::bail!(error);
+                }
+            }
             subagent_thread.update(cx, |thread, cx| {
                 thread.apply_explicit_profile(profile, cx);
             });
@@ -3699,6 +3751,45 @@ pub fn skills_resolver_for_project(
                     .map(|state| Arc::new(apply_skill_overrides(&state.skills)))
             })
             .unwrap_or_else(|| Arc::new(Vec::new()))
+    }
+}
+
+/// The skill names a thread's profile is restricted to, or `None` when the
+/// profile has no `skills` filter. Read at invocation time so profile changes
+/// apply without re-registering tools.
+fn thread_skill_filter(thread: &Entity<Thread>, cx: &App) -> Option<HashSet<String>> {
+    let profile_id = thread.read(cx).profile().clone();
+    agent_settings::AgentSettings::get_global(cx)
+        .profiles
+        .get(&profile_id)
+        .and_then(|profile| profile.skills.as_ref())
+        .map(|skills| skills.iter().map(|name| name.to_string()).collect())
+}
+
+/// Like [`skills_resolver_for_project`], but additionally restricts the
+/// resolved skills to the spawning thread's profile filter, so a session
+/// whose profile hides a skill cannot invoke it by name either.
+pub fn skills_resolver_for_thread(
+    weak_agent: WeakEntity<NativeAgent>,
+    weak_thread: WeakEntity<Thread>,
+    project_id: EntityId,
+) -> impl Fn(&App) -> Arc<Vec<Skill>> + Send + Sync + 'static {
+    let project_resolver = skills_resolver_for_project(weak_agent, project_id);
+    move |cx: &App| {
+        let skills = project_resolver(cx);
+        let Some(thread) = weak_thread.upgrade() else {
+            return skills;
+        };
+        let Some(filter) = thread_skill_filter(&thread, cx) else {
+            return skills;
+        };
+        Arc::new(
+            skills
+                .iter()
+                .filter(|skill| filter.contains(skill.name.as_str()))
+                .cloned()
+                .collect(),
+        )
     }
 }
 
@@ -5279,6 +5370,96 @@ mod internal_tests {
             assert!(
                 !catalog.contains(&"deploy"),
                 "deploy should be excluded from catalog: {catalog:?}"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_profile_skills_filter_hides_unlisted_skills(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let skills_dir = global_skills_dir();
+
+        for (name, description) in [("skill-a", "First"), ("skill-b", "Second")] {
+            let dir = skills_dir.join(name);
+            fs.create_dir(&dir).await.unwrap();
+            fs.insert_file(
+                dir.join("SKILL.md"),
+                format!(
+                    "---\nname: {name}\ndescription: {description}\n---\n\nbody"
+                )
+                .into_bytes(),
+            )
+            .await;
+        }
+
+        SettingsStore::update_global(cx, |store, cx| {
+            store
+                .set_user_settings(
+                    r#"{ "agent": { "profiles": { "restricted": { "name": "Restricted", "skills": ["skill-a"] } } } }"#,
+                    cx,
+                )
+                .unwrap();
+        });
+
+        let project = Project::test(fs.clone(), [], cx).await;
+        let thread_store = cx.new(|cx| ThreadStore::new(cx));
+        let agent =
+            cx.update(|cx| NativeAgent::new(thread_store, Templates::new(), fs.clone(), cx));
+
+        let connection = NativeAgentConnection(agent.clone());
+        let acp_thread = cx
+            .update(|cx| {
+                Rc::new(connection.clone()).new_session(
+                    project.clone(),
+                    PathList::new(&[Path::new("/")]),
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+        cx.run_until_parked();
+
+        let session_id = acp_thread.read_with(cx, |thread, _cx| thread.session_id().clone());
+
+        // Switch the session's thread to the restricted profile.
+        agent.read_with(cx, |agent, _cx| {
+            let session = agent.sessions.get(&session_id).unwrap();
+            session.thread.clone()
+        })
+        .update(cx, |thread, cx| {
+            thread.set_profile(agent_settings::AgentProfileId("restricted".into()), cx);
+        });
+
+        // The catalog the model sees (`available_skills`) is filtered.
+        cx.update(|cx| {
+            let skills = connection.available_skills(&session_id, cx);
+            let names: Vec<&str> = skills.iter().map(|skill| skill.name.as_str()).collect();
+            assert!(
+                names.contains(&"skill-a"),
+                "listed skill missing from available skills: {names:?}"
+            );
+            assert!(
+                !names.contains(&"skill-b"),
+                "unlisted skill leaked into available skills: {names:?}"
+            );
+        });
+
+        // The SkillTool resolver is filtered for the same thread.
+        let (thread, project_id) = agent.read_with(cx, |agent, _cx| {
+            let session = agent.sessions.get(&session_id).unwrap();
+            (session.thread.clone(), session.project_id)
+        });
+        let resolve = cx.update(|_cx| {
+            super::skills_resolver_for_thread(agent.downgrade(), thread.downgrade(), project_id)
+        });
+        cx.update(|cx| {
+            let skills = resolve(cx);
+            let names: Vec<&str> = skills.iter().map(|s| s.name.as_str()).collect();
+            assert!(names.contains(&"skill-a"), "resolver missing skill-a: {names:?}");
+            assert!(
+                !names.contains(&"skill-b"),
+                "resolver leaked skill-b: {names:?}"
             );
         });
     }

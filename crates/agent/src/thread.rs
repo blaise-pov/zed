@@ -4447,6 +4447,22 @@ impl Thread {
         self.subagent_slot_pool.clone()
     }
 
+    /// The set of skill names this thread's profile is restricted to, if any.
+    /// `None` means the profile has no `skills` filter and all skills are
+    /// visible.
+    pub(crate) fn allowed_skill_names(&self, cx: &App) -> Option<HashSet<String>> {
+        AgentSettings::get_global(cx)
+            .profiles
+            .get(&self.profile_id)
+            .and_then(|profile| profile.skills.as_ref())
+            .map(|skills| {
+                skills
+                    .iter()
+                    .map(|name| name.to_string())
+                    .collect::<HashSet<_>>()
+            })
+    }
+
     /// A system-prompt note for sub-agents that just hit the nesting depth
     /// limit, telling them to complete the task themselves. Only added when
     /// the `spawn_agent` tool was withheld because of the depth limit: not
@@ -4507,14 +4523,59 @@ impl Thread {
         log::trace!("Building request messages from {} thread messages", end_ix);
 
         let user_agents_md = UserAgentsMd::global(cx).and_then(|s| s.content().cloned());
+        // When the active profile restricts skills, filter the catalog the
+        // model sees to just those. The shared `ProjectContext` stays
+        // unfiltered (other sessions may have different profiles); a filtered
+        // copy is built per request so the prompt cache isn't disturbed for
+        // unrestricted threads.
+        let shared_project_context = self.project_context.read(cx);
+        let filtered_project_context;
+        let project_context = match self.allowed_skill_names(cx) {
+            Some(filter) => {
+                filtered_project_context = shared_project_context
+                    .clone()
+                    .with_skills(
+                        shared_project_context
+                            .skills()
+                            .iter()
+                            .filter(|summary| filter.contains(summary.name.as_str()))
+                            .cloned()
+                            .collect(),
+                    );
+                &filtered_project_context
+            }
+            None => shared_project_context,
+        };
         // Custom instructions from the active agent profile, if any.
         let custom_instructions = AgentSettings::get_global(cx)
             .profiles
             .get(&self.profile_id)
             .and_then(|profile| profile.custom_prompt.as_ref())
             .map(|prompt| prompt.to_string());
+        // Catalog of agents this profile may delegate to, rendered into the
+        // delegation section of the system prompt.
+        let available_agents = AgentSettings::get_global(cx)
+            .profiles
+            .get(&self.profile_id)
+            .and_then(|profile| profile.delegation.as_ref())
+            .map(|delegation| {
+                delegation
+                    .allowed
+                    .iter()
+                    .filter_map(|id| {
+                        let target = AgentSettings::get_global(cx).profiles.get(id)?;
+                        let description = target
+                            .description
+                            .as_ref()
+                            .map(|description| format!(": {description}"))
+                            .unwrap_or_default();
+                        Some(format!("- {id} — {}{description}", target.name))
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            });
         let system_prompt = SystemPromptTemplate {
-            project: self.project_context.read(cx),
+            project: project_context,
             available_tools,
             model_name: self.model().map(|m| m.name().0.to_string()),
             date: Local::now().format("%Y-%m-%d").to_string(),
@@ -4527,6 +4588,7 @@ impl Thread {
             is_windows: cfg!(target_os = "windows"),
             custom_instructions,
             subagent_delegation_note: self.subagent_delegation_note(cx),
+            available_agents,
         }
         .render(&self.templates)
         .context("failed to build system prompt")

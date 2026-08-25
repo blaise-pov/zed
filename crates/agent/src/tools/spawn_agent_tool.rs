@@ -45,6 +45,12 @@ pub struct SpawnAgentToolInput {
     /// Session ID of an existing agent session to continue instead of creating a new one. Omit to create a new agent.
     #[serde(default, deserialize_with = "deserialize_session_id")]
     pub session_id: Option<acp::SessionId>,
+    /// Optional opaque reference to a task managed outside Zed (e.g.
+    /// `TASK-42` in an external task-graph system). Zed does not resolve it;
+    /// the spawned agent is told to fetch the task details itself via its
+    /// tools (typically an MCP server).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
     /// Optional profile ID to use for this subagent. If not specified, the subagent will use the default profile.
     /// The profile controls which tools are available and can specify a default model.
     #[serde(default)]
@@ -226,7 +232,17 @@ impl AgentTool for SpawnAgentTool {
                 Ok((subagent, session_info))
             })?;
 
-            let send_result = subagent.send(input.message, cx).await;
+            let send_result = {
+                let message = match input.task_id.as_deref() {
+                    Some(task_id) => format!(
+                        "{message}\n\nTask reference: {task_id}. Fetch the details of this task \
+                         yourself via the task-management tools available to you.",
+                        message = input.message
+                    ),
+                    None => input.message.clone(),
+                };
+                subagent.send(message, cx).await
+            };
 
             let status = if send_result.is_ok() {
                 "completed"
