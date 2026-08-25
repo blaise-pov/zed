@@ -1210,6 +1210,7 @@ impl Language {
         {
             *grammar.highlight_map.lock() =
                 build_highlight_map(highlights_config.query.capture_names(), theme);
+            language_core::highlight_map::bump_theme_generation();
         }
     }
 

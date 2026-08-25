@@ -36,7 +36,7 @@ use gpui::{
     App, AppContext as _, Context, Entity, EventEmitter, HighlightStyle, SharedString, StyledText,
     Task, TextStyle,
 };
-use language_core::highlight_cache::{ChunkCaptureRun, ChunkCaptures, ChunkHighlightCache};
+use language_core::highlight_cache::{ChunkCaptures, ChunkHighlightCache};
 
 use lsp::LanguageServerId;
 use parking_lot::Mutex;
@@ -4032,6 +4032,7 @@ impl BufferSnapshot {
         if range.is_empty() {
             return Some(Vec::new());
         }
+        let generation = language_core::highlight_map::theme_generation();
         let mut runs = Vec::<HighlightRun>::new();
         for chunk in self
             .tree_sitter_data
@@ -4046,69 +4047,72 @@ impl BufferSnapshot {
                 return None;
             }
             let chunk_captures = match self.tree_sitter_data.highlights_by_chunks.get(chunk.id) {
-                Some(chunk_captures) => chunk_captures,
-                None => {
-                    let chunk_captures = self.compute_chunk_captures(chunk_range);
+                Some(chunk_captures) if chunk_captures.generation == generation => chunk_captures,
+                _ => {
+                    let chunk_captures = self.compute_chunk_captures(chunk_range, generation);
                     self.tree_sitter_data
                         .highlights_by_chunks
                         .insert(chunk.id, chunk_captures.clone());
                     chunk_captures
                 }
             };
-            let highlight_maps = chunk_captures
-                .grammars
-                .iter()
-                .map(|grammar| grammar.highlight_map())
-                .collect::<SmallVec<[HighlightMap; 2]>>();
-            for run in chunk_captures.runs.iter() {
-                if run.range.end <= range.start {
+            for (run_range, highlight_id) in chunk_captures.runs.iter() {
+                if run_range.end <= range.start {
                     continue;
                 }
-                if run.range.start >= range.end {
+                if run_range.start >= range.end {
                     break;
                 }
-                let highlight_id = run.stack.iter().rev().find_map(|capture| {
-                    highlight_maps
-                        .get(capture.grammar_index)?
-                        .get(capture.capture_id)
-                });
-                let Some(highlight_id) = highlight_id else {
-                    continue;
-                };
                 match runs.last_mut() {
                     Some((last_range, last_highlight_id))
-                        if *last_highlight_id == highlight_id
-                            && last_range.end == run.range.start =>
+                        if last_highlight_id == highlight_id
+                            && last_range.end == run_range.start =>
                     {
-                        last_range.end = run.range.end;
+                        last_range.end = run_range.end;
                     }
-                    _ => runs.push((run.range.clone(), highlight_id)),
+                    _ => runs.push((run_range.clone(), *highlight_id)),
                 }
             }
         }
         Some(runs)
     }
 
-    fn compute_chunk_captures(&self, range: Range<usize>) -> ChunkCaptures {
+    fn compute_chunk_captures(&self, range: Range<usize>, generation: u64) -> ChunkCaptures {
         let captures = self.syntax.captures(range.clone(), &self.text, |grammar| {
             grammar
                 .highlights_config
                 .as_ref()
                 .map(|config| &config.query)
         });
-        let grammars = captures
+        let highlight_maps = captures
             .grammars()
             .iter()
-            .map(|&grammar| grammar.clone())
-            .collect();
-        let runs = flattened_highlight_regions(captures, range)
-            .into_iter()
-            .map(|region| ChunkCaptureRun {
-                range: region.range,
-                stack: region.stack,
-            })
-            .collect();
-        ChunkCaptures { grammars, runs }
+            .map(|grammar| grammar.highlight_map())
+            .collect::<SmallVec<[HighlightMap; 2]>>();
+        let mut runs = Vec::<(Range<usize>, HighlightId)>::new();
+        for region in flattened_highlight_regions(captures, range) {
+            let highlight_id = region.stack.iter().rev().find_map(|capture| {
+                highlight_maps
+                    .get(capture.grammar_index)?
+                    .get(capture.capture_id)
+            });
+            let Some(highlight_id) = highlight_id else {
+                continue;
+            };
+            match runs.last_mut() {
+                Some((last_range, last_highlight_id))
+                    if *last_highlight_id == highlight_id
+                        && last_range.end == region.range.start =>
+                {
+                    last_range.end = region.range.end;
+                }
+                _ => runs.push((region.range, highlight_id)),
+            }
+        }
+        ChunkCaptures {
+            generation,
+            runs: runs.into(),
+        }
     }
 
     pub fn highlighted_text_for_range<T: ToOffset>(

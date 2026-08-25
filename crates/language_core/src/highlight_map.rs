@@ -1,5 +1,22 @@
 use smallvec::SmallVec;
-use std::{num::NonZeroU32, ops::Range, sync::Arc};
+use std::{
+    num::NonZeroU32,
+    ops::Range,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+};
+
+static THEME_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+pub fn theme_generation() -> u64 {
+    THEME_GENERATION.load(Ordering::Acquire)
+}
+
+pub fn bump_theme_generation() {
+    THEME_GENERATION.fetch_add(1, Ordering::Release);
+}
 
 #[derive(Clone, Debug)]
 pub struct HighlightMap(Arc<[Option<HighlightId>]>);

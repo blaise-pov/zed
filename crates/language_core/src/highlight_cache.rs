@@ -1,5 +1,4 @@
-use crate::grammar::Grammar;
-use crate::highlight_map::{CaptureId, CapturedRange};
+use crate::highlight_map::{CaptureId, CapturedRange, HighlightId};
 use collections::FxHasher;
 use lru::LruCache;
 use parking_lot::Mutex;
@@ -92,16 +91,10 @@ pub struct HighlightCaptureRef {
     pub capture_id: CaptureId,
 }
 
-#[derive(Clone, Debug)]
-pub struct ChunkCaptureRun {
-    pub range: Range<usize>,
-    pub stack: SmallVec<[HighlightCaptureRef; 4]>,
-}
-
 #[derive(Clone)]
 pub struct ChunkCaptures {
-    pub grammars: SmallVec<[Arc<Grammar>; 2]>,
-    pub runs: Arc<[ChunkCaptureRun]>,
+    pub generation: u64,
+    pub runs: Arc<[(Range<usize>, HighlightId)]>,
 }
 
 pub struct ChunkHighlightCache(Mutex<CostBudgetedLru<usize, ChunkCaptures>>);
@@ -128,12 +121,7 @@ impl ChunkHighlightCache {
     }
 
     pub fn insert(&self, chunk_id: usize, captures: ChunkCaptures) {
-        let cost = captures.grammars.len() * size_of::<Arc<Grammar>>()
-            + captures
-                .runs
-                .iter()
-                .map(|run| size_of::<ChunkCaptureRun>() + small_vec_heap_bytes(&run.stack))
-                .sum::<usize>();
+        let cost = captures.runs.len() * size_of::<(Range<usize>, HighlightId)>();
         self.0.lock().insert(chunk_id, captures, cost);
     }
 
