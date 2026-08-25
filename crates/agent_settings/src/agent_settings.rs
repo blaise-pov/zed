@@ -1,5 +1,9 @@
+mod agent_graph;
 mod agent_profile;
 mod user_agents_md;
+
+pub use agent_graph::{check_delegation, validate_profiles};
+pub use agent_profile::Delegation;
 
 use std::cmp::Ordering::{Equal, Greater, Less};
 use std::fmt;
@@ -862,12 +866,18 @@ impl Settings for AgentSettings {
             inline_alternatives: agent.inline_alternatives.unwrap_or_default(),
             favorite_models: agent.favorite_models,
             default_profile: AgentProfileId(agent.default_profile.unwrap()),
-            profiles: agent
-                .profiles
-                .unwrap()
-                .into_iter()
-                .map(|(key, val)| (AgentProfileId(key), val.into()))
-                .collect(),
+            profiles: {
+                let profiles: IndexMap<AgentProfileId, AgentProfileSettings> = agent
+                    .profiles
+                    .unwrap()
+                    .into_iter()
+                    .map(|(key, val)| (AgentProfileId(key), val.into()))
+                    .collect();
+                for error in agent_graph::validate_profiles(&profiles) {
+                    log::warn!("agent profile configuration error: {error}");
+                }
+                profiles
+            },
             nested_sub_agents: NestedSubAgentsSettings::from_content(
                 agent.nested_sub_agents.as_ref(),
             ),

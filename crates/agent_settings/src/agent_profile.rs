@@ -6,8 +6,8 @@ use convert_case::{Case, Casing as _};
 use fs::Fs;
 use gpui::{App, SharedString};
 use settings::{
-    AgentProfileContent, ContextServerPresetContent, LanguageModelSelection, Settings as _,
-    SettingsContent, SettingsStore, update_settings_file,
+    AgentProfileContent, ContextServerPresetContent, DelegationContent, LanguageModelSelection,
+    Settings as _, SettingsContent, SettingsStore, update_settings_file,
 };
 use util::ResultExt as _;
 
@@ -82,6 +82,9 @@ impl AgentProfile {
             context_servers,
             default_model,
             custom_prompt,
+            description: None,
+            skills: None,
+            delegation: None,
         };
 
         update_settings_file(fs, cx, {
@@ -116,6 +119,50 @@ pub struct AgentProfileSettings {
     pub default_model: Option<LanguageModelSelection>,
     /// Custom system prompt instructions for this profile.
     pub custom_prompt: Option<SharedString>,
+    /// What this profile is for; shown to the parent agent in the delegation
+    /// catalog.
+    pub description: Option<SharedString>,
+    /// When set, only the listed skills are visible to sessions using this
+    /// profile.
+    pub skills: Option<Vec<Arc<str>>>,
+    /// When present, this profile may delegate via `spawn_agent`; a profile
+    /// without it is a solo agent.
+    pub delegation: Option<Delegation>,
+}
+
+/// Which sub-agents a profile may spawn, and how deeply they may nest.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Delegation {
+    pub allowed: Vec<AgentProfileId>,
+    /// Maximum delegation levels below an agent running this profile.
+    /// Clamped to [1, 5]; default 1.
+    pub max_depth: u8,
+}
+
+impl Default for Delegation {
+    fn default() -> Self {
+        Self {
+            allowed: Vec::new(),
+            max_depth: 1,
+        }
+    }
+}
+
+impl From<DelegationContent> for Delegation {
+    fn from(content: DelegationContent) -> Self {
+        let default = Self::default();
+        Self {
+            allowed: content
+                .allowed
+                .into_iter()
+                .map(AgentProfileId)
+                .collect(),
+            max_depth: content
+                .max_depth
+                .map(|depth| depth.clamp(1, 5) as u8)
+                .unwrap_or(default.max_depth),
+        }
+    }
 }
 
 impl AgentProfileSettings {
@@ -191,6 +238,16 @@ impl AgentProfileSettings {
                     .collect(),
                 default_model: self.default_model.clone(),
                 custom_prompt: self.custom_prompt.clone().map(|s| s.into()),
+                description: self.description.clone().map(|s| s.into()),
+                skills: self.skills.clone(),
+                delegation: self.delegation.as_ref().map(|delegation| DelegationContent {
+                    allowed: delegation
+                        .allowed
+                        .iter()
+                        .map(|id| Arc::from(id.as_str()))
+                        .collect(),
+                    max_depth: Some(u32::from(delegation.max_depth)),
+                }),
             },
         );
 
@@ -207,6 +264,9 @@ impl From<AgentProfileContent> for AgentProfileSettings {
             context_servers,
             default_model,
             custom_prompt,
+            description,
+            skills,
+            delegation,
         } = content;
 
         Self {
@@ -219,6 +279,9 @@ impl From<AgentProfileContent> for AgentProfileSettings {
                 .collect(),
             default_model,
             custom_prompt: custom_prompt.map(|s| s.into()),
+            description: description.map(|s| s.into()),
+            skills,
+            delegation: delegation.map(|delegation| delegation.into()),
         }
     }
 }
@@ -251,6 +314,9 @@ mod tests {
             context_servers,
             default_model: None,
             custom_prompt: None,
+            description: None,
+            skills: None,
+            delegation: None,
         }
     }
 

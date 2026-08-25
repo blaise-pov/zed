@@ -557,6 +557,26 @@ pub struct AgentProfileContent {
     pub default_model: Option<LanguageModelSelection>,
     /// Custom system prompt instructions for this profile.
     pub custom_prompt: Option<Arc<str>>,
+    /// Free-form description of what this profile is for. Surfaced to the
+    /// parent agent in the catalog of delegatable agents.
+    pub description: Option<Arc<str>>,
+    /// Restricts which skills are visible to this profile. When omitted, all
+    /// skills remain visible.
+    pub skills: Option<Vec<Arc<str>>>,
+    /// Declares that this profile may delegate to other profiles via
+    /// `spawn_agent`. A profile without this block is a solo agent.
+    pub delegation: Option<DelegationContent>,
+}
+
+#[with_fallible_options]
+#[derive(Debug, PartialEq, Clone, Default, Serialize, Deserialize, JsonSchema, MergeFrom)]
+pub struct DelegationContent {
+    /// Profile ids this profile may spawn via `spawn_agent`.
+    #[serde(default)]
+    pub allowed: Vec<Arc<str>>,
+    /// How many delegation levels may exist below an agent running this
+    /// profile. Clamped to [1, 5]; default 1 (no further delegation).
+    pub max_depth: Option<u32>,
 }
 
 #[with_fallible_options]
