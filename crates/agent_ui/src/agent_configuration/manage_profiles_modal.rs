@@ -17,7 +17,9 @@ use ui::{
 };
 use workspace::{ModalView, Workspace};
 
+use crate::agent_configuration::delegation_editor::DelegationEditor;
 use crate::agent_configuration::manage_profiles_modal::profile_modal_header::ProfileModalHeader;
+use crate::agent_configuration::skills_editor::SkillsEditor;
 use crate::agent_configuration::tool_picker::{ToolPicker, ToolPickerDelegate};
 use crate::language_model_selector::{LanguageModelSelector, language_model_selector};
 use crate::{AgentPanel, ManageProfiles};
@@ -40,6 +42,14 @@ enum Mode {
         profile_id: AgentProfileId,
         model_picker: Entity<LanguageModelSelector>,
         _subscription: Subscription,
+    },
+    ConfigureDelegation {
+        profile_id: AgentProfileId,
+        delegation_editor: Entity<DelegationEditor>,
+    },
+    ConfigureSkills {
+        profile_id: AgentProfileId,
+        skills_editor: Entity<SkillsEditor>,
     },
 }
 
@@ -95,6 +105,8 @@ pub struct ViewProfileMode {
     configure_default_model: NavigableEntry,
     configure_tools: NavigableEntry,
     configure_mcps: NavigableEntry,
+    configure_delegation: NavigableEntry,
+    configure_skills: NavigableEntry,
     delete_profile: NavigableEntry,
     cancel_item: NavigableEntry,
 }
@@ -206,6 +218,8 @@ impl ManageProfilesModal {
             configure_default_model: NavigableEntry::focusable(cx),
             configure_tools: NavigableEntry::focusable(cx),
             configure_mcps: NavigableEntry::focusable(cx),
+            configure_delegation: NavigableEntry::focusable(cx),
+            configure_skills: NavigableEntry::focusable(cx),
             delete_profile: NavigableEntry::focusable(cx),
             cancel_item: NavigableEntry::focusable(cx),
         });
@@ -354,6 +368,48 @@ impl ManageProfilesModal {
         self.focus_handle(cx).focus(window, cx);
     }
 
+    fn configure_delegation(
+        &mut self,
+        profile_id: AgentProfileId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        telemetry::event!(
+            "Agent Profile Delegation Configured",
+            profile_id = profile_id.as_str(),
+            is_builtin = builtin_profiles::is_builtin(&profile_id)
+        );
+        let delegation_editor = cx.new(|cx| {
+            DelegationEditor::new(profile_id.clone(), self.fs.clone(), window, cx)
+        });
+
+        self.mode = Mode::ConfigureDelegation {
+            profile_id,
+            delegation_editor,
+        };
+        self.focus_handle(cx).focus(window, cx);
+    }
+
+    fn configure_skills(
+        &mut self,
+        profile_id: AgentProfileId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        telemetry::event!(
+            "Agent Profile Skills Configured",
+            profile_id = profile_id.as_str(),
+            is_builtin = builtin_profiles::is_builtin(&profile_id)
+        );
+        let skills_editor = cx.new(|cx| SkillsEditor::new(profile_id.clone(), self.fs.clone(), window, cx));
+
+        self.mode = Mode::ConfigureSkills {
+            profile_id,
+            skills_editor,
+        };
+        self.focus_handle(cx).focus(window, cx);
+    }
+
     fn configure_builtin_tools(
         &mut self,
         profile_id: AgentProfileId,
@@ -432,6 +488,8 @@ impl ManageProfilesModal {
             Mode::ConfigureTools { .. } => {}
             Mode::ConfigureMcps { .. } => {}
             Mode::ConfigureDefaultModel { .. } => {}
+            Mode::ConfigureDelegation { .. } => {}
+            Mode::ConfigureSkills { .. } => {}
         }
     }
 
@@ -495,6 +553,12 @@ impl ManageProfilesModal {
             Mode::ConfigureDefaultModel { profile_id, .. } => {
                 self.view_profile(profile_id.clone(), window, cx)
             }
+            Mode::ConfigureDelegation { profile_id, .. } => {
+                self.view_profile(profile_id.clone(), window, cx)
+            }
+            Mode::ConfigureSkills { profile_id, .. } => {
+                self.view_profile(profile_id.clone(), window, cx)
+            }
         }
     }
 }
@@ -510,6 +574,11 @@ impl Focusable for ManageProfilesModal {
             Mode::ConfigureTools { tool_picker, .. } => tool_picker.focus_handle(cx),
             Mode::ConfigureMcps { tool_picker, .. } => tool_picker.focus_handle(cx),
             Mode::ConfigureDefaultModel { model_picker, .. } => model_picker.focus_handle(cx),
+            Mode::ConfigureDelegation {
+                delegation_editor,
+                ..
+            } => delegation_editor.focus_handle(cx),
+            Mode::ConfigureSkills { skills_editor, .. } => skills_editor.focus_handle(cx),
         }
     }
 }
@@ -862,6 +931,84 @@ impl ManageProfilesModal {
                         )
                         .child(
                             div()
+                                .id("configure-delegation")
+                                .track_focus(&mode.configure_delegation.focus_handle)
+                                .on_action({
+                                    let profile_id = mode.profile_id.clone();
+                                    cx.listener(move |this, _: &menu::Confirm, window, cx| {
+                                        this.configure_delegation(
+                                            profile_id.clone(),
+                                            window,
+                                            cx,
+                                        );
+                                    })
+                                })
+                                .child(
+                                    ListItem::new("configure-delegation-item")
+                                        .toggle_state(
+                                            mode.configure_delegation
+                                                .focus_handle
+                                                .contains_focused(window, cx),
+                                        )
+                                        .inset(true)
+                                        .spacing(ListItemSpacing::Sparse)
+                                        .start_slot(
+                                            Icon::new(IconName::UserGroup)
+                                                .size(IconSize::Small)
+                                                .color(Color::Muted),
+                                        )
+                                        .child(Label::new("Configure Delegation"))
+                                        .on_click({
+                                            let profile_id = mode.profile_id.clone();
+                                            cx.listener(move |this, _, window, cx| {
+                                                this.configure_delegation(
+                                                    profile_id.clone(),
+                                                    window,
+                                                    cx,
+                                                );
+                                            })
+                                        }),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .id("configure-skills")
+                                .track_focus(&mode.configure_skills.focus_handle)
+                                .on_action({
+                                    let profile_id = mode.profile_id.clone();
+                                    cx.listener(move |this, _: &menu::Confirm, window, cx| {
+                                        this.configure_skills(profile_id.clone(), window, cx);
+                                    })
+                                })
+                                .child(
+                                    ListItem::new("configure-skills-item")
+                                        .toggle_state(
+                                            mode.configure_skills
+                                                .focus_handle
+                                                .contains_focused(window, cx),
+                                        )
+                                        .inset(true)
+                                        .spacing(ListItemSpacing::Sparse)
+                                        .start_slot(
+                                            Icon::new(IconName::Sparkle)
+                                                .size(IconSize::Small)
+                                                .color(Color::Muted),
+                                        )
+                                        .child(Label::new("Configure Skills"))
+                                        .on_click({
+                                            let profile_id = mode.profile_id.clone();
+                                            cx.listener(move |this, _, window, cx| {
+                                                this.configure_skills(
+                                                    profile_id.clone(),
+                                                    window,
+                                                    cx,
+                                                );
+                                            })
+                                        }),
+                                ),
+                        )
+                        .child(
+                            div()
                                 .id("delete-profile")
                                 .track_focus(&mode.delete_profile.focus_handle)
                                 .on_action({
@@ -943,6 +1090,8 @@ impl ManageProfilesModal {
         .entry(mode.configure_default_model)
         .entry(mode.configure_tools)
         .entry(mode.configure_mcps)
+        .entry(mode.configure_delegation)
+        .entry(mode.configure_skills)
         .entry(mode.delete_profile)
         .entry(mode.cancel_item)
     }
@@ -1069,6 +1218,50 @@ impl Render for ManageProfilesModal {
                         ))
                         .child(ListSeparator)
                         .child(tool_picker.clone())
+                        .child(ListSeparator)
+                        .child(go_back_item)
+                        .into_any_element()
+                }
+                Mode::ConfigureDelegation {
+                    profile_id,
+                    delegation_editor,
+                } => {
+                    let profile_name = settings
+                        .profiles
+                        .get(profile_id)
+                        .map(|profile| profile.name.clone())
+                        .unwrap_or_else(|| "Unknown".into());
+
+                    v_flex()
+                        .pb_1()
+                        .child(ProfileModalHeader::new(
+                            format!("{profile_name} — Configure Delegation"),
+                            Some(IconName::UserGroup),
+                        ))
+                        .child(ListSeparator)
+                        .child(delegation_editor.clone())
+                        .child(ListSeparator)
+                        .child(go_back_item)
+                        .into_any_element()
+                }
+                Mode::ConfigureSkills {
+                    profile_id,
+                    skills_editor,
+                } => {
+                    let profile_name = settings
+                        .profiles
+                        .get(profile_id)
+                        .map(|profile| profile.name.clone())
+                        .unwrap_or_else(|| "Unknown".into());
+
+                    v_flex()
+                        .pb_1()
+                        .child(ProfileModalHeader::new(
+                            format!("{profile_name} — Configure Skills"),
+                            Some(IconName::Sparkle),
+                        ))
+                        .child(ListSeparator)
+                        .child(skills_editor.clone())
                         .child(ListSeparator)
                         .child(go_back_item)
                         .into_any_element()

@@ -5,7 +5,9 @@ use agent_settings::{AgentProfileId, AgentProfileSettings};
 use fs::Fs;
 use gpui::{App, Context, DismissEvent, Entity, EventEmitter, Focusable, Task, WeakEntity, Window};
 use picker::{Picker, PickerDelegate};
-use settings::{AgentProfileContent, ContextServerPresetContent, update_settings_file};
+use settings::{
+    AgentProfileContent, ContextServerPresetContent, DelegationContent, update_settings_file,
+};
 use ui::{ListItem, ListItemSpacing, prelude::*};
 use util::ResultExt as _;
 
@@ -313,6 +315,18 @@ impl PickerDelegate for ToolPickerDelegate {
                             .collect(),
                             default_model: default_profile.default_model.clone(),
                             custom_prompt: default_profile.custom_prompt.clone().map(|s| s.into()),
+                            description: default_profile.description.clone().map(|s| s.into()),
+                            skills: default_profile.skills.clone(),
+                            delegation: default_profile.delegation.as_ref().map(|delegation| {
+                                DelegationContent {
+                                    allowed: delegation
+                                        .allowed
+                                        .iter()
+                                        .map(|id| Arc::from(id.as_str()))
+                                        .collect(),
+                                    max_depth: Some(u32::from(delegation.max_depth)),
+                                }
+                            }),
                         });
 
                 if let Some(server_id) = server_id {
