@@ -559,42 +559,18 @@ impl MultiWorkspace {
     }
 
     pub fn close_window(&mut self, _: &CloseWindow, window: &mut Window, cx: &mut Context<Self>) {
-        cx.spawn_in(window, async move |this, cx| {
-            let workspaces = this.update(cx, |multi_workspace, _cx| {
-                multi_workspace.workspaces().cloned().collect::<Vec<_>>()
-            })?;
-
-            let mut prepared = anyhow::Ok(true);
-            for workspace in workspaces {
-                prepared = match workspace.update_in(cx, |workspace, window, cx| {
-                    workspace.prepare_to_close(CloseIntent::CloseWindow, window, cx)
-                }) {
-                    Ok(task) => task.await,
-                    Err(error) => Err(error),
-                };
-                if !matches!(prepared, Ok(true)) {
-                    break;
-                }
-            }
-
-            if !matches!(prepared, Ok(true)) {
-                this.update(cx, |multi_workspace, cx| {
-                    for workspace in multi_workspace.workspaces() {
-                        workspace.update(cx, |workspace, _| {
-                            workspace.removing = false;
-                        });
-                    }
-                })?;
-                prepared?;
+        let Some(window_handle) = window.window_handle().downcast::<Self>() else {
+            log::error!("cannot close a window whose root is not a MultiWorkspace");
+            return;
+        };
+        cx.spawn(async move |_, cx| {
+            if !crate::prepare_window_to_close(window_handle, CloseIntent::CloseWindow, cx).await? {
                 return anyhow::Ok(());
             }
 
-            let flush_tasks = this.update_in(cx, |multi_workspace, window, cx| {
-                multi_workspace.flush_pending_serialization(window, cx)
-            })?;
-            futures::future::join_all(flush_tasks).await;
+            crate::flush_windows_serialization(&[window_handle], cx).await;
 
-            cx.update(|window, _cx| {
+            window_handle.update(cx, |_, window, _cx| {
                 window.remove_window();
             })?;
 
@@ -1466,31 +1442,24 @@ impl MultiWorkspace {
     }
 
     pub fn serialize(&mut self, cx: &mut Context<Self>) {
-        self._serialize_task = Some(cx.spawn(async move |this, cx| {
-            let Some((window_id, state)) = this
-                .read_with(cx, |this, cx| {
-                    let state = MultiWorkspaceState {
-                        active_workspace_id: this.workspace().read(cx).database_id(),
-                        project_groups: this
-                            .project_groups
-                            .iter()
-                            .map(|group| {
-                                crate::persistence::model::SerializedProjectGroup::from_group(
-                                    &group.key,
-                                    group.expanded,
-                                )
-                            })
-                            .collect::<Vec<_>>(),
-                        sidebar_open: this.sidebar_open,
-                        sidebar_state: this.sidebar.as_ref().and_then(|s| s.serialized_state(cx)),
-                    };
-                    (this.window_id, state)
+        let state = MultiWorkspaceState {
+            active_workspace_id: self.workspace().read(cx).database_id(),
+            project_groups: self
+                .project_groups
+                .iter()
+                .map(|group| {
+                    crate::persistence::model::SerializedProjectGroup::from_group(
+                        &group.key,
+                        group.expanded,
+                    )
                 })
-                .ok()
-            else {
-                return;
-            };
-            let kvp = cx.update(|cx| db::kvp::KeyValueStore::global(cx));
+                .collect::<Vec<_>>(),
+            sidebar_open: self.sidebar_open,
+            sidebar_state: self.sidebar.as_ref().and_then(|s| s.serialized_state(cx)),
+        };
+        let window_id = self.window_id;
+        let kvp = db::kvp::KeyValueStore::global(cx);
+        self._serialize_task = Some(cx.background_spawn(async move {
             crate::persistence::write_multi_workspace_state(&kvp, window_id, state).await;
         }));
     }
