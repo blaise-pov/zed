@@ -3,10 +3,13 @@ use std::sync::Arc;
 use agent_settings::{AgentProfileId, AgentSettings};
 use editor::Editor;
 use fs::Fs;
-use gpui::{App, Context, Entity, FocusHandle, Focusable, Render, SharedString, Subscription, Window, prelude::*};
+use gpui::{
+    App, Context, Entity, FocusHandle, Focusable, Render, SharedString, Subscription, Window,
+    prelude::*,
+};
 use settings::{Settings as _, SettingsStore, update_settings_file};
 use ui::{
-    Icon, IconName, IconSize, Label, LabelSize, ListItem, ListItemSpacing, Color, prelude::*,
+    Color, Icon, IconName, IconSize, Label, LabelSize, ListItem, ListItemSpacing, prelude::*,
 };
 
 const MIN_MAX_DEPTH: u32 = 1;
@@ -158,10 +161,7 @@ impl DelegationEditor {
             else {
                 return;
             };
-            profile
-                .delegation
-                .get_or_insert_default()
-                .max_depth = Some(next);
+            profile.delegation.get_or_insert_default().max_depth = Some(next);
         });
         cx.notify();
     }
@@ -215,25 +215,21 @@ impl DelegationEditor {
                 ListItem::new(SharedString::from(id.as_str()))
                     .inset(true)
                     .spacing(ListItemSpacing::Sparse)
-                    .child(
-                        v_flex()
-                            .child(Label::new(profile.name.clone()))
-                            .when_some(
-                                profile.description.clone(),
-                                |this, description| {
-                                    this.child(
-                                        Label::new(format!("id: {}", id.as_str()))
-                                            .size(ui::LabelSize::XSmall)
-                                            .color(Color::Muted),
-                                    )
-                                    .child(
-                                        Label::new(description)
-                                            .size(LabelSize::XSmall)
-                                            .color(Color::Muted),
-                                    )
-                                },
-                            ),
-                    )
+                    .child(v_flex().child(Label::new(profile.name.clone())).when_some(
+                        profile.description.clone(),
+                        |this, description| {
+                            this.child(
+                                Label::new(format!("id: {}", id.as_str()))
+                                    .size(ui::LabelSize::XSmall)
+                                    .color(Color::Muted),
+                            )
+                            .child(
+                                Label::new(description)
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Muted),
+                            )
+                        },
+                    ))
                     .end_slot::<Icon>(is_allowed.then(|| {
                         Icon::new(IconName::Check)
                             .size(IconSize::Small)
@@ -257,8 +253,14 @@ impl Focusable for DelegationEditor {
 
 impl Render for DelegationEditor {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        v_flex()
-            .track_focus(&self.focus_handle(cx))
-            .child(self.render_profiles_list(cx))
+        v_flex().track_focus(&self.focus_handle(cx)).child(
+            // The profile list can be longer than the screen is tall;
+            // keep it bounded and scrollable.
+            div()
+                .id("delegation-profiles-list")
+                .max_h(rems(28.))
+                .overflow_y_scroll()
+                .child(self.render_profiles_list(cx)),
+        )
     }
 }

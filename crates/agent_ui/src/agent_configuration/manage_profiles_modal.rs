@@ -379,9 +379,8 @@ impl ManageProfilesModal {
             profile_id = profile_id.as_str(),
             is_builtin = builtin_profiles::is_builtin(&profile_id)
         );
-        let delegation_editor = cx.new(|cx| {
-            DelegationEditor::new(profile_id.clone(), self.fs.clone(), window, cx)
-        });
+        let delegation_editor =
+            cx.new(|cx| DelegationEditor::new(profile_id.clone(), self.fs.clone(), window, cx));
 
         self.mode = Mode::ConfigureDelegation {
             profile_id,
@@ -401,7 +400,8 @@ impl ManageProfilesModal {
             profile_id = profile_id.as_str(),
             is_builtin = builtin_profiles::is_builtin(&profile_id)
         );
-        let skills_editor = cx.new(|cx| SkillsEditor::new(profile_id.clone(), self.fs.clone(), window, cx));
+        let skills_editor =
+            cx.new(|cx| SkillsEditor::new(profile_id.clone(), self.fs.clone(), window, cx));
 
         self.mode = Mode::ConfigureSkills {
             profile_id,
@@ -575,8 +575,7 @@ impl Focusable for ManageProfilesModal {
             Mode::ConfigureMcps { tool_picker, .. } => tool_picker.focus_handle(cx),
             Mode::ConfigureDefaultModel { model_picker, .. } => model_picker.focus_handle(cx),
             Mode::ConfigureDelegation {
-                delegation_editor,
-                ..
+                delegation_editor, ..
             } => delegation_editor.focus_handle(cx),
             Mode::ConfigureSkills { skills_editor, .. } => skills_editor.focus_handle(cx),
         }
@@ -936,11 +935,7 @@ impl ManageProfilesModal {
                                 .on_action({
                                     let profile_id = mode.profile_id.clone();
                                     cx.listener(move |this, _: &menu::Confirm, window, cx| {
-                                        this.configure_delegation(
-                                            profile_id.clone(),
-                                            window,
-                                            cx,
-                                        );
+                                        this.configure_delegation(profile_id.clone(), window, cx);
                                     })
                                 })
                                 .child(
@@ -1143,129 +1138,137 @@ impl Render for ManageProfilesModal {
                 this.focus_handle(cx).focus(window, cx);
             }))
             .on_mouse_down_out(cx.listener(|_this, _, _, cx| cx.emit(DismissEvent)))
-            .child(match &self.mode {
-                Mode::ChooseProfile(mode) => self
-                    .render_choose_profile(mode.clone(), window, cx)
-                    .into_any_element(),
-                Mode::NewProfile(mode) => self
-                    .render_new_profile(mode.clone(), window, cx)
-                    .into_any_element(),
-                Mode::ViewProfile(mode) => self
-                    .render_view_profile(mode.clone(), window, cx)
-                    .into_any_element(),
-                Mode::ConfigureTools {
-                    profile_id,
-                    tool_picker,
-                    ..
-                } => {
-                    let profile_name = settings
-                        .profiles
-                        .get(profile_id)
-                        .map(|profile| profile.name.clone())
-                        .unwrap_or_else(|| "Unknown".into());
+            .child(
+                // Any mode's list can outgrow the screen; keep the modal
+                // content bounded and scrollable.
+                div()
+                    .id("manage-profiles-content")
+                    .max_h(rems(36.))
+                    .overflow_y_scroll()
+                    .child(match &self.mode {
+                        Mode::ChooseProfile(mode) => self
+                            .render_choose_profile(mode.clone(), window, cx)
+                            .into_any_element(),
+                        Mode::NewProfile(mode) => self
+                            .render_new_profile(mode.clone(), window, cx)
+                            .into_any_element(),
+                        Mode::ViewProfile(mode) => self
+                            .render_view_profile(mode.clone(), window, cx)
+                            .into_any_element(),
+                        Mode::ConfigureTools {
+                            profile_id,
+                            tool_picker,
+                            ..
+                        } => {
+                            let profile_name = settings
+                                .profiles
+                                .get(profile_id)
+                                .map(|profile| profile.name.clone())
+                                .unwrap_or_else(|| "Unknown".into());
 
-                    v_flex()
-                        .pb_1()
-                        .child(ProfileModalHeader::new(
-                            format!("{profile_name} — Configure Built-in Tools"),
-                            Some(IconName::Settings),
-                        ))
-                        .child(ListSeparator)
-                        .child(tool_picker.clone())
-                        .child(ListSeparator)
-                        .child(go_back_item)
-                        .into_any_element()
-                }
-                Mode::ConfigureDefaultModel {
-                    profile_id,
-                    model_picker,
-                    ..
-                } => {
-                    let profile_name = settings
-                        .profiles
-                        .get(profile_id)
-                        .map(|profile| profile.name.clone())
-                        .unwrap_or_else(|| "Unknown".into());
+                            v_flex()
+                                .pb_1()
+                                .child(ProfileModalHeader::new(
+                                    format!("{profile_name} — Configure Built-in Tools"),
+                                    Some(IconName::Settings),
+                                ))
+                                .child(ListSeparator)
+                                .child(tool_picker.clone())
+                                .child(ListSeparator)
+                                .child(go_back_item)
+                                .into_any_element()
+                        }
+                        Mode::ConfigureDefaultModel {
+                            profile_id,
+                            model_picker,
+                            ..
+                        } => {
+                            let profile_name = settings
+                                .profiles
+                                .get(profile_id)
+                                .map(|profile| profile.name.clone())
+                                .unwrap_or_else(|| "Unknown".into());
 
-                    v_flex()
-                        .pb_1()
-                        .child(ProfileModalHeader::new(
-                            format!("{profile_name} — Configure Default Model"),
-                            Some(IconName::ZedAgent),
-                        ))
-                        .child(ListSeparator)
-                        .child(v_flex().w(rems(34.)).child(model_picker.clone()))
-                        .child(ListSeparator)
-                        .child(go_back_item)
-                        .into_any_element()
-                }
-                Mode::ConfigureMcps {
-                    profile_id,
-                    tool_picker,
-                    ..
-                } => {
-                    let profile_name = settings
-                        .profiles
-                        .get(profile_id)
-                        .map(|profile| profile.name.clone())
-                        .unwrap_or_else(|| "Unknown".into());
+                            v_flex()
+                                .pb_1()
+                                .child(ProfileModalHeader::new(
+                                    format!("{profile_name} — Configure Default Model"),
+                                    Some(IconName::ZedAgent),
+                                ))
+                                .child(ListSeparator)
+                                .child(v_flex().w(rems(34.)).child(model_picker.clone()))
+                                .child(ListSeparator)
+                                .child(go_back_item)
+                                .into_any_element()
+                        }
+                        Mode::ConfigureMcps {
+                            profile_id,
+                            tool_picker,
+                            ..
+                        } => {
+                            let profile_name = settings
+                                .profiles
+                                .get(profile_id)
+                                .map(|profile| profile.name.clone())
+                                .unwrap_or_else(|| "Unknown".into());
 
-                    v_flex()
-                        .pb_1()
-                        .child(ProfileModalHeader::new(
-                            format!("{profile_name} — Configure MCP Tools"),
-                            Some(IconName::ToolHammer),
-                        ))
-                        .child(ListSeparator)
-                        .child(tool_picker.clone())
-                        .child(ListSeparator)
-                        .child(go_back_item)
-                        .into_any_element()
-                }
-                Mode::ConfigureDelegation {
-                    profile_id,
-                    delegation_editor,
-                } => {
-                    let profile_name = settings
-                        .profiles
-                        .get(profile_id)
-                        .map(|profile| profile.name.clone())
-                        .unwrap_or_else(|| "Unknown".into());
+                            v_flex()
+                                .pb_1()
+                                .child(ProfileModalHeader::new(
+                                    format!("{profile_name} — Configure MCP Tools"),
+                                    Some(IconName::ToolHammer),
+                                ))
+                                .child(ListSeparator)
+                                .child(tool_picker.clone())
+                                .child(ListSeparator)
+                                .child(go_back_item)
+                                .into_any_element()
+                        }
+                        Mode::ConfigureDelegation {
+                            profile_id,
+                            delegation_editor,
+                        } => {
+                            let profile_name = settings
+                                .profiles
+                                .get(profile_id)
+                                .map(|profile| profile.name.clone())
+                                .unwrap_or_else(|| "Unknown".into());
 
-                    v_flex()
-                        .pb_1()
-                        .child(ProfileModalHeader::new(
-                            format!("{profile_name} — Configure Delegation"),
-                            Some(IconName::UserGroup),
-                        ))
-                        .child(ListSeparator)
-                        .child(delegation_editor.clone())
-                        .child(ListSeparator)
-                        .child(go_back_item)
-                        .into_any_element()
-                }
-                Mode::ConfigureSkills {
-                    profile_id,
-                    skills_editor,
-                } => {
-                    let profile_name = settings
-                        .profiles
-                        .get(profile_id)
-                        .map(|profile| profile.name.clone())
-                        .unwrap_or_else(|| "Unknown".into());
+                            v_flex()
+                                .pb_1()
+                                .child(ProfileModalHeader::new(
+                                    format!("{profile_name} — Configure Delegation"),
+                                    Some(IconName::UserGroup),
+                                ))
+                                .child(ListSeparator)
+                                .child(delegation_editor.clone())
+                                .child(ListSeparator)
+                                .child(go_back_item)
+                                .into_any_element()
+                        }
+                        Mode::ConfigureSkills {
+                            profile_id,
+                            skills_editor,
+                        } => {
+                            let profile_name = settings
+                                .profiles
+                                .get(profile_id)
+                                .map(|profile| profile.name.clone())
+                                .unwrap_or_else(|| "Unknown".into());
 
-                    v_flex()
-                        .pb_1()
-                        .child(ProfileModalHeader::new(
-                            format!("{profile_name} — Configure Skills"),
-                            Some(IconName::Sparkle),
-                        ))
-                        .child(ListSeparator)
-                        .child(skills_editor.clone())
-                        .child(ListSeparator)
-                        .child(go_back_item)
-                        .into_any_element()
-                }
-            })
+                            v_flex()
+                                .pb_1()
+                                .child(ProfileModalHeader::new(
+                                    format!("{profile_name} — Configure Skills"),
+                                    Some(IconName::Sparkle),
+                                ))
+                                .child(ListSeparator)
+                                .child(skills_editor.clone())
+                                .child(ListSeparator)
+                                .child(go_back_item)
+                                .into_any_element()
+                        }
+                    }),
+            )
     }
 }
