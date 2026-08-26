@@ -146,15 +146,19 @@ impl ProfileSelector {
             self.picker = Some(picker);
         }
 
-        if self.pending_refresh {
+        // Always sync the picker's candidates with the live settings: a
+        // settings change that happened while this selector was already
+        // deployed (or a missed store notification) would otherwise leave a
+        // stale profile list in the popover.
+        let live_profiles = AgentProfile::available_profiles(cx);
+        if self.profiles != live_profiles || self.pending_refresh {
+            self.profiles = live_profiles.clone();
             if let Some(picker) = &self.picker {
-                let profiles = AgentProfile::available_profiles(cx);
-                self.profiles = profiles.clone();
                 picker.update(cx, |picker, cx| {
                     let query = picker.query(cx);
                     picker
                         .delegate
-                        .refresh_profiles(profiles.clone(), query, cx);
+                        .refresh_profiles(live_profiles.clone(), query, cx);
                 });
             }
             self.pending_refresh = false;
