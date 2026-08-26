@@ -85,6 +85,9 @@ pub struct ProjectSettingsContent {
     ///
     /// Default: false
     pub disable_ai: Option<SaturatingBool>,
+    /// Agent settings declared in a project-local settings file. Merged into
+    /// the global agent settings with per-key precedence over user settings.
+    pub agent: Option<crate::agent::AgentSettingsContent>,
 }
 
 /// When to scan content of linked directories.

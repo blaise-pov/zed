@@ -307,31 +307,47 @@ impl PickerDelegate for ToolPickerDelegate {
                             .map(|(server_id, preset)| {
                                 (
                                     server_id,
-                                    ContextServerPresetContent {
-                                        tools: preset.tools,
+                                    match preset.enabled {
+                                        Some(enabled) => {
+                                            ContextServerPresetContent::Enabled(enabled)
+                                        }
+                                        None => ContextServerPresetContent::Tools {
+                                            tools: preset.tools,
+                                        },
                                     },
                                 )
                             })
                             .collect(),
-                            default_model: default_profile.default_model.clone(),
-                            custom_prompt: default_profile.custom_prompt.clone().map(|s| s.into()),
-                            description: default_profile.description.clone().map(|s| s.into()),
-                            skills: default_profile.skills.clone(),
-                            delegation: default_profile.delegation.as_ref().map(|delegation| {
-                                DelegationContent {
-                                    allowed: delegation
-                                        .allowed
-                                        .iter()
-                                        .map(|id| Arc::from(id.as_str()))
-                                        .collect(),
-                                    max_depth: Some(u32::from(delegation.max_depth)),
-                                }
-                            }),
-                        });
+                        default_model: default_profile.default_model.clone(),
+                        custom_prompt: default_profile.custom_prompt.clone().map(|s| s.into()),
+                        description: default_profile.description.clone().map(|s| s.into()),
+                        skills: default_profile.skills.clone(),
+                        delegation: default_profile.delegation.as_ref().map(|delegation| {
+                            DelegationContent {
+                                allowed: delegation
+                                    .allowed
+                                    .iter()
+                                    .map(|id| Arc::from(id.as_str()))
+                                    .collect(),
+                                max_depth: Some(u32::from(delegation.max_depth)),
+                            }
+                        }),
+                    });
 
                 if let Some(server_id) = server_id {
                     let preset = profile.context_servers.entry(server_id).or_default();
-                    *preset.tools.entry(tool_name).or_default() = !is_currently_enabled;
+                    match preset {
+                        ContextServerPresetContent::Enabled(enabled) => {
+                            // Translate a whole-server toggle into a per-tool
+                            // map, seeded with the previous enablement.
+                            let enabled = *enabled;
+                            let tools = [(tool_name, !enabled)].into_iter().collect();
+                            *preset = ContextServerPresetContent::Tools { tools };
+                        }
+                        ContextServerPresetContent::Tools { tools } => {
+                            *tools.entry(tool_name).or_default() = !is_currently_enabled;
+                        }
+                    }
                 } else {
                     *profile.tools.entry(tool_name).or_default() = !is_currently_enabled;
                 }

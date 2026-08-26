@@ -55,9 +55,7 @@
       }
     },
     "context_servers": {
-      "task-graph": {
-        "command": { "path": "taskgraph.exe", "args": [], "env": { "TGR_TOKEN": "${TGR_TOKEN}" } }
-      }
+      "task-graph": { "command": "taskgraph.exe", "args": [], "env": { "TGR_TOKEN": "${TGR_TOKEN}" } }
     }
   }
 }

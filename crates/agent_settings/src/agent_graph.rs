@@ -108,8 +108,10 @@ fn detect_cycles(profiles: &IndexMap<AgentProfileId, AgentProfileSettings>) -> V
         Done,
     }
 
-    let mut states: HashMap<&AgentProfileId, NodeState> =
-        profiles.keys().map(|id| (id, NodeState::Unvisited)).collect();
+    let mut states: HashMap<&AgentProfileId, NodeState> = profiles
+        .keys()
+        .map(|id| (id, NodeState::Unvisited))
+        .collect();
     let mut errors = Vec::new();
 
     for start in profiles.keys() {
@@ -135,10 +137,7 @@ fn detect_cycles(profiles: &IndexMap<AgentProfileId, AgentProfileSettings>) -> V
             *edge_ix += 1;
             match states.get(target) {
                 Some(NodeState::InProgress) => {
-                    let cycle_start = stack
-                        .iter()
-                        .position(|&(id, _)| id == target)
-                        .unwrap_or(0);
+                    let cycle_start = stack.iter().position(|&(id, _)| id == target).unwrap_or(0);
                     let participants: Vec<String> = stack[cycle_start..]
                         .iter()
                         .map(|&(id, _)| id.to_string())
@@ -164,12 +163,14 @@ fn detect_cycles(profiles: &IndexMap<AgentProfileId, AgentProfileSettings>) -> V
 #[cfg(test)]
 mod tests {
     use super::*;
-    use collections::IndexMap as Map;
 
     fn profile_with_delegation(allowed: &[&str]) -> AgentProfileSettings {
         AgentProfileSettings {
             delegation: Some(crate::Delegation {
-                allowed: allowed.iter().map(|id| AgentProfileId((*id).into())).collect(),
+                allowed: allowed
+                    .iter()
+                    .map(|id| AgentProfileId((*id).into()))
+                    .collect(),
                 ..Default::default()
             }),
             ..test_profile()
@@ -232,7 +233,11 @@ mod tests {
         ]);
         let errors = validate_profiles(&map);
         assert_eq!(errors.len(), 1, "cycle reported once: {errors:?}");
-        assert!(errors[0].contains("a -> b -> a"), "unexpected: {}", errors[0]);
+        assert!(
+            errors[0].contains("a -> b -> a"),
+            "unexpected: {}",
+            errors[0]
+        );
     }
 
     #[test]
@@ -252,7 +257,11 @@ mod tests {
         ]);
         let errors = validate_profiles(&map);
         assert_eq!(errors.len(), 1);
-        assert!(errors[0].contains("a -> b -> c -> a"), "unexpected: {}", errors[0]);
+        assert!(
+            errors[0].contains("a -> b -> c -> a"),
+            "unexpected: {}",
+            errors[0]
+        );
     }
 
     #[test]
@@ -268,8 +277,7 @@ mod tests {
                 if i == 99 {
                     (id, test_profile())
                 } else {
-                    let target: &str =
-                        Box::leak(format!("level-{}", i + 1).into_boxed_str());
+                    let target: &str = Box::leak(format!("level-{}", i + 1).into_boxed_str());
                     (id, profile_with_delegation(&[target]))
                 }
             })
@@ -304,7 +312,10 @@ mod tests {
         let error = check_delegation(&id("parent"), Some(&parent), 0, Some(&id("other")))
             .expect("unlisted target must be rejected");
         assert!(error.contains("'other'"), "unexpected: {error}");
-        assert!(error.contains("Allowed profiles: child"), "unexpected: {error}");
+        assert!(
+            error.contains("Allowed profiles: child"),
+            "unexpected: {error}"
+        );
     }
 
     #[test]
@@ -337,9 +348,8 @@ mod tests {
 
     #[test]
     fn check_delegation_rejects_unknown_parent_profile() {
-        let error =
-            check_delegation(&id("ghost"), None, 0, Some(&id("child")))
-                .expect("unknown parent profile must be rejected");
+        let error = check_delegation(&id("ghost"), None, 0, Some(&id("child")))
+            .expect("unknown parent profile must be rejected");
         assert!(error.contains("Unknown profile"), "unexpected: {error}");
     }
 }

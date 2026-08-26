@@ -295,6 +295,11 @@ pub struct AgentSettingsContent {
     /// Controls whether and how deeply sub-agents can nest further
     /// sub-agents via `spawn_agent`.
     pub nested_sub_agents: Option<NestedSubAgentsSettingsContent>,
+    /// Context server definitions, equivalent to
+    /// `project.context_servers`. Lets a project or user keep all agent
+    /// configuration under a single `agent` block; entries here take
+    /// precedence over `project.context_servers`.
+    pub context_servers: Option<HashMap<Arc<str>, crate::project::ContextServerSettingsContent>>,
     /// Where to show a popup notification when the agent is waiting for user input.
     ///
     /// Default: "primary_screen"
@@ -580,9 +585,30 @@ pub struct DelegationContent {
 }
 
 #[with_fallible_options]
-#[derive(Debug, PartialEq, Clone, Default, Serialize, Deserialize, JsonSchema, MergeFrom)]
-pub struct ContextServerPresetContent {
-    pub tools: IndexMap<Arc<str>, bool>,
+#[derive(Debug, PartialEq, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(untagged)]
+pub enum ContextServerPresetContent {
+    /// Enables or disables the entire server for the profile.
+    Enabled(bool),
+    /// Enables individual tools of the server.
+    Tools {
+        #[serde(default)]
+        tools: IndexMap<Arc<str>, bool>,
+    },
+}
+
+impl Default for ContextServerPresetContent {
+    fn default() -> Self {
+        Self::Tools {
+            tools: IndexMap::default(),
+        }
+    }
+}
+
+impl crate::merge_from::MergeFrom for ContextServerPresetContent {
+    fn merge_from(&mut self, other: &Self) {
+        *self = other.clone();
+    }
 }
 
 #[derive(

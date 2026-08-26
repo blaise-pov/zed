@@ -152,11 +152,7 @@ impl From<DelegationContent> for Delegation {
     fn from(content: DelegationContent) -> Self {
         let default = Self::default();
         Self {
-            allowed: content
-                .allowed
-                .into_iter()
-                .map(AgentProfileId)
-                .collect(),
+            allowed: content.allowed.into_iter().map(AgentProfileId).collect(),
             max_depth: content
                 .max_depth
                 .map(|depth| depth.clamp(1, 5) as u8)
@@ -197,10 +193,17 @@ impl AgentProfileSettings {
     }
 
     pub fn is_context_server_tool_enabled(&self, server_id: &str, tool_name: &str) -> bool {
-        self.context_servers
-            .get(server_id)
-            .and_then(|preset| preset.tools.get(tool_name).copied())
-            .unwrap_or(self.enable_all_context_servers)
+        match self.context_servers.get(server_id) {
+            Some(preset) => match preset.enabled {
+                Some(enabled) => enabled,
+                None => preset
+                    .tools
+                    .get(tool_name)
+                    .copied()
+                    .unwrap_or(self.enable_all_context_servers),
+            },
+            None => self.enable_all_context_servers,
+        }
     }
 
     pub fn save_to_settings(
@@ -230,8 +233,11 @@ impl AgentProfileSettings {
                     .map(|(server_id, preset)| {
                         (
                             server_id,
-                            ContextServerPresetContent {
-                                tools: preset.tools,
+                            match preset.enabled {
+                                Some(enabled) => ContextServerPresetContent::Enabled(enabled),
+                                None => ContextServerPresetContent::Tools {
+                                    tools: preset.tools,
+                                },
                             },
                         )
                     })
@@ -240,14 +246,17 @@ impl AgentProfileSettings {
                 custom_prompt: self.custom_prompt.clone().map(|s| s.into()),
                 description: self.description.clone().map(|s| s.into()),
                 skills: self.skills.clone(),
-                delegation: self.delegation.as_ref().map(|delegation| DelegationContent {
-                    allowed: delegation
-                        .allowed
-                        .iter()
-                        .map(|id| Arc::from(id.as_str()))
-                        .collect(),
-                    max_depth: Some(u32::from(delegation.max_depth)),
-                }),
+                delegation: self
+                    .delegation
+                    .as_ref()
+                    .map(|delegation| DelegationContent {
+                        allowed: delegation
+                            .allowed
+                            .iter()
+                            .map(|id| Arc::from(id.as_str()))
+                            .collect(),
+                        max_depth: Some(u32::from(delegation.max_depth)),
+                    }),
             },
         );
 
@@ -288,13 +297,23 @@ impl From<AgentProfileContent> for AgentProfileSettings {
 
 #[derive(Debug, Clone, Default)]
 pub struct ContextServerPreset {
+    /// When set, enables or disables the entire server for this profile,
+    /// overriding any per-tool toggles.
+    pub enabled: Option<bool>,
     pub tools: IndexMap<Arc<str>, bool>,
 }
 
 impl From<settings::ContextServerPresetContent> for ContextServerPreset {
     fn from(content: settings::ContextServerPresetContent) -> Self {
-        Self {
-            tools: content.tools,
+        match content {
+            settings::ContextServerPresetContent::Enabled(enabled) => Self {
+                enabled: Some(enabled),
+                tools: IndexMap::default(),
+            },
+            settings::ContextServerPresetContent::Tools { tools } => Self {
+                enabled: None,
+                tools,
+            },
         }
     }
 }
@@ -322,6 +341,7 @@ mod tests {
 
     fn preset(tools: &[(&str, bool)]) -> ContextServerPreset {
         ContextServerPreset {
+            enabled: None,
             tools: tools
                 .iter()
                 .map(|(name, enabled)| (Arc::from(*name), *enabled))
@@ -382,5 +402,88 @@ mod tests {
 
         assert!(!AgentProfileSettings::is_unmodified_default(&write, cx));
         assert!(AgentProfileSettings::is_unmodified_default(&minimal, cx));
+    }
+
+    #[gpui::test]
+    fn project_local_agent_settings_merge_with_user_settings(cx: &mut gpui::App) {
+        use gpui::UpdateGlobal as _;
+        use settings::{LocalSettingsKind, LocalSettingsPath, WorktreeId};
+
+        let store = SettingsStore::test(cx);
+        cx.set_global(store);
+        project::DisableAiSettings::register(cx);
+        AgentSettings::register(cx);
+
+        SettingsStore::update_global(cx, |store, cx| {
+            store
+                .set_user_settings(
+                    r#"{ "agent": { "default_profile": "write", "profiles": { "orchestrator": { "name": "User Orchestrator" } } } }"#,
+                    cx,
+                )
+                .unwrap();
+        });
+
+        let root = std::sync::Arc::from(util::rel_path::RelPath::from_unix_str("root").unwrap());
+        SettingsStore::update_global(cx, |store, cx| {
+            store
+                .set_local_settings(
+                    WorktreeId::from_usize(1),
+                    LocalSettingsPath::InWorktree(root),
+                    LocalSettingsKind::Settings,
+                    Some(
+                        r#"{
+                            "agent": {
+                                "default_profile": "orchestrator",
+                                "context_servers": {
+                                    "demo": { "command": "npx", "args": ["-y", "demo-mcp"] }
+                                },
+                                "profiles": {
+                                    "orchestrator": {
+                                        "name": "Project Orchestrator",
+                                        "context_servers": { "postgres": true, "docker": false }
+                                    },
+                                    "backend": { "name": "Backend" }
+                                }
+                            }
+                        }"#,
+                    ),
+                    cx,
+                )
+                .unwrap();
+        });
+
+        let profiles = AgentProfile::available_profiles(cx);
+        // The project's entry overrides the user's profile of the same id.
+        assert_eq!(
+            profiles.get(&AgentProfileId("orchestrator".into())),
+            Some(&"Project Orchestrator".into())
+        );
+        // Profiles only present in the project file are available too.
+        assert_eq!(
+            profiles.get(&AgentProfileId("backend".into())),
+            Some(&"Backend".into())
+        );
+
+        let settings = AgentSettings::get_global(cx);
+        assert_eq!(
+            settings.default_profile,
+            AgentProfileId("orchestrator".into())
+        );
+
+        let profile = settings
+            .profiles
+            .get(&AgentProfileId("orchestrator".into()))
+            .unwrap();
+        // A boolean preset enables or disables the whole server.
+        assert!(profile.is_context_server_tool_enabled("postgres", "any_tool"));
+        assert!(!profile.is_context_server_tool_enabled("docker", "any_tool"));
+
+        // Server definitions under `agent.context_servers` are surfaced
+        // through the project context server settings.
+        assert!(
+            project::project_settings::ProjectSettings::get_global(cx)
+                .context_servers
+                .contains_key("demo")
+        );
     }
 }

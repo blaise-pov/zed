@@ -1092,20 +1092,20 @@ impl SettingsStore {
                     }),
                 }?;
                 if let Some(new_settings) = new_settings {
+                    let new_agent = new_settings.agent.clone();
+                    let mut new_content = SettingsContent {
+                        project: new_settings,
+                        ..Default::default()
+                    };
+                    new_content.agent = new_agent;
                     match self.local_settings.entry((root_id, directory_path)) {
                         btree_map::Entry::Vacant(v) => {
-                            v.insert(SettingsContent {
-                                project: new_settings,
-                                ..Default::default()
-                            });
+                            v.insert(new_content);
                             zed_settings_changed = true;
                         }
                         btree_map::Entry::Occupied(mut o) => {
-                            if &o.get().project != &new_settings {
-                                o.insert(SettingsContent {
-                                    project: new_settings,
-                                    ..Default::default()
-                                });
+                            if o.get() != &new_content {
+                                o.insert(new_content);
                                 zed_settings_changed = true;
                             }
                         }
@@ -1372,6 +1372,13 @@ impl SettingsStore {
                     .merge_from(&local_settings.project.disable_ai);
             }
 
+            // Merge agent settings from project-local settings files into the
+            // global value, with the project's entries taking precedence per
+            // key over user settings.
+            for local_settings in self.local_settings.values() {
+                merged.agent.merge_from(&local_settings.agent);
+            }
+
             self.merged_settings = Rc::new(merged);
 
             for setting_value in self.setting_values.values_mut() {
@@ -1408,6 +1415,23 @@ impl SettingsStore {
                     .disable_ai
                     .merge_from(&local_settings.project.disable_ai);
             }
+
+            // Recompute agent settings the same way, since they now also
+            // depend on all local settings.
+            merged.agent = self.default_settings.agent.clone();
+            if let Some(global) = &self.global_settings {
+                merged.agent.merge_from(&global.agent);
+            }
+            if let Some(user) = &self.user_settings {
+                merged.agent.merge_from(&user.content.agent);
+            }
+            if let Some(server) = &self.server_settings {
+                merged.agent.merge_from(&server.agent);
+            }
+            for local_settings in self.local_settings.values() {
+                merged.agent.merge_from(&local_settings.agent);
+            }
+
             self.merged_settings = Rc::new(merged);
 
             for setting_value in self.setting_values.values_mut() {

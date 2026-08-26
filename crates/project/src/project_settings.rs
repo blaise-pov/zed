@@ -721,12 +721,26 @@ impl Settings for ProjectSettings {
                 .unwrap_or_else(|| DEFAULT_WORKTREE_DIRECTORY.to_string()),
         };
         Self {
-            context_servers: project
-                .context_servers
-                .clone()
-                .into_iter()
-                .map(|(key, value)| (key, value.into()))
-                .collect(),
+            context_servers: {
+                let mut context_servers: HashMap<Arc<str>, ContextServerSettings> = project
+                    .context_servers
+                    .clone()
+                    .into_iter()
+                    .map(|(key, value)| (key, value.into()))
+                    .collect();
+                // Server definitions may also live under `agent.context_servers`;
+                // they take precedence over `project.context_servers`.
+                if let Some(agent_servers) = content
+                    .agent
+                    .as_ref()
+                    .and_then(|agent| agent.context_servers.as_ref())
+                {
+                    for (key, value) in agent_servers {
+                        context_servers.insert(key.clone(), value.clone().into());
+                    }
+                }
+                context_servers
+            },
             context_server_timeout: project.context_server_timeout.unwrap_or(60),
             lsp: project
                 .lsp
