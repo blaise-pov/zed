@@ -373,6 +373,7 @@ impl EditToolTest {
                 is_windows: cfg!(target_os = "windows"),
                 custom_instructions: None,
                 subagent_delegation_note: None,
+                available_agents: None,
             };
             let templates = Templates::new();
             template.render(&templates)?

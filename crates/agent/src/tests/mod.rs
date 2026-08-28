@@ -310,9 +310,29 @@ fn insert_profile(
             context_servers: IndexMap::default(),
             default_model,
             custom_prompt: None,
+            description: None,
+            skills: None,
+            delegation: None,
         },
     );
     agent_settings::AgentSettings::override_global(settings, cx);
+}
+
+/// Gives the default profile a delegation block so tests can spawn
+/// subagents under the fork's per-profile delegation rules. The default
+/// profile delegates to itself, so subagents run with the same toolset the
+/// tests were written against.
+fn enable_default_profile_delegation(cx: &mut App) -> AgentProfileId {
+    let mut settings = agent_settings::AgentSettings::get_global(cx).clone();
+    let default_profile_id = settings.default_profile.clone();
+    if let Some(profile) = settings.profiles.get_mut(&default_profile_id) {
+        profile.delegation = Some(agent_settings::Delegation {
+            allowed: vec![default_profile_id.clone()],
+            max_depth: 5,
+        });
+    }
+    agent_settings::AgentSettings::override_global(settings, cx);
+    default_profile_id
 }
 
 /// Turns terminal sandboxing off so the non-sandboxed `TerminalTool` is the
@@ -5560,6 +5580,7 @@ async fn test_terminal_tool_permission_rules(cx: &mut TestAppContext) {
 #[gpui::test]
 async fn test_subagent_tool_call_end_to_end(cx: &mut TestAppContext) {
     init_test(cx);
+    let subagent_profile = cx.update(|cx| enable_default_profile_delegation(cx));
     cx.update(|cx| {
         LanguageModelRegistry::test(cx);
     });
@@ -5610,7 +5631,8 @@ async fn test_subagent_tool_call_end_to_end(cx: &mut TestAppContext) {
         label: "label".to_string(),
         message: "subagent task prompt".to_string(),
         session_id: None,
-        profile: None,
+        task_id: None,
+        profile: Some(subagent_profile.clone()),
     };
     let subagent_tool_use = LanguageModelToolUse {
         id: "subagent_1".into(),
@@ -5697,6 +5719,7 @@ async fn test_subagent_tool_call_end_to_end(cx: &mut TestAppContext) {
 #[gpui::test]
 async fn test_subagent_tool_output_does_not_include_thinking(cx: &mut TestAppContext) {
     init_test(cx);
+    let subagent_profile = cx.update(|cx| enable_default_profile_delegation(cx));
     cx.update(|cx| {
         LanguageModelRegistry::test(cx);
     });
@@ -5747,7 +5770,8 @@ async fn test_subagent_tool_output_does_not_include_thinking(cx: &mut TestAppCon
         label: "label".to_string(),
         message: "subagent task prompt".to_string(),
         session_id: None,
-        profile: None,
+        task_id: None,
+        profile: Some(subagent_profile.clone()),
     };
     let subagent_tool_use = LanguageModelToolUse {
         id: "subagent_1".into(),
@@ -5847,6 +5871,7 @@ async fn test_subagent_tool_output_does_not_include_thinking(cx: &mut TestAppCon
 #[gpui::test]
 async fn test_subagent_tool_call_cancellation_during_task_prompt(cx: &mut TestAppContext) {
     init_test(cx);
+    let subagent_profile = cx.update(|cx| enable_default_profile_delegation(cx));
     cx.update(|cx| {
         LanguageModelRegistry::test(cx);
     });
@@ -5897,7 +5922,8 @@ async fn test_subagent_tool_call_cancellation_during_task_prompt(cx: &mut TestAp
         label: "label".to_string(),
         message: "subagent task prompt".to_string(),
         session_id: None,
-        profile: None,
+        task_id: None,
+        profile: Some(subagent_profile.clone()),
     };
     let subagent_tool_use = LanguageModelToolUse {
         id: "subagent_1".into(),
@@ -5979,6 +6005,7 @@ async fn test_subagent_tool_call_cancellation_during_task_prompt(cx: &mut TestAp
 #[gpui::test]
 async fn test_subagent_tool_resume_session(cx: &mut TestAppContext) {
     init_test(cx);
+    let subagent_profile = cx.update(|cx| enable_default_profile_delegation(cx));
     cx.update(|cx| {
         LanguageModelRegistry::test(cx);
     });
@@ -6029,7 +6056,8 @@ async fn test_subagent_tool_resume_session(cx: &mut TestAppContext) {
         label: "initial task".to_string(),
         message: "do the first task".to_string(),
         session_id: None,
-        profile: None,
+        task_id: None,
+        profile: Some(subagent_profile.clone()),
     };
     let subagent_tool_use = LanguageModelToolUse {
         id: "subagent_1".into(),
@@ -6093,7 +6121,8 @@ async fn test_subagent_tool_resume_session(cx: &mut TestAppContext) {
         label: "follow-up task".to_string(),
         message: "do the follow-up task".to_string(),
         session_id: Some(subagent_session_id.clone()),
-        profile: None,
+        task_id: None,
+        profile: Some(subagent_profile.clone()),
     };
     let resume_tool_use = LanguageModelToolUse {
         id: "subagent_2".into(),
@@ -7050,6 +7079,7 @@ async fn test_parent_cancel_stops_subagent(cx: &mut TestAppContext) {
 #[gpui::test]
 async fn test_subagent_context_window_warning(cx: &mut TestAppContext) {
     init_test(cx);
+    let subagent_profile = cx.update(|cx| enable_default_profile_delegation(cx));
     cx.update(|cx| {
         LanguageModelRegistry::test(cx);
     });
@@ -7100,7 +7130,8 @@ async fn test_subagent_context_window_warning(cx: &mut TestAppContext) {
         label: "label".to_string(),
         message: "subagent task prompt".to_string(),
         session_id: None,
-        profile: None,
+        task_id: None,
+        profile: Some(subagent_profile.clone()),
     };
     let subagent_tool_use = LanguageModelToolUse {
         id: "subagent_1".into(),
@@ -7178,6 +7209,7 @@ async fn test_subagent_context_window_warning(cx: &mut TestAppContext) {
 #[gpui::test]
 async fn test_subagent_no_context_window_warning_when_already_at_warning(cx: &mut TestAppContext) {
     init_test(cx);
+    let subagent_profile = cx.update(|cx| enable_default_profile_delegation(cx));
     cx.update(|cx| {
         LanguageModelRegistry::test(cx);
     });
@@ -7228,7 +7260,8 @@ async fn test_subagent_no_context_window_warning_when_already_at_warning(cx: &mu
         label: "initial task".to_string(),
         message: "do the first task".to_string(),
         session_id: None,
-        profile: None,
+        task_id: None,
+        profile: Some(subagent_profile.clone()),
     };
     let subagent_tool_use = LanguageModelToolUse {
         id: "subagent_1".into(),
@@ -7297,7 +7330,8 @@ async fn test_subagent_no_context_window_warning_when_already_at_warning(cx: &mu
         label: "follow-up task".to_string(),
         message: "do the follow-up task".to_string(),
         session_id: Some(subagent_session_id.clone()),
-        profile: None,
+        task_id: None,
+        profile: Some(subagent_profile.clone()),
     };
     let resume_tool_use = LanguageModelToolUse {
         id: "subagent_2".into(),
@@ -7357,6 +7391,7 @@ async fn test_subagent_no_context_window_warning_when_already_at_warning(cx: &mu
 #[gpui::test]
 async fn test_subagent_error_propagation(cx: &mut TestAppContext) {
     init_test(cx);
+    let subagent_profile = cx.update(|cx| enable_default_profile_delegation(cx));
     cx.update(|cx| {
         LanguageModelRegistry::test(cx);
     });
@@ -7407,7 +7442,8 @@ async fn test_subagent_error_propagation(cx: &mut TestAppContext) {
         label: "label".to_string(),
         message: "subagent task prompt".to_string(),
         session_id: None,
-        profile: None,
+        task_id: None,
+        profile: Some(subagent_profile.clone()),
     };
     let subagent_tool_use = LanguageModelToolUse {
         id: "subagent_1".into(),

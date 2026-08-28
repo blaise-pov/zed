@@ -5391,6 +5391,8 @@ mod internal_tests {
 
     #[gpui::test]
     async fn test_profile_skills_filter_hides_unlisted_skills(cx: &mut TestAppContext) {
+        use gpui::UpdateGlobal as _;
+
         init_test(cx);
         let fs = FakeFs::new(cx.executor());
         let skills_dir = global_skills_dir();
@@ -5408,13 +5410,15 @@ mod internal_tests {
             .await;
         }
 
-        SettingsStore::update_global(cx, |store, cx| {
-            store
-                .set_user_settings(
-                    r#"{ "agent": { "profiles": { "restricted": { "name": "Restricted", "skills": ["skill-a"] } } } }"#,
-                    cx,
-                )
-                .unwrap();
+        cx.update(|cx| {
+            SettingsStore::update_global(cx, |store, cx| {
+                store
+                    .set_user_settings(
+                        r#"{ "agent": { "profiles": { "restricted": { "name": "Restricted", "skills": ["skill-a"] } } } }"#,
+                        cx,
+                    )
+                    .unwrap();
+            });
         });
 
         let project = Project::test(fs.clone(), [], cx).await;
