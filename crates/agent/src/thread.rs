@@ -23,6 +23,7 @@ use agent_settings::{
 };
 use anyhow::{Context as _, Result, anyhow};
 use chrono::{DateTime, Local, Utc};
+use regex::Regex;
 use client::UserStore;
 use cloud_api_types::Plan;
 use collections::{HashMap, HashSet, IndexMap};
@@ -227,11 +228,22 @@ impl std::fmt::Display for PromptId {
 
 pub(crate) const MAX_RETRY_ATTEMPTS: u8 = 4;
 pub(crate) const BASE_RETRY_DELAY: Duration = Duration::from_secs(5);
+/// Hard cap on parked retries so the turn's `u8` attempt counter cannot
+/// overflow while parking without a total budget.
+const MAX_PARK_ATTEMPTS: u8 = 200;
+/// Sanity ceiling for a single guided wait when the policy parks without a
+/// total budget, guarding against bogus provider guidance.
+const MAX_GUIDED_WAIT: Duration = Duration::from_secs(24 * 60 * 60);
 
 #[derive(Debug, Clone, PartialEq)]
 enum RetryStrategy {
     ExponentialBackoff,
     FixedDelay { delay: Duration, max_attempts: u8 },
+    /// The provider rate-limited the request: wait for its reset guidance
+    /// when available, otherwise poll with an exponentially growing delay.
+    ParkedPolling {
+        policy: language_model::RateLimitParkingPolicy,
+    },
 }
 
 impl RetryStrategy {
@@ -247,6 +259,23 @@ impl RetryStrategy {
                 delay,
                 max_attempts,
             } => (attempt <= *max_attempts).then_some(*delay),
+            RetryStrategy::ParkedPolling { policy } => {
+                if attempt > self.max_attempts() {
+                    return None;
+                }
+                if let Some(guided) = rate_limit_guided_wait(error) {
+                    let ceiling = policy.max_total_wait.unwrap_or(MAX_GUIDED_WAIT);
+                    return Some(guided.min(ceiling));
+                }
+                // Poll adaptively: initial wait, doubling up to the policy's
+                // ceiling, then polling at that ceiling until the budget is
+                // spent.
+                let mut wait = policy.initial_wait.max(Duration::from_secs(1));
+                for _ in 1..attempt {
+                    wait = wait.saturating_mul(2).min(policy.max_wait);
+                }
+                Some(wait)
+            }
         }
     }
 
@@ -254,8 +283,94 @@ impl RetryStrategy {
         match self {
             RetryStrategy::ExponentialBackoff => MAX_RETRY_ATTEMPTS,
             RetryStrategy::FixedDelay { max_attempts, .. } => *max_attempts,
+            RetryStrategy::ParkedPolling { policy } => {
+                let Some(total) = policy.max_total_wait else {
+                    return MAX_PARK_ATTEMPTS;
+                };
+                // How many poll attempts the budget affords under the
+                // deterministic exponential schedule.
+                let mut cumulative = Duration::ZERO;
+                let mut wait = policy.initial_wait.max(Duration::from_secs(1));
+                let mut attempts = 0_u32;
+                while cumulative < total && attempts < u32::from(MAX_PARK_ATTEMPTS) {
+                    cumulative = cumulative.saturating_add(wait);
+                    wait = wait.saturating_mul(2).min(policy.max_wait);
+                    attempts += 1;
+                }
+                attempts.min(u32::from(u8::MAX)) as u8
+            }
         }
     }
+}
+
+/// The provider's own reset guidance for a rate-limit rejection: a
+/// `Retry-After` duration, or a reset time parsed from the error message.
+fn rate_limit_guided_wait(error: &LanguageModelCompletionError) -> Option<Duration> {
+    if let LanguageModelCompletionError::ProviderRejection { retry_after, .. } = error
+        && let Some(retry_after) = *retry_after
+    {
+        return Some(retry_after);
+    }
+    parse_reset_wait_from_message(&error.to_string())
+}
+
+/// Parses reset guidance embedded in a provider's rate-limit error message:
+/// an RFC 3339 reset timestamp ("...until 2026-08-27T14:30:00Z..."), or a
+/// spelled-out duration ("...retry in 3h 21m", "4 hours, 2 minutes").
+fn parse_reset_wait_from_message(message: &str) -> Option<Duration> {
+    use std::sync::LazyLock;
+
+    static TIMESTAMP: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?")
+            .expect("rate limit timestamp regex should compile")
+    });
+    static DURATION: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(
+            r"(?i)(\d+(?:\.\d+)?)\s*(hours?|hrs?|h|minutes?|mins?|m|seconds?|secs?|s)\b",
+        )
+        .expect("rate limit duration regex should compile")
+    });
+
+    if let Some(matched) = TIMESTAMP.find(message) {
+        // Normalize a space-separated timestamp and a missing offset so
+        // `parse_from_rfc3339` accepts it; treat offset-less timestamps as
+        // UTC.
+        let mut candidate = matched.as_str().replace(' ', "T");
+        if !candidate.ends_with('Z')
+            && !candidate
+                .chars()
+                .rev()
+                .take_while(|c| c.is_ascii_digit() || *c == '+' || *c == '-' || *c == ':')
+                .any(|c| c == '+' || c == '-')
+        {
+            candidate.push('Z');
+        }
+        if let Ok(reset_at) = DateTime::parse_from_rfc3339(&candidate) {
+            return reset_at
+                .with_timezone(&Utc)
+                .signed_duration_since(Utc::now())
+                .to_std()
+                .ok();
+        }
+    }
+
+    let mut seconds = 0_f64;
+    let mut found = false;
+    for captures in DURATION.captures_iter(message) {
+        let value: f64 = captures.get(1)?.as_str().parse().ok()?;
+        let unit = captures.get(2)?.as_str().to_ascii_lowercase();
+        let multiplier = if unit.starts_with('h') {
+            3600.0
+        } else if unit.starts_with('m') {
+            60.0
+        } else {
+            1.0
+        };
+        seconds += value * multiplier;
+        found = true;
+    }
+    found.then(|| Duration::from_secs_f64(seconds.min(MAX_GUIDED_WAIT.as_secs_f64())))
+        .filter(|wait| !wait.is_zero())
 }
 
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
@@ -3492,7 +3607,8 @@ impl Thread {
             return Err(anyhow!(error));
         }
 
-        let Some(strategy) = Self::retry_strategy_for(&error) else {
+        let rate_limit_policy = model.rate_limit_parking_policy(cx);
+        let Some(strategy) = Self::retry_strategy_for(&error, rate_limit_policy) else {
             return Err(anyhow!(error));
         };
 
@@ -4786,10 +4902,22 @@ impl Thread {
         self.prompt_id = PromptId::new();
     }
 
-    fn retry_strategy_for(error: &LanguageModelCompletionError) -> Option<RetryStrategy> {
+    fn retry_strategy_for(
+        error: &LanguageModelCompletionError,
+        rate_limit_policy: language_model::RateLimitParkingPolicy,
+    ) -> Option<RetryStrategy> {
         use LanguageModelCompletionError::*;
 
         match error {
+            // Rate limits park the turn: wait for the provider's reset
+            // guidance when available, otherwise poll adaptively within the
+            // policy's budget.
+            ProviderRejection {
+                category: ProviderErrorCategory::RateLimit,
+                ..
+            } => Some(RetryStrategy::ParkedPolling {
+                policy: rate_limit_policy,
+            }),
             // A rejection with no status (e.g. a content-policy rejection
             // like `cyber_policy`) is permanent: retrying sends the same
             // request and gets the same answer. A rejection with a
@@ -8754,7 +8882,7 @@ mod tests {
             "This content was flagged as potentially violating our terms of use."
         );
 
-        assert!(Thread::retry_strategy_for(&error).is_none());
+        assert!(Thread::retry_strategy_for(&error, parking_policy()).is_none());
     }
 
     #[test]
@@ -8767,11 +8895,15 @@ mod tests {
             "invalid x-api-key".to_string(),
             None,
         );
-        assert!(Thread::retry_strategy_for(&error).is_none());
+        assert!(Thread::retry_strategy_for(&error, parking_policy()).is_none());
+    }
+
+    fn parking_policy() -> language_model::RateLimitParkingPolicy {
+        language_model::RateLimitParkingPolicy::default()
     }
 
     #[test]
-    fn test_retry_strategy_retries_status_less_transient_category() {
+    fn test_retry_strategy_parks_rate_limit_rejections() {
         let error = LanguageModelCompletionError::from_provider_response(
             language_model::ANTHROPIC_PROVIDER_NAME,
             None,
@@ -8782,15 +8914,16 @@ mod tests {
         );
 
         assert_eq!(
-            Thread::retry_strategy_for(&error),
-            Some(RetryStrategy::ExponentialBackoff)
+            Thread::retry_strategy_for(&error, parking_policy()),
+            Some(RetryStrategy::ParkedPolling {
+                policy: parking_policy(),
+            })
         );
     }
 
     #[test]
     fn test_retry_strategy_uses_exponential_backoff_without_retry_after() {
         for status in [
-            http_client::StatusCode::TOO_MANY_REQUESTS,
             http_client::StatusCode::INTERNAL_SERVER_ERROR,
             http_client::StatusCode::SERVICE_UNAVAILABLE,
             http_client::StatusCode::from_u16(529).unwrap(),
@@ -8801,7 +8934,7 @@ mod tests {
                 "upstream failure".to_string(),
                 None,
             );
-            let strategy = Thread::retry_strategy_for(&error)
+            let strategy = Thread::retry_strategy_for(&error, parking_policy())
                 .unwrap_or_else(|| panic!("expected a retry strategy for status {status}"));
             assert_eq!(
                 strategy,
@@ -8828,7 +8961,7 @@ mod tests {
     }
 
     #[test]
-    fn test_retry_strategy_honors_retry_after_with_a_fixed_delay() {
+    fn test_retry_strategy_honors_retry_after_while_parked() {
         let retry_after = Duration::from_secs(3);
         let error = LanguageModelCompletionError::from_http_status(
             language_model::LanguageModelProviderName::new("Anthropic"),
@@ -8836,21 +8969,110 @@ mod tests {
             "rate limited".to_string(),
             Some(retry_after),
         );
-        let strategy = Thread::retry_strategy_for(&error).expect("429 should retry");
+        let strategy = Thread::retry_strategy_for(&error, parking_policy()).expect("429 should retry");
         assert_eq!(
             strategy,
-            RetryStrategy::FixedDelay {
-                delay: retry_after,
-                max_attempts: MAX_RETRY_ATTEMPTS,
+            RetryStrategy::ParkedPolling {
+                policy: parking_policy(),
             }
         );
-        // The delay stays fixed across attempts, unlike exponential backoff.
+        // The provider's guidance is honored at every attempt within the
+        // parking budget, which is far larger than the legacy retry count.
         assert_eq!(strategy.delay_after(&error, 1), Some(retry_after));
-        assert_eq!(
-            strategy.delay_after(&error, MAX_RETRY_ATTEMPTS),
-            Some(retry_after)
+        assert_eq!(strategy.delay_after(&error, MAX_RETRY_ATTEMPTS), Some(retry_after));
+    }
+
+    #[test]
+    fn test_park_polls_adaptively_without_guidance() {
+        let policy = language_model::RateLimitParkingPolicy {
+            initial_wait: Duration::from_secs(10),
+            max_wait: Duration::from_secs(30),
+            max_total_wait: Some(Duration::from_secs(200)),
+        };
+        let error = LanguageModelCompletionError::from_provider_response(
+            language_model::ANTHROPIC_PROVIDER_NAME,
+            None,
+            Some("rate_limit_error".to_string()),
+            "Rate limit exceeded".to_string(),
+            None,
+            language_model::ProviderErrorCategory::RateLimit,
         );
-        assert_eq!(strategy.delay_after(&error, MAX_RETRY_ATTEMPTS + 1), None);
+        let strategy = RetryStrategy::ParkedPolling { policy };
+
+        assert_eq!(strategy.delay_after(&error, 1), Some(Duration::from_secs(10)));
+        assert_eq!(strategy.delay_after(&error, 2), Some(Duration::from_secs(20)));
+        assert_eq!(strategy.delay_after(&error, 3), Some(Duration::from_secs(30)));
+        assert_eq!(strategy.delay_after(&error, 4), Some(Duration::from_secs(30)));
+
+        // Budget: cumulative waits 10 + 20 + 30*5 = 180 after six
+        // attempts; a seventh (180 < 200) is still affordable, the eighth
+        // pushes past 200 and is the last one scheduled.
+        assert_eq!(strategy.max_attempts(), 8);
+        assert_eq!(strategy.delay_after(&error, 8), Some(Duration::from_secs(30)));
+        assert_eq!(strategy.delay_after(&error, 9), None);
+    }
+
+    #[test]
+    fn test_park_without_budget_keeps_polling() {
+        let policy = language_model::RateLimitParkingPolicy {
+            max_total_wait: None,
+            ..language_model::RateLimitParkingPolicy::default()
+        };
+        let strategy = RetryStrategy::ParkedPolling { policy };
+        assert_eq!(strategy.max_attempts(), MAX_PARK_ATTEMPTS);
+        assert!(strategy
+            .delay_after(&rate_limit_error("Rate limit exceeded"), MAX_PARK_ATTEMPTS)
+            .is_some());
+        assert_eq!(
+            strategy.delay_after(&rate_limit_error("Rate limit exceeded"), MAX_PARK_ATTEMPTS + 1),
+            None
+        );
+    }
+
+    #[test]
+    fn test_park_parses_reset_timestamp_from_message() {
+        let reset_at = Utc::now() + chrono::Duration::hours(2);
+        let error = rate_limit_error(&format!(
+            "Usage limit reached. Limit resets at {}. Try again later.",
+            reset_at.to_rfc3339()
+        ));
+        let wait = parse_reset_wait_from_message(&error.to_string()).expect("should parse timestamp");
+        // The exact sub-second remainder varies with test timing; anything
+        // within two hours minus a small tolerance is correct.
+        assert!(wait > Duration::from_secs(2 * 60 * 60 - 60));
+        assert!(wait <= Duration::from_secs(2 * 60 * 60));
+    }
+
+    #[test]
+    fn test_park_parses_duration_from_message() {
+        let error = rate_limit_error("Rate limit reached. You can retry in 1h 30m 15s.");
+        let wait = parse_reset_wait_from_message(&error.to_string()).expect("should parse duration");
+        assert_eq!(wait, Duration::from_secs(60 * 60 + 30 * 60 + 15));
+    }
+
+    #[test]
+    fn test_park_guided_wait_is_capped_by_budget() {
+        let policy = language_model::RateLimitParkingPolicy {
+            max_total_wait: Some(Duration::from_secs(600)),
+            ..language_model::RateLimitParkingPolicy::default()
+        };
+        let error = rate_limit_error("Rate limit reached. Retry in 5 hours.");
+        let strategy = RetryStrategy::ParkedPolling { policy };
+        assert_eq!(
+            strategy.delay_after(&error, 1),
+            Some(Duration::from_secs(600))
+        );
+    }
+
+    fn rate_limit_error(message: &str) -> LanguageModelCompletionError {
+        LanguageModelCompletionError::from_provider_response(
+            language_model::ANTHROPIC_PROVIDER_NAME,
+            None,
+            Some("rate_limit_error".to_string()),
+            message.to_string(),
+            None,
+            language_model::ProviderErrorCategory::RateLimit,
+        )
     }
 
     #[gpui::test]
