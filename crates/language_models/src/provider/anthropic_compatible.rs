@@ -10,7 +10,7 @@ use language_model::{
     LanguageModelCompletionEvent, LanguageModelId, LanguageModelName, LanguageModelProvider,
     LanguageModelProviderId, LanguageModelProviderName, LanguageModelProviderState,
     LanguageModelRequest, LanguageModelToolChoice, ProviderSettingsView, RateLimiter,
-    SubPageProviderSettings,
+    RateLimitParkingPolicy, SubPageProviderSettings,
 };
 use settings::Settings;
 use std::sync::Arc;
@@ -31,6 +31,7 @@ pub struct AnthropicCompatibleSettings {
     pub api_url: String,
     pub available_models: Vec<AvailableModel>,
     pub custom_headers: CustomHeaders,
+    pub rate_limit: RateLimitParkingPolicy,
 }
 
 pub struct AnthropicCompatibleLanguageModelProvider {
@@ -367,6 +368,10 @@ impl LanguageModel for AnthropicCompatibleLanguageModel {
 
     fn provider_name(&self) -> LanguageModelProviderName {
         self.provider_name.clone()
+    }
+
+    fn rate_limit_parking_policy(&self, cx: &App) -> RateLimitParkingPolicy {
+        self.state.read(cx).settings.rate_limit
     }
 
     fn supports_tools(&self) -> bool {

@@ -1,7 +1,9 @@
 use std::sync::Arc;
 
 use collections::HashMap;
-use settings::RegisterSetting;
+use language_model::RateLimitParkingPolicy;
+use settings::{RateLimitSettingsContent, RegisterSetting};
+use std::time::Duration;
 
 use crate::provider::{
     anthropic, anthropic::AnthropicSettings, anthropic_compatible::AnthropicCompatibleSettings,
@@ -42,6 +44,21 @@ fn custom_headers_from(
         .filter(|map| !map.is_empty())
         .map(|map| resolve_custom_headers(provider_name, map, reserved))
         .unwrap_or_default()
+}
+
+fn rate_limit_policy_from(content: Option<RateLimitSettingsContent>) -> RateLimitParkingPolicy {
+    let Some(content) = content else {
+        return RateLimitParkingPolicy::default();
+    };
+    RateLimitParkingPolicy {
+        initial_wait: Duration::from_secs(content.initial_wait_seconds.unwrap_or(60).max(1)),
+        max_wait: Duration::from_secs(content.max_wait_seconds.unwrap_or(300).max(1)),
+        max_total_wait: match content.max_total_wait_seconds {
+            Some(0) => None,
+            Some(secs) => Some(Duration::from_secs(secs)),
+            None => RateLimitParkingPolicy::default().max_total_wait,
+        },
+    }
 }
 
 impl settings::Settings for AllLanguageModelSettings {
@@ -89,6 +106,7 @@ impl settings::Settings for AllLanguageModelSettings {
                                 value.custom_headers,
                                 anthropic::RESERVED_HEADER_NAMES,
                             ),
+                            rate_limit: rate_limit_policy_from(value.rate_limit),
                         },
                     )
                 })
@@ -187,6 +205,7 @@ impl settings::Settings for AllLanguageModelSettings {
                                 value.custom_headers,
                                 &[],
                             ),
+                            rate_limit: rate_limit_policy_from(value.rate_limit),
                         },
                     )
                 })

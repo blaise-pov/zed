@@ -44,6 +44,30 @@ pub struct AnthropicCompatibleSettingsContent {
     pub api_url: String,
     pub available_models: Vec<AnthropicCompatibleAvailableModel>,
     pub custom_headers: Option<HashMap<String, String>>,
+    pub rate_limit: Option<RateLimitSettingsContent>,
+}
+
+/// Parking policy for provider rate limits. When a provider rejects a
+/// request with a rate limit, turns wait for the provider's reset guidance
+/// when available, otherwise poll with an exponentially growing delay.
+#[with_fallible_options]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, JsonSchema, MergeFrom)]
+pub struct RateLimitSettingsContent {
+    /// Seconds before the first retry when the provider returns a rate
+    /// limit without reset guidance.
+    ///
+    /// Default: 60
+    pub initial_wait_seconds: Option<u64>,
+    /// Upper bound in seconds for a single poll interval while parked
+    /// without guidance.
+    ///
+    /// Default: 300
+    pub max_wait_seconds: Option<u64>,
+    /// Total parking budget in seconds before the turn fails. `0` parks
+    /// until cancelled.
+    ///
+    /// Default: 18000 (5 hours)
+    pub max_total_wait_seconds: Option<u64>,
 }
 
 #[with_fallible_options]
@@ -408,6 +432,7 @@ pub struct OpenAiCompatibleSettingsContent {
     pub api_url: String,
     pub available_models: Vec<OpenAiCompatibleAvailableModel>,
     pub custom_headers: Option<HashMap<String, String>>,
+    pub rate_limit: Option<RateLimitSettingsContent>,
 }
 
 #[with_fallible_options]

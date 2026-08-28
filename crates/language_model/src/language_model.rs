@@ -14,6 +14,7 @@ use gpui::{AnyView, App, AsyncApp, Task, Window};
 use icons::IconName;
 use parking_lot::Mutex;
 use std::sync::Arc;
+use std::time::Duration;
 
 pub type CreateProviderSettingsView = Arc<dyn Fn(&mut Window, &mut App) -> AnyView + 'static>;
 
@@ -24,6 +25,36 @@ pub use env_var::{EnvVar, env_var};
 
 pub fn init(cx: &mut App) {
     registry::init(cx);
+}
+
+/// How a turn should park when its provider rate-limits it (HTTP 429 /
+/// rate-limit rejection).
+///
+/// Parking waits for the provider's reset guidance when available (a
+/// `Retry-After` header or a reset timestamp embedded in the error
+/// message); otherwise it polls with an exponentially growing delay up to
+/// `max_wait`, until the total budget in `max_total_wait` is spent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RateLimitParkingPolicy {
+    /// Delay before the first retry when the provider gave no reset
+    /// guidance.
+    pub initial_wait: Duration,
+    /// Upper bound for a single poll interval while parking without
+    /// guidance.
+    pub max_wait: Duration,
+    /// Total parking budget before the turn fails. `None` parks until
+    /// cancelled.
+    pub max_total_wait: Option<Duration>,
+}
+
+impl Default for RateLimitParkingPolicy {
+    fn default() -> Self {
+        Self {
+            initial_wait: Duration::from_secs(60),
+            max_wait: Duration::from_secs(300),
+            max_total_wait: Some(Duration::from_secs(5 * 60 * 60)),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -94,6 +125,12 @@ pub trait LanguageModel: Send + Sync {
     /// When this model refuses a request, the model ID to fall back to (same provider).
     fn refusal_fallback_model_id(&self) -> Option<&'static str> {
         None
+    }
+
+    /// How turns using this model should park when the provider rate-limits
+    /// them. Providers override this to expose provider-specific settings.
+    fn rate_limit_parking_policy(&self, _cx: &App) -> RateLimitParkingPolicy {
+        RateLimitParkingPolicy::default()
     }
 
     fn telemetry_id(&self) -> String;

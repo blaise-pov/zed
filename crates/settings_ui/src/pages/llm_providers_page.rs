@@ -1128,6 +1128,7 @@ fn save_llm_provider_form(
                                         api_url: api_url.clone(),
                                         available_models,
                                         custom_headers: None,
+                                        rate_limit: None,
                                     },
                                 );
                         }
@@ -1141,6 +1142,7 @@ fn save_llm_provider_form(
                                         api_url: api_url.clone(),
                                         available_models,
                                         custom_headers: None,
+                                        rate_limit: None,
                                     },
                                 );
                         }

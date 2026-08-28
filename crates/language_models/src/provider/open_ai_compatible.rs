@@ -8,7 +8,8 @@ use language_model::{
     LanguageModelCompletionEvent, LanguageModelEffortLevel, LanguageModelId, LanguageModelName,
     LanguageModelProvider, LanguageModelProviderId, LanguageModelProviderName,
     LanguageModelProviderState, LanguageModelRequest, LanguageModelToolChoice,
-    LanguageModelToolSchemaFormat, ProviderSettingsView, RateLimiter, SubPageProviderSettings,
+    LanguageModelToolSchemaFormat, ProviderSettingsView, RateLimiter, RateLimitParkingPolicy,
+    SubPageProviderSettings,
 };
 use open_ai::{
     ResponseStreamEvent,
@@ -36,6 +37,7 @@ pub struct OpenAiCompatibleSettings {
     pub api_url: String,
     pub available_models: Vec<AvailableModel>,
     pub custom_headers: CustomHeaders,
+    pub rate_limit: RateLimitParkingPolicy,
 }
 
 impl ApiCompatibleProviderSettings for OpenAiCompatibleSettings {
@@ -352,6 +354,10 @@ impl LanguageModel for OpenAiCompatibleLanguageModel {
 
     fn provider_name(&self) -> LanguageModelProviderName {
         self.provider_name.clone()
+    }
+
+    fn rate_limit_parking_policy(&self, cx: &App) -> RateLimitParkingPolicy {
+        self.state.read(cx).settings.rate_limit
     }
 
     fn supports_tools(&self) -> bool {
