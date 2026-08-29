@@ -1,5 +1,8 @@
+mod agent_task;
+mod agent_task_store;
 mod db;
 mod legacy_thread;
+mod mcp_agent_task_provider;
 mod native_agent_server;
 pub mod outline;
 mod pattern_extraction;
@@ -12,9 +15,12 @@ mod thread_store;
 mod tool_permissions;
 mod tools;
 
+pub use agent_task::*;
+pub use agent_task_store::*;
 use context_server::ContextServerId;
 pub use db::*;
 use itertools::Itertools;
+pub use mcp_agent_task_provider::*;
 pub use native_agent_server::NativeAgentServer;
 pub use pattern_extraction::*;
 pub use sandboxing::{

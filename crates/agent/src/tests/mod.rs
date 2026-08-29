@@ -9245,3 +9245,254 @@ async fn test_mid_turn_model_and_settings_refresh(cx: &mut TestAppContext) {
     // Thinking should now be enabled.
     assert!(model_b_completions[0].thinking_allowed);
 }
+
+#[gpui::test]
+async fn test_subagent_task_id_prompt_formatting(cx: &mut TestAppContext) {
+    init_test(cx);
+    let subagent_profile = cx.update(|cx| enable_default_profile_delegation(cx));
+    cx.update(|cx| {
+        LanguageModelRegistry::test(cx);
+        cx.update_flags(true, vec!["subagents".to_string()]);
+    });
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/", json!({})).await;
+    let project = Project::test(fs.clone(), [path!("/").as_ref()], cx).await;
+    let thread_store = cx.new(|cx| ThreadStore::new(cx));
+    let agent = cx.update(|cx| NativeAgent::new(thread_store, Templates::new(), fs, cx));
+    let connection = Rc::new(NativeAgentConnection(agent.clone()));
+
+    let acp_thread = cx
+        .update(|cx| {
+            connection
+                .clone()
+                .new_session(project.clone(), PathList::new(&[Path::new("")]), cx)
+        })
+        .await
+        .unwrap();
+
+    let session_id = acp_thread.read_with(cx, |thread, _| thread.session_id().clone());
+    let thread = agent.read_with(cx, |agent, _| {
+        agent.sessions.get(&session_id).unwrap().thread.clone()
+    });
+
+    let model = Arc::new(FakeLanguageModel::default());
+    thread.update(cx, |thread, cx| {
+        thread.set_model(model.clone(), cx);
+    });
+
+    let _events = thread
+        .update(cx, |thread, cx| {
+            thread.send(ClientUserMessageId::new(), ["Run task"], cx)
+        })
+        .unwrap();
+
+    cx.run_until_parked();
+
+    let tool_input = SpawnAgentToolInput {
+        label: "Subagent task test".into(),
+        message: "Implement persistence layer".into(),
+        session_id: None,
+        task_id: Some("TASK-42".into()),
+        profile: Some(subagent_profile),
+    };
+
+    let tool_use = LanguageModelToolUse {
+        id: "tool_spawn_1".into(),
+        name: SpawnAgentTool::NAME.into(),
+        raw_input: serde_json::to_string(&tool_input).unwrap(),
+        input: language_model::LanguageModelToolUseInput::Json(
+            serde_json::to_value(&tool_input).unwrap(),
+        ),
+        is_input_complete: true,
+        thought_signature: None,
+    };
+
+    model.send_last_completion_stream_event(LanguageModelCompletionEvent::ToolUse(tool_use));
+    model.end_last_completion_stream();
+
+    cx.run_until_parked();
+
+    let subagent_session_id = thread.read_with(cx, |thread, cx| {
+        thread
+            .running_subagent_ids(cx)
+            .get(0)
+            .expect("subagent thread should be running")
+            .clone()
+    });
+
+    let subagent_thread = agent.read_with(cx, |agent, _cx| {
+        agent
+            .sessions
+            .get(&subagent_session_id)
+            .expect("subagent session should exist")
+            .thread
+            .clone()
+    });
+
+    subagent_thread.read_with(cx, |sub_t, _cx| {
+        let msg = sub_t.last_message().expect("message should exist");
+        let reqs = msg.to_request();
+        let text = reqs
+            .iter()
+            .flat_map(|r| &r.content)
+            .find_map(|c| match c {
+                language_model::MessageContent::Text(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .expect("text content should exist");
+        assert!(text.contains("Implement persistence layer"));
+        assert!(text.contains("Task reference: TASK-42"));
+    });
+}
+
+#[test]
+fn test_subagent_slot_pool_concurrency_limit() {
+    use std::sync::Arc;
+
+    let pool = Arc::new(crate::SubagentSlotPool::default());
+    assert!(pool.try_acquire(2), "first slot should be acquired");
+    assert!(pool.try_acquire(2), "second slot should be acquired");
+    assert!(
+        !pool.try_acquire(2),
+        "third slot should be rejected due to max_concurrent=2"
+    );
+
+    {
+        let _guard = crate::SubagentSlotGuard::new(pool.clone());
+        assert!(
+            !pool.try_acquire(2),
+            "guard holds a slot, so pool remains full"
+        );
+    }
+
+    // After guard drop, a slot is released
+    assert!(
+        pool.try_acquire(2),
+        "slot should be acquireable after guard drop"
+    );
+}
+
+#[gpui::test]
+async fn test_mcp_agent_task_provider_fetch_graph(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/", json!({})).await;
+    let project = Project::test(fs.clone(), [path!("/").as_ref()], cx).await;
+    let context_server_store = project.read_with(cx, |p, _| p.context_server_store());
+
+    let mut tool_calls = setup_context_server(
+        "tgr",
+        vec![context_server::types::Tool {
+            name: "task_graph".into(),
+            title: None,
+            description: None,
+            input_schema: serde_json::Value::Object(Default::default()),
+            output_schema: None,
+            annotations: None,
+        }],
+        &context_server_store,
+        cx,
+    );
+
+    let provider = McpAgentTaskProvider::new(context_server_store, ContextServerId("tgr".into()));
+
+    let fetch_task = cx.update(|cx| provider.fetch_graph(cx));
+
+    let (params, tx) = tool_calls.next().await.expect("expected tool call");
+    assert_eq!(params.name, "task_graph");
+
+    let graph_json = json!({
+        "tasks": [
+            {
+                "id": "TASK-1",
+                "parent_id": null,
+                "title": "Root Task",
+                "status": "ready",
+                "attempt": 1,
+                "assignee": "worker_1",
+                "write_scopes": ["src/"]
+            }
+        ]
+    });
+
+    tx.send(context_server::types::CallToolResponse {
+        content: vec![context_server::types::ToolResponseContent::Text {
+            text: graph_json.to_string(),
+        }],
+        is_error: None,
+        meta: None,
+        structured_content: None,
+    })
+    .unwrap();
+
+    let graph = fetch_task.await.expect("fetch_graph should succeed");
+    assert_eq!(graph.tasks.len(), 1);
+    assert_eq!(graph.tasks[0].id.0.as_ref(), "TASK-1");
+    assert_eq!(graph.tasks[0].title, "Root Task");
+    assert_eq!(graph.tasks[0].status, AgentTaskStatus::Ready);
+}
+
+#[gpui::test]
+async fn test_mcp_agent_task_provider_missing_server(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/", json!({})).await;
+    let project = Project::test(fs.clone(), [path!("/").as_ref()], cx).await;
+    let context_server_store = project.read_with(cx, |p, _| p.context_server_store());
+
+    let provider = McpAgentTaskProvider::new(
+        context_server_store,
+        ContextServerId("nonexistent_server".into()),
+    );
+
+    let result = cx.update(|cx| provider.fetch_graph(cx)).await;
+    assert!(result.is_err());
+    let err_msg = result.unwrap_err().to_string();
+    assert!(err_msg.contains("Task server 'nonexistent_server' is not running"));
+}
+
+#[gpui::test]
+async fn test_mcp_agent_task_provider_invalid_json(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/", json!({})).await;
+    let project = Project::test(fs.clone(), [path!("/").as_ref()], cx).await;
+    let context_server_store = project.read_with(cx, |p, _| p.context_server_store());
+
+    let mut tool_calls = setup_context_server(
+        "tgr",
+        vec![context_server::types::Tool {
+            name: "task_graph".into(),
+            title: None,
+            description: None,
+            input_schema: serde_json::Value::Object(Default::default()),
+            output_schema: None,
+            annotations: None,
+        }],
+        &context_server_store,
+        cx,
+    );
+
+    let provider = McpAgentTaskProvider::new(context_server_store, ContextServerId("tgr".into()));
+
+    let fetch_task = cx.update(|cx| provider.fetch_graph(cx));
+
+    let (_params, tx) = tool_calls.next().await.expect("expected tool call");
+
+    // Send JSON missing required fields
+    tx.send(context_server::types::CallToolResponse {
+        content: vec![context_server::types::ToolResponseContent::Text {
+            text: r#"{"invalid_field": 123}"#.to_string(),
+        }],
+        is_error: None,
+        meta: None,
+        structured_content: None,
+    })
+    .unwrap();
+
+    let result = fetch_task.await;
+    assert!(result.is_err());
+    let err = result.unwrap_err().to_string();
+    assert!(err.contains("failed to parse AgentTaskGraph"));
+}
