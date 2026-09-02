@@ -559,7 +559,7 @@ impl SettingsStore {
     fn update_settings_file_inner(
         &self,
         fs: Arc<dyn Fs>,
-        update: impl 'static + Send + FnOnce(String, AsyncApp) -> Result<String>,
+        update: Box<dyn Send + FnOnce(String, AsyncApp) -> Result<String>>,
     ) -> oneshot::Receiver<Result<()>> {
         let (tx, rx) = oneshot::channel::<Result<()>>();
         self.setting_file_updates_tx
@@ -626,11 +626,17 @@ impl SettingsStore {
         fs: Arc<dyn Fs>,
         update: impl 'static + Send + FnOnce(&mut SettingsContent, &App),
     ) -> oneshot::Receiver<Result<()>> {
-        self.update_settings_file_inner(fs, move |old_text: String, cx: AsyncApp| {
-            cx.read_global(|store: &SettingsStore, cx| {
-                store.new_text_for_update(old_text, |content| update(content, cx))
-            })
-        })
+        let mut update = Some(update);
+        self.update_settings_file_inner(
+            fs,
+            Box::new(move |old_text: String, cx: AsyncApp| {
+                cx.read_global(|store: &SettingsStore, cx| {
+                    store.new_text_for_update_inner(old_text, &mut |content| {
+                        (update.take().expect("called once"))(content, cx)
+                    })
+                })
+            }),
+        )
     }
 
     /// In-memory-only fallback used when no `ProjectSettingsUpdater` has been
@@ -678,11 +684,14 @@ impl SettingsStore {
         fs: Arc<dyn Fs>,
         vscode_settings: VsCodeSettings,
     ) -> oneshot::Receiver<Result<()>> {
-        self.update_settings_file_inner(fs, move |old_text: String, cx: AsyncApp| {
-            cx.read_global(|store: &SettingsStore, _cx| {
-                store.get_vscode_edits(old_text, &vscode_settings)
-            })
-        })
+        self.update_settings_file_inner(
+            fs,
+            Box::new(move |old_text: String, cx: AsyncApp| {
+                cx.read_global(|store: &SettingsStore, _cx| {
+                    store.get_vscode_edits(old_text, &vscode_settings)
+                })
+            }),
+        )
     }
 
     pub fn get_all_files(&self) -> Vec<SettingsFile> {
@@ -873,7 +882,18 @@ impl SettingsStore {
         old_text: String,
         update: impl FnOnce(&mut SettingsContent),
     ) -> Result<String> {
-        let edits = self.edits_for_update(&old_text, update)?;
+        let mut update = Some(update);
+        self.new_text_for_update_inner(old_text, &mut |content| {
+            (update.take().expect("called once"))(content)
+        })
+    }
+
+    fn new_text_for_update_inner(
+        &self,
+        old_text: String,
+        update: &mut dyn FnMut(&mut SettingsContent),
+    ) -> Result<String> {
+        let edits = self.edits_for_update_inner(&old_text, update)?;
         let mut new_text = old_text;
         for (range, replacement) in edits.into_iter() {
             new_text.replace_range(range, &replacement);
@@ -893,6 +913,17 @@ impl SettingsStore {
         &self,
         text: &str,
         update: impl FnOnce(&mut SettingsContent),
+    ) -> Result<Vec<(Range<usize>, String)>> {
+        let mut update = Some(update);
+        self.edits_for_update_inner(text, &mut |content| {
+            (update.take().expect("called once"))(content)
+        })
+    }
+
+    fn edits_for_update_inner(
+        &self,
+        text: &str,
+        update: &mut dyn FnMut(&mut SettingsContent),
     ) -> Result<Vec<(Range<usize>, String)>> {
         let old_content = if text.trim().is_empty() {
             UserSettingsContent::default()
