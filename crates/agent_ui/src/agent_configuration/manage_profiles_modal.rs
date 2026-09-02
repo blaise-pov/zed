@@ -3,15 +3,15 @@ mod profile_modal_header;
 use std::sync::Arc;
 
 use agent::ContextServerRegistry;
-use agent_settings::{AgentProfile, AgentProfileId, AgentSettings, builtin_profiles};
+use agent_settings::{
+    AgentProfile, AgentProfileId, AgentSettings, ProfileOrigin, builtin_profiles,
+};
 use editor::Editor;
 use fs::Fs;
 use gpui::{DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, Subscription, prelude::*};
 use language_model::{LanguageModel, LanguageModelRegistry};
 use settings::SettingsStore;
-use settings::{
-    LanguageModelProviderSetting, LanguageModelSelection, Settings as _, update_settings_file,
-};
+use settings::{LanguageModelProviderSetting, LanguageModelSelection, Settings as _};
 use ui::{
     KeyBinding, ListItem, ListItemSpacing, ListSeparator, Navigable, NavigableEntry, prelude::*,
 };
@@ -46,10 +46,21 @@ enum Mode {
     ConfigureDelegation {
         profile_id: AgentProfileId,
         delegation_editor: Entity<DelegationEditor>,
+        _subscription: Subscription,
     },
     ConfigureSkills {
         profile_id: AgentProfileId,
         skills_editor: Entity<SkillsEditor>,
+    },
+    ConfigureCustomPrompt {
+        profile_id: AgentProfileId,
+        prompt_editor: Entity<Editor>,
+        _subscription: Subscription,
+    },
+    ConfigureDescription {
+        profile_id: AgentProfileId,
+        description_editor: Entity<Editor>,
+        _subscription: Subscription,
     },
 }
 
@@ -102,6 +113,8 @@ pub struct ChooseProfileMode {
 pub struct ViewProfileMode {
     profile_id: AgentProfileId,
     fork_profile: NavigableEntry,
+    configure_description: NavigableEntry,
+    configure_custom_prompt: NavigableEntry,
     configure_default_model: NavigableEntry,
     configure_tools: NavigableEntry,
     configure_mcps: NavigableEntry,
@@ -115,6 +128,8 @@ pub struct ViewProfileMode {
 pub struct NewProfileMode {
     name_editor: Entity<Editor>,
     base_profile_id: Option<AgentProfileId>,
+    target_origin: ProfileOrigin,
+    available_origins: Vec<ProfileOrigin>,
 }
 
 pub struct ManageProfilesModal {
@@ -183,6 +198,22 @@ impl ManageProfilesModal {
         }
     }
 
+    pub fn save_profile_change_by_origin(
+        fs: Arc<dyn Fs>,
+        origin: &ProfileOrigin,
+        cx: &App,
+        update: impl 'static + Send + FnOnce(&mut settings::SettingsContent, &App),
+    ) {
+        match origin {
+            ProfileOrigin::Global => {
+                settings::update_settings_file(fs, cx, update);
+            }
+            ProfileOrigin::Project { worktree_id, path } => {
+                settings::update_project_settings_file(fs, *worktree_id, path.clone(), cx, update);
+            }
+        }
+    }
+
     fn choose_profile(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.mode = Mode::choose_profile(window, cx);
         self.focus_handle(cx).focus(window, cx);
@@ -199,9 +230,40 @@ impl ManageProfilesModal {
             editor.set_placeholder_text("Profile name", window, cx);
         });
 
+        let mut available_origins = vec![ProfileOrigin::Global];
+        let app_state = workspace::AppState::global(cx);
+        for workspace in app_state
+            .workspace_store
+            .read(cx)
+            .workspaces()
+            .filter_map(|w| w.upgrade())
+        {
+            let project = workspace.read(cx).project();
+            for worktree in project.read(cx).worktrees(cx) {
+                let worktree_read = worktree.read(cx);
+                if worktree_read.is_visible() {
+                    let origin = ProfileOrigin::Project {
+                        worktree_id: worktree_read.id(),
+                        path: paths::local_settings_file_relative_path().into(),
+                    };
+                    if !available_origins.contains(&origin) {
+                        available_origins.push(origin);
+                    }
+                }
+            }
+        }
+
+        let target_origin = base_profile_id
+            .as_ref()
+            .and_then(|id| AgentSettings::get_global(cx).profiles.get(id))
+            .map(|p| p.origin.clone())
+            .unwrap_or_default();
+
         self.mode = Mode::NewProfile(NewProfileMode {
             name_editor,
             base_profile_id,
+            target_origin,
+            available_origins,
         });
         self.focus_handle(cx).focus(window, cx);
     }
@@ -215,6 +277,8 @@ impl ManageProfilesModal {
         self.mode = Mode::ViewProfile(ViewProfileMode {
             profile_id,
             fork_profile: NavigableEntry::focusable(cx),
+            configure_description: NavigableEntry::focusable(cx),
+            configure_custom_prompt: NavigableEntry::focusable(cx),
             configure_default_model: NavigableEntry::focusable(cx),
             configure_tools: NavigableEntry::focusable(cx),
             configure_mcps: NavigableEntry::focusable(cx),
@@ -239,6 +303,15 @@ impl ManageProfilesModal {
         );
         let fs = self.fs.clone();
         let profile_id_for_closure = profile_id.clone();
+
+        let profile = AgentSettings::get_global(cx)
+            .profiles
+            .get(&profile_id)
+            .cloned();
+        let origin = profile
+            .as_ref()
+            .map(|p| p.origin.clone())
+            .unwrap_or_default();
 
         let model_picker = cx.new(|cx| {
             let profile_id = profile_id_for_closure.clone();
@@ -270,27 +343,35 @@ impl ManageProfilesModal {
                 },
                 {
                     let fs = fs.clone();
+                    let origin = origin.clone();
                     move |model, cx| {
                         let provider = model.provider_id().0.to_string();
                         let model_id = model.id().0.to_string();
                         let profile_id = profile_id.clone();
 
-                        update_settings_file(fs.clone(), cx, move |settings, _cx| {
-                            let agent_settings = settings.agent.get_or_insert_default();
-                            if let Some(profiles) = agent_settings.profiles.as_mut() {
-                                if let Some(profile) = profiles.get_mut(profile_id.0.as_ref()) {
-                                    profile.default_model = Some(LanguageModelSelection {
-                                        provider: LanguageModelProviderSetting(provider.clone()),
-                                        model: model_id.clone(),
-                                        enable_thinking: model.supports_thinking(),
-                                        effort: model
-                                            .default_effort_level()
-                                            .map(|effort| effort.value.to_string()),
-                                        speed: None,
-                                    });
+                        Self::save_profile_change_by_origin(
+                            fs.clone(),
+                            &origin,
+                            cx,
+                            move |settings, _cx| {
+                                let agent_settings = settings.agent.get_or_insert_default();
+                                if let Some(profiles) = agent_settings.profiles.as_mut() {
+                                    if let Some(profile) = profiles.get_mut(profile_id.0.as_ref()) {
+                                        profile.default_model = Some(LanguageModelSelection {
+                                            provider: LanguageModelProviderSetting(
+                                                provider.clone(),
+                                            ),
+                                            model: model_id.clone(),
+                                            enable_thinking: model.supports_thinking(),
+                                            effort: model
+                                                .default_effort_level()
+                                                .map(|effort| effort.value.to_string()),
+                                            speed: None,
+                                        });
+                                    }
                                 }
-                            }
-                        });
+                            },
+                        );
                     }
                 },
                 {
@@ -381,10 +462,17 @@ impl ManageProfilesModal {
         );
         let delegation_editor =
             cx.new(|cx| DelegationEditor::new(profile_id.clone(), self.fs.clone(), window, cx));
+        let dismiss_subscription = cx.subscribe_in(&delegation_editor, window, {
+            let profile_id = profile_id.clone();
+            move |this, _delegation_editor, _: &DismissEvent, window, cx| {
+                this.view_profile(profile_id.clone(), window, cx);
+            }
+        });
 
         self.mode = Mode::ConfigureDelegation {
             profile_id,
             delegation_editor,
+            _subscription: dismiss_subscription,
         };
         self.focus_handle(cx).focus(window, cx);
     }
@@ -406,6 +494,144 @@ impl ManageProfilesModal {
         self.mode = Mode::ConfigureSkills {
             profile_id,
             skills_editor,
+        };
+        self.focus_handle(cx).focus(window, cx);
+    }
+
+    fn configure_custom_prompt(
+        &mut self,
+        profile_id: AgentProfileId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        telemetry::event!(
+            "Agent Profile Custom Prompt Configured",
+            profile_id = profile_id.as_str(),
+            is_builtin = builtin_profiles::is_builtin(&profile_id)
+        );
+        let settings = AgentSettings::get_global(cx);
+        let prompt = settings
+            .profiles
+            .get(&profile_id)
+            .and_then(|profile| profile.custom_prompt.clone())
+            .unwrap_or_default();
+
+        let prompt_editor = cx.new(|cx| {
+            let mut editor = Editor::auto_height(6, 16, window, cx);
+            editor.set_placeholder_text(
+                "Custom prompt / instructions for this profile…",
+                window,
+                cx,
+            );
+            if !prompt.is_empty() {
+                editor.set_text(prompt.to_string(), window, cx);
+            }
+            editor
+        });
+
+        let fs = self.fs.clone();
+        let target_profile_id = profile_id.clone();
+        let subscription = cx.subscribe(&prompt_editor, move |_this, editor, event, cx| {
+            // Persist only on blur: saving on every keystroke would rewrite
+            // the settings file per character typed.
+            if matches!(event, editor::EditorEvent::Blurred) {
+                let text = editor.read(cx).text(cx);
+                let text = text.trim().to_string();
+                let fs = fs.clone();
+                let profile_id = target_profile_id.clone();
+                let origin = AgentSettings::get_global(cx)
+                    .profiles
+                    .get(&profile_id)
+                    .map(|p| p.origin.clone())
+                    .unwrap_or_default();
+                Self::save_profile_change_by_origin(fs, &origin, cx, move |settings, _cx| {
+                    let Some(profile) = settings
+                        .agent
+                        .get_or_insert_default()
+                        .profiles
+                        .get_or_insert_default()
+                        .get_mut(profile_id.0.as_ref())
+                    else {
+                        return;
+                    };
+                    profile.custom_prompt = (!text.is_empty()).then(|| Arc::from(text.as_str()));
+                });
+            }
+        });
+
+        self.mode = Mode::ConfigureCustomPrompt {
+            profile_id,
+            prompt_editor,
+            _subscription: subscription,
+        };
+        self.focus_handle(cx).focus(window, cx);
+    }
+
+    fn configure_description(
+        &mut self,
+        profile_id: AgentProfileId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        telemetry::event!(
+            "Agent Profile Description Configured",
+            profile_id = profile_id.as_str(),
+            is_builtin = builtin_profiles::is_builtin(&profile_id)
+        );
+        let settings = AgentSettings::get_global(cx);
+        let description = settings
+            .profiles
+            .get(&profile_id)
+            .and_then(|profile| profile.description.clone())
+            .unwrap_or_default();
+
+        let description_editor = cx.new(|cx| {
+            let mut editor = Editor::auto_height(2, 6, window, cx);
+            editor.set_placeholder_text(
+                "Short description shown in delegation catalog…",
+                window,
+                cx,
+            );
+            if !description.is_empty() {
+                editor.set_text(description.to_string(), window, cx);
+            }
+            editor
+        });
+
+        let fs = self.fs.clone();
+        let target_profile_id = profile_id.clone();
+        let subscription = cx.subscribe(&description_editor, move |_this, editor, event, cx| {
+            // Persist only on blur: saving on every keystroke would rewrite
+            // the settings file per character typed.
+            if matches!(event, editor::EditorEvent::Blurred) {
+                let text = editor.read(cx).text(cx);
+                let text = text.trim().to_string();
+                let fs = fs.clone();
+                let profile_id = target_profile_id.clone();
+                let origin = AgentSettings::get_global(cx)
+                    .profiles
+                    .get(&profile_id)
+                    .map(|p| p.origin.clone())
+                    .unwrap_or_default();
+                Self::save_profile_change_by_origin(fs, &origin, cx, move |settings, _cx| {
+                    let Some(profile) = settings
+                        .agent
+                        .get_or_insert_default()
+                        .profiles
+                        .get_or_insert_default()
+                        .get_mut(profile_id.0.as_ref())
+                    else {
+                        return;
+                    };
+                    profile.description = (!text.is_empty()).then(|| Arc::from(text.as_str()));
+                });
+            }
+        });
+
+        self.mode = Mode::ConfigureDescription {
+            profile_id,
+            description_editor,
+            _subscription: subscription,
         };
         self.focus_handle(cx).focus(window, cx);
     }
@@ -473,9 +699,15 @@ impl ManageProfilesModal {
             Mode::NewProfile(mode) => {
                 let name = mode.name_editor.read(cx).text(cx);
                 let base_profile_id = mode.base_profile_id.clone();
+                let target_origin = mode.target_origin.clone();
 
-                let profile_id =
-                    AgentProfile::create(name, base_profile_id.clone(), self.fs.clone(), cx);
+                let profile_id = AgentProfile::create(
+                    name,
+                    base_profile_id.clone(),
+                    target_origin,
+                    self.fs.clone(),
+                    cx,
+                );
                 telemetry::event!(
                     "Agent Profile Created",
                     profile_id = profile_id.as_str(),
@@ -490,6 +722,8 @@ impl ManageProfilesModal {
             Mode::ConfigureDefaultModel { .. } => {}
             Mode::ConfigureDelegation { .. } => {}
             Mode::ConfigureSkills { .. } => {}
+            Mode::ConfigureCustomPrompt { .. } => {}
+            Mode::ConfigureDescription { .. } => {}
         }
     }
 
@@ -506,9 +740,15 @@ impl ManageProfilesModal {
 
         telemetry::event!("Agent Profile Deleted", profile_id = profile_id.as_str());
 
+        let origin = AgentSettings::get_global(cx)
+            .profiles
+            .get(&profile_id)
+            .map(|p| p.origin.clone())
+            .unwrap_or_default();
+
         let fs = self.fs.clone();
 
-        update_settings_file(fs, cx, move |settings, _cx| {
+        Self::save_profile_change_by_origin(fs, &origin, cx, move |settings, _cx| {
             let Some(agent_settings) = settings.agent.as_mut() else {
                 return;
             };
@@ -559,6 +799,12 @@ impl ManageProfilesModal {
             Mode::ConfigureSkills { profile_id, .. } => {
                 self.view_profile(profile_id.clone(), window, cx)
             }
+            Mode::ConfigureCustomPrompt { profile_id, .. } => {
+                self.view_profile(profile_id.clone(), window, cx)
+            }
+            Mode::ConfigureDescription { profile_id, .. } => {
+                self.view_profile(profile_id.clone(), window, cx)
+            }
         }
     }
 }
@@ -571,13 +817,40 @@ impl Focusable for ManageProfilesModal {
             Mode::ChooseProfile(_) => self.focus_handle.clone(),
             Mode::NewProfile(mode) => mode.name_editor.focus_handle(cx),
             Mode::ViewProfile(_) => self.focus_handle.clone(),
-            Mode::ConfigureTools { tool_picker, .. } => tool_picker.focus_handle(cx),
-            Mode::ConfigureMcps { tool_picker, .. } => tool_picker.focus_handle(cx),
-            Mode::ConfigureDefaultModel { model_picker, .. } => model_picker.focus_handle(cx),
+            Mode::ConfigureTools {
+                tool_picker,
+                profile_id: _,
+                _subscription: _,
+            } => tool_picker.focus_handle(cx),
+            Mode::ConfigureMcps {
+                tool_picker,
+                profile_id: _,
+                _subscription: _,
+            } => tool_picker.focus_handle(cx),
+            Mode::ConfigureDefaultModel {
+                model_picker,
+                profile_id: _,
+                _subscription: _,
+            } => model_picker.focus_handle(cx),
             Mode::ConfigureDelegation {
-                delegation_editor, ..
+                delegation_editor,
+                profile_id: _,
+                _subscription: _,
             } => delegation_editor.focus_handle(cx),
-            Mode::ConfigureSkills { skills_editor, .. } => skills_editor.focus_handle(cx),
+            Mode::ConfigureSkills {
+                skills_editor,
+                profile_id: _,
+            } => skills_editor.focus_handle(cx),
+            Mode::ConfigureCustomPrompt {
+                prompt_editor,
+                profile_id: _,
+                _subscription: _,
+            } => prompt_editor.focus_handle(cx),
+            Mode::ConfigureDescription {
+                description_editor,
+                profile_id: _,
+                _subscription: _,
+            } => description_editor.focus_handle(cx),
         }
     }
 }
@@ -592,6 +865,11 @@ impl ManageProfilesModal {
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
         let is_focused = profile.navigation.focus_handle.contains_focused(window, cx);
+
+        let origin = AgentSettings::get_global(cx)
+            .profiles
+            .get(&profile.id)
+            .map(|p| &p.origin);
 
         div()
             .id(format!("profile-{}", profile.id))
@@ -608,6 +886,16 @@ impl ManageProfilesModal {
                     .inset(true)
                     .spacing(ListItemSpacing::Sparse)
                     .child(Label::new(profile.name.clone()))
+                    .when(
+                        matches!(origin, Some(ProfileOrigin::Project { .. })),
+                        |this| {
+                            this.end_slot(
+                                Label::new("Project")
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Accent),
+                            )
+                        },
+                    )
                     .when(is_focused, |this| {
                         this.end_slot(
                             h_flex()
@@ -726,6 +1014,11 @@ impl ManageProfilesModal {
                 .unwrap_or_else(|| "Unknown".into())
         });
 
+        let has_project_origin = mode
+            .available_origins
+            .iter()
+            .any(|origin| matches!(origin, ProfileOrigin::Project { .. }));
+
         v_flex()
             .id("new-profile")
             .track_focus(&self.focus_handle(cx))
@@ -741,6 +1034,66 @@ impl ManageProfilesModal {
             ))
             .child(ListSeparator)
             .child(h_flex().p_2().child(mode.name_editor))
+            .when(has_project_origin, |this| {
+                let is_global = matches!(mode.target_origin, ProfileOrigin::Global);
+                let project_origin = mode
+                    .available_origins
+                    .iter()
+                    .find(|o| matches!(o, ProfileOrigin::Project { .. }))
+                    .cloned();
+
+                this.child(ListSeparator).child(
+                    h_flex()
+                        .px_2()
+                        .py_1p5()
+                        .gap_2()
+                        .items_center()
+                        .justify_between()
+                        .child(
+                            Label::new("Save to:")
+                                .size(LabelSize::Small)
+                                .color(Color::Muted),
+                        )
+                        .child(
+                            h_flex()
+                                .gap_1()
+                                .child(
+                                    Button::new("origin-global", "Global")
+                                        .style(if is_global {
+                                            ButtonStyle::Filled
+                                        } else {
+                                            ButtonStyle::Subtle
+                                        })
+                                        .size(ButtonSize::None)
+                                        .on_click(cx.listener(|this, _, _window, cx| {
+                                            if let Mode::NewProfile(ref mut mode) = this.mode {
+                                                mode.target_origin = ProfileOrigin::Global;
+                                                cx.notify();
+                                            }
+                                        })),
+                                )
+                                .when_some(project_origin, |this, project_origin| {
+                                    let is_project =
+                                        matches!(mode.target_origin, ProfileOrigin::Project { .. });
+                                    this.child(
+                                        Button::new("origin-project", "Current Project")
+                                            .style(if is_project {
+                                                ButtonStyle::Filled
+                                            } else {
+                                                ButtonStyle::Subtle
+                                            })
+                                            .size(ButtonSize::None)
+                                            .on_click(cx.listener(move |this, _, _window, cx| {
+                                                if let Mode::NewProfile(ref mut mode) = this.mode {
+                                                    mode.target_origin = project_origin.clone();
+                                                    cx.notify();
+                                                }
+                                            })),
+                                    )
+                                }),
+                        ),
+                )
+            })
     }
 
     fn render_view_profile(
@@ -750,12 +1103,12 @@ impl ManageProfilesModal {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let settings = AgentSettings::get_global(cx);
+        let profile = settings.profiles.get(&mode.profile_id);
 
-        let profile_name = settings
-            .profiles
-            .get(&mode.profile_id)
+        let profile_name = profile
             .map(|profile| profile.name.clone())
             .unwrap_or_else(|| "Unknown".into());
+        let profile_origin = profile.map(|p| p.origin.clone());
 
         let icon = match mode.profile_id.as_str() {
             "write" => IconName::Pencil,
@@ -767,7 +1120,9 @@ impl ManageProfilesModal {
             div()
                 .track_focus(&self.focus_handle(cx))
                 .size_full()
-                .child(ProfileModalHeader::new(profile_name, Some(icon)))
+                .child(
+                    ProfileModalHeader::new(profile_name, Some(icon)).with_origin(profile_origin),
+                )
                 .child(
                     v_flex()
                         .pb_1()
@@ -802,6 +1157,84 @@ impl ManageProfilesModal {
                                             cx.listener(move |this, _, window, cx| {
                                                 this.new_profile(
                                                     Some(profile_id.clone()),
+                                                    window,
+                                                    cx,
+                                                );
+                                            })
+                                        }),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .id("configure-description")
+                                .track_focus(&mode.configure_description.focus_handle)
+                                .on_action({
+                                    let profile_id = mode.profile_id.clone();
+                                    cx.listener(move |this, _: &menu::Confirm, window, cx| {
+                                        this.configure_description(profile_id.clone(), window, cx);
+                                    })
+                                })
+                                .child(
+                                    ListItem::new("configure-description-item")
+                                        .toggle_state(
+                                            mode.configure_description
+                                                .focus_handle
+                                                .contains_focused(window, cx),
+                                        )
+                                        .inset(true)
+                                        .spacing(ListItemSpacing::Sparse)
+                                        .start_slot(
+                                            Icon::new(IconName::Info)
+                                                .size(IconSize::Small)
+                                                .color(Color::Muted),
+                                        )
+                                        .child(Label::new("Configure Description"))
+                                        .on_click({
+                                            let profile_id = mode.profile_id.clone();
+                                            cx.listener(move |this, _, window, cx| {
+                                                this.configure_description(
+                                                    profile_id.clone(),
+                                                    window,
+                                                    cx,
+                                                );
+                                            })
+                                        }),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .id("configure-custom-prompt")
+                                .track_focus(&mode.configure_custom_prompt.focus_handle)
+                                .on_action({
+                                    let profile_id = mode.profile_id.clone();
+                                    cx.listener(move |this, _: &menu::Confirm, window, cx| {
+                                        this.configure_custom_prompt(
+                                            profile_id.clone(),
+                                            window,
+                                            cx,
+                                        );
+                                    })
+                                })
+                                .child(
+                                    ListItem::new("configure-custom-prompt-item")
+                                        .toggle_state(
+                                            mode.configure_custom_prompt
+                                                .focus_handle
+                                                .contains_focused(window, cx),
+                                        )
+                                        .inset(true)
+                                        .spacing(ListItemSpacing::Sparse)
+                                        .start_slot(
+                                            Icon::new(IconName::Quote)
+                                                .size(IconSize::Small)
+                                                .color(Color::Muted),
+                                        )
+                                        .child(Label::new("Configure Custom Prompt"))
+                                        .on_click({
+                                            let profile_id = mode.profile_id.clone();
+                                            cx.listener(move |this, _, window, cx| {
+                                                this.configure_custom_prompt(
+                                                    profile_id.clone(),
                                                     window,
                                                     cx,
                                                 );
@@ -1082,6 +1515,8 @@ impl ManageProfilesModal {
                 .into_any_element(),
         )
         .entry(mode.fork_profile)
+        .entry(mode.configure_description)
+        .entry(mode.configure_custom_prompt)
         .entry(mode.configure_default_model)
         .entry(mode.configure_tools)
         .entry(mode.configure_mcps)
@@ -1158,20 +1593,23 @@ impl Render for ManageProfilesModal {
                         Mode::ConfigureTools {
                             profile_id,
                             tool_picker,
-                            ..
+                            _subscription: _,
                         } => {
-                            let profile_name = settings
-                                .profiles
-                                .get(profile_id)
+                            let profile = settings.profiles.get(profile_id);
+                            let profile_name = profile
                                 .map(|profile| profile.name.clone())
                                 .unwrap_or_else(|| "Unknown".into());
+                            let profile_origin = profile.map(|p| p.origin.clone());
 
                             v_flex()
                                 .pb_1()
-                                .child(ProfileModalHeader::new(
-                                    format!("{profile_name} — Configure Built-in Tools"),
-                                    Some(IconName::Settings),
-                                ))
+                                .child(
+                                    ProfileModalHeader::new(
+                                        format!("{profile_name} — Configure Built-in Tools"),
+                                        Some(IconName::Settings),
+                                    )
+                                    .with_origin(profile_origin),
+                                )
                                 .child(ListSeparator)
                                 .child(tool_picker.clone())
                                 .child(ListSeparator)
@@ -1181,20 +1619,23 @@ impl Render for ManageProfilesModal {
                         Mode::ConfigureDefaultModel {
                             profile_id,
                             model_picker,
-                            ..
+                            _subscription: _,
                         } => {
-                            let profile_name = settings
-                                .profiles
-                                .get(profile_id)
+                            let profile = settings.profiles.get(profile_id);
+                            let profile_name = profile
                                 .map(|profile| profile.name.clone())
                                 .unwrap_or_else(|| "Unknown".into());
+                            let profile_origin = profile.map(|p| p.origin.clone());
 
                             v_flex()
                                 .pb_1()
-                                .child(ProfileModalHeader::new(
-                                    format!("{profile_name} — Configure Default Model"),
-                                    Some(IconName::ZedAgent),
-                                ))
+                                .child(
+                                    ProfileModalHeader::new(
+                                        format!("{profile_name} — Configure Default Model"),
+                                        Some(IconName::ZedAgent),
+                                    )
+                                    .with_origin(profile_origin),
+                                )
                                 .child(ListSeparator)
                                 .child(v_flex().w(rems(34.)).child(model_picker.clone()))
                                 .child(ListSeparator)
@@ -1204,20 +1645,23 @@ impl Render for ManageProfilesModal {
                         Mode::ConfigureMcps {
                             profile_id,
                             tool_picker,
-                            ..
+                            _subscription: _,
                         } => {
-                            let profile_name = settings
-                                .profiles
-                                .get(profile_id)
+                            let profile = settings.profiles.get(profile_id);
+                            let profile_name = profile
                                 .map(|profile| profile.name.clone())
                                 .unwrap_or_else(|| "Unknown".into());
+                            let profile_origin = profile.map(|p| p.origin.clone());
 
                             v_flex()
                                 .pb_1()
-                                .child(ProfileModalHeader::new(
-                                    format!("{profile_name} — Configure MCP Tools"),
-                                    Some(IconName::ToolHammer),
-                                ))
+                                .child(
+                                    ProfileModalHeader::new(
+                                        format!("{profile_name} — Configure MCP Tools"),
+                                        Some(IconName::ToolHammer),
+                                    )
+                                    .with_origin(profile_origin),
+                                )
                                 .child(ListSeparator)
                                 .child(tool_picker.clone())
                                 .child(ListSeparator)
@@ -1227,19 +1671,23 @@ impl Render for ManageProfilesModal {
                         Mode::ConfigureDelegation {
                             profile_id,
                             delegation_editor,
+                            _subscription: _,
                         } => {
-                            let profile_name = settings
-                                .profiles
-                                .get(profile_id)
+                            let profile = settings.profiles.get(profile_id);
+                            let profile_name = profile
                                 .map(|profile| profile.name.clone())
                                 .unwrap_or_else(|| "Unknown".into());
+                            let profile_origin = profile.map(|p| p.origin.clone());
 
                             v_flex()
                                 .pb_1()
-                                .child(ProfileModalHeader::new(
-                                    format!("{profile_name} — Configure Delegation"),
-                                    Some(IconName::UserGroup),
-                                ))
+                                .child(
+                                    ProfileModalHeader::new(
+                                        format!("{profile_name} — Configure Delegation"),
+                                        Some(IconName::UserGroup),
+                                    )
+                                    .with_origin(profile_origin),
+                                )
                                 .child(ListSeparator)
                                 .child(delegation_editor.clone())
                                 .child(ListSeparator)
@@ -1250,25 +1698,233 @@ impl Render for ManageProfilesModal {
                             profile_id,
                             skills_editor,
                         } => {
-                            let profile_name = settings
-                                .profiles
-                                .get(profile_id)
+                            let profile = settings.profiles.get(profile_id);
+                            let profile_name = profile
                                 .map(|profile| profile.name.clone())
                                 .unwrap_or_else(|| "Unknown".into());
+                            let profile_origin = profile.map(|p| p.origin.clone());
 
                             v_flex()
                                 .pb_1()
-                                .child(ProfileModalHeader::new(
-                                    format!("{profile_name} — Configure Skills"),
-                                    Some(IconName::Sparkle),
-                                ))
+                                .child(
+                                    ProfileModalHeader::new(
+                                        format!("{profile_name} — Configure Skills"),
+                                        Some(IconName::Sparkle),
+                                    )
+                                    .with_origin(profile_origin),
+                                )
                                 .child(ListSeparator)
                                 .child(skills_editor.clone())
                                 .child(ListSeparator)
                                 .child(go_back_item)
                                 .into_any_element()
                         }
+                        Mode::ConfigureCustomPrompt {
+                            profile_id,
+                            prompt_editor,
+                            _subscription: _,
+                        } => {
+                            let profile = settings.profiles.get(profile_id);
+                            let profile_name = profile
+                                .map(|profile| profile.name.clone())
+                                .unwrap_or_else(|| "Unknown".into());
+                            let profile_origin = profile.map(|p| p.origin.clone());
+
+                            v_flex()
+                                .pb_1()
+                                .child(
+                                    ProfileModalHeader::new(
+                                        format!("{profile_name} — Configure Custom Prompt"),
+                                        Some(IconName::Quote),
+                                    )
+                                    .with_origin(profile_origin),
+                                )
+                                .child(ListSeparator)
+                                .child(
+                                    v_flex()
+                                        .p_2()
+                                        .gap_1()
+                                        .child(
+                                            Label::new(
+                                                "Custom system instructions injected for this profile",
+                                            )
+                                            .size(LabelSize::XSmall)
+                                            .color(Color::Muted),
+                                        )
+                                        .child(
+                                            div()
+                                                .p_1()
+                                                .border_1()
+                                                .border_color(cx.theme().colors().border)
+                                                .rounded_md()
+                                                .child(prompt_editor.clone()),
+                                        ),
+                                )
+                                .child(ListSeparator)
+                                .child(go_back_item)
+                                .into_any_element()
+                        }
+                        Mode::ConfigureDescription {
+                            profile_id,
+                            description_editor,
+                            _subscription: _,
+                        } => {
+                            let profile = settings.profiles.get(profile_id);
+                            let profile_name = profile
+                                .map(|profile| profile.name.clone())
+                                .unwrap_or_else(|| "Unknown".into());
+                            let profile_origin = profile.map(|p| p.origin.clone());
+
+                            v_flex()
+                                .pb_1()
+                                .child(
+                                    ProfileModalHeader::new(
+                                        format!("{profile_name} — Configure Description"),
+                                        Some(IconName::Info),
+                                    )
+                                    .with_origin(profile_origin),
+                                )
+                                .child(ListSeparator)
+                                .child(
+                                    v_flex()
+                                        .p_2()
+                                        .gap_1()
+                                        .child(
+                                            Label::new(
+                                                "Short description shown to parent agents in the delegation catalog",
+                                            )
+                                            .size(LabelSize::XSmall)
+                                            .color(Color::Muted),
+                                        )
+                                        .child(
+                                            div()
+                                                .p_1()
+                                                .border_1()
+                                                .border_color(cx.theme().colors().border)
+                                                .rounded_md()
+                                                .child(description_editor.clone()),
+                                        ),
+                                )
+                                .child(ListSeparator)
+                                .child(go_back_item)
+                                .into_any_element()
+                        }
                     }),
             )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fs::FakeFs;
+    use gpui::UpdateGlobal as _;
+    use settings::{LocalSettingsKind, LocalSettingsPath, WorktreeId};
+
+    #[gpui::test]
+    fn test_save_profile_change_routes_to_correct_origin(cx: &mut gpui::App) {
+        let fs = FakeFs::new(cx.background_executor().clone());
+        let store = SettingsStore::test(cx);
+        cx.set_global(store);
+        project::DisableAiSettings::register(cx);
+        AgentSettings::register(cx);
+
+        // 1. Setup user settings with a global profile
+        SettingsStore::update_global(cx, |store, cx| {
+            store
+                .set_user_settings(
+                    r#"{ "agent": { "profiles": { "global_agent": { "name": "Global Agent" } } } }"#,
+                    cx,
+                )
+                .unwrap();
+        });
+
+        // 2. Setup local project settings with a project profile
+        let root = std::sync::Arc::from(util::rel_path::RelPath::from_unix_str("").unwrap());
+        let worktree_id = WorktreeId::from_usize(1);
+        let project_path: Arc<util::rel_path::RelPath> = std::sync::Arc::from(
+            util::rel_path::RelPath::from_unix_str(".zed/settings.json").unwrap(),
+        );
+
+        SettingsStore::update_global(cx, |store, cx| {
+            store
+                .set_local_settings(
+                    worktree_id,
+                    LocalSettingsPath::InWorktree(root),
+                    LocalSettingsKind::Settings,
+                    Some(
+                        r#"{
+                            "agent": {
+                                "profiles": {
+                                    "project_agent": { "name": "Project Agent" }
+                                }
+                            }
+                        }"#,
+                    ),
+                    cx,
+                )
+                .unwrap();
+        });
+
+        let settings = AgentSettings::get_global(cx);
+        let global_profile = settings
+            .profiles
+            .get(&AgentProfileId("global_agent".into()))
+            .unwrap();
+        assert_eq!(global_profile.origin, ProfileOrigin::Global);
+
+        let project_profile = settings
+            .profiles
+            .get(&AgentProfileId("project_agent".into()))
+            .unwrap();
+        assert_eq!(
+            project_profile.origin,
+            ProfileOrigin::Project {
+                worktree_id,
+                path: project_path,
+            }
+        );
+
+        // 3. Test saving change to global profile
+        ManageProfilesModal::save_profile_change_by_origin(
+            fs.clone(),
+            &global_profile.origin,
+            cx,
+            |settings, _cx| {
+                let agent = settings.agent.get_or_insert_default();
+                let profiles = agent.profiles.get_or_insert_default();
+                if let Some(profile) = profiles.get_mut("global_agent") {
+                    profile.custom_prompt = Some(Arc::from("Global Custom Prompt"));
+                }
+            },
+        );
+
+        // 4. Test saving change to project profile
+        ManageProfilesModal::save_profile_change_by_origin(
+            fs.clone(),
+            &project_profile.origin,
+            cx,
+            |settings, _cx| {
+                let agent = settings.agent.get_or_insert_default();
+                let profiles = agent.profiles.get_or_insert_default();
+                if let Some(profile) = profiles.get_mut("project_agent") {
+                    profile.custom_prompt = Some(Arc::from("Project Custom Prompt"));
+                }
+            },
+        );
+
+        // 5. Test deleting project profile
+        ManageProfilesModal::save_profile_change_by_origin(
+            fs,
+            &project_profile.origin,
+            cx,
+            |settings, _cx| {
+                if let Some(agent) = settings.agent.as_mut() {
+                    if let Some(profiles) = agent.profiles.as_mut() {
+                        profiles.shift_remove("project_agent");
+                    }
+                }
+            },
+        );
     }
 }

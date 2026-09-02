@@ -1,12 +1,14 @@
 use std::sync::Arc;
 
-use agent_skills::{SkillIndex, SkillSource};
 use agent_settings::{AgentProfileId, AgentSettings};
+use agent_skills::{SkillIndex, SkillSource};
 use fs::Fs;
-use gpui::{App, Context, FocusHandle, Focusable, Render, SharedString, Subscription, Window, prelude::*};
+use gpui::{
+    App, Context, FocusHandle, Focusable, Render, SharedString, Subscription, Window, prelude::*,
+};
 use settings::{Settings as _, SettingsStore, update_settings_file};
 use ui::{
-    Icon, IconName, IconSize, Label, LabelSize, ListItem, ListItemSpacing, ListSeparator, Color,
+    Color, Icon, IconName, IconSize, Label, LabelSize, ListItem, ListItemSpacing, ListSeparator,
     prelude::*,
 };
 
@@ -77,9 +79,15 @@ impl SkillsEditor {
     }
 
     fn write_filter(&mut self, filter: Option<Vec<Arc<str>>>, cx: &mut Context<Self>) {
+        let origin = AgentSettings::get_global(cx)
+            .profiles
+            .get(&self.profile_id)
+            .map(|p| p.origin.clone())
+            .unwrap_or_default();
+
         let fs = self.fs.clone();
         let profile_id = self.profile_id.clone();
-        update_settings_file(fs, cx, move |settings, _cx| {
+        let update_fn = move |settings: &mut settings::SettingsContent, _cx: &App| {
             let Some(profile) = settings
                 .agent
                 .get_or_insert_default()
@@ -90,7 +98,16 @@ impl SkillsEditor {
                 return;
             };
             profile.skills = filter;
-        });
+        };
+
+        match origin {
+            agent_settings::ProfileOrigin::Global => {
+                update_settings_file(fs, cx, update_fn);
+            }
+            agent_settings::ProfileOrigin::Project { worktree_id, path } => {
+                settings::update_project_settings_file(fs, worktree_id, path, cx, update_fn);
+            }
+        }
         cx.notify();
     }
 
@@ -103,15 +120,13 @@ impl SkillsEditor {
                 .inset(true)
                 .spacing(ListItemSpacing::Sparse)
                 .child(
-                    v_flex()
-                        .child(Label::new("Restrict Skills"))
-                        .child(
-                            Label::new(
-                                "When enabled, only the checked skills are visible to this profile",
-                            )
-                            .size(LabelSize::XSmall)
-                            .color(Color::Muted),
-                        ),
+                    v_flex().child(Label::new("Restrict Skills")).child(
+                        Label::new(
+                            "When enabled, only the checked skills are visible to this profile",
+                        )
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                    ),
                 )
                 .end_slot::<Icon>(filter_enabled.then(|| {
                     Icon::new(IconName::Check)
@@ -136,13 +151,11 @@ impl SkillsEditor {
                         .inset(true)
                         .spacing(ListItemSpacing::Sparse)
                         .child(
-                            v_flex()
-                                .child(Label::new(name.clone()))
-                                .child(
-                                    Label::new(source)
-                                        .size(LabelSize::XSmall)
-                                        .color(Color::Muted),
-                                ),
+                            v_flex().child(Label::new(name.clone())).child(
+                                Label::new(source)
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Muted),
+                            ),
                         )
                         .end_slot::<Icon>(is_allowed.then(|| {
                             Icon::new(IconName::Check)
@@ -171,11 +184,17 @@ fn collect_skills_with_source(cx: &App) -> Vec<(Arc<str>, String)> {
 
     if let Some(index) = cx.try_global::<SkillIndex>() {
         for skill in &index.global_skills {
-            push(skill.name.clone(), format!("global — {}", skill.description));
+            push(
+                skill.name.clone(),
+                format!("global — {}", skill.description),
+            );
         }
         for group in &index.project_skills {
             for skill in &group.skills {
-                push(skill.name.clone(), format!("project — {}", skill.description));
+                push(
+                    skill.name.clone(),
+                    format!("project — {}", skill.description),
+                );
             }
         }
     }

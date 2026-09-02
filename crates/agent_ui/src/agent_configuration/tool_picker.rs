@@ -179,7 +179,10 @@ impl PickerDelegate for ToolPickerDelegate {
     }
 
     fn can_select(&self, ix: usize, _window: &mut Window, _cx: &mut Context<Picker<Self>>) -> bool {
-        matches!(self.filtered_items.get(ix), Some(PickerItem::Tool { .. }))
+        matches!(
+            self.filtered_items.get(ix),
+            Some(PickerItem::Tool { .. } | PickerItem::ContextServer { .. })
+        )
     }
 
     fn placeholder_text(&self, _window: &mut Window, _cx: &mut App) -> Arc<str> {
@@ -205,10 +208,22 @@ impl PickerDelegate for ToolPickerDelegate {
                         BTreeMap::default();
 
                     for item in all_items.iter() {
-                        if let PickerItem::Tool { server_id, name } = item.clone()
-                            && name.contains(&query)
-                        {
-                            tools_by_provider.entry(server_id).or_default().push(name);
+                        match item.clone() {
+                            PickerItem::Tool { server_id, name } => {
+                                let matches_tool = name.contains(&query);
+                                let matches_server = server_id
+                                    .as_ref()
+                                    .map(|s| s.contains(&query))
+                                    .unwrap_or(false);
+                                if matches_tool || matches_server {
+                                    tools_by_provider.entry(server_id).or_default().push(name);
+                                }
+                            }
+                            PickerItem::ContextServer { server_id } => {
+                                if server_id.contains(&query) {
+                                    tools_by_provider.entry(Some(server_id)).or_default();
+                                }
+                            }
                         }
                     }
 
@@ -251,108 +266,156 @@ impl PickerDelegate for ToolPickerDelegate {
             return;
         };
 
-        let PickerItem::Tool {
-            name: tool_name,
-            server_id,
-        } = item
-        else {
-            return;
-        };
+        let is_currently_enabled = match item {
+            PickerItem::ContextServer { server_id } => {
+                let is_enabled = self
+                    .profile_settings
+                    .context_servers
+                    .get(server_id.as_ref())
+                    .and_then(|preset| preset.enabled)
+                    .unwrap_or(self.profile_settings.enable_all_context_servers);
 
-        let is_currently_enabled = if let Some(server_id) = server_id.clone() {
-            let preset = self
-                .profile_settings
-                .context_servers
-                .entry(server_id)
-                .or_default();
-            let is_enabled = *preset.tools.entry(tool_name.clone()).or_default();
-            *preset.tools.entry(tool_name.clone()).or_default() = !is_enabled;
-            is_enabled
-        } else {
-            let is_enabled = *self
-                .profile_settings
-                .tools
-                .entry(tool_name.clone())
-                .or_default();
-            *self
-                .profile_settings
-                .tools
-                .entry(tool_name.clone())
-                .or_default() = !is_enabled;
-            is_enabled
-        };
-
-        update_settings_file(self.fs.clone(), cx, {
-            let profile_id = self.profile_id.clone();
-            let default_profile = self.profile_settings.clone();
-            let server_id = server_id.clone();
-            let tool_name = tool_name.clone();
-            move |settings, _cx| {
-                let profiles = settings
-                    .agent
-                    .get_or_insert_default()
-                    .profiles
-                    .get_or_insert_default();
-                let profile = profiles
-                    .entry(profile_id.0)
-                    .or_insert_with(|| AgentProfileContent {
-                        name: default_profile.name.into(),
-                        tools: default_profile.tools,
-                        enable_all_context_servers: Some(
-                            default_profile.enable_all_context_servers,
-                        ),
-                        context_servers: default_profile
-                            .context_servers
-                            .into_iter()
-                            .map(|(server_id, preset)| {
-                                (
-                                    server_id,
-                                    match preset.enabled {
-                                        Some(enabled) => {
-                                            ContextServerPresetContent::Enabled(enabled)
-                                        }
-                                        None => ContextServerPresetContent::Tools {
-                                            tools: preset.tools,
-                                        },
-                                    },
-                                )
-                            })
-                            .collect(),
-                        default_model: default_profile.default_model.clone(),
-                        custom_prompt: default_profile.custom_prompt.clone().map(|s| s.into()),
-                        description: default_profile.description.clone().map(|s| s.into()),
-                        skills: default_profile.skills.clone(),
-                        delegation: default_profile.delegation.as_ref().map(|delegation| {
-                            DelegationContent {
-                                allowed: delegation
-                                    .allowed
-                                    .iter()
-                                    .map(|id| Arc::from(id.as_str()))
-                                    .collect(),
-                                max_depth: Some(u32::from(delegation.max_depth)),
-                            }
-                        }),
-                    });
-
-                if let Some(server_id) = server_id {
-                    let preset = profile.context_servers.entry(server_id).or_default();
-                    match preset {
-                        ContextServerPresetContent::Enabled(enabled) => {
-                            // Translate a whole-server toggle into a per-tool
-                            // map, seeded with the previous enablement.
-                            let enabled = *enabled;
-                            let tools = [(tool_name, !enabled)].into_iter().collect();
-                            *preset = ContextServerPresetContent::Tools { tools };
-                        }
-                        ContextServerPresetContent::Tools { tools } => {
-                            *tools.entry(tool_name).or_default() = !is_currently_enabled;
-                        }
-                    }
+                let preset = self
+                    .profile_settings
+                    .context_servers
+                    .entry(server_id.clone())
+                    .or_default();
+                preset.enabled = Some(!is_enabled);
+                is_enabled
+            }
+            PickerItem::Tool {
+                name: tool_name,
+                server_id,
+            } => {
+                if let Some(server_id) = server_id.clone() {
+                    let preset = self
+                        .profile_settings
+                        .context_servers
+                        .entry(server_id)
+                        .or_default();
+                    let is_enabled = match preset.enabled {
+                        Some(enabled) => preset.tools.get(tool_name).copied().unwrap_or(enabled),
+                        None => preset
+                            .tools
+                            .get(tool_name)
+                            .copied()
+                            .unwrap_or(self.profile_settings.enable_all_context_servers),
+                    };
+                    preset.tools.insert(tool_name.clone(), !is_enabled);
+                    preset.enabled = None;
+                    is_enabled
                 } else {
-                    *profile.tools.entry(tool_name).or_default() = !is_currently_enabled;
+                    let is_enabled = *self
+                        .profile_settings
+                        .tools
+                        .entry(tool_name.clone())
+                        .or_default();
+                    *self
+                        .profile_settings
+                        .tools
+                        .entry(tool_name.clone())
+                        .or_default() = !is_enabled;
+                    is_enabled
                 }
             }
-        });
+        };
+
+        let profile_id = self.profile_id.clone();
+        let default_profile = self.profile_settings.clone();
+        let item = item.clone();
+
+        let update_fn = move |settings: &mut settings::SettingsContent, _cx: &App| {
+            let profiles = settings
+                .agent
+                .get_or_insert_default()
+                .profiles
+                .get_or_insert_default();
+            let profile = profiles
+                .entry(profile_id.0)
+                .or_insert_with(|| AgentProfileContent {
+                    name: default_profile.name.into(),
+                    origin: None,
+                    tools: default_profile.tools,
+                    enable_all_context_servers: Some(default_profile.enable_all_context_servers),
+                    context_servers: default_profile
+                        .context_servers
+                        .into_iter()
+                        .map(|(server_id, preset)| {
+                            (
+                                server_id,
+                                match preset.enabled {
+                                    Some(enabled) => ContextServerPresetContent::Enabled(enabled),
+                                    None => ContextServerPresetContent::Tools {
+                                        tools: preset.tools,
+                                    },
+                                },
+                            )
+                        })
+                        .collect(),
+                    default_model: default_profile.default_model.clone(),
+                    custom_prompt: default_profile.custom_prompt.clone().map(|s| s.into()),
+                    description: default_profile.description.clone().map(|s| s.into()),
+                    skills: default_profile.skills.clone(),
+                    delegation: default_profile.delegation.as_ref().map(|delegation| {
+                        DelegationContent {
+                            allowed: delegation
+                                .allowed
+                                .iter()
+                                .map(|id| Arc::from(id.as_str()))
+                                .collect(),
+                            max_depth: Some(u32::from(delegation.max_depth)),
+                        }
+                    }),
+                    tool_permissions: default_profile
+                        .tool_permissions
+                        .as_ref()
+                        .map(|tool_permissions| tool_permissions.to_content()),
+                });
+
+            match item {
+                PickerItem::ContextServer { server_id } => {
+                    profile.context_servers.insert(
+                        server_id,
+                        ContextServerPresetContent::Enabled(!is_currently_enabled),
+                    );
+                }
+                PickerItem::Tool {
+                    name: tool_name,
+                    server_id,
+                } => {
+                    if let Some(server_id) = server_id {
+                        let preset = profile.context_servers.entry(server_id).or_default();
+                        match preset {
+                            ContextServerPresetContent::Enabled(enabled) => {
+                                let enabled = *enabled;
+                                let tools = [(tool_name, !enabled)].into_iter().collect();
+                                *preset = ContextServerPresetContent::Tools { tools };
+                            }
+                            ContextServerPresetContent::Tools { tools } => {
+                                *tools.entry(tool_name).or_default() = !is_currently_enabled;
+                            }
+                        }
+                    } else {
+                        *profile.tools.entry(tool_name).or_default() = !is_currently_enabled;
+                    }
+                }
+            }
+        };
+
+        match &self.profile_settings.origin {
+            agent_settings::ProfileOrigin::Global => {
+                update_settings_file(self.fs.clone(), cx, update_fn);
+            }
+            agent_settings::ProfileOrigin::Project { worktree_id, path } => {
+                settings::update_project_settings_file(
+                    self.fs.clone(),
+                    *worktree_id,
+                    path.clone(),
+                    cx,
+                    update_fn,
+                );
+            }
+        }
     }
 
     fn dismissed(&mut self, _window: &mut Window, cx: &mut Context<Picker<Self>>) {
@@ -366,34 +429,56 @@ impl PickerDelegate for ToolPickerDelegate {
         ix: usize,
         selected: bool,
         _window: &mut Window,
-        cx: &mut Context<Picker<Self>>,
+        _cx: &mut Context<Picker<Self>>,
     ) -> Option<Self::ListItem> {
         let item = &self.filtered_items.get(ix)?;
         match item {
-            PickerItem::ContextServer { server_id, .. } => Some(
-                div()
-                    .px_2()
-                    .pb_1()
-                    .when(ix > 1, |this| {
-                        this.mt_1()
-                            .pt_2()
-                            .border_t_1()
-                            .border_color(cx.theme().colors().border_variant)
-                    })
-                    .child(
-                        Label::new(server_id)
-                            .size(LabelSize::XSmall)
-                            .color(Color::Muted),
-                    )
-                    .into_any_element(),
-            ),
+            PickerItem::ContextServer { server_id, .. } => {
+                let is_server_enabled = self
+                    .profile_settings
+                    .context_servers
+                    .get(server_id.as_ref())
+                    .and_then(|preset| preset.enabled)
+                    .unwrap_or(self.profile_settings.enable_all_context_servers);
+
+                Some(
+                    ListItem::new(ix)
+                        .inset(true)
+                        .spacing(ListItemSpacing::Sparse)
+                        .toggle_state(selected)
+                        .start_slot(
+                            Icon::new(IconName::Server)
+                                .size(IconSize::Small)
+                                .color(Color::Muted),
+                        )
+                        .child(
+                            h_flex().gap_2().child(Label::new(server_id.clone())).child(
+                                Label::new("(All Tools)")
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Muted),
+                            ),
+                        )
+                        .end_slot::<Icon>(is_server_enabled.then(|| {
+                            Icon::new(IconName::Check)
+                                .size(IconSize::Small)
+                                .color(Color::Success)
+                        }))
+                        .into_any_element(),
+                )
+            }
             PickerItem::Tool { name, server_id } => {
                 let is_enabled = if let Some(server_id) = server_id {
                     self.profile_settings
                         .context_servers
                         .get(server_id.as_ref())
-                        .and_then(|preset| preset.tools.get(name))
-                        .copied()
+                        .map(|preset| match preset.enabled {
+                            Some(enabled) => enabled,
+                            None => preset
+                                .tools
+                                .get(name)
+                                .copied()
+                                .unwrap_or(self.profile_settings.enable_all_context_servers),
+                        })
                         .unwrap_or(self.profile_settings.enable_all_context_servers)
                 } else {
                     self.profile_settings
