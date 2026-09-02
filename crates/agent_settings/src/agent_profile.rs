@@ -11,7 +11,7 @@ use settings::{
 };
 use util::ResultExt as _;
 
-use crate::{AgentProfileId, AgentSettings};
+use crate::{AgentProfileId, AgentSettings, ToolPermissions, compile_tool_permissions};
 
 pub mod builtin_profiles {
     use super::AgentProfileId;
@@ -22,6 +22,27 @@ pub mod builtin_profiles {
 
     pub fn is_builtin(profile_id: &AgentProfileId) -> bool {
         profile_id.as_str() == WRITE || profile_id.as_str() == ASK || profile_id.as_str() == MINIMAL
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum ProfileOrigin {
+    #[default]
+    Global,
+    Project {
+        worktree_id: settings::WorktreeId,
+        path: Arc<util::rel_path::RelPath>,
+    },
+}
+
+impl From<settings::ProfileOriginContent> for ProfileOrigin {
+    fn from(content: settings::ProfileOriginContent) -> Self {
+        match content {
+            settings::ProfileOriginContent::Global => Self::Global,
+            settings::ProfileOriginContent::Project { worktree_id, path } => {
+                Self::Project { worktree_id, path }
+            }
+        }
     }
 }
 
@@ -45,6 +66,7 @@ impl AgentProfile {
     pub fn create(
         name: String,
         base_profile_id: Option<AgentProfileId>,
+        origin: ProfileOrigin,
         fs: Arc<dyn Fs>,
         cx: &App,
     ) -> AgentProfileId {
@@ -74,25 +96,51 @@ impl AgentProfile {
         let custom_prompt = base_profile
             .as_ref()
             .and_then(|profile| profile.custom_prompt.clone());
+        let description = base_profile
+            .as_ref()
+            .and_then(|profile| profile.description.clone());
+        let skills = base_profile
+            .as_ref()
+            .and_then(|profile| profile.skills.clone());
+        let delegation = base_profile
+            .as_ref()
+            .and_then(|profile| profile.delegation.clone());
+        let tool_permissions = base_profile
+            .as_ref()
+            .and_then(|profile| profile.tool_permissions.clone());
 
         let profile_settings = AgentProfileSettings {
             name: name.into(),
+            origin: origin.clone(),
             tools,
             enable_all_context_servers,
             context_servers,
             default_model,
             custom_prompt,
-            description: None,
-            skills: None,
-            delegation: None,
+            description,
+            skills,
+            delegation,
+            tool_permissions,
         };
 
-        update_settings_file(fs, cx, {
-            let id = id.clone();
-            move |settings, _cx| {
-                profile_settings.save_to_settings(id, settings).log_err();
+        match &origin {
+            ProfileOrigin::Global => {
+                update_settings_file(fs, cx, {
+                    let id = id.clone();
+                    move |settings, _cx| {
+                        profile_settings.save_to_settings(id, settings).log_err();
+                    }
+                });
             }
-        });
+            ProfileOrigin::Project { worktree_id, path } => {
+                settings::update_project_settings_file(fs, *worktree_id, path.clone(), cx, {
+                    let id = id.clone();
+                    move |settings, _cx| {
+                        profile_settings.save_to_settings(id, settings).log_err();
+                    }
+                });
+            }
+        }
 
         id
     }
@@ -108,10 +156,11 @@ impl AgentProfile {
 }
 
 /// A profile for the Zed Agent that controls its behavior.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct AgentProfileSettings {
     /// The name of the profile.
     pub name: SharedString,
+    pub origin: ProfileOrigin,
     pub tools: IndexMap<Arc<str>, bool>,
     pub enable_all_context_servers: bool,
     pub context_servers: IndexMap<Arc<str>, ContextServerPreset>,
@@ -128,6 +177,8 @@ pub struct AgentProfileSettings {
     /// When present, this profile may delegate via `spawn_agent`; a profile
     /// without it is a solo agent.
     pub delegation: Option<Delegation>,
+    /// Tool permissions and write scopes for this profile.
+    pub tool_permissions: Option<ToolPermissions>,
 }
 
 /// Which sub-agents a profile may spawn, and how deeply they may nest.
@@ -224,6 +275,7 @@ impl AgentProfileSettings {
             profile_id.0,
             AgentProfileContent {
                 name: self.name.clone().into(),
+                origin: None,
                 tools: self.tools.clone(),
                 enable_all_context_servers: Some(self.enable_all_context_servers),
                 context_servers: self
@@ -257,6 +309,10 @@ impl AgentProfileSettings {
                             .collect(),
                         max_depth: Some(u32::from(delegation.max_depth)),
                     }),
+                tool_permissions: self
+                    .tool_permissions
+                    .as_ref()
+                    .map(|tool_permissions| tool_permissions.to_content()),
             },
         );
 
@@ -266,8 +322,10 @@ impl AgentProfileSettings {
 
 impl From<AgentProfileContent> for AgentProfileSettings {
     fn from(content: AgentProfileContent) -> Self {
+        let origin = content.origin.map(Into::into).unwrap_or_default();
         let AgentProfileContent {
             name,
+            origin: _,
             tools,
             enable_all_context_servers,
             context_servers,
@@ -276,10 +334,12 @@ impl From<AgentProfileContent> for AgentProfileSettings {
             description,
             skills,
             delegation,
+            tool_permissions,
         } = content;
 
         Self {
             name: name.into(),
+            origin,
             tools,
             enable_all_context_servers: enable_all_context_servers.unwrap_or_default(),
             context_servers: context_servers
@@ -291,11 +351,12 @@ impl From<AgentProfileContent> for AgentProfileSettings {
             description: description.map(|s| s.into()),
             skills,
             delegation: delegation.map(|delegation| delegation.into()),
+            tool_permissions: tool_permissions.map(|tp| compile_tool_permissions(Some(tp))),
         }
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct ContextServerPreset {
     /// When set, enables or disables the entire server for this profile,
     /// overriding any per-tool toggles.
@@ -328,6 +389,7 @@ mod tests {
     ) -> AgentProfileSettings {
         AgentProfileSettings {
             name: "test".into(),
+            origin: ProfileOrigin::Global,
             tools: IndexMap::default(),
             enable_all_context_servers,
             context_servers,
@@ -336,6 +398,7 @@ mod tests {
             description: None,
             skills: None,
             delegation: None,
+            tool_permissions: None,
         }
     }
 
@@ -484,6 +547,236 @@ mod tests {
             project::project_settings::ProjectSettings::get_global(cx)
                 .context_servers
                 .contains_key("demo")
+        );
+
+        // Check origins:
+        let write_profile = settings
+            .profiles
+            .get(&AgentProfileId("write".into()))
+            .unwrap();
+        assert_eq!(write_profile.origin, ProfileOrigin::Global);
+
+        let orchestrator_profile = settings
+            .profiles
+            .get(&AgentProfileId("orchestrator".into()))
+            .unwrap();
+        assert_eq!(
+            orchestrator_profile.origin,
+            ProfileOrigin::Project {
+                worktree_id: WorktreeId::from_usize(1),
+                path: std::sync::Arc::from(
+                    util::rel_path::RelPath::from_unix_str("root/.zed/settings.json").unwrap()
+                ),
+            }
+        );
+
+        let backend_profile = settings
+            .profiles
+            .get(&AgentProfileId("backend".into()))
+            .unwrap();
+        assert_eq!(
+            backend_profile.origin,
+            ProfileOrigin::Project {
+                worktree_id: WorktreeId::from_usize(1),
+                path: std::sync::Arc::from(
+                    util::rel_path::RelPath::from_unix_str("root/.zed/settings.json").unwrap()
+                ),
+            }
+        );
+    }
+
+    #[gpui::test]
+    fn test_create_project_profile_and_global_profile(cx: &mut gpui::App) {
+        use fs::FakeFs;
+        use gpui::UpdateGlobal as _;
+        use settings::{LocalSettingsKind, LocalSettingsPath, WorktreeId};
+
+        let fs = FakeFs::new(cx.background_executor().clone());
+        let store = SettingsStore::test(cx);
+        cx.set_global(store);
+        project::DisableAiSettings::register(cx);
+        AgentSettings::register(cx);
+
+        let root = std::sync::Arc::from(util::rel_path::RelPath::from_unix_str("").unwrap());
+        SettingsStore::update_global(cx, |store, cx| {
+            store
+                .set_local_settings(
+                    WorktreeId::from_usize(1),
+                    LocalSettingsPath::InWorktree(root),
+                    LocalSettingsKind::Settings,
+                    Some(
+                        r#"{
+                            "agent": {
+                                "profiles": {
+                                    "existing_project_profile": { "name": "Existing" }
+                                }
+                            }
+                        }"#,
+                    ),
+                    cx,
+                )
+                .unwrap();
+        });
+
+        // 1. Create global profile
+        let global_id = AgentProfile::create(
+            "Global Profile".to_string(),
+            None,
+            ProfileOrigin::Global,
+            fs.clone(),
+            cx,
+        );
+        assert_eq!(global_id, AgentProfileId("global-profile".into()));
+
+        // 2. Create project profile
+        let project_origin = ProfileOrigin::Project {
+            worktree_id: WorktreeId::from_usize(1),
+            path: std::sync::Arc::from(
+                util::rel_path::RelPath::from_unix_str(".zed/settings.json").unwrap(),
+            ),
+        };
+        let project_id =
+            AgentProfile::create("Project Profile".to_string(), None, project_origin, fs, cx);
+        assert_eq!(project_id, AgentProfileId("project-profile".into()));
+    }
+
+    #[test]
+    fn test_profile_tool_permissions_deserialization_and_matching() {
+        let json = serde_json::json!({
+            "name": "Backend Engineer",
+            "tool_permissions": {
+                "default": "deny",
+                "tools": {
+                    "terminal": {
+                        "default": "deny",
+                        "always_allow": [
+                            { "pattern": "^go\\s+(test|build|vet)" },
+                            { "pattern": "^cargo\\s+(test|check)" }
+                        ],
+                        "always_deny": [
+                            { "pattern": "^git\\s+push\\s+--force" },
+                            { "pattern": "^dropdb" }
+                        ]
+                    },
+                    "edit_file": {
+                        "default": "allow",
+                        "write_scopes": ["backend/**", "proto/**"]
+                    },
+                    "write_file": {
+                        "default": "allow",
+                        "write_scopes": ["backend/**", "proto/**"]
+                    }
+                }
+            }
+        });
+
+        let content: AgentProfileContent = serde_json::from_value(json).unwrap();
+        let settings = AgentProfileSettings::from(content);
+
+        let perms = settings
+            .tool_permissions
+            .expect("tool_permissions should be parsed");
+        assert_eq!(perms.default, settings::ToolPermissionMode::Deny);
+
+        let terminal_rules = perms.tools.get("terminal").expect("terminal rules present");
+        assert_eq!(
+            terminal_rules.default,
+            Some(settings::ToolPermissionMode::Deny)
+        );
+        assert!(
+            terminal_rules
+                .always_allow
+                .iter()
+                .any(|r| r.is_match("go test ./..."))
+        );
+        assert!(
+            terminal_rules
+                .always_allow
+                .iter()
+                .any(|r| r.is_match("cargo check"))
+        );
+        assert!(
+            !terminal_rules
+                .always_allow
+                .iter()
+                .any(|r| r.is_match("cargo run"))
+        );
+        assert!(
+            terminal_rules
+                .always_deny
+                .iter()
+                .any(|r| r.is_match("git push --force"))
+        );
+        assert!(
+            terminal_rules
+                .always_deny
+                .iter()
+                .any(|r| r.is_match("dropdb test"))
+        );
+
+        let edit_rules = perms
+            .tools
+            .get("edit_file")
+            .expect("edit_file rules present");
+        assert_eq!(
+            edit_rules.default,
+            Some(settings::ToolPermissionMode::Allow)
+        );
+        let write_scopes = edit_rules
+            .write_scopes
+            .as_ref()
+            .expect("write_scopes present");
+        assert!(
+            write_scopes
+                .is_match(util::rel_path::RelPath::new_test("backend/src/main.rs").as_ref())
+        );
+        assert!(
+            write_scopes
+                .is_match(util::rel_path::RelPath::new_test("proto/service.proto").as_ref())
+        );
+        assert!(
+            !write_scopes
+                .is_match(util::rel_path::RelPath::new_test("frontend/src/App.tsx").as_ref())
+        );
+        assert!(!write_scopes.is_match(util::rel_path::RelPath::new_test("README.md").as_ref()));
+    }
+
+    #[gpui::test]
+    fn test_invalid_write_scopes_fail_closed() {
+        let json = serde_json::json!({
+            "name": "Backend Engineer",
+            "tool_permissions": {
+                "default": "deny",
+                "tools": {
+                    "edit_file": {
+                        "default": "allow",
+                        "write_scopes": ["backend/**", "[invalid"]
+                    }
+                }
+            }
+        });
+
+        let content: AgentProfileContent = serde_json::from_value(json).unwrap();
+        let settings = AgentProfileSettings::from(content);
+
+        let perms = settings
+            .tool_permissions
+            .expect("tool_permissions should be parsed");
+        let edit_rules = perms
+            .tools
+            .get("edit_file")
+            .expect("edit_file rules present");
+
+        // An invalid glob must not silently drop write restrictions: the
+        // scopes are withheld and the tool is blocked via invalid_patterns,
+        // mirroring how invalid regex rules fail closed.
+        assert!(edit_rules.write_scopes.is_none());
+        assert_eq!(edit_rules.invalid_patterns.len(), 1);
+        assert_eq!(edit_rules.invalid_patterns[0].rule_type, "write_scopes");
+        assert!(
+            edit_rules.invalid_patterns[0]
+                .pattern
+                .contains("backend/**")
         );
     }
 }

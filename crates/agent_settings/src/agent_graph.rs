@@ -180,6 +180,7 @@ mod tests {
     fn test_profile() -> AgentProfileSettings {
         AgentProfileSettings {
             name: "test".into(),
+            origin: crate::ProfileOrigin::Global,
             tools: IndexMap::default(),
             enable_all_context_servers: false,
             context_servers: IndexMap::default(),
@@ -188,6 +189,7 @@ mod tests {
             description: None,
             skills: None,
             delegation: None,
+            tool_permissions: None,
         }
     }
 

@@ -3,7 +3,7 @@ mod agent_profile;
 mod user_agents_md;
 
 pub use agent_graph::{check_delegation, validate_profiles};
-pub use agent_profile::Delegation;
+pub use agent_profile::{Delegation, ProfileOrigin};
 
 use std::cmp::Ordering::{Equal, Greater, Less};
 use std::fmt;
@@ -544,7 +544,7 @@ impl Default for SandboxPermissions {
     }
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct ToolPermissions {
     /// Global default permission when no tool-specific rules or patterns match.
     pub default: ToolPermissionMode,
@@ -552,6 +552,74 @@ pub struct ToolPermissions {
 }
 
 impl ToolPermissions {
+    /// Converts compiled tool permissions back into content representation.
+    pub fn to_content(&self) -> settings::ToolPermissionsContent {
+        let tools = self
+            .tools
+            .iter()
+            .map(|(tool_name, rules)| {
+                let always_allow = if rules.always_allow.is_empty() {
+                    None
+                } else {
+                    Some(settings::ExtendingVec(
+                        rules
+                            .always_allow
+                            .iter()
+                            .map(|r| settings::ToolRegexRule {
+                                pattern: r.pattern.clone(),
+                                case_sensitive: if r.case_sensitive { Some(true) } else { None },
+                            })
+                            .collect(),
+                    ))
+                };
+                let always_deny = if rules.always_deny.is_empty() {
+                    None
+                } else {
+                    Some(settings::ExtendingVec(
+                        rules
+                            .always_deny
+                            .iter()
+                            .map(|r| settings::ToolRegexRule {
+                                pattern: r.pattern.clone(),
+                                case_sensitive: if r.case_sensitive { Some(true) } else { None },
+                            })
+                            .collect(),
+                    ))
+                };
+                let always_confirm = if rules.always_confirm.is_empty() {
+                    None
+                } else {
+                    Some(settings::ExtendingVec(
+                        rules
+                            .always_confirm
+                            .iter()
+                            .map(|r| settings::ToolRegexRule {
+                                pattern: r.pattern.clone(),
+                                case_sensitive: if r.case_sensitive { Some(true) } else { None },
+                            })
+                            .collect(),
+                    ))
+                };
+                let write_scopes = rules.write_scopes.as_ref().map(|ws| ws.scopes.clone());
+                (
+                    tool_name.clone(),
+                    settings::ToolRulesContent {
+                        default: rules.default,
+                        always_allow,
+                        always_deny,
+                        always_confirm,
+                        write_scopes,
+                    },
+                )
+            })
+            .collect();
+
+        settings::ToolPermissionsContent {
+            default: Some(self.default),
+            tools,
+        }
+    }
+
     /// Returns all invalid regex patterns across all tools.
     pub fn invalid_patterns(&self) -> Vec<&InvalidRegexPattern> {
         self.tools
@@ -569,24 +637,49 @@ impl ToolPermissions {
 }
 
 /// Represents a regex pattern that failed to compile.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InvalidRegexPattern {
     /// The pattern string that failed to compile.
     pub pattern: String,
-    /// Which rule list this pattern was in (e.g., "always_deny", "always_allow", "always_confirm").
+    /// Which rule list this pattern was in (e.g., "always_deny", "always_allow",
+    /// "always_confirm", "write_scopes").
     pub rule_type: String,
     /// The error message from the regex compiler.
     pub error: String,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct ToolRules {
     pub default: Option<ToolPermissionMode>,
     pub always_allow: Vec<CompiledRegex>,
     pub always_deny: Vec<CompiledRegex>,
     pub always_confirm: Vec<CompiledRegex>,
-    /// Patterns that failed to compile. If non-empty, tool calls should be blocked.
+    pub write_scopes: Option<WriteScopes>,
+    /// Patterns that failed to compile (regex rules or write-scope globs).
+    /// If non-empty, tool calls should be blocked.
     pub invalid_patterns: Vec<InvalidRegexPattern>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct WriteScopes {
+    pub scopes: Vec<Arc<str>>,
+    pub matcher: util::paths::PathMatcher,
+}
+
+impl WriteScopes {
+    /// Compiles the scope globs. Returns an error describing the first
+    /// invalid glob so callers can fail closed instead of silently dropping
+    /// write restrictions.
+    pub fn new(scopes: Vec<Arc<str>>) -> Result<Self, String> {
+        let patterns: Vec<&str> = scopes.iter().map(|s| s.as_ref()).collect();
+        let matcher = util::paths::PathMatcher::new(&patterns, util::paths::PathStyle::local())
+            .map_err(|error| error.to_string())?;
+        Ok(Self { scopes, matcher })
+    }
+
+    pub fn is_match(&self, path: &util::rel_path::RelPath) -> bool {
+        self.matcher.is_match(path)
+    }
 }
 
 #[derive(Clone)]
@@ -604,6 +697,14 @@ impl std::fmt::Debug for CompiledRegex {
             .finish()
     }
 }
+
+impl PartialEq for CompiledRegex {
+    fn eq(&self, other: &Self) -> bool {
+        self.pattern == other.pattern && self.case_sensitive == other.case_sensitive
+    }
+}
+
+impl Eq for CompiledRegex {}
 
 impl CompiledRegex {
     pub fn new(pattern: &str, case_sensitive: bool) -> Option<Self> {
@@ -984,7 +1085,9 @@ fn insert_granted_subtree(
     subtrees.push(granted);
 }
 
-fn compile_tool_permissions(content: Option<settings::ToolPermissionsContent>) -> ToolPermissions {
+pub fn compile_tool_permissions(
+    content: Option<settings::ToolPermissionsContent>,
+) -> ToolPermissions {
     let Some(content) = content else {
         return ToolPermissions::default();
     };
@@ -994,6 +1097,32 @@ fn compile_tool_permissions(content: Option<settings::ToolPermissionsContent>) -
         .into_iter()
         .map(|(tool_name, rules_content)| {
             let mut invalid_patterns = Vec::new();
+
+            let write_scopes = match rules_content.write_scopes {
+                Some(scopes) => {
+                    // Keep the raw globs for the error message; `scopes` is
+                    // moved into `WriteScopes::new` below.
+                    let raw_scopes = scopes
+                        .iter()
+                        .map(|scope| scope.as_ref())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    match WriteScopes::new(scopes) {
+                        Ok(scopes) => Some(scopes),
+                        Err(error) => {
+                            // Fail closed: an invalid scope glob must not
+                            // silently disable write restrictions for the tool.
+                            invalid_patterns.push(InvalidRegexPattern {
+                                pattern: raw_scopes,
+                                rule_type: "write_scopes".to_string(),
+                                error,
+                            });
+                            None
+                        }
+                    }
+                }
+                None => None,
+            };
 
             let (always_allow, allow_errors) = compile_regex_rules(
                 rules_content.always_allow.map(|v| v.0).unwrap_or_default(),
@@ -1020,7 +1149,7 @@ fn compile_tool_permissions(content: Option<settings::ToolPermissionsContent>) -
             // attempt to use a tool with invalid patterns in their settings.
             for invalid in &invalid_patterns {
                 log::error!(
-                    "Invalid regex pattern in tool_permissions for '{}' tool ({}): '{}' - {}",
+                    "Invalid pattern in tool_permissions for '{}' tool ({}): '{}' - {}",
                     tool_name,
                     invalid.rule_type,
                     invalid.pattern,
@@ -1034,6 +1163,7 @@ fn compile_tool_permissions(content: Option<settings::ToolPermissionsContent>) -
                 always_allow,
                 always_deny,
                 always_confirm,
+                write_scopes,
                 invalid_patterns,
             };
             (tool_name, rules)
