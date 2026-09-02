@@ -8,9 +8,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use crate::ExtendingVec;
-
-use crate::DockPosition;
+use crate::{DockPosition, ExtendingVec, WorktreeId};
+use util::rel_path::RelPath;
 
 /// Where to position the threads sidebar.
 #[derive(
@@ -548,10 +547,28 @@ impl AgentSettingsContent {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum ProfileOriginContent {
+    #[default]
+    Global,
+    Project {
+        worktree_id: WorktreeId,
+        path: Arc<RelPath>,
+    },
+}
+
+impl crate::merge_from::MergeFrom for ProfileOriginContent {
+    fn merge_from(&mut self, other: &Self) {
+        *self = other.clone();
+    }
+}
+
 #[with_fallible_options]
 #[derive(Debug, PartialEq, Clone, Serialize, Deserialize, JsonSchema, MergeFrom)]
 pub struct AgentProfileContent {
     pub name: Arc<str>,
+    #[serde(skip)]
+    pub origin: Option<ProfileOriginContent>,
     #[serde(default)]
     pub tools: IndexMap<Arc<str>, bool>,
     /// Whether all context servers are enabled by default.
@@ -571,6 +588,8 @@ pub struct AgentProfileContent {
     /// Declares that this profile may delegate to other profiles via
     /// `spawn_agent`. A profile without this block is a solo agent.
     pub delegation: Option<DelegationContent>,
+    /// Permissions for tools invoked by this profile.
+    pub tool_permissions: Option<ToolPermissionsContent>,
 }
 
 #[with_fallible_options]
@@ -1080,6 +1099,9 @@ pub struct ToolRulesContent {
     /// removed by a higher-priority layer—only new patterns can be added.
     /// Default: []
     pub always_confirm: Option<ExtendingVec<ToolRegexRule>>,
+
+    /// Write scopes (globs/path prefixes) allowed for file-modifying tools.
+    pub write_scopes: Option<Vec<Arc<str>>>,
 }
 
 #[with_fallible_options]

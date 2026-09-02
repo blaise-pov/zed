@@ -432,6 +432,7 @@ pub fn init(cx: &mut App) {
     init_renderers(cx);
     let queue = ProjectSettingsUpdateQueue::new(cx);
     cx.set_global(queue);
+    settings::set_project_settings_updater(cx, SettingsUiProjectSettingsUpdater);
 
     cx.on_action(|_: &OpenSettings, cx| {
         open_settings_editor(None, None, None, cx);
@@ -4696,10 +4697,44 @@ fn update_settings_file(
 struct ProjectSettingsUpdateEntry {
     worktree_id: WorktreeId,
     rel_path: Arc<RelPath>,
-    settings_window: WeakEntity<SettingsWindow>,
+    settings_window: Option<WeakEntity<SettingsWindow>>,
     project: WeakEntity<Project>,
     worktree: WeakEntity<Worktree>,
-    update: Box<dyn FnOnce(&mut SettingsContent, &App)>,
+    update: Box<dyn 'static + Send + FnOnce(&mut SettingsContent, &App)>,
+}
+
+struct SettingsUiProjectSettingsUpdater;
+
+impl settings::ProjectSettingsUpdater for SettingsUiProjectSettingsUpdater {
+    fn update_project_settings_file(
+        &self,
+        _fs: Arc<dyn fs::Fs>,
+        worktree_id: WorktreeId,
+        rel_path: Arc<RelPath>,
+        cx: &App,
+        update: Box<dyn 'static + Send + FnOnce(&mut SettingsContent, &App)>,
+    ) {
+        let Some((worktree, project)) = all_projects(None, cx).find_map(|project| {
+            project
+                .read(cx)
+                .worktree_for_id(worktree_id, cx)
+                .zip(Some(project))
+        }) else {
+            log::error!("Could not find project with worktree id: {}", worktree_id);
+            return;
+        };
+
+        let entry = ProjectSettingsUpdateEntry {
+            worktree_id,
+            rel_path,
+            settings_window: None,
+            project: project.downgrade(),
+            worktree: worktree.downgrade(),
+            update,
+        };
+
+        ProjectSettingsUpdateQueue::enqueue_with_app(cx, entry);
+    }
 }
 
 struct ProjectSettingsUpdateQueue {
@@ -4728,6 +4763,14 @@ impl ProjectSettingsUpdateQueue {
                 log::error!("Failed to enqueue project settings update: {err}");
             }
         });
+    }
+
+    fn enqueue_with_app(cx: &App, entry: ProjectSettingsUpdateEntry) {
+        if let Some(queue) = cx.try_global::<Self>() {
+            if let Err(err) = queue.tx.unbounded_send(entry) {
+                log::error!("Failed to enqueue project settings update: {err}");
+            }
+        }
     }
 
     async fn process_entry(entry: ProjectSettingsUpdateEntry, cx: &mut AsyncApp) -> Result<()> {
@@ -4760,13 +4803,17 @@ impl ProjectSettingsUpdateQueue {
         let buffer_store = project.read_with(cx, |project, _cx| project.buffer_store().clone())?;
 
         let cached_buffer = settings_window
-            .read_with(cx, |settings_window, _| {
-                settings_window
-                    .project_setting_file_buffers
-                    .get(&project_path)
-                    .cloned()
+            .as_ref()
+            .and_then(|w| {
+                w.read_with(cx, |settings_window, _| {
+                    settings_window
+                        .project_setting_file_buffers
+                        .get(&project_path)
+                        .cloned()
+                })
+                .ok()
             })
-            .unwrap_or_default();
+            .flatten();
 
         let buffer = if let Some(cached_buffer) = cached_buffer {
             let needs_reload = cached_buffer.read_with(cx, |buffer, _| buffer.has_conflict());
@@ -4783,10 +4830,12 @@ impl ProjectSettingsUpdateQueue {
                 .await
                 .context("Failed to open settings file")?;
 
-            let _ = settings_window.update(cx, |this, _cx| {
-                this.project_setting_file_buffers
-                    .insert(project_path, buffer.clone());
-            });
+            if let Some(settings_window) = &settings_window {
+                let _ = settings_window.update(cx, |this, _cx| {
+                    this.project_setting_file_buffers
+                        .insert(project_path, buffer.clone());
+                });
+            }
 
             buffer
         };
@@ -4814,7 +4863,7 @@ impl ProjectSettingsUpdateQueue {
 fn update_project_setting_file(
     worktree_id: WorktreeId,
     rel_path: Arc<RelPath>,
-    update: impl 'static + FnOnce(&mut SettingsContent, &App),
+    update: impl 'static + Send + FnOnce(&mut SettingsContent, &App),
     settings_window: Entity<SettingsWindow>,
     cx: &mut App,
 ) -> Result<()> {
@@ -4832,7 +4881,7 @@ fn update_project_setting_file(
     let entry = ProjectSettingsUpdateEntry {
         worktree_id,
         rel_path,
-        settings_window: settings_window.downgrade(),
+        settings_window: Some(settings_window.downgrade()),
         project: project.downgrade(),
         worktree: worktree.downgrade(),
         update: Box::new(update),
@@ -6537,7 +6586,7 @@ mod project_settings_update_tests {
         let entry = ProjectSettingsUpdateEntry {
             worktree_id: setup.worktree_id,
             rel_path: setup.rel_path.clone(),
-            settings_window: WeakEntity::new_invalid(),
+            settings_window: None,
             project: setup.project.downgrade(),
             worktree: setup.worktree,
             update: Box::new(|content, _cx| {
@@ -6571,7 +6620,7 @@ mod project_settings_update_tests {
         let entry = ProjectSettingsUpdateEntry {
             worktree_id: setup.worktree_id,
             rel_path: setup.rel_path.clone(),
-            settings_window: WeakEntity::new_invalid(),
+            settings_window: None,
             project: setup.project.downgrade(),
             worktree: setup.worktree,
             update: Box::new(|content, _cx| {
@@ -6609,7 +6658,7 @@ mod project_settings_update_tests {
             let entry = ProjectSettingsUpdateEntry {
                 worktree_id: setup.worktree_id,
                 rel_path: setup.rel_path.clone(),
-                settings_window: WeakEntity::new_invalid(),
+                settings_window: None,
                 project: setup.project.downgrade(),
                 worktree: setup.worktree.clone(),
                 update: Box::new(move |content, _cx| {
@@ -6653,7 +6702,7 @@ mod project_settings_update_tests {
             let entry = ProjectSettingsUpdateEntry {
                 worktree_id: setup.worktree_id,
                 rel_path: setup.rel_path.clone(),
-                settings_window: WeakEntity::new_invalid(),
+                settings_window: None,
                 project: setup.project.downgrade(),
                 worktree: setup.worktree.clone(),
                 update: Box::new(move |content, _cx| {
@@ -6669,7 +6718,7 @@ mod project_settings_update_tests {
             let entry = ProjectSettingsUpdateEntry {
                 worktree_id: setup.worktree_id,
                 rel_path: setup.rel_path.clone(),
-                settings_window: WeakEntity::new_invalid(),
+                settings_window: None,
                 project: WeakEntity::new_invalid(),
                 worktree: setup.worktree.clone(),
                 update: Box::new(|content, _cx| {
@@ -6685,7 +6734,7 @@ mod project_settings_update_tests {
             let entry = ProjectSettingsUpdateEntry {
                 worktree_id: setup.worktree_id,
                 rel_path: setup.rel_path.clone(),
-                settings_window: WeakEntity::new_invalid(),
+                settings_window: None,
                 project: setup.project.downgrade(),
                 worktree: setup.worktree.clone(),
                 update: Box::new(move |content, _cx| {
@@ -6728,7 +6777,7 @@ mod project_settings_update_tests {
         let entry = ProjectSettingsUpdateEntry {
             worktree_id: setup.worktree_id,
             rel_path: setup.rel_path.clone(),
-            settings_window: WeakEntity::new_invalid(),
+            settings_window: None,
             project: setup.project.downgrade(),
             worktree: WeakEntity::new_invalid(),
             update: Box::new(|content, _cx| {
@@ -6800,7 +6849,7 @@ mod project_settings_update_tests {
         let entry = ProjectSettingsUpdateEntry {
             worktree_id: setup.worktree_id,
             rel_path: setup.rel_path.clone(),
-            settings_window: settings_window.downgrade(),
+            settings_window: Some(settings_window.downgrade()),
             project: setup.project.downgrade(),
             worktree: setup.worktree.clone(),
             update: Box::new(|content, _cx| {

@@ -633,6 +633,46 @@ impl SettingsStore {
         })
     }
 
+    /// In-memory-only fallback used when no `ProjectSettingsUpdater` has been
+    /// registered (i.e. outside the full Zed app, such as in tests). The
+    /// update is applied to the store but never written to disk.
+    pub fn update_project_settings_file_fallback(
+        &self,
+        _fs: Arc<dyn Fs>,
+        root_id: WorktreeId,
+        rel_path: Arc<RelPath>,
+        update: impl 'static + Send + FnOnce(&mut SettingsContent, &App),
+    ) {
+        log::warn!(
+            "No project settings updater registered; updating {} in memory only \
+             (the change will not be written to disk)",
+            rel_path.as_unix_str(),
+        );
+        self.setting_file_updates_tx
+            .unbounded_send(Box::new(move |cx: AsyncApp| {
+                async move {
+                    cx.update_global(|store: &mut SettingsStore, cx| {
+                        let dir_path = rel_path
+                            .ancestors()
+                            .nth(
+                                paths::local_settings_file_relative_path()
+                                    .components()
+                                    .count(),
+                            )
+                            .map(Arc::from)
+                            .unwrap_or_else(|| RelPath::empty_arc());
+                        let entry = store.local_settings.entry((root_id, dir_path)).or_default();
+                        update(entry, cx);
+                        store.recompute_values(None, cx);
+                        Ok(())
+                    })
+                }
+                .boxed_local()
+            }))
+            .map_err(|err| anyhow::format_err!("Failed to update local settings: {}", err))
+            .log_with_level(log::Level::Warn);
+    }
+
     pub fn import_vscode_settings(
         &self,
         fs: Arc<dyn Fs>,
@@ -1092,7 +1132,21 @@ impl SettingsStore {
                     }),
                 }?;
                 if let Some(new_settings) = new_settings {
-                    let new_agent = new_settings.agent.clone();
+                    let mut new_agent = new_settings.agent.clone();
+                    if let Some(agent) = new_agent.as_mut() {
+                        if let Some(profiles) = agent.profiles.as_mut() {
+                            let file_rel_path: Arc<RelPath> = directory_path
+                                .join(local_settings_file_relative_path())
+                                .into();
+                            for profile in profiles.values_mut() {
+                                profile.origin =
+                                    Some(settings_content::ProfileOriginContent::Project {
+                                        worktree_id: root_id,
+                                        path: file_rel_path.clone(),
+                                    });
+                            }
+                        }
+                    }
                     let mut new_content = SettingsContent {
                         project: new_settings,
                         ..Default::default()

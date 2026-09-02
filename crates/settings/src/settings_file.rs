@@ -281,3 +281,42 @@ pub fn update_settings_file_with_completion(
 ) -> futures::channel::oneshot::Receiver<anyhow::Result<()>> {
     SettingsStore::global(cx).update_settings_file_with_completion(fs, update)
 }
+
+pub trait ProjectSettingsUpdater: 'static + Send + Sync {
+    fn update_project_settings_file(
+        &self,
+        fs: Arc<dyn Fs>,
+        worktree_id: crate::WorktreeId,
+        rel_path: Arc<util::rel_path::RelPath>,
+        cx: &App,
+        update: Box<dyn 'static + Send + FnOnce(&mut SettingsContent, &App)>,
+    );
+}
+
+pub struct GlobalProjectSettingsUpdater(pub Box<dyn ProjectSettingsUpdater>);
+impl gpui::Global for GlobalProjectSettingsUpdater {}
+
+pub fn set_project_settings_updater(cx: &mut App, updater: impl ProjectSettingsUpdater) {
+    cx.set_global(GlobalProjectSettingsUpdater(Box::new(updater)));
+}
+
+pub fn update_project_settings_file(
+    fs: Arc<dyn Fs>,
+    worktree_id: crate::WorktreeId,
+    rel_path: Arc<util::rel_path::RelPath>,
+    cx: &App,
+    update: impl 'static + Send + FnOnce(&mut SettingsContent, &App),
+) {
+    if let Some(updater) = cx.try_global::<GlobalProjectSettingsUpdater>() {
+        updater
+            .0
+            .update_project_settings_file(fs, worktree_id, rel_path, cx, Box::new(update));
+    } else {
+        SettingsStore::global(cx).update_project_settings_file_fallback(
+            fs,
+            worktree_id,
+            rel_path,
+            update,
+        );
+    }
+}
