@@ -23,7 +23,6 @@ use agent_settings::{
 };
 use anyhow::{Context as _, Result, anyhow};
 use chrono::{DateTime, Local, Utc};
-use regex::Regex;
 use client::UserStore;
 use cloud_api_types::Plan;
 use collections::{HashMap, HashSet, IndexMap};
@@ -231,16 +230,16 @@ pub(crate) const BASE_RETRY_DELAY: Duration = Duration::from_secs(5);
 /// Hard cap on parked retries so the turn's `u8` attempt counter cannot
 /// overflow while parking without a total budget.
 const MAX_PARK_ATTEMPTS: u8 = 200;
-/// Sanity ceiling for a single guided wait when the policy parks without a
-/// total budget, guarding against bogus provider guidance.
-const MAX_GUIDED_WAIT: Duration = Duration::from_secs(24 * 60 * 60);
 
 #[derive(Debug, Clone, PartialEq)]
 enum RetryStrategy {
     ExponentialBackoff,
-    FixedDelay { delay: Duration, max_attempts: u8 },
-    /// The provider rate-limited the request: wait for its reset guidance
-    /// when available, otherwise poll with an exponentially growing delay.
+    FixedDelay {
+        delay: Duration,
+        max_attempts: u8,
+    },
+    /// The provider rate-limited the request: poll adaptively with an
+    /// exponentially growing delay until the budget is spent.
     ParkedPolling {
         policy: language_model::RateLimitParkingPolicy,
     },
@@ -262,10 +261,6 @@ impl RetryStrategy {
             RetryStrategy::ParkedPolling { policy } => {
                 if attempt > self.max_attempts() {
                     return None;
-                }
-                if let Some(guided) = rate_limit_guided_wait(error) {
-                    let ceiling = policy.max_total_wait.unwrap_or(MAX_GUIDED_WAIT);
-                    return Some(guided.min(ceiling));
                 }
                 // Poll adaptively: initial wait, doubling up to the policy's
                 // ceiling, then polling at that ceiling until the budget is
@@ -301,76 +296,6 @@ impl RetryStrategy {
             }
         }
     }
-}
-
-/// The provider's own reset guidance for a rate-limit rejection: a
-/// `Retry-After` duration, or a reset time parsed from the error message.
-fn rate_limit_guided_wait(error: &LanguageModelCompletionError) -> Option<Duration> {
-    if let LanguageModelCompletionError::ProviderRejection { retry_after, .. } = error
-        && let Some(retry_after) = *retry_after
-    {
-        return Some(retry_after);
-    }
-    parse_reset_wait_from_message(&error.to_string())
-}
-
-/// Parses reset guidance embedded in a provider's rate-limit error message:
-/// an RFC 3339 reset timestamp ("...until 2026-08-27T14:30:00Z..."), or a
-/// spelled-out duration ("...retry in 3h 21m", "4 hours, 2 minutes").
-fn parse_reset_wait_from_message(message: &str) -> Option<Duration> {
-    use std::sync::LazyLock;
-
-    static TIMESTAMP: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?")
-            .expect("rate limit timestamp regex should compile")
-    });
-    static DURATION: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(
-            r"(?i)(\d+(?:\.\d+)?)\s*(hours?|hrs?|h|minutes?|mins?|m|seconds?|secs?|s)\b",
-        )
-        .expect("rate limit duration regex should compile")
-    });
-
-    if let Some(matched) = TIMESTAMP.find(message) {
-        // Normalize a space-separated timestamp and a missing offset so
-        // `parse_from_rfc3339` accepts it; treat offset-less timestamps as
-        // UTC.
-        let mut candidate = matched.as_str().replace(' ', "T");
-        if !candidate.ends_with('Z')
-            && !candidate
-                .chars()
-                .rev()
-                .take_while(|c| c.is_ascii_digit() || *c == '+' || *c == '-' || *c == ':')
-                .any(|c| c == '+' || c == '-')
-        {
-            candidate.push('Z');
-        }
-        if let Ok(reset_at) = DateTime::parse_from_rfc3339(&candidate) {
-            return reset_at
-                .with_timezone(&Utc)
-                .signed_duration_since(Utc::now())
-                .to_std()
-                .ok();
-        }
-    }
-
-    let mut seconds = 0_f64;
-    let mut found = false;
-    for captures in DURATION.captures_iter(message) {
-        let value: f64 = captures.get(1)?.as_str().parse().ok()?;
-        let unit = captures.get(2)?.as_str().to_ascii_lowercase();
-        let multiplier = if unit.starts_with('h') {
-            3600.0
-        } else if unit.starts_with('m') {
-            60.0
-        } else {
-            1.0
-        };
-        seconds += value * multiplier;
-        found = true;
-    }
-    found.then(|| Duration::from_secs_f64(seconds.min(MAX_GUIDED_WAIT.as_secs_f64())))
-        .filter(|wait| !wait.is_zero())
 }
 
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
@@ -4659,16 +4584,14 @@ impl Thread {
         let filtered_project_context;
         let project_context = match self.allowed_skill_names(cx) {
             Some(filter) => {
-                filtered_project_context = shared_project_context
-                    .clone()
-                    .with_skills(
-                        shared_project_context
-                            .skills()
-                            .iter()
-                            .filter(|summary| filter.contains(summary.name.as_str()))
-                            .cloned()
-                            .collect(),
-                    );
+                filtered_project_context = shared_project_context.clone().with_skills(
+                    shared_project_context
+                        .skills()
+                        .iter()
+                        .filter(|summary| filter.contains(summary.name.as_str()))
+                        .cloned()
+                        .collect(),
+                );
                 &filtered_project_context
             }
             None => shared_project_context,
@@ -8961,7 +8884,7 @@ mod tests {
     }
 
     #[test]
-    fn test_retry_strategy_honors_retry_after_while_parked() {
+    fn test_retry_strategy_ignores_retry_after_while_parked() {
         let retry_after = Duration::from_secs(3);
         let error = LanguageModelCompletionError::from_http_status(
             language_model::LanguageModelProviderName::new("Anthropic"),
@@ -8969,21 +8892,23 @@ mod tests {
             "rate limited".to_string(),
             Some(retry_after),
         );
-        let strategy = Thread::retry_strategy_for(&error, parking_policy()).expect("429 should retry");
+        let strategy =
+            Thread::retry_strategy_for(&error, parking_policy()).expect("429 should retry");
         assert_eq!(
             strategy,
             RetryStrategy::ParkedPolling {
                 policy: parking_policy(),
             }
         );
-        // The provider's guidance is honored at every attempt within the
-        // parking budget, which is far larger than the legacy retry count.
-        assert_eq!(strategy.delay_after(&error, 1), Some(retry_after));
-        assert_eq!(strategy.delay_after(&error, MAX_RETRY_ATTEMPTS), Some(retry_after));
+        // Rate-limit parking ignores the provider's retry_after and uses adaptive polling.
+        assert_eq!(
+            strategy.delay_after(&error, 1),
+            Some(parking_policy().initial_wait)
+        );
     }
 
     #[test]
-    fn test_park_polls_adaptively_without_guidance() {
+    fn test_park_polls_adaptively() {
         let policy = language_model::RateLimitParkingPolicy {
             initial_wait: Duration::from_secs(10),
             max_wait: Duration::from_secs(30),
@@ -8999,16 +8924,31 @@ mod tests {
         );
         let strategy = RetryStrategy::ParkedPolling { policy };
 
-        assert_eq!(strategy.delay_after(&error, 1), Some(Duration::from_secs(10)));
-        assert_eq!(strategy.delay_after(&error, 2), Some(Duration::from_secs(20)));
-        assert_eq!(strategy.delay_after(&error, 3), Some(Duration::from_secs(30)));
-        assert_eq!(strategy.delay_after(&error, 4), Some(Duration::from_secs(30)));
+        assert_eq!(
+            strategy.delay_after(&error, 1),
+            Some(Duration::from_secs(10))
+        );
+        assert_eq!(
+            strategy.delay_after(&error, 2),
+            Some(Duration::from_secs(20))
+        );
+        assert_eq!(
+            strategy.delay_after(&error, 3),
+            Some(Duration::from_secs(30))
+        );
+        assert_eq!(
+            strategy.delay_after(&error, 4),
+            Some(Duration::from_secs(30))
+        );
 
         // Budget: cumulative waits 10 + 20 + 30*5 = 180 after six
         // attempts; a seventh (180 < 200) is still affordable, the eighth
         // pushes past 200 and is the last one scheduled.
         assert_eq!(strategy.max_attempts(), 8);
-        assert_eq!(strategy.delay_after(&error, 8), Some(Duration::from_secs(30)));
+        assert_eq!(
+            strategy.delay_after(&error, 8),
+            Some(Duration::from_secs(30))
+        );
         assert_eq!(strategy.delay_after(&error, 9), None);
     }
 
@@ -9020,47 +8960,17 @@ mod tests {
         };
         let strategy = RetryStrategy::ParkedPolling { policy };
         assert_eq!(strategy.max_attempts(), MAX_PARK_ATTEMPTS);
-        assert!(strategy
-            .delay_after(&rate_limit_error("Rate limit exceeded"), MAX_PARK_ATTEMPTS)
-            .is_some());
-        assert_eq!(
-            strategy.delay_after(&rate_limit_error("Rate limit exceeded"), MAX_PARK_ATTEMPTS + 1),
-            None
+        assert!(
+            strategy
+                .delay_after(&rate_limit_error("Rate limit exceeded"), MAX_PARK_ATTEMPTS)
+                .is_some()
         );
-    }
-
-    #[test]
-    fn test_park_parses_reset_timestamp_from_message() {
-        let reset_at = Utc::now() + chrono::Duration::hours(2);
-        let error = rate_limit_error(&format!(
-            "Usage limit reached. Limit resets at {}. Try again later.",
-            reset_at.to_rfc3339()
-        ));
-        let wait = parse_reset_wait_from_message(&error.to_string()).expect("should parse timestamp");
-        // The exact sub-second remainder varies with test timing; anything
-        // within two hours minus a small tolerance is correct.
-        assert!(wait > Duration::from_secs(2 * 60 * 60 - 60));
-        assert!(wait <= Duration::from_secs(2 * 60 * 60));
-    }
-
-    #[test]
-    fn test_park_parses_duration_from_message() {
-        let error = rate_limit_error("Rate limit reached. You can retry in 1h 30m 15s.");
-        let wait = parse_reset_wait_from_message(&error.to_string()).expect("should parse duration");
-        assert_eq!(wait, Duration::from_secs(60 * 60 + 30 * 60 + 15));
-    }
-
-    #[test]
-    fn test_park_guided_wait_is_capped_by_budget() {
-        let policy = language_model::RateLimitParkingPolicy {
-            max_total_wait: Some(Duration::from_secs(600)),
-            ..language_model::RateLimitParkingPolicy::default()
-        };
-        let error = rate_limit_error("Rate limit reached. Retry in 5 hours.");
-        let strategy = RetryStrategy::ParkedPolling { policy };
         assert_eq!(
-            strategy.delay_after(&error, 1),
-            Some(Duration::from_secs(600))
+            strategy.delay_after(
+                &rate_limit_error("Rate limit exceeded"),
+                MAX_PARK_ATTEMPTS + 1
+            ),
+            None
         );
     }
 

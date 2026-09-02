@@ -30,17 +30,13 @@ pub fn init(cx: &mut App) {
 /// How a turn should park when its provider rate-limits it (HTTP 429 /
 /// rate-limit rejection).
 ///
-/// Parking waits for the provider's reset guidance when available (a
-/// `Retry-After` header or a reset timestamp embedded in the error
-/// message); otherwise it polls with an exponentially growing delay up to
-/// `max_wait`, until the total budget in `max_total_wait` is spent.
+/// Parking polls with an exponentially growing delay up to `max_wait`, until
+/// the total budget in `max_total_wait` is spent.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RateLimitParkingPolicy {
-    /// Delay before the first retry when the provider gave no reset
-    /// guidance.
+    /// Delay before the first retry.
     pub initial_wait: Duration,
-    /// Upper bound for a single poll interval while parking without
-    /// guidance.
+    /// Upper bound for a single poll interval while parking.
     pub max_wait: Duration,
     /// Total parking budget before the turn fails. `None` parks until
     /// cancelled.
