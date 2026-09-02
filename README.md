@@ -5,40 +5,93 @@
 
 ## Возможности этого форка
 
-Форк расширяет агентов Zed до иерархии специализированных агентов с декларативными профилями. Все настройки — обычные профили в `settings.json` (user или `.zed/settings.json` проекта; проект переопределяет пользовательские по ключу).
+Форк превращает Zed в IDE и Execution Runtime для **иерархии специализированных автономных агентов**. Все настройки определяются декларативно в `settings.json` (пользовательском или `.zed/settings.json` проекта; настройки проекта дополняют и переопределяют глобальные).
 
-### Иерархия агентов (делегирование)
+В качестве Control Plane для управления целями, графом задач, ревью и координацией используется [**Task Graph Runtime (TGR)**](https://github.com/blaise-pov/tgr) — автономный MCP-сервер.
 
-- Профиль с блоком `delegation` может порождать субагентов через встроенный инструмент `spawn_agent(profile, task_id?, ...)`; без блока — соло-агент, спавн для него запрещён.
-- `delegation.allowed` — список профилей, которым можно делегировать; `max_depth` (1–5, по умолчанию 1) — глубина вложенности.
-- Дополнительно действует глобальный гейт `agent.nested_sub_agents` (`enabled`, `max_depth`, `max_concurrent` — лимит одновременных субагентов на всё дерево сессий).
-- Циклы и висячие ссылки в графе делегирования ловятся валидатором при загрузке настроек (ошибки — в лог).
-- Результат работы субагента возвращается в тред родителя; follow-up — через `session_id`.
+---
 
-### Профили
+### 1. Профили агентов (Agent Profiles)
 
-Помимо стандартных полей (`tools`, `context_servers`, `default_model`) профиль поддерживает:
+Каждый агент — это профиль с границами ответственности:
 
-- `custom_prompt` — слой инструкций в системном промпте агента;
-- `description` — описание для каталога делегирования (видит родитель);
-- `skills` — фильтр видимых скиллов;
-- `delegation` — правила делегирования.
+- `custom_prompt` — слой специализированных системных инструкций;
+- `description` — описание для каталога делегирования;
+- `skills` — белый список доступных скиллов;
+- `delegation` — правила делегирования (`allowed` профили, `max_depth`);
+- `tool_permissions` — гранулярные политики инструментов (`always_allow`, `always_deny`, `write_scopes`);
+- `default_model` / `tools` / `context_servers` — стандартные переопределения модели, тулов и MCP-серверов.
 
-Все новые поля редактируются в UI: Agent Panel → Manage Profiles → Configure Delegation (allowed-чеклист, max depth, description) и Configure Skills (ограничение + чеклист скиллов).
+Настройки профилей редактируются как в JSON, так и в UI: **Agent Panel → Manage Profiles** (редакторы Delegation, Skills и Tool Permissions).
 
-### Скиллы
+---
 
-Скиллы — из `~/.agents/skills/` (глобальные), `.agents/skills/` проекта (перекрывают глобальные по имени, требуют trust) и встроенных. Профильный фильтр `skills` применяется в трёх точках: каталог в системном промпте, `available_skills` и инструмент `skill`.
+### 2. Иерархия агентов и делегирование (`spawn_agent`)
 
-### Rate-limit парковка
+- Профиль с блоком `delegation` может порождать субагентов через `spawn_agent(profile, task_id?, ...)`. Профиль без блока считается соло-агентом (спавн запрещен).
+- `delegation.allowed` задает разрешенные дочерние профили, `max_depth` (1–5) — допустимую глубину рекурсии.
+- Глобальный лимит `agent.nested_sub_agents` (`enabled`, `max_depth`, `max_concurrent`) ограничивает параллелизм во всем дереве сессий.
+- Модуль `AgentGraph` статически валидирует граф делегирования при загрузке настроек (проверка циклов и недостижимых узлов).
+- Субагент сохраняет профиль при смене родительского профиля; результат возвращается в тред родителя, продолжение диалога — через `session_id`.
 
-При 429/rate-limit ход не падает после 75 секунд ретраиев, а «паркуется»:
+---
 
-- Если провайдер указал `Retry-After` или время сброса в тексте ошибки (RFC 3339 таймстемп или «retry in 3h 21m») — Zed ждёт ровно до указанного времени и продолжает сам.
-- Если guidance нет — адаптивный поллинг: 60с → 120с → 240с → потолок 300с, в пределах бюджета (по умолчанию 5 часов).
-- Парковка видна в UI (отсчёт до ретрая), отменяется Esc/стоп; переживает только пока открыт Zed.
+### 3. Безопасность автономных агентов (Tool Permissions & Write Scopes)
 
-Для кастомных провайдеров политика настраивается (прочие используют дефолт 60/300/18000):
+Для защиты кодовой базы при автономной работе агентов:
+
+- **Приоритет глобального Deny**: глобальные запреты нельзя переопределить профилем.
+- **Fail-Closed для автономных профилей**: если профилю заданы `tool_permissions`, любые действия, требующие подтверждения пользователя (`Confirm`), **автоматически отклоняются** (`PolicyDenied`), предотвращая зависание агента. Невалидные glob-шаблоны в `write_scopes` и невалидные regex-правила тоже блокируют инструмент (fail-closed), а не молча игнорируются.
+- **Write Scopes (`write_scopes`)**: файловые операции (`edit_file`, `write_file`, `copy_path`, `move_path`, `delete_path`, `create_directory`) ограничены списком glob-шаблонов (например, `["backend/**", "proto/**"]`). Попытка изменить файлы вне скоупа блокируется.
+  - Scopes задаются **per-tool**: инструмент без собственной записи `write_scopes` ограничен только `default` профиля. Рекомендуется `default: "deny"` с явными `allow`-правилами, чтобы забытый инструмент не остался неограниченным.
+- **Anti-Escape & Sandbox Protection**: попытки выхода за пределы рабочей директории через симлинки, изменение чувствительных файлов (`.zed/settings.json`, `.cargo/config.toml`) или глобальных скиллов (`~/.agents/skills`) блокируются с кодом `PolicyDenied`.
+- **Ограничения автономных профилей** (побочный эффект fail-closed, важно учитывать при настройке):
+  - Любая sandbox-эскалация запрещена: терминал с повышенными правами, создание директорий вне проекта и `fetch` к ещё не выданным хостам возвращают `PolicyDenied` (хосты нельзя выдать без пользовательского промпта).
+  - `rename_symbol` запрещён: LSP-переименование правит произвольный набор файлов проекта, поэтому не может быть ограничено `write_scopes`. Используйте `edit_file`.
+
+---
+
+### 4. Панель задач (Agent Task Panel) и изоляция в Git Worktree
+
+Интегрированный UI для работы с задачами TGR:
+
+- **Дерево задач**: визуализация иерархии Goal → Task → Subtasks со статусами (`Ready`, `Claimed`, `Running`, `Review`, `Waiting for Approval`, `Completed`, `Failed`, `Stale`, `Blocked`) и номером текущей попытки (`#attempt`).
+- **Действия**: запуск (`Run Task`), утверждение (`Force Approve`), запрос доработок (`Request Changes`), отклонение (`Reject`), повтор (`Retry`).
+- **Diff & Timeline**: просмотр изменений задачи относительно базовой ветки (`View Task Diff`) и живая хронологическая лента событий (`AgentTaskTimeline`).
+- **Изоляция в Git Worktree**: автоматическое создание ветки `agent-task/{task_id}` и отдельной рабочей директории. Параллельные воркеры работают в изолированных файловых деревьях, не мешая друг другу.
+
+---
+
+### 5. Интеграция с Task Graph Runtime (TGR)
+
+[**TGR (Task Graph Runtime)**](https://github.com/blaise-pov/tgr) — легковесный, независимый Control Plane демон на Go (`cmd/taskgraph`), предоставляющий MCP-сервер по протоколу JSON-RPC 2.0 (stdio) на базе SQLite WAL:
+
+- **Задачи и DAG**: 12-состояний жизненного цикла, проверка ацикличности, pull-based планировщик с учетом приоритетов.
+- **Лизинг и Recovery**: атомарный захват задач (`task_claim`), аренда с heartbeat и автоматический сборщик зависших воркеров при сбоях (`recovery.Worker`).
+- **Двухфазное ревью**: встроенный Review & Approval Workflow с защитой от саморевью (**Dual-Actor Safety**).
+- **База знаний и обучение**: фиксация выводов (`lessons`) и предложений новых навыков (`skill_candidates`).
+- **Артефакты**: версионируемые неизменяемые результаты работы.
+
+Zed взаимодействует с TGR через встроенный `McpAgentTaskProvider` и реактивный `AgentTaskStore`.
+
+---
+
+### 6. Скиллы (Skills) и 3-уровневая фильтрация
+
+Скиллы загружаются из `~/.agents/skills/` (глобальные), `.agents/skills/` проекта (перекрывают глобальные по имени, требуют доверия) и встроенных наборов. Фильтр профиля `skills` работает на 3 уровнях:
+1. Каталог скиллов в системном промпте.
+2. Список доступных скиллов (`available_skills`) в сессии.
+3. Инструмент `skill` (блокирует неразрешенные вызовы).
+
+---
+
+### 7. Rate-Limit парковка (Adaptive Backoff)
+
+При ошибках `429 Too Many Requests` от LLM-провайдеров ход не падает, а паркуется:
+
+- Адаптивный экспоненциальный поллинг: 60с → 120с → 240с → потолок 300с, в пределах общего бюджета (по умолчанию 5 часов).
+- Визуальный таймер обратного отсчета в UI с возможностью отмены (Esc / Стоп) или ручного перезапуска.
+- Настраивается индивидуально для каждого провайдера:
 
 ```jsonc
 // .zed/settings.json
@@ -60,38 +113,78 @@
 }
 ```
 
-### MCP-серверы и секреты
+---
 
-В `command.env` и `command.args` контекст-серверов поддерживается интерполяция `${VAR}` из окружения — секреты не попадают в коммитируемые настройки. Незаданная переменная — явная ошибка с её именем.
+### 8. MCP-серверы и переменные окружения
 
-### Пример
+В `command.env` и `command.args` context-серверов поддерживается подстановка переменных окружения `${VAR}` и `${VAR:-default}`. Секреты и пути не попадают в репозиторий:
 
 ```jsonc
 // .zed/settings.json
 {
   "agent": {
     "default_profile": "orchestrator",
-    "nested_sub_agents": { "enabled": true, "max_depth": 3 },
+    "nested_sub_agents": {
+      "enabled": true,
+      "max_depth": 3,
+      "max_concurrent": 6
+    },
     "profiles": {
       "orchestrator": {
         "name": "Orchestrator",
-        "description": "Coordinates implementation",
-        "delegation": { "allowed": ["backend"], "max_depth": 1 }
+        "description": "Coordinates task execution",
+        "delegation": {
+          "allowed": ["backend", "reviewer"],
+          "max_depth": 2
+        }
       },
       "backend": {
-        "name": "Backend Agent",
-        "custom_prompt": "You implement backend tasks...",
-        "skills": ["deploy"]
+        "name": "Backend Engineer",
+        "custom_prompt": "You implement backend services...",
+        "skills": ["go", "postgres"],
+        "tool_permissions": {
+          "default": "deny",
+          "tools": {
+            "terminal": {
+              "default": "deny",
+              "always_allow": [
+                { "pattern": "^go\\s+(test|build)" },
+                { "pattern": "^task\\s+test" }
+              ]
+            },
+            "edit_file": {
+              "default": "allow",
+              "write_scopes": ["backend/**", "proto/**"]
+            },
+            "write_file": {
+              "default": "allow",
+              "write_scopes": ["backend/**", "proto/**"]
+            }
+          }
+        }
+      },
+      "reviewer": {
+        "name": "Code Reviewer",
+        "tools": {
+          "edit_file": false,
+          "write_file": false,
+          "terminal": false
+        }
       }
     },
     "context_servers": {
-      "task-graph": { "command": "taskgraph.exe", "args": [], "env": { "TGR_TOKEN": "${TGR_TOKEN}" } }
+      "task-graph": {
+        "command": "taskgraph",
+        "args": ["serve", "--project", "${ZED_PROJECT_PATH}"],
+        "env": {
+          "TGR_PROJECT_ID": "${ZED_PROJECT_ID}",
+          "TGR_AUTH_TOKEN": "${TGR_TOKEN:-default_token}"
+        }
+      }
     }
   }
 }
 ```
-
-`spawn_agent(profile="backend", task_id="TASK-42")` запустит сессию профиля `backend`; ссылка на задачу попадёт в промпт субагента, детали он получит сам через свои MCP-инструменты (Task Graph Runtime подключается как обычный context-сервер).
 
 ---
 
