@@ -1,6 +1,6 @@
 use super::tool_permissions::{
-    authorize_symlink_access, canonicalize_worktree_roots, detect_symlink_escape,
-    resolve_creatable_global_skill_path, sensitive_settings_kind,
+    authorize_symlink_access, canonicalize_worktree_roots, check_profile_write_scope,
+    detect_symlink_escape, resolve_creatable_global_skill_path, sensitive_settings_kind,
 };
 use agent_client_protocol::schema::v1 as acp;
 use agent_settings::AgentSettings;
@@ -15,7 +15,7 @@ use util::markdown::MarkdownInlineCode;
 
 use crate::{
     AgentTool, ToolCallEventStream, ToolInput, ToolPermissionDecision,
-    authorize_with_sensitive_settings, decide_permission_for_path,
+    authorize_with_sensitive_settings, decide_permission_for_path_with_profile,
 };
 use std::path::{Path, PathBuf};
 
@@ -113,6 +113,7 @@ impl AgentTool for CreateDirectoryTool {
             let input = input.recv().await.map_err(|e| e.to_string())?;
 
             let fs = project.read_with(cx, |project, _cx| project.fs().clone());
+            let profile = cx.update(|cx| event_stream.profile_settings(cx));
 
             // Resolve where this directory lives. The global agent-skills dir is a
             // special case allowed outside the project; anything else outside the
@@ -122,6 +123,23 @@ impl AgentTool for CreateDirectoryTool {
             let in_project = project.read_with(cx, |project, cx| {
                 project.find_project_path(&input.path, cx).is_some()
             });
+
+            if let Some(profile) = &profile {
+                if profile.tool_permissions.is_some() {
+                    if global_skill_directory.is_some() {
+                        return Err(format!(
+                            "PolicyDenied: Creating global skills directory is outside project write scopes for profile '{}'",
+                            profile.name
+                        ));
+                    }
+                    if !in_project {
+                        return Err(format!(
+                            "PolicyDenied: Creating directory '{}' outside project is disallowed for autonomous profile '{}'",
+                            input.path, profile.name
+                        ));
+                    }
+                }
+            }
 
             // A path outside the project (and not the global skills dir) can only
             // be created as a narrow sandbox write grant: create the directory and
@@ -134,7 +152,12 @@ impl AgentTool for CreateDirectoryTool {
             }
 
             let decision = cx.update(|cx| {
-                decide_permission_for_path(Self::NAME, &input.path, AgentSettings::get_global(cx))
+                decide_permission_for_path_with_profile(
+                    Self::NAME,
+                    &input.path,
+                    AgentSettings::get_global(cx),
+                    profile.as_ref(),
+                )
             });
 
             if let ToolPermissionDecision::Deny(reason) = decision {
@@ -145,6 +168,18 @@ impl AgentTool for CreateDirectoryTool {
 
             let canonical_roots = canonicalize_worktree_roots(&project, &fs, cx).await;
 
+            cx.update(|cx| {
+                check_profile_write_scope(
+                    Self::NAME,
+                    Path::new(&input.path),
+                    &project,
+                    &canonical_roots,
+                    profile.as_ref(),
+                    cx,
+                )
+            })
+            .map_err(|e| e.to_string())?;
+
             let symlink_escape_target = project.read_with(cx, |project, cx| {
                 detect_symlink_escape(project, &input.path, &canonical_roots, cx)
                     .map(|(_, target)| target)
@@ -154,6 +189,25 @@ impl AgentTool for CreateDirectoryTool {
                 sensitive_settings_kind(Path::new(&input.path), &canonical_roots, fs.as_ref())
                     .await;
 
+            if let Some(profile) = &profile {
+                if profile.tool_permissions.is_some() {
+                    if let Some(target) = symlink_escape_target {
+                        return Err(format!(
+                            "PolicyDenied: Creating directory '{}' escapes project boundaries via symlink to '{}' (disallowed for autonomous profile '{}')",
+                            input.path,
+                            target.display(),
+                            profile.name
+                        ));
+                    }
+                    if sensitive_kind.is_some() {
+                        return Err(format!(
+                            "PolicyDenied: Accessing sensitive settings is disallowed for autonomous profile '{}'",
+                            profile.name
+                        ));
+                    }
+                }
+            }
+
             let decision =
                 if matches!(decision, ToolPermissionDecision::Allow) && sensitive_kind.is_some() {
                     ToolPermissionDecision::Confirm
@@ -161,7 +215,9 @@ impl AgentTool for CreateDirectoryTool {
                     decision
                 };
 
-            let authorize = if let Some(canonical_target) = symlink_escape_target {
+            let authorize = if profile.as_ref().is_some_and(|p| p.tool_permissions.is_some()) {
+                None
+            } else if let Some(canonical_target) = symlink_escape_target {
                 // Symlink escape authorization replaces (rather than supplements)
                 // the normal tool-permission prompt. The symlink prompt already
                 // requires explicit user approval with the canonical target shown,

@@ -305,6 +305,7 @@ fn insert_profile(
         AgentProfileId(profile_id.into()),
         agent_settings::AgentProfileSettings {
             name: profile_id.into(),
+            origin: Default::default(),
             tools: tools.iter().map(|tool| (Arc::from(*tool), true)).collect(),
             enable_all_context_servers: false,
             context_servers: IndexMap::default(),
@@ -313,6 +314,7 @@ fn insert_profile(
             description: None,
             skills: None,
             delegation: None,
+            tool_permissions: None,
         },
     );
     agent_settings::AgentSettings::override_global(settings, cx);
@@ -5380,6 +5382,7 @@ async fn test_terminal_tool_permission_rules(cx: &mut TestAppContext) {
                         agent_settings::CompiledRegex::new(r"rm\s+-rf", false).unwrap(),
                     ],
                     always_confirm: vec![],
+                    write_scopes: None,
                     invalid_patterns: vec![],
                 },
             );
@@ -5433,6 +5436,7 @@ async fn test_terminal_tool_permission_rules(cx: &mut TestAppContext) {
                     ],
                     always_deny: vec![],
                     always_confirm: vec![],
+                    write_scopes: None,
                     invalid_patterns: vec![],
                 },
             );
@@ -5492,6 +5496,7 @@ async fn test_terminal_tool_permission_rules(cx: &mut TestAppContext) {
                     always_confirm: vec![
                         agent_settings::CompiledRegex::new(r"sudo", false).unwrap(),
                     ],
+                    write_scopes: None,
                     invalid_patterns: vec![],
                 },
             );
@@ -5540,6 +5545,7 @@ async fn test_terminal_tool_permission_rules(cx: &mut TestAppContext) {
                     always_allow: vec![],
                     always_deny: vec![],
                     always_confirm: vec![],
+                    write_scopes: None,
                     invalid_patterns: vec![],
                 },
             );
@@ -7520,6 +7526,7 @@ async fn test_edit_file_tool_deny_rule_blocks_edit(cx: &mut TestAppContext) {
                 always_allow: vec![],
                 always_deny: vec![agent_settings::CompiledRegex::new(r"sensitive", false).unwrap()],
                 always_confirm: vec![],
+                write_scopes: None,
                 invalid_patterns: vec![],
             },
         );
@@ -7588,6 +7595,7 @@ async fn test_delete_path_tool_deny_rule_blocks_deletion(cx: &mut TestAppContext
                 always_allow: vec![],
                 always_deny: vec![agent_settings::CompiledRegex::new(r"important", false).unwrap()],
                 always_confirm: vec![],
+                write_scopes: None,
                 invalid_patterns: vec![],
             },
         );
@@ -7642,6 +7650,7 @@ async fn test_move_path_tool_denies_if_destination_denied(cx: &mut TestAppContex
                 always_allow: vec![],
                 always_deny: vec![agent_settings::CompiledRegex::new(r"protected", false).unwrap()],
                 always_confirm: vec![],
+                write_scopes: None,
                 invalid_patterns: vec![],
             },
         );
@@ -7698,6 +7707,7 @@ async fn test_move_path_tool_denies_if_source_denied(cx: &mut TestAppContext) {
                 always_allow: vec![],
                 always_deny: vec![agent_settings::CompiledRegex::new(r"secret", false).unwrap()],
                 always_confirm: vec![],
+                write_scopes: None,
                 invalid_patterns: vec![],
             },
         );
@@ -7756,6 +7766,7 @@ async fn test_copy_path_tool_deny_rule_blocks_copy(cx: &mut TestAppContext) {
                     agent_settings::CompiledRegex::new(r"confidential", false).unwrap(),
                 ],
                 always_confirm: vec![],
+                write_scopes: None,
                 invalid_patterns: vec![],
             },
         );
@@ -7800,6 +7811,7 @@ async fn test_web_search_tool_deny_rule_blocks_search(cx: &mut TestAppContext) {
                     agent_settings::CompiledRegex::new(r"internal\.company", false).unwrap(),
                 ],
                 always_confirm: vec![],
+                write_scopes: None,
                 invalid_patterns: vec![],
             },
         );
@@ -7846,6 +7858,7 @@ async fn test_edit_file_tool_allow_rule_skips_confirmation(cx: &mut TestAppConte
                 always_allow: vec![agent_settings::CompiledRegex::new(r"\.md$", false).unwrap()],
                 always_deny: vec![],
                 always_confirm: vec![],
+                write_scopes: None,
                 invalid_patterns: vec![],
             },
         );
@@ -7977,6 +7990,7 @@ async fn test_fetch_tool_deny_rule_blocks_url(cx: &mut TestAppContext) {
                     agent_settings::CompiledRegex::new(r"internal\.company\.com", false).unwrap(),
                 ],
                 always_confirm: vec![],
+                write_scopes: None,
                 invalid_patterns: vec![],
             },
         );
@@ -8015,6 +8029,7 @@ async fn test_fetch_tool_allow_rule_skips_confirmation(cx: &mut TestAppContext) 
                 always_allow: vec![agent_settings::CompiledRegex::new(r"docs\.rs", false).unwrap()],
                 always_deny: vec![],
                 always_confirm: vec![],
+                write_scopes: None,
                 invalid_patterns: vec![],
             },
         );
@@ -8062,6 +8077,7 @@ async fn test_fetch_tool_prompts_for_ungranted_host(cx: &mut TestAppContext) {
                 always_allow: vec![],
                 always_deny: vec![],
                 always_confirm: vec![],
+                write_scopes: None,
                 invalid_patterns: vec![],
             },
         );
@@ -8105,6 +8121,7 @@ async fn test_fetch_tool_granted_host_skips_prompt(cx: &mut TestAppContext) {
                 always_allow: vec![],
                 always_deny: vec![],
                 always_confirm: vec![],
+                write_scopes: None,
                 invalid_patterns: vec![],
             },
         );
@@ -8151,6 +8168,7 @@ async fn test_fetch_tool_refuses_loopback_without_unsandboxed(cx: &mut TestAppCo
                 always_allow: vec![],
                 always_deny: vec![],
                 always_confirm: vec![],
+                write_scopes: None,
                 invalid_patterns: vec![],
             },
         );
@@ -8193,6 +8211,7 @@ async fn test_fetch_tool_unsandboxed_lifts_restrictions(cx: &mut TestAppContext)
                 always_allow: vec![],
                 always_deny: vec![],
                 always_confirm: vec![],
+                write_scopes: None,
                 invalid_patterns: vec![],
             },
         );
@@ -8239,6 +8258,7 @@ async fn test_fetch_tool_refuses_redirect_to_loopback(cx: &mut TestAppContext) {
                 always_allow: vec![],
                 always_deny: vec![],
                 always_confirm: vec![],
+                write_scopes: None,
                 invalid_patterns: vec![],
             },
         );
@@ -8297,6 +8317,7 @@ async fn test_fetch_tool_reauthorizes_redirect_to_new_host(cx: &mut TestAppConte
                 always_allow: vec![],
                 always_deny: vec![],
                 always_confirm: vec![],
+                write_scopes: None,
                 invalid_patterns: vec![],
             },
         );
@@ -8359,6 +8380,7 @@ async fn test_fetch_tool_follows_same_host_redirect(cx: &mut TestAppContext) {
                 always_allow: vec![],
                 always_deny: vec![],
                 always_confirm: vec![],
+                write_scopes: None,
                 invalid_patterns: vec![],
             },
         );
@@ -8529,6 +8551,7 @@ async fn test_external_settings_edit_resolves_pending_authorization(cx: &mut Tes
                 always_allow: vec![],
                 always_deny: vec![],
                 always_confirm: vec![],
+                write_scopes: None,
                 invalid_patterns: vec![],
             },
         );
@@ -8600,6 +8623,7 @@ async fn test_external_deny_rule_resolves_pending_authorization(cx: &mut TestApp
                 always_allow: vec![],
                 always_deny: vec![],
                 always_confirm: vec![],
+                write_scopes: None,
                 invalid_patterns: vec![],
             },
         );
@@ -9495,4 +9519,105 @@ async fn test_mcp_agent_task_provider_invalid_json(cx: &mut TestAppContext) {
     assert!(result.is_err());
     let err = result.unwrap_err().to_string();
     assert!(err.contains("failed to parse AgentTaskGraph"));
+}
+
+#[gpui::test]
+async fn test_profile_write_scopes_allowed_and_denied(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(
+        "/root",
+        json!({
+            "backend": {
+                "src": {
+                    "main.rs": "fn main() {}"
+                }
+            },
+            "frontend": {
+                "src": {
+                    "App.tsx": "export const App = () => null;"
+                }
+            }
+        }),
+    )
+    .await;
+
+    let fs_dyn: Arc<dyn Fs> = fs.clone();
+    let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
+    let canonical_roots = crate::canonicalize_worktree_roots(&project, &fs_dyn, cx).await;
+
+    let mut tools = collections::HashMap::default();
+    tools.insert(
+        Arc::from("edit_file"),
+        agent_settings::ToolRules {
+            default: Some(settings::ToolPermissionMode::Allow),
+            always_allow: vec![],
+            always_deny: vec![],
+            always_confirm: vec![],
+            write_scopes: Some(
+                agent_settings::WriteScopes::new(vec![Arc::from("backend/**")]).unwrap(),
+            ),
+            invalid_patterns: vec![],
+        },
+    );
+
+    let profile = agent_settings::AgentProfileSettings {
+        name: "backend_engineer".into(),
+        origin: Default::default(),
+        tools: collections::IndexMap::default(),
+        enable_all_context_servers: false,
+        context_servers: collections::IndexMap::default(),
+        default_model: None,
+        custom_prompt: None,
+        description: None,
+        skills: None,
+        delegation: None,
+        tool_permissions: Some(agent_settings::ToolPermissions {
+            default: settings::ToolPermissionMode::Deny,
+            tools,
+        }),
+    };
+
+    // Path inside backend/** write_scope is allowed
+    let backend_path = std::path::Path::new("root/backend/src/main.rs");
+    let allowed = cx.update(|cx| {
+        crate::check_profile_write_scope(
+            "edit_file",
+            backend_path,
+            &project,
+            &canonical_roots,
+            Some(&profile),
+            cx,
+        )
+    });
+    assert!(
+        allowed.is_ok(),
+        "backend/src/main.rs should be within write_scopes"
+    );
+
+    // Path outside backend/** write_scope is denied with PolicyDenied
+    let frontend_path = std::path::Path::new("root/frontend/src/App.tsx");
+    let denied = cx.update(|cx| {
+        crate::check_profile_write_scope(
+            "edit_file",
+            frontend_path,
+            &project,
+            &canonical_roots,
+            Some(&profile),
+            cx,
+        )
+    });
+    assert!(
+        denied.is_err(),
+        "frontend/src/App.tsx should be outside write_scopes"
+    );
+    let err_msg = denied.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("PolicyDenied"),
+        "error message should contain PolicyDenied, got: {err_msg}"
+    );
+    assert!(
+        err_msg.contains("outside write_scopes"),
+        "error message should state outside write_scopes, got: {err_msg}"
+    );
 }

@@ -5,7 +5,7 @@ use crate::{
     GoToDefinitionTool, GrepTool, ListAgentsAndModelsTool, ListDirectoryTool, MovePathTool,
     ProjectSnapshot, ReadFileTool, RenameTool, SandboxedTerminalTool, SpawnAgentTool,
     SystemPromptTemplate, Template, Templates, TerminalTool, ToolPermissionDecision, WebSearchTool,
-    WriteFileTool, decide_permission_from_settings,
+    WriteFileTool, decide_permission_for_profile,
 };
 use acp_thread::{ClientUserMessageId, MentionUri};
 use action_log::ActionLog;
@@ -49,6 +49,7 @@ use language_model::{
 };
 use project::{Project, trusted_worktrees::TrustedWorktrees};
 use prompt_store::ProjectContext;
+
 use schemars::{JsonSchema, Schema};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -1850,6 +1851,8 @@ impl Thread {
                 cancellation_rx,
                 self.sandbox_grants.clone(),
                 Some(cx.weak_entity()),
+                Some(self.profile().clone()),
+                self.is_subagent(),
             );
             tool.replay(input, output, tool_event_stream, cx).log_err();
         }
@@ -3835,6 +3838,8 @@ impl Thread {
             cancellation_rx,
             self.sandbox_grants.clone(),
             Some(cx.weak_entity()),
+            Some(self.profile().clone()),
+            self.is_subagent(),
         );
         tool_event_stream.update_fields(
             acp::ToolCallUpdateFields::new().status(acp::ToolCallStatus::InProgress),
@@ -5769,6 +5774,8 @@ pub struct ToolCallEventStream {
     /// sandbox grant is recorded so it survives reopening. `None` in tests and
     /// for streams not tied to a live thread.
     thread: Option<WeakEntity<Thread>>,
+    profile_id: Option<agent_settings::AgentProfileId>,
+    is_subagent: bool,
 }
 
 impl ToolCallEventStream {
@@ -5800,6 +5807,8 @@ impl ToolCallEventStream {
             cancellation_rx,
             sandbox_grants,
             None,
+            None,
+            false,
         );
 
         (stream, ToolCallEventStreamReceiver(events_rx))
@@ -5821,6 +5830,8 @@ impl ToolCallEventStream {
             cancellation_rx,
             Rc::new(RefCell::new(ThreadSandboxGrants::default())),
             None,
+            None,
+            false,
         );
 
         (
@@ -5844,6 +5855,8 @@ impl ToolCallEventStream {
         cancellation_rx: watch::Receiver<bool>,
         sandbox_grants: Rc<RefCell<ThreadSandboxGrants>>,
         thread: Option<WeakEntity<Thread>>,
+        profile_id: Option<agent_settings::AgentProfileId>,
+        is_subagent: bool,
     ) -> Self {
         Self {
             tool_use_id,
@@ -5853,16 +5866,29 @@ impl ToolCallEventStream {
             cancellation_rx,
             sandbox_grants,
             thread,
+            profile_id,
+            is_subagent,
         }
     }
 
     /// Whether the owning thread is a subagent, so prompts can say "for this
     /// subagent" instead of "for this thread".
-    fn is_subagent(&self, cx: &App) -> bool {
-        self.thread
-            .as_ref()
-            .and_then(|thread| thread.upgrade())
-            .is_some_and(|thread| thread.read(cx).is_subagent())
+    fn is_subagent(&self, _cx: &App) -> bool {
+        self.is_subagent
+    }
+
+    /// Profile ID for the owning thread.
+    pub fn profile_id(&self, _cx: &App) -> Option<agent_settings::AgentProfileId> {
+        self.profile_id.clone()
+    }
+
+    /// Profile settings for the owning thread.
+    pub fn profile_settings(&self, cx: &App) -> Option<agent_settings::AgentProfileSettings> {
+        let profile_id = self.profile_id.as_ref()?;
+        agent_settings::AgentSettings::get_global(cx)
+            .profiles
+            .get(profile_id)
+            .cloned()
     }
 
     /// Persist the thread so a freshly recorded "for this thread" sandbox grant
@@ -5994,11 +6020,19 @@ impl ToolCallEventStream {
 
         // MCP tools are gated only by tool id (no per-input pattern
         // matching), so we pass a single empty input value just to satisfy
-        // `decide_permission_from_settings`' signature.
+        // `decide_permission_for_profile`' signature.
+        let profile_id = self.profile_id.clone();
         let check_settings: Box<dyn Fn(&App) -> ToolPermissionDecision> =
             Box::new(move |cx: &App| {
                 let settings = agent_settings::AgentSettings::get_global(cx);
-                decide_permission_from_settings(&tool_id, &[String::new()], settings)
+                let profile = profile_id.as_ref().and_then(|id| settings.profiles.get(id));
+                decide_permission_for_profile(
+                    &tool_id,
+                    &[String::new()],
+                    settings,
+                    profile,
+                    util::shell::ShellKind::system(),
+                )
             });
 
         self.run_authorization_loop(title, options, None, Some(check_settings), cx)
@@ -6032,12 +6066,17 @@ impl ToolCallEventStream {
 
         let tool_name = context.tool_name.clone();
         let input_values = context.input_values.clone();
+        let profile_id = self.profile_id.clone();
         let check_settings: Box<dyn Fn(&App) -> ToolPermissionDecision> =
             Box::new(move |cx: &App| {
-                decide_permission_from_settings(
+                let settings = agent_settings::AgentSettings::get_global(cx);
+                let profile = profile_id.as_ref().and_then(|id| settings.profiles.get(id));
+                decide_permission_for_profile(
                     &tool_name,
                     &input_values,
-                    agent_settings::AgentSettings::get_global(cx),
+                    settings,
+                    profile,
+                    util::shell::ShellKind::system(),
                 )
             });
 
@@ -6076,6 +6115,15 @@ impl ToolCallEventStream {
     ) -> Task<Result<()>> {
         if Self::sandbox_request_covered_by_grants(&request, &self.sandbox_grants, cx) {
             return Task::ready(Ok(()));
+        }
+
+        if let Some(profile) = self.profile_settings(cx) {
+            if profile.tool_permissions.is_some() {
+                return Task::ready(Err(anyhow!(
+                    "PolicyDenied: Sandbox escalation is disallowed for profile '{}'",
+                    profile.name
+                )));
+            }
         }
 
         let (network_hosts, network_all_hosts) = match &request.network {
@@ -6723,6 +6771,18 @@ impl ToolCallEventStream {
         check_settings: Option<Box<dyn Fn(&App) -> ToolPermissionDecision>>,
         cx: &mut App,
     ) -> Task<Result<()>> {
+        if check_settings.is_none() {
+            if let Some(profile) = self.profile_settings(cx) {
+                if profile.tool_permissions.is_some() {
+                    return Task::ready(Err(anyhow!(
+                        "PolicyDenied: Action '{}' requires human confirmation, which is disallowed for autonomous profile '{}'",
+                        title,
+                        profile.name
+                    )));
+                }
+            }
+        }
+
         // Short-circuit when current settings yield a definitive answer.
         if let Some(check) = check_settings.as_ref() {
             match check(cx) {

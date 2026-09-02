@@ -1,10 +1,11 @@
 use super::tool_permissions::{
-    authorize_symlink_access, canonicalize_worktree_roots, detect_symlink_escape,
-    resolve_global_skill_descendant_path, resolves_to_global_skills_dir, sensitive_settings_kind,
+    authorize_symlink_access, canonicalize_worktree_roots, check_profile_write_scope,
+    detect_symlink_escape, resolve_global_skill_descendant_path, resolves_to_global_skills_dir,
+    sensitive_settings_kind,
 };
 use crate::{
     AgentTool, ToolCallEventStream, ToolInput, ToolPermissionDecision,
-    authorize_with_sensitive_settings, decide_permission_for_path,
+    authorize_with_sensitive_settings, decide_permission_for_path_with_profile,
 };
 use action_log::ActionLog;
 use agent_client_protocol::schema::v1 as acp;
@@ -86,8 +87,14 @@ impl AgentTool for DeletePathTool {
             let input = input.recv().await.map_err(|e| e.to_string())?;
             let path = input.path;
 
+            let profile = cx.update(|cx| event_stream.profile_settings(cx));
             let decision = cx.update(|cx| {
-                decide_permission_for_path(Self::NAME, &path, AgentSettings::get_global(cx))
+                decide_permission_for_path_with_profile(
+                    Self::NAME,
+                    &path,
+                    AgentSettings::get_global(cx),
+                    profile.as_ref(),
+                )
             });
 
             if let ToolPermissionDecision::Deny(reason) = decision {
@@ -96,6 +103,18 @@ impl AgentTool for DeletePathTool {
 
             let fs = project.read_with(cx, |project, _cx| project.fs().clone());
             let canonical_roots = canonicalize_worktree_roots(&project, &fs, cx).await;
+
+            cx.update(|cx| {
+                check_profile_write_scope(
+                    Self::NAME,
+                    Path::new(&path),
+                    &project,
+                    &canonical_roots,
+                    profile.as_ref(),
+                    cx,
+                )
+            })
+            .map_err(|e| e.to_string())?;
 
             if resolves_to_global_skills_dir(Path::new(&path), fs.as_ref()).await {
                 return Err(
@@ -107,6 +126,15 @@ impl AgentTool for DeletePathTool {
             let global_skill_path =
                 resolve_global_skill_descendant_path(Path::new(&path), fs.as_ref()).await;
 
+            if let Some(profile) = &profile {
+                if profile.tool_permissions.is_some() && global_skill_path.is_some() {
+                    return Err(format!(
+                        "PolicyDenied: Operating on global skills path is outside project write scopes for profile '{}'",
+                        profile.name
+                    ));
+                }
+            }
+
             let symlink_escape_target = project.read_with(cx, |project, cx| {
                 detect_symlink_escape(project, &path, &canonical_roots, cx)
                     .map(|(_, target)| target)
@@ -115,6 +143,25 @@ impl AgentTool for DeletePathTool {
             let settings_kind =
                 sensitive_settings_kind(Path::new(&path), &canonical_roots, fs.as_ref()).await;
 
+            if let Some(profile) = &profile {
+                if profile.tool_permissions.is_some() {
+                    if let Some(target) = symlink_escape_target {
+                        return Err(format!(
+                            "PolicyDenied: Deleting path '{}' escapes project boundaries via symlink to '{}' (disallowed for autonomous profile '{}')",
+                            path,
+                            target.display(),
+                            profile.name
+                        ));
+                    }
+                    if settings_kind.is_some() {
+                        return Err(format!(
+                            "PolicyDenied: Accessing sensitive settings is disallowed for autonomous profile '{}'",
+                            profile.name
+                        ));
+                    }
+                }
+            }
+
             let decision =
                 if matches!(decision, ToolPermissionDecision::Allow) && settings_kind.is_some() {
                     ToolPermissionDecision::Confirm
@@ -122,7 +169,9 @@ impl AgentTool for DeletePathTool {
                     decision
                 };
 
-            let authorize = if let Some(canonical_target) = symlink_escape_target {
+            let authorize = if profile.as_ref().is_some_and(|p| p.tool_permissions.is_some()) {
+                None
+            } else if let Some(canonical_target) = symlink_escape_target {
                 // Symlink escape authorization replaces (rather than supplements)
                 // the normal tool-permission prompt. The symlink prompt already
                 // requires explicit user approval with the canonical target shown,

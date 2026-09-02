@@ -266,6 +266,7 @@ mod tests {
                     always_allow: vec![],
                     always_deny: vec![],
                     always_confirm: vec![],
+                    write_scopes: None,
                     invalid_patterns: vec![],
                 },
             );
@@ -674,6 +675,7 @@ mod tests {
                     always_allow: vec![],
                     always_deny: vec![],
                     always_confirm: vec![],
+                    write_scopes: None,
                     invalid_patterns: vec![],
                 },
             );
@@ -729,6 +731,7 @@ mod tests {
                     always_allow: vec![],
                     always_deny: vec![],
                     always_confirm: vec![],
+                    write_scopes: None,
                     invalid_patterns: vec![],
                 },
             );
@@ -787,6 +790,7 @@ mod tests {
                     always_allow: vec![],
                     always_deny: vec![],
                     always_confirm: vec![],
+                    write_scopes: None,
                     invalid_patterns: vec![],
                 },
             );

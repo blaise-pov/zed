@@ -1,10 +1,11 @@
 use crate::{
     Thread, ToolCallEventStream, ToolPermissionContext, ToolPermissionDecision,
-    decide_permission_for_path,
+    decide_permission_for_path_with_profile,
 };
 use agent_client_protocol::schema::v1 as acp;
+use agent_settings::AgentProfileSettings;
 use agent_skills::is_agents_skills_path;
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, bail};
 use fs::Fs;
 use gpui::{App, Entity, Task, WeakEntity};
 use project::{Project, ProjectPath};
@@ -611,6 +612,77 @@ pub fn collect_symlink_escapes<'a>(
     escapes
 }
 
+/// Validates that `path` is permitted by the profile's `write_scopes` filesystem policy.
+pub fn check_profile_write_scope(
+    tool_name: &str,
+    path: &Path,
+    project: &Entity<Project>,
+    canonical_worktree_roots: &[PathBuf],
+    profile: Option<&AgentProfileSettings>,
+    cx: &App,
+) -> Result<()> {
+    let Some(profile) = profile else {
+        return Ok(());
+    };
+    let Some(tool_permissions) = &profile.tool_permissions else {
+        return Ok(());
+    };
+    let Some(tool_rules) = tool_permissions.tools.get(tool_name) else {
+        return Ok(());
+    };
+    let Some(write_scopes) = &tool_rules.write_scopes else {
+        return Ok(());
+    };
+
+    let resolved = resolve_project_path(project.read(cx), path, canonical_worktree_roots, cx);
+    let project_path = match resolved {
+        Ok(ResolvedProjectPath::Safe(p)) => p,
+        Ok(ResolvedProjectPath::SymlinkEscape {
+            canonical_target, ..
+        }) => {
+            bail!(
+                "PolicyDenied: Cannot {} '{}': path escapes project boundaries via symlink to '{}' (disallowed for profile '{}')",
+                tool_name,
+                path.display(),
+                canonical_target.display(),
+                profile.name
+            );
+        }
+        Err(_) => {
+            bail!(
+                "PolicyDenied: Cannot {} '{}': path is outside project worktrees (disallowed for profile '{}')",
+                tool_name,
+                path.display(),
+                profile.name
+            );
+        }
+    };
+
+    let worktree = project
+        .read(cx)
+        .worktree_for_id(project_path.worktree_id, cx);
+    let matched_with_root = worktree
+        .as_ref()
+        .map(|w| {
+            let root_name = w.read(cx).root_name();
+            let combined = root_name.join(&project_path.path);
+            write_scopes.is_match(&combined)
+        })
+        .unwrap_or(false);
+
+    if write_scopes.is_match(&project_path.path) || matched_with_root {
+        Ok(())
+    } else {
+        let scopes: Vec<&str> = write_scopes.scopes.iter().map(|s| s.as_ref()).collect();
+        bail!(
+            "PolicyDenied: '{}' outside write_scopes {:?} for profile '{}'",
+            path.display(),
+            scopes,
+            profile.name
+        );
+    }
+}
+
 /// Checks authorization for file edits, handling symlink escapes and
 /// sensitive settings paths.
 ///
@@ -634,7 +706,9 @@ pub fn authorize_file_edit(
     let path_str = path.to_string_lossy();
 
     let settings = agent_settings::AgentSettings::get_global(cx);
-    let decision = decide_permission_for_path(tool_name, &path_str, settings);
+    let profile = event_stream.profile_settings(cx);
+    let decision =
+        decide_permission_for_path_with_profile(tool_name, &path_str, settings, profile.as_ref());
 
     if let ToolPermissionDecision::Deny(reason) = decision {
         return Task::ready(Err(anyhow!("{}", reason)));
@@ -667,6 +741,18 @@ pub fn authorize_file_edit(
 
         let canonical_roots = canonicalize_worktree_roots(&project_entity, &fs, cx).await;
 
+        let profile = cx.update(|cx| event_stream.profile_settings(cx));
+        cx.update(|cx| {
+            check_profile_write_scope(
+                &tool_name,
+                &path_owned,
+                &project_entity,
+                &canonical_roots,
+                profile.as_ref(),
+                cx,
+            )
+        })?;
+
         let resolved = project_entity.read_with(cx, |project, cx| {
             resolve_project_path(project, &path_owned, &canonical_roots, cx)
         });
@@ -675,6 +761,17 @@ pub fn authorize_file_edit(
             canonical_target, ..
         }) = &resolved
         {
+            if let Some(profile) = &profile {
+                if profile.tool_permissions.is_some() {
+                    bail!(
+                        "PolicyDenied: Path '{}' escapes project boundaries via symlink to '{}' (disallowed for autonomous profile '{}')",
+                        path_owned.display(),
+                        canonical_target.display(),
+                        profile.name
+                    );
+                }
+            }
+
             let authorize = cx.update(|cx| {
                 authorize_symlink_access(
                     &tool_name,
@@ -699,6 +796,17 @@ pub fn authorize_file_edit(
                     canonical_target, ..
                 }) = &parent_resolved
                 {
+                    if let Some(profile) = &profile {
+                        if profile.tool_permissions.is_some() {
+                            bail!(
+                                "PolicyDenied: Path '{}' escapes project boundaries via symlink to '{}' (disallowed for autonomous profile '{}')",
+                                path_owned.display(),
+                                canonical_target.display(),
+                                profile.name
+                            );
+                        }
+                    }
+
                     let authorize = cx.update(|cx| {
                         authorize_symlink_access(
                             &tool_name,
@@ -713,8 +821,6 @@ pub fn authorize_file_edit(
             }
         }
 
-        let explicitly_allowed = matches!(decision, ToolPermissionDecision::Allow);
-
         // Check sensitive settings asynchronously. Short-circuit on the
         // raw-path fast paths to skip the canonicalization in
         // `sensitive_settings_kind`; the slow path still runs for paths
@@ -728,6 +834,19 @@ pub fn authorize_file_edit(
             sensitive_settings_kind(&path_owned, &canonical_roots, fs.as_ref()).await
         };
 
+        if let Some(profile) = &profile {
+            if profile.tool_permissions.is_some() {
+                if settings_kind.is_some() {
+                    bail!(
+                        "PolicyDenied: Editing sensitive settings is disallowed for autonomous profile '{}'",
+                        profile.name
+                    );
+                }
+                return Ok(());
+            }
+        }
+
+        let explicitly_allowed = matches!(decision, ToolPermissionDecision::Allow);
         let is_sensitive = settings_kind.is_some();
         if explicitly_allowed && !is_sensitive {
             return Ok(());

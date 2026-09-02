@@ -1,6 +1,8 @@
 use crate::AgentTool;
 use crate::tools::TerminalTool;
-use agent_settings::{AgentSettings, CompiledRegex, ToolPermissions, ToolRules};
+use agent_settings::{
+    AgentProfileSettings, AgentSettings, CompiledRegex, ToolPermissions, ToolRules,
+};
 use settings::ToolPermissionMode;
 use shell_command_parser::{
     TerminalCommandValidation, extract_commands, validate_terminal_command,
@@ -453,7 +455,7 @@ fn check_invalid_patterns(tool_name: &str, rules: &ToolRules) -> Option<String> 
     let pattern_word = if count == 1 { "pattern" } else { "patterns" };
 
     Some(format!(
-        "The {} tool cannot run because {} regex {} failed to compile. \
+        "The {} tool cannot run because {} invalid {} (regex rules or write_scopes globs) failed to compile. \
          Please fix the invalid patterns in your tool_permissions settings.",
         tool_name, count, pattern_word
     ))
@@ -539,6 +541,100 @@ pub fn decide_permission_for_path(
     settings: &AgentSettings,
 ) -> ToolPermissionDecision {
     decide_permission_for_paths(tool_name, &[raw_path.to_string()], settings)
+}
+
+/// Determines permission decision for a tool invocation taking the active profile's
+/// tool_permissions into account.
+///
+/// Hardcoded security rules are enforced by [`ToolPermissionDecision::from_input`]
+/// for both the global and the profile-level rule sets.
+pub fn decide_permission_for_profile(
+    tool_name: &str,
+    inputs: &[String],
+    settings: &AgentSettings,
+    profile: Option<&AgentProfileSettings>,
+    shell_kind: ShellKind,
+) -> ToolPermissionDecision {
+    let global_decision = ToolPermissionDecision::from_input(
+        tool_name,
+        inputs,
+        &settings.tool_permissions,
+        shell_kind,
+    );
+
+    // Global Deny can never be bypassed or escalated by a profile.
+    if matches!(global_decision, ToolPermissionDecision::Deny(_)) {
+        return global_decision;
+    }
+
+    if let Some(profile) = profile {
+        if let Some(profile_permissions) = &profile.tool_permissions {
+            let profile_decision = ToolPermissionDecision::from_input(
+                tool_name,
+                inputs,
+                profile_permissions,
+                shell_kind,
+            );
+
+            match profile_decision {
+                ToolPermissionDecision::Deny(reason) => {
+                    return ToolPermissionDecision::Deny(format!(
+                        "PolicyDenied: {} for profile '{}'",
+                        reason, profile.name
+                    ));
+                }
+                ToolPermissionDecision::Confirm => {
+                    return ToolPermissionDecision::Deny(format!(
+                        "PolicyDenied: Tool '{}' requires human confirmation, which is disallowed for profile '{}'",
+                        tool_name, profile.name
+                    ));
+                }
+                ToolPermissionDecision::Allow => {
+                    return ToolPermissionDecision::Allow;
+                }
+            }
+        }
+    }
+
+    global_decision
+}
+
+pub fn decide_permission_for_paths_with_profile(
+    tool_name: &str,
+    raw_paths: &[String],
+    settings: &AgentSettings,
+    profile: Option<&AgentProfileSettings>,
+) -> ToolPermissionDecision {
+    let raw_decision =
+        decide_permission_for_profile(tool_name, raw_paths, settings, profile, ShellKind::system());
+
+    let normalized: Vec<String> = raw_paths.iter().map(|p| normalize_path(p)).collect();
+    let any_changed = raw_paths
+        .iter()
+        .zip(&normalized)
+        .any(|(raw, norm)| raw != norm);
+    if !any_changed {
+        return raw_decision;
+    }
+
+    let normalized_decision = decide_permission_for_profile(
+        tool_name,
+        &normalized,
+        settings,
+        profile,
+        ShellKind::system(),
+    );
+
+    most_restrictive(raw_decision, normalized_decision)
+}
+
+pub fn decide_permission_for_path_with_profile(
+    tool_name: &str,
+    raw_path: &str,
+    settings: &AgentSettings,
+    profile: Option<&AgentProfileSettings>,
+) -> ToolPermissionDecision {
+    decide_permission_for_paths_with_profile(tool_name, &[raw_path.to_string()], settings, profile)
 }
 
 pub fn most_restrictive(
@@ -737,6 +833,7 @@ mod tests {
                                 .unwrap_or_else(|| panic!("invalid regex in test: {p:?}"))
                         })
                         .collect(),
+                    write_scopes: None,
                     invalid_patterns: vec![],
                 },
             );
@@ -1016,6 +1113,7 @@ mod tests {
                 always_allow: vec![],
                 always_deny: vec![],
                 always_confirm: vec![],
+                write_scopes: None,
                 invalid_patterns: vec![],
             },
         );
@@ -1026,6 +1124,7 @@ mod tests {
                 always_allow: vec![],
                 always_deny: vec![],
                 always_confirm: vec![],
+                write_scopes: None,
                 invalid_patterns: vec![],
             },
         );
@@ -1063,6 +1162,7 @@ mod tests {
                 always_allow: vec![],
                 always_deny: vec![],
                 always_confirm: vec![],
+                write_scopes: None,
                 invalid_patterns: vec![],
             },
         );
@@ -1093,6 +1193,7 @@ mod tests {
                 always_allow: vec![CompiledRegex::new("echo", false).unwrap()],
                 always_deny: vec![],
                 always_confirm: vec![],
+                write_scopes: None,
                 invalid_patterns: vec![InvalidRegexPattern {
                     pattern: "[bad".into(),
                     rule_type: "always_deny".into(),
@@ -1144,6 +1245,7 @@ mod tests {
                 always_allow: vec![],
                 always_deny: vec![],
                 always_confirm: vec![],
+                write_scopes: None,
                 invalid_patterns: vec![],
             },
         );
@@ -1461,6 +1563,7 @@ mod tests {
                 always_allow: vec![],
                 always_deny: vec![],
                 always_confirm: vec![],
+                write_scopes: None,
                 invalid_patterns: vec![],
             },
         );
@@ -1471,6 +1574,7 @@ mod tests {
                 always_allow: vec![],
                 always_deny: vec![],
                 always_confirm: vec![],
+                write_scopes: None,
                 invalid_patterns: vec![],
             },
         );
@@ -1575,6 +1679,7 @@ mod tests {
                 always_allow: vec![],
                 always_deny: vec![],
                 always_confirm: vec![],
+                write_scopes: None,
                 invalid_patterns: vec![
                     InvalidRegexPattern {
                         pattern: "[bad1".into(),
@@ -1603,8 +1708,8 @@ mod tests {
         match result {
             ToolPermissionDecision::Deny(msg) => {
                 assert!(
-                    msg.contains("2 regex patterns"),
-                    "Expected '2 regex patterns' in message, got: {}",
+                    msg.contains("2 invalid patterns"),
+                    "Expected '2 invalid patterns' in message, got: {}",
                     msg
                 );
             }
@@ -2249,6 +2354,7 @@ mod tests {
                 always_allow: vec![],
                 always_deny: vec![deny_regex],
                 always_confirm: vec![],
+                write_scopes: None,
                 invalid_patterns: vec![],
             },
         );
@@ -2318,6 +2424,7 @@ mod tests {
                             .unwrap_or_else(|| panic!("invalid regex: {p:?}"))
                     })
                     .collect(),
+                write_scopes: None,
                 invalid_patterns: vec![],
             },
         );
@@ -2414,6 +2521,208 @@ mod tests {
     #[test]
     fn decide_permission_for_path_denies_edit_file_traversal_to_dotenv() {
         let decision = path_perm(EditFileTool::NAME, "src/../.env", &["^\\.env"], &[], &[]);
+        assert!(matches!(decision, ToolPermissionDecision::Deny(_)));
+    }
+
+    #[test]
+    fn test_decide_permission_for_profile_terminal_policy() {
+        let mut tools = collections::HashMap::default();
+        tools.insert(
+            Arc::from("terminal"),
+            ToolRules {
+                default: Some(ToolPermissionMode::Deny),
+                always_allow: vec![
+                    CompiledRegex::new("^go\\s+test", false).unwrap(),
+                    CompiledRegex::new("^task\\s+build$", false).unwrap(),
+                ],
+                always_deny: vec![
+                    CompiledRegex::new("^git\\s+push\\s+--force", false).unwrap(),
+                    CompiledRegex::new("^dropdb", false).unwrap(),
+                ],
+                always_confirm: vec![],
+                write_scopes: None,
+                invalid_patterns: vec![],
+            },
+        );
+
+        let profile = AgentProfileSettings {
+            name: "backend_engineer".into(),
+            origin: Default::default(),
+            tools: collections::IndexMap::default(),
+            enable_all_context_servers: false,
+            context_servers: collections::IndexMap::default(),
+            default_model: None,
+            custom_prompt: None,
+            description: None,
+            skills: None,
+            delegation: None,
+            tool_permissions: Some(ToolPermissions {
+                default: ToolPermissionMode::Deny,
+                tools,
+            }),
+        };
+
+        let settings = test_agent_settings(ToolPermissions::default());
+
+        // Allowed commands
+        assert_eq!(
+            decide_permission_for_profile(
+                TerminalTool::NAME,
+                &["go test ./...".to_string()],
+                &settings,
+                Some(&profile),
+                ShellKind::Posix,
+            ),
+            ToolPermissionDecision::Allow
+        );
+        assert_eq!(
+            decide_permission_for_profile(
+                TerminalTool::NAME,
+                &["task build".to_string()],
+                &settings,
+                Some(&profile),
+                ShellKind::Posix,
+            ),
+            ToolPermissionDecision::Allow
+        );
+
+        // Denied commands (explicit deny)
+        assert!(matches!(
+            decide_permission_for_profile(
+                TerminalTool::NAME,
+                &["git push --force".to_string()],
+                &settings,
+                Some(&profile),
+                ShellKind::Posix,
+            ),
+            ToolPermissionDecision::Deny(_)
+        ));
+        assert!(matches!(
+            decide_permission_for_profile(
+                TerminalTool::NAME,
+                &["dropdb test".to_string()],
+                &settings,
+                Some(&profile),
+                ShellKind::Posix,
+            ),
+            ToolPermissionDecision::Deny(_)
+        ));
+
+        // Denied commands (not in allowlist) - autonomous mode fail-closed
+        assert!(matches!(
+            decide_permission_for_profile(
+                TerminalTool::NAME,
+                &["cargo build".to_string()],
+                &settings,
+                Some(&profile),
+                ShellKind::Posix,
+            ),
+            ToolPermissionDecision::Deny(_)
+        ));
+
+        // Hardcoded critical security denial
+        assert!(matches!(
+            decide_permission_for_profile(
+                TerminalTool::NAME,
+                &["rm -rf /".to_string()],
+                &settings,
+                Some(&profile),
+                ShellKind::Posix,
+            ),
+            ToolPermissionDecision::Deny(_)
+        ));
+    }
+
+    #[test]
+    fn test_decide_permission_for_profile_global_deny_wins() {
+        let mut global_tools = collections::HashMap::default();
+        global_tools.insert(
+            Arc::from("terminal"),
+            ToolRules {
+                default: Some(ToolPermissionMode::Deny),
+                always_allow: vec![],
+                always_deny: vec![],
+                always_confirm: vec![],
+                write_scopes: None,
+                invalid_patterns: vec![],
+            },
+        );
+        let settings = test_agent_settings(ToolPermissions {
+            default: ToolPermissionMode::Confirm,
+            tools: global_tools,
+        });
+
+        let mut profile_tools = collections::HashMap::default();
+        profile_tools.insert(
+            Arc::from("terminal"),
+            ToolRules {
+                default: Some(ToolPermissionMode::Deny),
+                always_allow: vec![CompiledRegex::new("^go\\s+test", false).unwrap()],
+                always_deny: vec![],
+                always_confirm: vec![],
+                write_scopes: None,
+                invalid_patterns: vec![],
+            },
+        );
+        let profile = AgentProfileSettings {
+            name: "backend_engineer".into(),
+            origin: Default::default(),
+            tools: collections::IndexMap::default(),
+            enable_all_context_servers: false,
+            context_servers: collections::IndexMap::default(),
+            default_model: None,
+            custom_prompt: None,
+            description: None,
+            skills: None,
+            delegation: None,
+            tool_permissions: Some(ToolPermissions {
+                default: ToolPermissionMode::Deny,
+                tools: profile_tools,
+            }),
+        };
+
+        // Global Deny takes precedence over profile's allow
+        let decision = decide_permission_for_profile(
+            TerminalTool::NAME,
+            &["go test ./...".to_string()],
+            &settings,
+            Some(&profile),
+            ShellKind::Posix,
+        );
+        assert!(matches!(decision, ToolPermissionDecision::Deny(_)));
+    }
+
+    #[test]
+    fn test_decide_permission_for_profile_autonomous_denies_confirm() {
+        let profile = AgentProfileSettings {
+            name: "backend_engineer".into(),
+            origin: Default::default(),
+            tools: collections::IndexMap::default(),
+            enable_all_context_servers: false,
+            context_servers: collections::IndexMap::default(),
+            default_model: None,
+            custom_prompt: None,
+            description: None,
+            skills: None,
+            delegation: None,
+            tool_permissions: Some(ToolPermissions {
+                default: ToolPermissionMode::Confirm,
+                tools: collections::HashMap::default(),
+            }),
+        };
+
+        let settings = test_agent_settings(ToolPermissions {
+            default: ToolPermissionMode::Confirm,
+            tools: collections::HashMap::default(),
+        });
+
+        let decision = decide_permission_for_profile(
+            "some_tool",
+            &["input".to_string()],
+            &settings,
+            Some(&profile),
+            ShellKind::Posix,
+        );
         assert!(matches!(decision, ToolPermissionDecision::Deny(_)));
     }
 }

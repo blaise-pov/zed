@@ -1,11 +1,11 @@
 use super::tool_permissions::{
-    authorize_symlink_escapes, canonicalize_worktree_roots, collect_symlink_escapes,
-    resolve_creatable_global_skill_descendant_path, resolve_global_skill_descendant_path,
-    resolves_to_global_skills_dir, sensitive_settings_kind,
+    authorize_symlink_escapes, canonicalize_worktree_roots, check_profile_write_scope,
+    collect_symlink_escapes, resolve_creatable_global_skill_descendant_path,
+    resolve_global_skill_descendant_path, resolves_to_global_skills_dir, sensitive_settings_kind,
 };
 use crate::{
     AgentTool, ToolCallEventStream, ToolInput, ToolPermissionDecision,
-    authorize_with_sensitive_settings, decide_permission_for_paths,
+    authorize_with_sensitive_settings, decide_permission_for_paths_with_profile,
 };
 use agent_client_protocol::schema::v1 as acp;
 use agent_settings::AgentSettings;
@@ -108,8 +108,14 @@ impl AgentTool for MovePathTool {
                 .await
                 .map_err(|e| e.to_string())?;
             let paths = vec![input.source_path.clone(), input.destination_path.clone()];
+            let profile = cx.update(|cx| event_stream.profile_settings(cx));
             let decision = cx.update(|cx| {
-                decide_permission_for_paths(Self::NAME, &paths, AgentSettings::get_global(cx))
+                decide_permission_for_paths_with_profile(
+                    Self::NAME,
+                    &paths,
+                    AgentSettings::get_global(cx),
+                    profile.as_ref(),
+                )
             });
             if let ToolPermissionDecision::Deny(reason) = decision {
                 return Err(reason);
@@ -117,6 +123,26 @@ impl AgentTool for MovePathTool {
 
             let fs = project.read_with(cx, |project, _cx| project.fs().clone());
             let canonical_roots = canonicalize_worktree_roots(&project, &fs, cx).await;
+
+            cx.update(|cx| {
+                check_profile_write_scope(
+                    Self::NAME,
+                    Path::new(&input.source_path),
+                    &project,
+                    &canonical_roots,
+                    profile.as_ref(),
+                    cx,
+                )?;
+                check_profile_write_scope(
+                    Self::NAME,
+                    Path::new(&input.destination_path),
+                    &project,
+                    &canonical_roots,
+                    profile.as_ref(),
+                    cx,
+                )
+            })
+            .map_err(|e| e.to_string())?;
 
             if resolves_to_global_skills_dir(Path::new(&input.source_path), fs.as_ref()).await
                 || resolves_to_global_skills_dir(
@@ -139,6 +165,17 @@ impl AgentTool for MovePathTool {
                 fs.as_ref(),
             )
             .await;
+
+            if let Some(profile) = &profile {
+                if profile.tool_permissions.is_some()
+                    && (global_source_path.is_some() || global_destination_path.is_some())
+                {
+                    return Err(format!(
+                        "PolicyDenied: Operating on global skills path is outside project write scopes for profile '{}'",
+                        profile.name
+                    ));
+                }
+            }
 
             let symlink_escapes: Vec<(&str, std::path::PathBuf)> =
                 project.read_with(cx, |project, cx| {
@@ -164,8 +201,29 @@ impl AgentTool for MovePathTool {
             )
             .await);
 
-            let needs_confirmation = matches!(decision, ToolPermissionDecision::Confirm)
-                || (matches!(decision, ToolPermissionDecision::Allow) && sensitive_kind.is_some());
+            if let Some(profile) = &profile {
+                if profile.tool_permissions.is_some() {
+                    if !symlink_escapes.is_empty() {
+                        return Err(format!(
+                            "PolicyDenied: Moving path '{}' escapes project boundaries via symlink (disallowed for autonomous profile '{}')",
+                            input.source_path, profile.name
+                        ));
+                    }
+                    if sensitive_kind.is_some() {
+                        return Err(format!(
+                            "PolicyDenied: Accessing sensitive settings is disallowed for autonomous profile '{}'",
+                            profile.name
+                        ));
+                    }
+                }
+            }
+
+            let needs_confirmation = profile
+                .as_ref()
+                .map_or(true, |p| p.tool_permissions.is_none())
+                && (matches!(decision, ToolPermissionDecision::Confirm)
+                    || (matches!(decision, ToolPermissionDecision::Allow)
+                        && sensitive_kind.is_some()));
 
             let authorize = if !symlink_escapes.is_empty() {
                 // Symlink escape authorization replaces (rather than supplements)

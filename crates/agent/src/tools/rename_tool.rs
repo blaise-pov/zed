@@ -9,7 +9,12 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use super::symbol_locator::SymbolLocator;
-use crate::{AgentTool, ToolCallEventStream, ToolInput};
+use crate::{
+    AgentTool, ToolCallEventStream, ToolInput, ToolPermissionDecision,
+    decide_permission_for_path_with_profile,
+};
+use agent_settings::{AgentProfileSettings, AgentSettings};
+use settings::Settings as _;
 
 /// Renames a symbol across the project using the language server.
 ///
@@ -64,7 +69,7 @@ impl AgentTool for RenameTool {
     fn run(
         self: Arc<Self>,
         input: ToolInput<Self::Input>,
-        _event_stream: ToolCallEventStream,
+        event_stream: ToolCallEventStream,
         cx: &mut App,
     ) -> Task<Result<String, String>> {
         let project = self.project.clone();
@@ -75,6 +80,23 @@ impl AgentTool for RenameTool {
                 .map_err(|e| format!("Failed to receive tool input: {e}"))?;
 
             let resolved = input.symbol.resolve(&project, cx).await?;
+
+            let profile = cx.update(|cx| event_stream.profile_settings(cx));
+            let path_str = resolved.buffer.read_with(cx, |buffer, cx| {
+                buffer
+                    .file()
+                    .map(|file| file.full_path(cx).display().to_string())
+                    .unwrap_or_default()
+            });
+            let decision = cx.update(|cx| {
+                decide_permission_for_path_with_profile(
+                    Self::NAME,
+                    &path_str,
+                    &AgentSettings::get_global(cx),
+                    profile.as_ref(),
+                )
+            });
+            check_rename_permissions(profile.as_ref(), decision)?;
 
             let rename_task = project.update(cx, |project, cx| {
                 project.perform_rename(
@@ -121,5 +143,82 @@ impl AgentTool for RenameTool {
 
             Ok(output)
         })
+    }
+}
+
+/// Permission gate for `rename_symbol`.
+///
+/// Unlike file tools, a language-server rename edits an unbounded set of
+/// project files chosen by the server, so `write_scopes` cannot be enforced
+/// per path. Autonomous profiles (those with `tool_permissions`) therefore
+/// fail closed: the tool is denied outright rather than risking writes
+/// outside the profile's scopes.
+fn check_rename_permissions(
+    profile: Option<&AgentProfileSettings>,
+    decision: ToolPermissionDecision,
+) -> Result<(), String> {
+    if let Some(profile) = profile
+        && profile.tool_permissions.is_some()
+    {
+        return Err(format!(
+            "PolicyDenied: rename_symbol performs language-server-wide edits across an \
+             unbounded set of files, so it cannot be confined to write_scopes and is \
+             disallowed for autonomous profile '{}'. Use edit_file instead.",
+            profile.name
+        ));
+    }
+
+    if let ToolPermissionDecision::Deny(reason) = decision {
+        return Err(reason);
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use agent_settings::ToolPermissions;
+
+    fn autonomous_profile() -> AgentProfileSettings {
+        AgentProfileSettings {
+            name: "backend_engineer".into(),
+            origin: Default::default(),
+            tools: collections::IndexMap::default(),
+            enable_all_context_servers: false,
+            context_servers: collections::IndexMap::default(),
+            default_model: None,
+            custom_prompt: None,
+            description: None,
+            skills: None,
+            delegation: None,
+            tool_permissions: Some(ToolPermissions::default()),
+        }
+    }
+
+    #[test]
+    fn test_rename_denied_for_autonomous_profile() {
+        let profile = autonomous_profile();
+        let error =
+            check_rename_permissions(Some(&profile), ToolPermissionDecision::Allow).unwrap_err();
+        assert!(error.contains("PolicyDenied"));
+        assert!(error.contains("backend_engineer"));
+    }
+
+    #[test]
+    fn test_rename_denied_by_deny_decision() {
+        let error =
+            check_rename_permissions(None, ToolPermissionDecision::Deny("blocked by rule".into()))
+                .unwrap_err();
+        assert_eq!(error, "blocked by rule");
+    }
+
+    #[test]
+    fn test_rename_allowed_without_profile_or_deny() {
+        assert!(check_rename_permissions(None, ToolPermissionDecision::Allow).is_ok());
+        // A non-autonomous profile (no tool_permissions) still allows rename.
+        let mut profile = autonomous_profile();
+        profile.tool_permissions = None;
+        assert!(check_rename_permissions(Some(&profile), ToolPermissionDecision::Allow).is_ok());
     }
 }

@@ -675,20 +675,27 @@ async fn run_terminal_tool(
     }
 
     if request.needs_escalation() {
+        let profile = cx.update(|cx| event_stream.profile_settings(cx));
+        let is_autonomous = profile
+            .as_ref()
+            .and_then(|p| p.tool_permissions.as_ref())
+            .is_some();
         let reason = sandbox_input
             .reason
             .as_deref()
             .map(str::trim)
-            .filter(|reason| !reason.is_empty());
-        let Some(reason) = reason else {
+            .filter(|reason| !reason.is_empty())
+            .map(|r| r.to_string())
+            .unwrap_or_default();
+
+        if reason.is_empty() && !is_autonomous {
             return Err(
                 "This command requests elevated sandbox permissions, so a `reason` is \
                  required: briefly justify why the command needs them, then run it again."
                     .to_string(),
             );
-        };
-        let approve =
-            cx.update(|cx| event_stream.authorize_sandbox(request.clone(), reason.to_string(), cx));
+        }
+        let approve = cx.update(|cx| event_stream.authorize_sandbox(request.clone(), reason, cx));
         if let Err(error) = approve.await {
             if want_unsandboxed {
                 return Ok(format!(
@@ -2335,6 +2342,7 @@ mod tests {
                     ],
                     always_deny: vec![],
                     always_confirm: vec![],
+                    write_scopes: None,
                     invalid_patterns: vec![],
                 },
             );
@@ -2494,7 +2502,7 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_run_old_anchored_git_pattern_no_longer_auto_allows_env_prefix(
+    async fn test_confirm_takes_precedence_over_allow_with_matching_prefix(
         cx: &mut gpui::TestAppContext,
     ) {
         crate::tests::init_test(cx);
@@ -2521,6 +2529,7 @@ mod tests {
                     ],
                     always_deny: vec![],
                     always_confirm: vec![],
+                    write_scopes: None,
                     invalid_patterns: vec![],
                 },
             );
@@ -2798,7 +2807,7 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_allow_all_terminal_specific_default_with_empty_patterns(
+    async fn test_terminal_tool_default_allow_bypasses_invalid_substitution_check(
         cx: &mut gpui::TestAppContext,
     ) {
         crate::tests::init_test(cx);
@@ -2823,6 +2832,7 @@ mod tests {
                     always_allow: vec![],
                     always_deny: vec![],
                     always_confirm: vec![],
+                    write_scopes: None,
                     invalid_patterns: vec![],
                 },
             );
@@ -2896,6 +2906,7 @@ mod tests {
                     ],
                     always_deny: vec![],
                     always_confirm: vec![],
+                    write_scopes: None,
                     invalid_patterns: vec![],
                 },
             );
@@ -2963,6 +2974,7 @@ mod tests {
                     ],
                     always_deny: vec![],
                     always_confirm: vec![],
+                    write_scopes: None,
                     invalid_patterns: vec![],
                 },
             );
@@ -3041,6 +3053,7 @@ mod tests {
                     ],
                     always_deny: vec![],
                     always_confirm: vec![],
+                    write_scopes: None,
                     invalid_patterns: vec![],
                 },
             );
