@@ -1112,6 +1112,8 @@
     "button": true,
     // Where to dock the agent panel. Can be 'left', 'right' or 'bottom'.
     "dock": "left",
+    // Where to dock the agent task panel. Can be 'left' or 'right'.
+    "task_dock": "left",
     // Whether the agent panel should use flexible (proportional) sizing.
     //
     // Default: true

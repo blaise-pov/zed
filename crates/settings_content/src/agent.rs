@@ -226,6 +226,10 @@ pub struct AgentSettingsContent {
     ///
     /// Default: left (Agentic layout), right (Classic layout)
     pub dock: Option<DockPosition>,
+    /// Where to dock the agent task panel.
+    ///
+    /// Default: left
+    pub task_dock: Option<DockPosition>,
     /// Whether the agent panel should use flexible (proportional) sizing.
     ///
     /// Default: true
@@ -390,6 +394,10 @@ pub struct AgentSettingsContent {
 impl AgentSettingsContent {
     pub fn set_dock(&mut self, dock: DockPosition) {
         self.dock = Some(dock);
+    }
+
+    pub fn set_task_dock(&mut self, dock: DockPosition) {
+        self.task_dock = Some(dock);
     }
 
     pub fn set_sidebar_side(&mut self, position: SidebarDockPosition) {

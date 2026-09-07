@@ -685,7 +685,7 @@ impl Panel for AgentTaskPanel {
     }
 
     fn position(&self, _window: &Window, cx: &App) -> DockPosition {
-        AgentSettings::get_global(cx).dock.into()
+        AgentSettings::get_global(cx).task_dock.into()
     }
 
     fn position_is_valid(&self, position: DockPosition) -> bool {
@@ -702,7 +702,7 @@ impl Panel for AgentTaskPanel {
             settings
                 .agent
                 .get_or_insert_default()
-                .set_dock(position.into());
+                .set_task_dock(position.into());
         });
     }
 
@@ -980,5 +980,43 @@ mod tests {
             assert_eq!(detail.summary.id.0.as_ref(), "TASK-1");
             assert!(!detail.acceptance_criteria.is_empty());
         });
+    }
+
+    #[gpui::test]
+    async fn test_agent_task_panel_dock_position_independent_of_agent_panel(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let file_system = FakeFs::new(cx.executor());
+        let _project = Project::test(file_system.clone(), [], cx).await;
+        let provider = Arc::new(TestProvider { offline: false });
+        let store = cx.update(|cx| cx.new(|cx| AgentTaskStore::new(provider, cx)));
+
+        let (panel, cx) = cx.add_window_view(|_window, cx| {
+            AgentTaskPanel::new(store, WeakEntity::new_invalid(), file_system, cx)
+        });
+        cx.run_until_parked();
+
+        let (initial_task_pos, initial_agent_pos) = cx.read(|cx| {
+            (
+                AgentSettings::get_global(cx).task_dock,
+                AgentSettings::get_global(cx).dock,
+            )
+        });
+        assert_eq!(initial_task_pos, settings::DockPosition::Left);
+
+        panel.update_in(cx, |panel, window, cx| {
+            panel.set_position(DockPosition::Right, window, cx);
+        });
+        cx.run_until_parked();
+
+        let (updated_task_pos, updated_agent_pos) = cx.read(|cx| {
+            (
+                AgentSettings::get_global(cx).task_dock,
+                AgentSettings::get_global(cx).dock,
+            )
+        });
+        assert_eq!(updated_task_pos, settings::DockPosition::Right);
+        assert_eq!(updated_agent_pos, initial_agent_pos);
     }
 }
