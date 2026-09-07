@@ -2,7 +2,7 @@ use crate::{
     CycleModeSelector, ManageProfiles, ToggleProfileSelector, ui::documentation_aside_side,
 };
 use agent_settings::{
-    AgentProfile, AgentProfileId, AgentSettings, AvailableProfiles, builtin_profiles,
+    AgentProfile, AgentProfileId, AgentSettings, AvailableProfiles, ProfileOrigin, builtin_profiles,
 };
 use fs::Fs;
 use fuzzy::{StringMatch, StringMatchCandidate, match_strings};
@@ -159,6 +159,12 @@ impl ProfileSelector {
                     picker
                         .delegate
                         .refresh_profiles(live_profiles.clone(), query, cx);
+                    // `refresh_profiles` already recomputed the entries
+                    // synchronously, but an in-flight fuzzy search spawned
+                    // against the old candidates could still land and clobber
+                    // them. Routing through `refresh` cancels it and re-runs
+                    // the search against the new candidates.
+                    picker.refresh(window, cx);
                 });
             }
             self.pending_refresh = false;
@@ -268,6 +274,7 @@ struct ProfileCandidate {
     id: AgentProfileId,
     name: SharedString,
     is_builtin: bool,
+    origin: ProfileOrigin,
 }
 
 #[derive(Clone)]
@@ -306,7 +313,7 @@ impl ProfilePickerDelegate {
         focus_handle: FocusHandle,
         cx: &mut Context<ProfileSelector>,
     ) -> Self {
-        let candidates = Self::candidates_from(profiles);
+        let candidates = Self::candidates_from(profiles, cx);
         let string_candidates = Arc::new(Self::string_candidates(&candidates));
         let filtered_entries = Self::entries_from_candidates(&candidates);
 
@@ -338,7 +345,7 @@ impl ProfilePickerDelegate {
         query: String,
         cx: &mut Context<Picker<Self>>,
     ) {
-        self.candidates = Self::candidates_from(profiles);
+        self.candidates = Self::candidates_from(profiles, cx);
         self.string_candidates = Arc::new(Self::string_candidates(&self.candidates));
         self.query = query;
 
@@ -355,15 +362,33 @@ impl ProfilePickerDelegate {
         cx.notify();
     }
 
-    fn candidates_from(profiles: AvailableProfiles) -> Vec<ProfileCandidate> {
-        profiles
-            .into_iter()
-            .map(|(id, name)| ProfileCandidate {
-                is_builtin: builtin_profiles::is_builtin(&id),
+    fn candidates_from(profiles: AvailableProfiles, cx: &App) -> Vec<ProfileCandidate> {
+        let settings = AgentSettings::get_global(cx);
+        let mut builtins = Vec::new();
+        let mut customs = Vec::new();
+
+        for (id, name) in profiles {
+            let is_builtin = builtin_profiles::is_builtin(&id);
+            let origin = settings
+                .profiles
+                .get(&id)
+                .map(|p| p.origin.clone())
+                .unwrap_or(ProfileOrigin::Global);
+            let candidate = ProfileCandidate {
                 id,
                 name,
-            })
-            .collect()
+                is_builtin,
+                origin,
+            };
+            if is_builtin {
+                builtins.push(candidate);
+            } else {
+                customs.push(candidate);
+            }
+        }
+
+        builtins.extend(customs);
+        builtins
     }
 
     fn string_candidates(candidates: &[ProfileCandidate]) -> Vec<StringMatchCandidate> {
@@ -644,6 +669,7 @@ impl PickerDelegate for ProfilePickerDelegate {
                 let active_id = self.provider.profile_id(cx);
                 let is_active = active_id == candidate.id;
                 let has_documentation = Self::documentation(candidate).is_some();
+                let is_project = matches!(candidate.origin, ProfileOrigin::Project { .. });
 
                 let has_warning = self.provider.is_restricted(cx)
                     && !Self::restricted_forbidden_tools(&candidate.id, cx).is_empty();
@@ -670,10 +696,29 @@ impl PickerDelegate for ProfilePickerDelegate {
                                 .inset(true)
                                 .spacing(ListItemSpacing::Sparse)
                                 .toggle_state(selected)
-                                .child(HighlightedLabel::new(
-                                    candidate.name.clone(),
-                                    entry.positions.clone(),
-                                ))
+                                .child(
+                                    h_flex()
+                                        .gap_1p5()
+                                        .items_center()
+                                        .child(HighlightedLabel::new(
+                                            candidate.name.clone(),
+                                            entry.positions.clone(),
+                                        ))
+                                        .when(is_project, |this| {
+                                            this.child(
+                                                div()
+                                                    .px_1p5()
+                                                    .py_0p5()
+                                                    .rounded_md()
+                                                    .bg(cx.theme().colors().element_hover)
+                                                    .child(
+                                                        Label::new("Project")
+                                                            .size(LabelSize::XSmall)
+                                                            .color(Color::Muted),
+                                                    ),
+                                            )
+                                        }),
+                                )
                                 .when(has_end_slot, |this| {
                                     this.end_slot(
                                         h_flex()
@@ -860,11 +905,13 @@ mod tests {
                 id: AgentProfileId("write".into()),
                 name: SharedString::from("Write"),
                 is_builtin: true,
+                origin: ProfileOrigin::Global,
             },
             ProfileCandidate {
                 id: AgentProfileId("my-custom".into()),
                 name: SharedString::from("My Custom"),
                 is_builtin: false,
+                origin: ProfileOrigin::Global,
             },
         ];
 
@@ -887,6 +934,7 @@ mod tests {
             id: AgentProfileId("write".into()),
             name: SharedString::from("Write"),
             is_builtin: true,
+            origin: ProfileOrigin::Global,
         }];
 
         cx.update(|cx| {
@@ -919,11 +967,13 @@ mod tests {
                 id: AgentProfileId("write".into()),
                 name: SharedString::from("Write"),
                 is_builtin: true,
+                origin: ProfileOrigin::Global,
             },
             ProfileCandidate {
                 id: AgentProfileId("ask".into()),
                 name: SharedString::from("Ask"),
                 is_builtin: true,
+                origin: ProfileOrigin::Global,
             },
         ];
 
@@ -957,6 +1007,62 @@ mod tests {
             // Active profile should be found at index 0
             let active_index = delegate.index_of_profile(&AgentProfileId("write".into()));
             assert_eq!(active_index, Some(0));
+        });
+    }
+
+    #[gpui::test]
+    fn candidates_from_sorts_builtins_first_and_reads_origin(cx: &mut TestAppContext) {
+        use gpui::UpdateGlobal as _;
+
+        cx.update(|cx| {
+            let store = SettingsStore::test(cx);
+            cx.set_global(store);
+            project::DisableAiSettings::register(cx);
+            AgentSettings::register(cx);
+
+            let root = std::sync::Arc::from(util::rel_path::RelPath::from_unix_str("").unwrap());
+            SettingsStore::update_global(cx, |store, cx| {
+                store
+                    .set_local_settings(
+                        settings::WorktreeId::from_usize(1),
+                        settings::LocalSettingsPath::InWorktree(root),
+                        settings::LocalSettingsKind::Settings,
+                        Some(
+                            r#"{
+                                "agent": {
+                                    "profiles": {
+                                        "backend-engineer": { "name": "Backend Engineer" }
+                                    }
+                                }
+                            }"#,
+                        ),
+                        cx,
+                    )
+                    .unwrap();
+            });
+
+            // The custom profile is inserted first to verify that
+            // `candidates_from` groups builtins ahead of custom profiles
+            // regardless of the settings-map iteration order.
+            let mut profiles = AvailableProfiles::default();
+            profiles.insert(
+                AgentProfileId("backend-engineer".into()),
+                SharedString::from("Backend Engineer"),
+            );
+            profiles.insert(AgentProfileId("write".into()), SharedString::from("Write"));
+
+            let candidates = ProfilePickerDelegate::candidates_from(profiles, cx);
+
+            assert_eq!(candidates.len(), 2);
+            assert_eq!(candidates[0].id.as_str(), "write");
+            assert!(candidates[0].is_builtin);
+            assert!(matches!(candidates[0].origin, ProfileOrigin::Global));
+            assert_eq!(candidates[1].id.as_str(), "backend-engineer");
+            assert!(!candidates[1].is_builtin);
+            assert!(matches!(
+                candidates[1].origin,
+                ProfileOrigin::Project { .. }
+            ));
         });
     }
 
