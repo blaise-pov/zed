@@ -1,6 +1,13 @@
 use std::collections::BTreeMap;
 
-const KNOWN_SHADOWED_KEYS: &[(&str, &str, &str)] = &[("SettingsContent", "terminal", "project")];
+// The shadowing below is intentional: these keys are declared as named
+// fields on the container for global settings files, while the flattened
+// `project` section re-declares them so project-local settings files can
+// carry the same keys with project-scoped precedence handled by the store.
+const KNOWN_SHADOWED_KEYS: &[(&str, &str, &str)] = &[
+    ("SettingsContent", "terminal", "project"),
+    ("SettingsContent", "agent", "project"),
+];
 
 #[test]
 fn no_key_collisions_between_named_fields_and_flattened_sections() {
