@@ -789,6 +789,138 @@ mod tests {
     }
 
     #[gpui::test]
+    fn test_project_local_agent_settings_do_not_override_layout_keys(cx: &mut gpui::App) {
+        use gpui::UpdateGlobal as _;
+        use settings::{DockPosition, LocalSettingsKind, LocalSettingsPath, WorktreeId};
+
+        let store = SettingsStore::test(cx);
+        cx.set_global(store);
+        project::DisableAiSettings::register(cx);
+        AgentSettings::register(cx);
+
+        SettingsStore::update_global(cx, |store, cx| {
+            store
+                .set_user_settings(
+                    r#"{
+                        "agent": {
+                            "dock": "right",
+                            "task_dock": "right",
+                            "flexible": false
+                        }
+                    }"#,
+                    cx,
+                )
+                .unwrap();
+        });
+
+        let initial_settings = AgentSettings::get_global(cx);
+        assert_eq!(initial_settings.dock, DockPosition::Right);
+        assert_eq!(initial_settings.task_dock, DockPosition::Right);
+        assert_eq!(initial_settings.flexible, false);
+
+        let root = std::sync::Arc::from(util::rel_path::RelPath::from_unix_str("root").unwrap());
+        SettingsStore::update_global(cx, |store, cx| {
+            store
+                .set_local_settings(
+                    WorktreeId::from_usize(1),
+                    LocalSettingsPath::InWorktree(root),
+                    LocalSettingsKind::Settings,
+                    Some(
+                        r#"{
+                            "agent": {
+                                "dock": "left",
+                                "task_dock": "left",
+                                "flexible": true,
+                                "default_profile": "project-profile"
+                            }
+                        }"#,
+                    ),
+                    cx,
+                )
+                .unwrap();
+        });
+
+        let updated_settings = AgentSettings::get_global(cx);
+        assert_eq!(
+            updated_settings.default_profile,
+            AgentProfileId("project-profile".into())
+        );
+        assert_eq!(updated_settings.dock, DockPosition::Right);
+        assert_eq!(updated_settings.task_dock, DockPosition::Right);
+        assert_eq!(updated_settings.flexible, false);
+    }
+
+    #[gpui::test]
+    fn test_active_profile_agent_settings_survive_local_settings_update(cx: &mut gpui::App) {
+        use gpui::UpdateGlobal as _;
+        use settings::{
+            ActiveSettingsProfileName, LocalSettingsKind, LocalSettingsPath, WorktreeId,
+        };
+
+        let store = SettingsStore::test(cx);
+        cx.set_global(store);
+        project::DisableAiSettings::register(cx);
+        AgentSettings::register(cx);
+
+        // Settings profiles are activated at runtime via the
+        // `ActiveSettingsProfileName` global (set by the profile selector),
+        // not via a user-settings key, so seed the global before parsing.
+        cx.set_global(ActiveSettingsProfileName("work".to_string()));
+
+        SettingsStore::update_global(cx, |store, cx| {
+            store
+                .set_user_settings(
+                    r#"{
+                        "agent": {
+                            "default_profile": "base-profile"
+                        },
+                        "profiles": {
+                            "work": {
+                                "base": "user",
+                                "settings": {
+                                    "agent": {
+                                        "default_profile": "profile-from-settings-profile"
+                                    }
+                                }
+                            }
+                        }
+                    }"#,
+                    cx,
+                )
+                .unwrap();
+        });
+
+        assert_eq!(
+            AgentSettings::get_global(cx).default_profile,
+            AgentProfileId("profile-from-settings-profile".into())
+        );
+
+        let root = std::sync::Arc::from(util::rel_path::RelPath::from_unix_str("root").unwrap());
+        SettingsStore::update_global(cx, |store, cx| {
+            store
+                .set_local_settings(
+                    WorktreeId::from_usize(1),
+                    LocalSettingsPath::InWorktree(root),
+                    LocalSettingsKind::Settings,
+                    Some(
+                        r#"{
+                            "languages": {
+                                "Rust": { "tab_size": 4 }
+                            }
+                        }"#,
+                    ),
+                    cx,
+                )
+                .unwrap();
+        });
+
+        assert_eq!(
+            AgentSettings::get_global(cx).default_profile,
+            AgentProfileId("profile-from-settings-profile".into())
+        );
+    }
+
+    #[gpui::test]
     fn test_create_project_profile_and_global_profile(cx: &mut gpui::App) {
         use fs::FakeFs;
         use gpui::UpdateGlobal as _;

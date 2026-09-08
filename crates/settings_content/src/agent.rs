@@ -405,6 +405,12 @@ impl AgentSettingsContent {
         self.task_dock = Some(dock);
     }
 
+    pub fn clear_layout_keys(&mut self) {
+        self.dock = None;
+        self.task_dock = None;
+        self.flexible = None;
+    }
+
     pub fn set_sidebar_side(&mut self, position: SidebarDockPosition) {
         self.sidebar_side = Some(position);
     }

@@ -1162,9 +1162,10 @@ impl SettingsStore {
                         message: error,
                     }),
                 }?;
-                if let Some(new_settings) = new_settings {
+                if let Some(mut new_settings) = new_settings {
                     let mut new_agent = new_settings.agent.clone();
                     if let Some(agent) = new_agent.as_mut() {
+                        agent.clear_layout_keys();
                         if let Some(profiles) = agent.profiles.as_mut() {
                             let file_rel_path: Arc<RelPath> = directory_path
                                 .join(local_settings_file_relative_path())
@@ -1177,6 +1178,9 @@ impl SettingsStore {
                                     });
                             }
                         }
+                    }
+                    if let Some(project_agent) = new_settings.agent.as_mut() {
+                        project_agent.clear_layout_keys();
                     }
                     let mut new_content = SettingsContent {
                         project: new_settings,
@@ -1464,9 +1468,13 @@ impl SettingsStore {
 
             // Merge agent settings from project-local settings files into the
             // global value, with the project's entries taking precedence per
-            // key over user settings.
+            // key over user settings. Layout keys (e.g. dock, task_dock) are
+            // excluded so project settings cannot override user window placement.
             for local_settings in self.local_settings.values() {
-                merged.agent.merge_from(&local_settings.agent);
+                if let Some(mut local_agent) = local_settings.agent.clone() {
+                    local_agent.clear_layout_keys();
+                    merged.agent.merge_from(&Some(local_agent));
+                }
             }
 
             self.merged_settings = Rc::new(merged);
@@ -1512,14 +1520,35 @@ impl SettingsStore {
             if let Some(global) = &self.global_settings {
                 merged.agent.merge_from(&global.agent);
             }
-            if let Some(user) = &self.user_settings {
-                merged.agent.merge_from(&user.content.agent);
+            if let Some(user_settings) = self.user_settings.as_ref() {
+                let active_profile = user_settings.for_profile(cx);
+                let should_merge_user_settings =
+                    active_profile.is_none_or(|profile| profile.base == ProfileBase::User);
+
+                if should_merge_user_settings {
+                    merged.agent.merge_from(&user_settings.content.agent);
+                    merged.agent.merge_from_option(
+                        user_settings
+                            .for_release_channel()
+                            .map(|content| &content.agent),
+                    );
+                    merged
+                        .agent
+                        .merge_from_option(user_settings.for_os().map(|content| &content.agent));
+                }
+
+                if let Some(profile) = active_profile {
+                    merged.agent.merge_from(&profile.settings.agent);
+                }
             }
             if let Some(server) = &self.server_settings {
                 merged.agent.merge_from(&server.agent);
             }
             for local_settings in self.local_settings.values() {
-                merged.agent.merge_from(&local_settings.agent);
+                if let Some(mut local_agent) = local_settings.agent.clone() {
+                    local_agent.clear_layout_keys();
+                    merged.agent.merge_from(&Some(local_agent));
+                }
             }
 
             self.merged_settings = Rc::new(merged);

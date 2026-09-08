@@ -5030,12 +5030,22 @@ impl Panel for AgentPanel {
             DockPosition::Right | DockPosition::Bottom => "right",
         };
         telemetry::event!("Agent Panel Side Changed", side = side);
-        settings::update_settings_file(self.fs.clone(), cx, move |settings, _| {
-            settings
-                .agent
-                .get_or_insert_default()
-                .set_dock(position.into());
-        });
+        let completion = settings::update_settings_file_with_completion(
+            self.fs.clone(),
+            cx,
+            move |settings, _| {
+                settings
+                    .agent
+                    .get_or_insert_default()
+                    .set_dock(position.into());
+            },
+        );
+        cx.spawn(async move |_this, _cx| {
+            if let Err(error) = completion.await {
+                log::error!("Failed to update agent panel dock position: {error:?}");
+            }
+        })
+        .detach();
     }
 
     fn default_size(&self, window: &Window, cx: &App) -> Pixels {
@@ -5062,12 +5072,22 @@ impl Panel for AgentPanel {
     }
 
     fn set_flexible_size(&mut self, flexible: bool, _window: &mut Window, cx: &mut Context<Self>) {
-        settings::update_settings_file(self.fs.clone(), cx, move |settings, _| {
-            settings
-                .agent
-                .get_or_insert_default()
-                .set_flexible_size(flexible);
-        });
+        let completion = settings::update_settings_file_with_completion(
+            self.fs.clone(),
+            cx,
+            move |settings, _| {
+                settings
+                    .agent
+                    .get_or_insert_default()
+                    .set_flexible_size(flexible);
+            },
+        );
+        cx.spawn(async move |_this, _cx| {
+            if let Err(error) = completion.await {
+                log::error!("Failed to update agent panel flexible size: {error:?}");
+            }
+        })
+        .detach();
     }
 
     fn set_active(&mut self, active: bool, window: &mut Window, cx: &mut Context<Self>) {
