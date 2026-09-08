@@ -3553,6 +3553,7 @@ fn atomic_replace<P: AsRef<Path>>(
     replacement_file: P,
 ) -> windows::core::Result<()> {
     use windows::{
+        Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION},
         Win32::Storage::FileSystem::{REPLACE_FILE_FLAGS, ReplaceFileW},
         core::HSTRING,
     };
@@ -3560,14 +3561,36 @@ fn atomic_replace<P: AsRef<Path>>(
     // If the file does not exist, create it.
     let _ = std::fs::File::create_new(replaced_file.as_ref());
 
-    unsafe {
-        ReplaceFileW(
-            &HSTRING::from(replaced_file.as_ref().to_string_lossy().into_owned()),
-            &HSTRING::from(replacement_file.as_ref().to_string_lossy().into_owned()),
-            None,
-            REPLACE_FILE_FLAGS::default(),
-            None,
-            None,
-        )
+    let replaced_path = HSTRING::from(replaced_file.as_ref().to_string_lossy().into_owned());
+    let replacement_path = HSTRING::from(replacement_file.as_ref().to_string_lossy().into_owned());
+
+    const MAX_RETRIES: u32 = 4;
+    for attempt in 0..MAX_RETRIES {
+        let result = unsafe {
+            ReplaceFileW(
+                &replaced_path,
+                &replacement_path,
+                None,
+                REPLACE_FILE_FLAGS::default(),
+                None,
+                None,
+            )
+        };
+
+        match result {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                let code = error.code();
+                let is_sharing_conflict = code == ERROR_SHARING_VIOLATION.to_hresult()
+                    || code == ERROR_ACCESS_DENIED.to_hresult();
+                if is_sharing_conflict && attempt + 1 < MAX_RETRIES {
+                    std::thread::sleep(std::time::Duration::from_millis(50 * (attempt as u64 + 1)));
+                    continue;
+                }
+                return Err(error);
+            }
+        }
     }
+
+    Ok(())
 }
