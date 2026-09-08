@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use agent_settings::{AgentProfileId, AgentSettings};
+use agent_settings::{AgentProfileId, AgentSettings, ProfileOrigin};
 use fs::Fs;
 use gpui::{
     App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, Render, SharedString,
@@ -356,35 +356,49 @@ impl PickerDelegate for DelegationPickerDelegate {
             } => {
                 let is_allowed =
                     delegation.is_some_and(|delegation| delegation.allowed.contains(id));
+                let is_project = settings
+                    .profiles
+                    .get(id)
+                    .is_some_and(|profile| matches!(profile.origin, ProfileOrigin::Project { .. }));
 
-                Some(
-                    ListItem::new(ix)
-                        .inset(true)
-                        .spacing(ListItemSpacing::Sparse)
-                        .toggle_state(selected)
-                        .child(
-                            v_flex()
-                                .child(Label::new(name.clone()))
-                                .child(
-                                    Label::new(format!("id: {}", id.as_str()))
+                let mut list_item = ListItem::new(ix)
+                    .inset(true)
+                    .spacing(ListItemSpacing::Sparse)
+                    .toggle_state(selected)
+                    .child(v_flex().child(Label::new(name.clone())).when_some(
+                        description.clone(),
+                        |this, description| {
+                            this.child(
+                                Label::new(description)
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Muted),
+                            )
+                        },
+                    ));
+
+                if is_project || is_allowed {
+                    list_item = list_item.end_slot(
+                        h_flex()
+                            .gap_2()
+                            .items_center()
+                            .when(is_project, |this| {
+                                this.child(
+                                    Label::new("Project")
                                         .size(LabelSize::XSmall)
-                                        .color(Color::Muted),
+                                        .color(Color::Accent),
                                 )
-                                .when_some(description.clone(), |this, description| {
-                                    this.child(
-                                        Label::new(description)
-                                            .size(LabelSize::XSmall)
-                                            .color(Color::Muted),
-                                    )
-                                }),
-                        )
-                        .end_slot::<Icon>(is_allowed.then(|| {
-                            Icon::new(IconName::Check)
-                                .size(IconSize::Small)
-                                .color(Color::Success)
-                        }))
-                        .into_any_element(),
-                )
+                            })
+                            .when(is_allowed, |this| {
+                                this.child(
+                                    Icon::new(IconName::Check)
+                                        .size(IconSize::Small)
+                                        .color(Color::Success),
+                                )
+                            }),
+                    );
+                }
+
+                Some(list_item.into_any_element())
             }
         }
     }

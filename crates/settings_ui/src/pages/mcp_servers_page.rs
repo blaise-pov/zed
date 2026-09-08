@@ -4,17 +4,23 @@ use collections::HashMap;
 use context_server::ContextServerId;
 use editor::Editor;
 use extension_host::ExtensionStore;
-use gpui::{Action as _, Entity, Focusable as _, ScrollHandle, WeakEntity, prelude::*};
+use gpui::{
+    Action as _, Entity, Focusable as _, ReadGlobal as _, ScrollHandle, WeakEntity, prelude::*,
+};
 use project::context_server_store::{
     ContextServerConfiguration, ContextServerStatus, ContextServerStore,
 };
 use project::project_settings::ContextServerSettings;
-use settings::{ContextServerCommand, ContextServerSettingsContent, OAuthClientSettings};
+use settings::{
+    ContextServerCommand, ContextServerSettingsContent, OAuthClientSettings, SettingsStore,
+    WorktreeId,
+};
 use ui::{
     AiSettingItem, AiSettingItemSource, AiSettingItemStatus, ContextMenu, Divider, PopoverMenu,
     Switch, ToggleState, Tooltip, prelude::*,
 };
 use util::ResultExt as _;
+use util::rel_path::RelPath;
 
 use zed_actions::ExtensionCategoryFilter;
 
@@ -34,7 +40,7 @@ pub(crate) fn render_mcp_servers_page(
         if server_ids.is_empty() {
             render_empty_state(cx)
         } else {
-            render_server_list(&server_ids, store, cx)
+            render_server_list(settings_window, &server_ids, store, cx)
         }
     } else {
         render_no_project_state(cx)
@@ -132,6 +138,7 @@ fn render_no_project_state(cx: &App) -> AnyElement {
 }
 
 fn render_server_list(
+    settings_window: &SettingsWindow,
     server_ids: &[ContextServerId],
     store: &Entity<ContextServerStore>,
     cx: &mut Context<SettingsWindow>,
@@ -140,15 +147,60 @@ fn render_server_list(
         .w_full()
         .gap_1()
         .children(itertools::intersperse_with(
-            server_ids
-                .iter()
-                .map(|server_id| render_context_server(server_id, store, cx).into_any_element()),
+            server_ids.iter().map(|server_id| {
+                render_context_server(settings_window, server_id, store, cx).into_any_element()
+            }),
             || Divider::horizontal_dashed().into_any_element(),
         ))
         .into_any_element()
 }
 
+/// Where a server's configuration lives. Controls on the MCP servers page
+/// must write to the defining file: project-local entries take precedence
+/// over user settings, so writing to the user file would be a no-op.
+#[derive(Clone, Debug)]
+enum McpServerSettingsOrigin {
+    User,
+    Extension,
+    Project {
+        worktree_id: WorktreeId,
+        file_path: Arc<RelPath>,
+    },
+}
+
+fn server_settings_origin(
+    context_server_id: &ContextServerId,
+    provided_by_extension: bool,
+    settings_window: &SettingsWindow,
+    cx: &App,
+) -> McpServerSettingsOrigin {
+    if provided_by_extension {
+        return McpServerSettingsOrigin::Extension;
+    }
+
+    if let Some(project) = settings_window.active_project(cx) {
+        let worktree_store = project.read(cx).worktree_store();
+        let settings_store = SettingsStore::global(cx);
+        for worktree in worktree_store.read(cx).visible_worktrees(cx) {
+            let worktree_id = worktree.read(cx).id();
+            for (directory_path, content) in settings_store.local_settings(worktree_id) {
+                if content.context_servers.contains_key(&context_server_id.0) {
+                    return McpServerSettingsOrigin::Project {
+                        worktree_id,
+                        file_path: directory_path
+                            .join(paths::local_settings_file_relative_path())
+                            .into(),
+                    };
+                }
+            }
+        }
+    }
+
+    McpServerSettingsOrigin::User
+}
+
 fn render_context_server(
+    settings_window: &SettingsWindow,
     context_server_id: &ContextServerId,
     store: &Entity<ContextServerStore>,
     cx: &mut Context<SettingsWindow>,
@@ -172,6 +224,13 @@ fn render_context_server(
     // started has no runtime configuration, and must not be mistaken for an
     // extension-provided server.
     let provided_by_extension = store.read(cx).is_extension_provided(context_server_id, cx);
+    let origin = server_settings_origin(
+        context_server_id,
+        provided_by_extension,
+        settings_window,
+        cx,
+    );
+    let is_project_origin = matches!(origin, McpServerSettingsOrigin::Project { .. });
     let display_name = if provided_by_extension {
         resolve_extension_display_name(context_server_id, cx).unwrap_or_else(|| item_id.clone())
     } else {
@@ -214,13 +273,20 @@ fn render_context_server(
             context_server_id,
             cx.entity().downgrade(),
             server_settings.clone(),
+            origin.clone(),
         )
     });
-    let uninstall_button = render_uninstall_button(context_server_id, provided_by_extension);
+    let uninstall_button =
+        render_uninstall_button(context_server_id, provided_by_extension, origin.clone());
 
     // Build toggle switch
-    let toggle_switch =
-        render_toggle_switch(context_server_id, store, is_enabled, is_transitioning);
+    let toggle_switch = render_toggle_switch(
+        context_server_id,
+        store,
+        is_enabled,
+        is_transitioning,
+        origin,
+    );
 
     // Surface invalid settings (which prevent the server from starting at all)
     // ahead of runtime status feedback, so the misconfiguration is visible.
@@ -230,6 +296,7 @@ fn render_context_server(
     };
 
     AiSettingItem::new(item_id, display_name, status, source)
+        .when(is_project_origin, |this| this.origin_badge("Project"))
         .when_some(configure_button, |this, button| this.action(button))
         .action(uninstall_button)
         .action(toggle_switch)
@@ -272,6 +339,7 @@ fn render_configure_button(
     context_server_id: &ContextServerId,
     settings_window: WeakEntity<SettingsWindow>,
     server_settings: Option<ContextServerSettings>,
+    origin: McpServerSettingsOrigin,
 ) -> impl IntoElement {
     let context_server_id = context_server_id.clone();
 
@@ -292,7 +360,7 @@ fn render_configure_button(
             .map(|settings| (context_server_id.clone(), settings));
         settings_window
             .update(cx, |this, cx| {
-                open_mcp_server_form(this, transport, existing, window, cx);
+                open_mcp_server_form(this, transport, existing, origin.clone(), window, cx);
             })
             .log_err();
     })
@@ -301,6 +369,7 @@ fn render_configure_button(
 fn render_uninstall_button(
     context_server_id: &ContextServerId,
     provided_by_extension: bool,
+    origin: McpServerSettingsOrigin,
 ) -> impl IntoElement {
     let context_server_id = context_server_id.clone();
 
@@ -312,7 +381,12 @@ fn render_uninstall_button(
     .tab_index(0isize)
     .tooltip(Tooltip::text("Uninstall MCP Server"))
     .on_click(move |_event, _window, cx| {
-        uninstall_server(&context_server_id, provided_by_extension, cx);
+        uninstall_server(
+            &context_server_id,
+            provided_by_extension,
+            origin.clone(),
+            cx,
+        );
     })
 }
 
@@ -321,6 +395,7 @@ fn render_toggle_switch(
     store: &Entity<ContextServerStore>,
     is_enabled: bool,
     is_transitioning: bool,
+    origin: McpServerSettingsOrigin,
 ) -> impl IntoElement {
     let context_server_id = context_server_id.clone();
     let store = store.clone();
@@ -355,7 +430,7 @@ fn render_toggle_switch(
             };
 
             let fs = <dyn fs::Fs>::global(cx);
-            settings::update_settings_file(fs, cx, {
+            write_server_settings(fs, &origin, cx, {
                 let context_server_id = context_server_id.clone();
                 move |settings, _| {
                     settings
@@ -568,6 +643,7 @@ pub(crate) fn render_add_server_popover(
                                         this,
                                         McpTransport::Stdio,
                                         None,
+                                        McpServerSettingsOrigin::User,
                                         window,
                                         cx,
                                     );
@@ -584,6 +660,7 @@ pub(crate) fn render_add_server_popover(
                                         this,
                                         McpTransport::Http,
                                         None,
+                                        McpServerSettingsOrigin::User,
                                         window,
                                         cx,
                                     );
@@ -628,6 +705,7 @@ pub(crate) fn render_add_server_popover(
 fn uninstall_server(
     context_server_id: &ContextServerId,
     provided_by_extension: bool,
+    origin: McpServerSettingsOrigin,
     cx: &mut App,
 ) {
     if provided_by_extension {
@@ -644,12 +722,34 @@ fn uninstall_server(
 
     let fs = <dyn fs::Fs>::global(cx);
     let context_server_id = context_server_id.clone();
-    settings::update_settings_file(fs, cx, move |settings, _| {
+    write_server_settings(fs, &origin, cx, move |settings, _| {
         settings
             .project
             .context_servers
             .remove(&context_server_id.0);
     });
+}
+
+/// Applies a settings mutation to the file the server is defined in: the
+/// project-local `.zed/settings.json` for project servers, the user settings
+/// file otherwise.
+fn write_server_settings(
+    fs: Arc<dyn fs::Fs>,
+    origin: &McpServerSettingsOrigin,
+    cx: &App,
+    update: impl 'static + Send + FnOnce(&mut settings::SettingsContent, &App),
+) {
+    match origin {
+        McpServerSettingsOrigin::Project {
+            worktree_id,
+            file_path,
+        } => {
+            settings::update_project_settings_file(fs, *worktree_id, file_path.clone(), cx, update)
+        }
+        McpServerSettingsOrigin::User | McpServerSettingsOrigin::Extension => {
+            settings::update_settings_file(fs, cx, update);
+        }
+    }
 }
 
 fn resolve_extension_for_context_server(
@@ -725,6 +825,8 @@ pub(crate) struct McpServerForm {
     transport: McpTransport,
     /// `Some` when editing an existing server (used to remove the old entry on rename).
     original_id: Option<ContextServerId>,
+    /// Where the edited server is defined, so saving writes to the same file.
+    origin: McpServerSettingsOrigin,
     name: Entity<Editor>,
     command: Entity<Editor>,
     args: Entity<Editor>,
@@ -740,6 +842,7 @@ impl McpServerForm {
     fn new(
         transport: McpTransport,
         existing: Option<(ContextServerId, ContextServerSettings)>,
+        origin: McpServerSettingsOrigin,
         window: &mut Window,
         cx: &mut Context<SettingsWindow>,
     ) -> Self {
@@ -793,6 +896,7 @@ impl McpServerForm {
         Self {
             transport,
             original_id,
+            origin,
             name: new_input("my-mcp-server", name_initial.as_deref(), window, cx),
             command: new_input("/path/to/server", command_initial.as_deref(), window, cx),
             args: new_input("--flag value", args_initial.as_deref(), window, cx),
@@ -856,15 +960,17 @@ fn new_kv_row(
 }
 
 /// Creates the form state and pushes the form sub-page onto the stack.
-pub(crate) fn open_mcp_server_form(
+fn open_mcp_server_form(
     settings_window: &mut SettingsWindow,
     transport: McpTransport,
     existing: Option<(ContextServerId, ContextServerSettings)>,
+    origin: McpServerSettingsOrigin,
     window: &mut Window,
     cx: &mut Context<SettingsWindow>,
 ) {
     let is_edit = existing.is_some();
-    settings_window.mcp_server_form = Some(McpServerForm::new(transport, existing, window, cx));
+    settings_window.mcp_server_form =
+        Some(McpServerForm::new(transport, existing, origin, window, cx));
 
     let title = if is_edit {
         "Configure MCP Server"
@@ -1172,7 +1278,12 @@ fn save_mcp_server_form(
     }
 
     let fs = <dyn fs::Fs>::global(cx);
-    settings::update_settings_file(fs, cx, move |settings, _| {
+    let origin = settings_window
+        .mcp_server_form
+        .as_ref()
+        .map(|form| form.origin.clone())
+        .unwrap_or(McpServerSettingsOrigin::User);
+    write_server_settings(fs, &origin, cx, move |settings, _| {
         if let Some(original_id) = &original_id
             && original_id.0 != id.0
         {

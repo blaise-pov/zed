@@ -1,12 +1,17 @@
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::{BTreeMap, HashSet},
+    sync::Arc,
+};
 
 use agent::ContextServerRegistry;
 use agent_settings::{AgentProfileId, AgentProfileSettings};
 use fs::Fs;
 use gpui::{App, Context, DismissEvent, Entity, EventEmitter, Focusable, Task, WeakEntity, Window};
 use picker::{Picker, PickerDelegate};
+use project::project_settings::ProjectSettings;
 use settings::{
-    AgentProfileContent, ContextServerPresetContent, DelegationContent, update_settings_file,
+    AgentProfileContent, ContextServerPresetContent, DelegationContent, Settings as _,
+    SettingsFile, SettingsStore, update_settings_file,
 };
 use ui::{ListItem, ListItemSpacing, prelude::*};
 use util::ResultExt as _;
@@ -75,6 +80,9 @@ pub struct ToolPickerDelegate {
     filtered_items: Vec<PickerItem>,
     selected_index: usize,
     mode: ToolPickerMode,
+    /// Servers defined in a project worktree's `.zed/settings.json` rather
+    /// than in user settings, badged in the UI like project-origin profiles.
+    project_server_ids: HashSet<Arc<str>>,
 }
 
 impl ToolPickerDelegate {
@@ -111,9 +119,46 @@ impl ToolPickerDelegate {
         cx: &mut Context<ToolPicker>,
     ) -> Self {
         let mut items = Vec::new();
+        let mut project_server_ids = HashSet::new();
 
-        for (id, tools) in registry.read(cx).servers() {
+        let registry_ref = registry.read(cx);
+        let server_store = registry_ref.server_store();
+        let global_servers = &ProjectSettings::get_global(cx).context_servers;
+        let store = server_store.read(cx);
+        let settings_store = cx.global::<SettingsStore>();
+        for (_, _, local_project_settings) in settings_store.get_all_locals::<ProjectSettings>() {
+            for server_id in local_project_settings.context_servers.keys() {
+                project_server_ids.insert(server_id.clone());
+            }
+        }
+        for file in settings_store.get_all_files() {
+            if let SettingsFile::Project(ref key) = file {
+                if let Some(content) =
+                    settings_store.get_content_for_file(SettingsFile::Project(key.clone()))
+                {
+                    for server_id in content.project.context_servers.keys() {
+                        project_server_ids.insert(server_id.clone());
+                    }
+                    if let Some(agent) = &content.agent {
+                        if let Some(servers) = &agent.context_servers {
+                            for server_id in servers.keys() {
+                                project_server_ids.insert(Arc::from(server_id.as_ref()));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        for (id, tools) in registry_ref.servers() {
             let server_id = id.clone().0;
+            // A custom server absent from the user settings must have been
+            // contributed by a project-local settings file; extension-provided
+            // servers are excluded since they are configured elsewhere.
+            if !store.is_extension_provided(id, cx)
+                && !global_servers.contains_key(server_id.as_ref())
+            {
+                project_server_ids.insert(server_id.clone());
+            }
             items.push(PickerItem::ContextServer {
                 server_id: server_id.clone(),
             });
@@ -131,6 +176,7 @@ impl ToolPickerDelegate {
             profile_settings,
             cx,
         )
+        .with_project_server_ids(project_server_ids)
     }
 
     fn new(
@@ -150,7 +196,13 @@ impl ToolPickerDelegate {
             profile_settings,
             filtered_items: Vec::new(),
             selected_index: 0,
+            project_server_ids: HashSet::new(),
         }
+    }
+
+    fn with_project_server_ids(mut self, project_server_ids: HashSet<Arc<str>>) -> Self {
+        self.project_server_ids = project_server_ids;
+        self
     }
 }
 
@@ -444,31 +496,48 @@ impl PickerDelegate for ToolPickerDelegate {
                     .get(server_id.as_ref())
                     .and_then(|preset| preset.enabled)
                     .unwrap_or(self.profile_settings.enable_all_context_servers);
+                let is_project_server = self.project_server_ids.contains(server_id.as_ref());
 
-                Some(
-                    ListItem::new(ix)
-                        .inset(true)
-                        .spacing(ListItemSpacing::Sparse)
-                        .toggle_state(selected)
-                        .start_slot(
-                            Icon::new(IconName::Server)
-                                .size(IconSize::Small)
+                let mut list_item = ListItem::new(ix)
+                    .inset(true)
+                    .spacing(ListItemSpacing::Sparse)
+                    .toggle_state(selected)
+                    .start_slot(
+                        Icon::new(IconName::Server)
+                            .size(IconSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .child(
+                        h_flex().gap_2().child(Label::new(server_id.clone())).child(
+                            Label::new("(All Tools)")
+                                .size(LabelSize::XSmall)
                                 .color(Color::Muted),
-                        )
-                        .child(
-                            h_flex().gap_2().child(Label::new(server_id.clone())).child(
-                                Label::new("(All Tools)")
-                                    .size(LabelSize::XSmall)
-                                    .color(Color::Muted),
-                            ),
-                        )
-                        .end_slot::<Icon>(is_server_enabled.then(|| {
-                            Icon::new(IconName::Check)
-                                .size(IconSize::Small)
-                                .color(Color::Success)
-                        }))
-                        .into_any_element(),
-                )
+                        ),
+                    );
+
+                if is_project_server || is_server_enabled {
+                    list_item = list_item.end_slot(
+                        h_flex()
+                            .gap_2()
+                            .items_center()
+                            .when(is_project_server, |this| {
+                                this.child(
+                                    Label::new("Project")
+                                        .size(LabelSize::XSmall)
+                                        .color(Color::Accent),
+                                )
+                            })
+                            .when(is_server_enabled, |this| {
+                                this.child(
+                                    Icon::new(IconName::Check)
+                                        .size(IconSize::Small)
+                                        .color(Color::Success),
+                                )
+                            }),
+                    );
+                }
+
+                Some(list_item.into_any_element())
             }
             PickerItem::Tool { name, server_id } => {
                 let is_enabled = if let Some(server_id) = server_id {

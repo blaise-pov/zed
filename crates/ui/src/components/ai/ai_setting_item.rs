@@ -75,6 +75,7 @@ pub struct AiSettingItem {
     source: AiSettingItemSource,
     icon: Option<AnyElement>,
     label: SharedString,
+    origin_badge: Option<SharedString>,
     detail_label: Option<SharedString>,
     actions: Vec<AnyElement>,
     details: Option<AnyElement>,
@@ -93,6 +94,7 @@ impl AiSettingItem {
             source,
             icon: None,
             label: label.into(),
+            origin_badge: None,
             detail_label: None,
             actions: Vec::new(),
             details: None,
@@ -101,6 +103,13 @@ impl AiSettingItem {
 
     pub fn icon(mut self, element: impl IntoElement) -> Self {
         self.icon = Some(element.into_any_element());
+        self
+    }
+
+    /// Accent badge next to the label marking entries defined in the project's
+    /// local settings, mirroring the profile list's "Project" badge.
+    pub fn origin_badge(mut self, badge: impl Into<SharedString>) -> Self {
+        self.origin_badge = Some(badge.into());
         self
     }
 
@@ -128,6 +137,7 @@ impl RenderOnce for AiSettingItem {
             source,
             icon,
             label,
+            origin_badge,
             detail_label,
             actions,
             details,
@@ -212,6 +222,13 @@ impl RenderOnce for AiSettingItem {
                             .gap_1p5()
                             .child(icon_container)
                             .child(Label::new(label).flex_shrink_0().truncate())
+                            .when_some(origin_badge, |this, badge| {
+                                this.child(
+                                    Label::new(badge)
+                                        .size(LabelSize::XSmall)
+                                        .color(Color::Accent),
+                                )
+                            })
                             .child(
                                 div()
                                     .id(source_id)
