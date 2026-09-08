@@ -283,12 +283,17 @@ fn parse_auto_compact_threshold(raw: &str) -> anyhow::Result<AutoCompactThreshol
     }
 }
 
+/// Default value of `agent.task_graph_server_id`: the `context_servers` key
+/// the agent task panel uses to find the task graph MCP server.
+pub const DEFAULT_TASK_GRAPH_SERVER_ID: &str = "tgs";
+
 #[derive(Clone, Debug, RegisterSetting)]
 pub struct AgentSettings {
     pub enabled: bool,
     pub button: bool,
     pub dock: DockPosition,
     pub task_dock: DockPosition,
+    pub task_graph_server_id: String,
     pub flexible: bool,
     pub sidebar_side: SidebarDockPosition,
     pub default_width: Pixels,
@@ -951,6 +956,10 @@ impl Settings for AgentSettings {
             button: agent.button.unwrap(),
             dock: agent.dock.unwrap(),
             task_dock: agent.task_dock.unwrap_or(DockPosition::Left),
+            task_graph_server_id: agent
+                .task_graph_server_id
+                .filter(|server_id| !server_id.trim().is_empty())
+                .unwrap_or_else(|| DEFAULT_TASK_GRAPH_SERVER_ID.to_string()),
             sidebar_side: agent.sidebar_side.unwrap(),
             default_width: agent.default_width.unwrap().into_gpui(),
             default_height: agent.default_height.unwrap().into_gpui(),

@@ -1114,6 +1114,9 @@
     "dock": "left",
     // Where to dock the agent task panel. Can be 'left' or 'right'.
     "task_dock": "left",
+    // The `context_servers` key of the MCP server used by the agent task
+    // panel. The server must be configured under this key.
+    "task_graph_server_id": "tgs",
     // Whether the agent panel should use flexible (proportional) sizing.
     //
     // Default: true

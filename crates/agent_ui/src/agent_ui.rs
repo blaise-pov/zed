@@ -981,6 +981,7 @@ mod tests {
             button: true,
             dock: DockPosition::Right,
             task_dock: DockPosition::Left,
+            task_graph_server_id: agent_settings::DEFAULT_TASK_GRAPH_SERVER_ID.to_string(),
             flexible: true,
             default_width: px(300.),
             default_height: px(600.),

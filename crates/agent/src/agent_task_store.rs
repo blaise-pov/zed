@@ -38,6 +38,18 @@ impl AgentTaskStore {
         &self.provider
     }
 
+    /// Swap the backing provider (e.g. when the configured task server id
+    /// changes) and refresh from the new server.
+    pub fn set_provider(&mut self, provider: Arc<dyn AgentTaskProvider>, cx: &mut Context<Self>) {
+        self.provider = provider;
+        self.graph = AgentTaskGraph::default();
+        self.events.clear();
+        self.is_offline = false;
+        self.last_error = None;
+        self.refresh(cx).detach();
+        cx.notify();
+    }
+
     pub fn graph(&self) -> &AgentTaskGraph {
         &self.graph
     }

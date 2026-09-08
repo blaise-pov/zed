@@ -72,7 +72,7 @@
 - **База знаний и обучение**: фиксация выводов (`lessons`) и предложений новых навыков (`skill_candidates`).
 - **Артефакты**: версионируемые неизменяемые результаты работы.
 
-Zed взаимодействует с TGR через встроенный `McpAgentTaskProvider` и реактивный `AgentTaskStore`.
+Zed взаимодействует с TGR через встроенный `McpAgentTaskProvider` и реактивный `AgentTaskStore`. Ключ сервера настраивается через `agent.task_graph_server_id` (по умолчанию `tgs`) и должен совпадать с ключом в `context_servers`; смена применяется без перезапуска.
 
 ---
 
@@ -124,6 +124,7 @@ Zed взаимодействует с TGR через встроенный `McpAg
 {
   "agent": {
     "default_profile": "orchestrator",
+    "task_graph_server_id": "tgs",
     "nested_sub_agents": {
       "enabled": true,
       "max_depth": 3,
@@ -172,8 +173,9 @@ Zed взаимодействует с TGR через встроенный `McpAg
         }
       }
     },
+    // Ключ должен совпадать со значением agent.task_graph_server_id (по умолчанию "tgs")
     "context_servers": {
-      "task-graph": {
+      "tgs": {
         "command": "taskgraph",
         "args": ["serve", "--project", "${ZED_PROJECT_PATH}"],
         "env": {

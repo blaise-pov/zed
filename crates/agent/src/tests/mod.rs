@@ -4,7 +4,7 @@ use acp_thread::{
     ThreadStatus,
 };
 use agent_client_protocol::schema::v1 as acp;
-use agent_settings::AgentProfileId;
+use agent_settings::{AgentProfileId, DEFAULT_TASK_GRAPH_SERVER_ID};
 use anyhow::Result;
 use client::{Client, RefreshLlmTokenListener, UserStore};
 use collections::IndexMap;
@@ -9395,7 +9395,7 @@ async fn test_mcp_agent_task_provider_fetch_graph(cx: &mut TestAppContext) {
     let context_server_store = project.read_with(cx, |p, _| p.context_server_store());
 
     let mut tool_calls = setup_context_server(
-        "tgr",
+        DEFAULT_TASK_GRAPH_SERVER_ID,
         vec![context_server::types::Tool {
             name: "task_graph".into(),
             title: None,
@@ -9408,7 +9408,10 @@ async fn test_mcp_agent_task_provider_fetch_graph(cx: &mut TestAppContext) {
         cx,
     );
 
-    let provider = McpAgentTaskProvider::new(context_server_store, ContextServerId("tgr".into()));
+    let provider = McpAgentTaskProvider::new(
+        context_server_store,
+        ContextServerId(DEFAULT_TASK_GRAPH_SERVER_ID.into()),
+    );
 
     let fetch_task = cx.update(|cx| provider.fetch_graph(cx));
 
@@ -9474,7 +9477,7 @@ async fn test_mcp_agent_task_provider_invalid_json(cx: &mut TestAppContext) {
     let context_server_store = project.read_with(cx, |p, _| p.context_server_store());
 
     let mut tool_calls = setup_context_server(
-        "tgr",
+        DEFAULT_TASK_GRAPH_SERVER_ID,
         vec![context_server::types::Tool {
             name: "task_graph".into(),
             title: None,
@@ -9487,7 +9490,10 @@ async fn test_mcp_agent_task_provider_invalid_json(cx: &mut TestAppContext) {
         cx,
     );
 
-    let provider = McpAgentTaskProvider::new(context_server_store, ContextServerId("tgr".into()));
+    let provider = McpAgentTaskProvider::new(
+        context_server_store,
+        ContextServerId(DEFAULT_TASK_GRAPH_SERVER_ID.into()),
+    );
 
     let fetch_task = cx.update(|cx| provider.fetch_graph(cx));
 

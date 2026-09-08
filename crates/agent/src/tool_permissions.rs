@@ -657,7 +657,9 @@ mod tests {
     use crate::pattern_extraction::extract_terminal_pattern;
     use crate::tools::{DeletePathTool, FetchTool, TerminalTool};
     use crate::{AgentTool, EditFileTool};
-    use agent_settings::{AgentProfileId, CompiledRegex, InvalidRegexPattern, ToolRules};
+    use agent_settings::{
+        AgentProfileId, CompiledRegex, DEFAULT_TASK_GRAPH_SERVER_ID, InvalidRegexPattern, ToolRules,
+    };
     use gpui::px;
     use settings::{DockPosition, NotifyWhenAgentWaiting, PlaySoundWhenAgentDone};
     use std::sync::Arc;
@@ -668,6 +670,7 @@ mod tests {
             button: true,
             dock: DockPosition::Right,
             task_dock: DockPosition::Left,
+            task_graph_server_id: DEFAULT_TASK_GRAPH_SERVER_ID.to_string(),
             flexible: true,
             default_width: px(300.),
             default_height: px(600.),

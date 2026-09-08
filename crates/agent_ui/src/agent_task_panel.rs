@@ -39,7 +39,7 @@ use gpui::{
     Stateful, Task, WeakEntity, Window, actions, prelude::*,
 };
 use markdown::{Markdown, MarkdownElement, MarkdownFont, MarkdownStyle};
-use settings::Settings;
+use settings::{Settings, SettingsStore};
 use ui::{
     Button, ButtonStyle, Color, Icon, IconButton, IconName, IconSize, Label, LabelSize, Tooltip,
     prelude::*,
@@ -62,9 +62,15 @@ pub fn init(file_system: Arc<dyn Fs>, cx: &mut App) {
     let subscription = cx.observe_new(move |workspace: &mut Workspace, window, cx| {
         let project = workspace.project().clone();
         let context_server_store = project.read(cx).context_server_store();
+        let server_id = context_server::ContextServerId(
+            AgentSettings::get_global(cx)
+                .task_graph_server_id
+                .clone()
+                .into(),
+        );
         let provider = Arc::new(agent::McpAgentTaskProvider::new(
             context_server_store,
-            context_server::ContextServerId("tgr".into()),
+            server_id,
         ));
         let store = cx.new(|cx| agent::AgentTaskStore::new(provider, cx));
 
@@ -106,6 +112,11 @@ impl AgentTaskPanel {
         })
         .detach();
 
+        cx.observe_global::<SettingsStore>(|this, cx| {
+            this.sync_task_server(cx);
+        })
+        .detach();
+
         Self {
             store,
             selected_task_id: None,
@@ -117,6 +128,27 @@ impl AgentTaskPanel {
             _fetch_detail_task: None,
             _action_task: None,
         }
+    }
+
+    /// Rebuild the task provider when the configured `task_graph_server_id`
+    /// setting changes, so the panel talks to a different MCP server without
+    /// a restart.
+    fn sync_task_server(&mut self, cx: &mut Context<Self>) {
+        let server_name = AgentSettings::get_global(cx).task_graph_server_id.clone();
+        if self.store.read(cx).provider().server_id().0.as_ref() == server_name {
+            return;
+        }
+
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        let context_server_store = workspace.read(cx).project().read(cx).context_server_store();
+        let provider = Arc::new(agent::McpAgentTaskProvider::new(
+            context_server_store,
+            context_server::ContextServerId(server_name.into()),
+        ));
+        self.store
+            .update(cx, |store, cx| store.set_provider(provider, cx));
     }
 
     fn select_task(&mut self, id: AgentTaskId, cx: &mut Context<Self>) {
@@ -698,12 +730,22 @@ impl Panel for AgentTaskPanel {
             DockPosition::Right | DockPosition::Bottom => "right",
         };
         telemetry::event!("Agent Task Panel Side Changed", side = side);
-        settings::update_settings_file(self.file_system.clone(), cx, move |settings, _| {
-            settings
-                .agent
-                .get_or_insert_default()
-                .set_task_dock(position.into());
-        });
+        let completion = settings::update_settings_file_with_completion(
+            self.file_system.clone(),
+            cx,
+            move |settings, _| {
+                settings
+                    .agent
+                    .get_or_insert_default()
+                    .set_task_dock(position.into());
+            },
+        );
+        cx.spawn(async move |_this, _cx| {
+            if let Err(error) = completion.await {
+                log::error!("Failed to update agent task panel dock position: {error:?}");
+            }
+        })
+        .detach();
     }
 
     fn default_size(&self, _window: &Window, _cx: &App) -> Pixels {

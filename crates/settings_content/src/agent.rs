@@ -230,6 +230,11 @@ pub struct AgentSettingsContent {
     ///
     /// Default: left
     pub task_dock: Option<DockPosition>,
+    /// The `context_servers` key of the MCP server backing the agent task
+    /// panel. The server must be configured under this key.
+    ///
+    /// Default: tgs
+    pub task_graph_server_id: Option<String>,
     /// Whether the agent panel should use flexible (proportional) sizing.
     ///
     /// Default: true
