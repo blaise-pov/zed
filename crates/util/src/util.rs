@@ -1017,9 +1017,149 @@ impl<O> From<anyhow::Result<O>> for ConnectionResult<O> {
     }
 }
 
+/// Parses environment variables from a `.env` file string.
+///
+/// Ignores empty lines and comments (lines starting with `#`).
+/// Strips optional `export ` prefix and outer matching single or double quotes.
+pub fn parse_env(content: &str) -> Vec<(String, String)> {
+    let mut vars = Vec::new();
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let line = line.strip_prefix("export ").unwrap_or(line).trim_start();
+        if let Some((key, value)) = line.split_once('=') {
+            let key = key.trim();
+            if key.is_empty() {
+                continue;
+            }
+            let mut value = value.trim();
+            if (value.starts_with('"') && value.ends_with('"') && value.len() >= 2)
+                || (value.starts_with('\'') && value.ends_with('\'') && value.len() >= 2)
+            {
+                value = &value[1..value.len() - 1];
+            } else if let Some((uncommented, _)) = value.split_once(" #") {
+                value = uncommented.trim_end();
+            }
+            vars.push((key.to_string(), value.to_string()));
+        }
+    }
+    vars
+}
+
+/// Loads environment variables from a `.env` file content into the current process environment.
+///
+/// Critical system environment variables (such as PATH or HOME) will not be overwritten
+/// if they are already present in the environment.
+pub fn load_env(content: &str) {
+    for (key, value) in parse_env(content) {
+        if matches!(
+            key.to_uppercase().as_str(),
+            "PATH" | "HOME" | "USER" | "USERNAME" | "SHELL" | "SYSTEMROOT"
+        ) && std::env::var(&key).is_ok()
+        {
+            continue;
+        }
+        unsafe {
+            std::env::set_var(&key, &value);
+        }
+    }
+}
+
+/// Expands `${VAR}` and `${VAR:-default}` references in a string using the current process environment.
+///
+/// If a referenced variable is not set and no default is provided, logs a warning
+/// and leaves the `${VAR}` token untouched.
+pub fn expand_env_vars(value: &str) -> String {
+    let mut expanded = String::with_capacity(value.len());
+    let mut rest = value;
+    while let Some(start) = rest.find("${") {
+        expanded.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        let Some(end) = after.find('}') else {
+            expanded.push_str(&rest[start..]);
+            return expanded;
+        };
+        let expr = &after[..end];
+        let (name, default) = match expr.split_once(":-") {
+            Some((name, default)) => (name.trim(), Some(default)),
+            None => (expr.trim(), None),
+        };
+        if let Ok(value) = std::env::var(name) {
+            expanded.push_str(&value);
+        } else if let Some(default) = default {
+            expanded.push_str(default);
+        } else {
+            log::warn!("environment variable {name:?} is not set");
+            expanded.push_str(&format!("${{{expr}}}"));
+        }
+        rest = &after[end + 1..];
+    }
+    expanded.push_str(rest);
+    expanded
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_parse_env() {
+        let content = r#"
+# Comment
+FOO=bar
+export BAZ="hello world"
+SINGLE='quoted value'
+EMPTY=
+  SPACED_KEY  =  spaced_value
+WITH_COMMENT=value_here # this is an inline comment
+"#;
+        let vars = parse_env(content);
+        assert_eq!(
+            vars,
+            vec![
+                ("FOO".to_string(), "bar".to_string()),
+                ("BAZ".to_string(), "hello world".to_string()),
+                ("SINGLE".to_string(), "quoted value".to_string()),
+                ("EMPTY".to_string(), "".to_string()),
+                ("SPACED_KEY".to_string(), "spaced_value".to_string()),
+                ("WITH_COMMENT".to_string(), "value_here".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_expand_env_vars() {
+        unsafe {
+            std::env::set_var("ZED_TEST_ENV_FOO", "hello");
+            std::env::set_var("ZED_TEST_ENV_BAR", "world");
+        }
+
+        // Exact match
+        assert_eq!(expand_env_vars("${ZED_TEST_ENV_FOO}"), "hello");
+        // Mixed text
+        assert_eq!(
+            expand_env_vars("greeting: ${ZED_TEST_ENV_FOO} ${ZED_TEST_ENV_BAR}!"),
+            "greeting: hello world!"
+        );
+        // Default when present is ignored
+        assert_eq!(expand_env_vars("${ZED_TEST_ENV_FOO:-fallback}"), "hello");
+        // Default when absent is used
+        assert_eq!(
+            expand_env_vars("${ZED_TEST_NONEXISTENT_VAR:-fallback}"),
+            "fallback"
+        );
+        // Absent without default leaves token intact
+        assert_eq!(
+            expand_env_vars("${ZED_TEST_NONEXISTENT_VAR}"),
+            "${ZED_TEST_NONEXISTENT_VAR}"
+        );
+        // Malformed without closing brace leaves tail intact
+        assert_eq!(expand_env_vars("test ${UNCLOSED"), "test ${UNCLOSED");
+        // No variables
+        assert_eq!(expand_env_vars("plain text"), "plain text");
+    }
 
     #[test]
     fn test_fs_embed_iter_and_get() {
