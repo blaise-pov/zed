@@ -2691,8 +2691,8 @@ impl Thread {
             .default_model
             .as_ref()?;
         Some(SelectedModel {
-            provider: LanguageModelProviderId::from(selection.provider.0.clone()),
-            model: LanguageModelId::from(selection.model.clone()),
+            provider: LanguageModelProviderId::from(util::expand_env_vars(&selection.provider.0)),
+            model: LanguageModelId::from(util::expand_env_vars(&selection.model)),
         })
     }
 

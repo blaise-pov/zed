@@ -936,6 +936,13 @@ pub fn normalize_path(raw: &str) -> String {
     }
 }
 
+pub fn expand_model_selection(mut selection: LanguageModelSelection) -> LanguageModelSelection {
+    selection.provider =
+        settings::LanguageModelProviderSetting(util::expand_env_vars(&selection.provider.0));
+    selection.model = util::expand_env_vars(&selection.model);
+    selection
+}
+
 impl Settings for AgentSettings {
     fn from_settings(content: &settings::SettingsContent) -> Self {
         let agent = content.agent.clone().unwrap();
@@ -953,21 +960,30 @@ impl Settings for AgentSettings {
                 None
             },
             flexible: agent.flexible.unwrap(),
-            default_model: Some(agent.default_model.unwrap()),
-            subagent_model: agent.subagent_model,
-            inline_assistant_model: agent.inline_assistant_model,
+            default_model: Some(expand_model_selection(agent.default_model.unwrap())),
+            subagent_model: agent.subagent_model.map(expand_model_selection),
+            inline_assistant_model: agent.inline_assistant_model.map(expand_model_selection),
             inline_assistant_use_streaming_tools: agent
                 .inline_assistant_use_streaming_tools
                 .unwrap_or(true),
             commit_message_include_project_rules: agent
                 .commit_message_include_project_rules
                 .unwrap(),
-            commit_message_model: agent.commit_message_model,
+            commit_message_model: agent.commit_message_model.map(expand_model_selection),
             commit_message_instructions: agent.commit_message_instructions,
-            thread_summary_model: agent.thread_summary_model,
-            compaction_model: agent.compaction_model,
-            inline_alternatives: agent.inline_alternatives.unwrap_or_default(),
-            favorite_models: agent.favorite_models,
+            thread_summary_model: agent.thread_summary_model.map(expand_model_selection),
+            compaction_model: agent.compaction_model.map(expand_model_selection),
+            inline_alternatives: agent
+                .inline_alternatives
+                .unwrap_or_default()
+                .into_iter()
+                .map(expand_model_selection)
+                .collect(),
+            favorite_models: agent
+                .favorite_models
+                .into_iter()
+                .map(expand_model_selection)
+                .collect(),
             default_profile: AgentProfileId(agent.default_profile.unwrap()),
             profiles: {
                 let profiles: IndexMap<AgentProfileId, AgentProfileSettings> = agent

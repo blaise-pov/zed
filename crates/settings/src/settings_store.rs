@@ -1219,6 +1219,11 @@ impl SettingsStore {
         Ok(())
     }
 
+    /// Recomputes all settings values and notifies global observers.
+    pub fn reload(&mut self, cx: &mut App) {
+        self.recompute_values(None, cx);
+    }
+
     pub fn set_extension_settings(
         &mut self,
         content: ExtensionsSettingsContent,

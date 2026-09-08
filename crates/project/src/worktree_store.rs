@@ -934,6 +934,10 @@ impl WorktreeStore {
 
         cx.spawn(async move |this, cx| {
             let worktree_id = next_worktree_id.await?;
+            let dot_env_path = abs_path.as_path().join(".env");
+            if let Ok(content) = fs.load(&dot_env_path).await {
+                util::load_env(&content);
+            }
             let worktree = Worktree::local(
                 SanitizedPath::cast_arc(abs_path.clone()),
                 visible,

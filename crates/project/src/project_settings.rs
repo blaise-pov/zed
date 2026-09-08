@@ -26,7 +26,13 @@ use settings::{
     LocalSettingsPath, RegisterSetting, SemanticTokenRules, Settings, SettingsLocation,
     SettingsStore, parse_json_with_comments, watch_config_file,
 };
-use std::{cell::OnceCell, collections::BTreeMap, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    cell::OnceCell,
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 use task::{DebugTaskFile, TaskTemplates, VsCodeDebugTaskFile, VsCodeTaskFile};
 use util::{ResultExt, rel_path::RelPath, serde::default_true};
 use worktree::{PathChange, UpdatedEntriesSet, Worktree, WorktreeId};
@@ -1184,6 +1190,25 @@ impl SettingsObserver {
 
         let mut settings_contents = Vec::new();
         for (path, _, change) in changes.iter() {
+            if path.as_std_path() == Path::new(".env") {
+                if change != &PathChange::Removed {
+                    let abs_path = worktree.read(cx).absolutize(path);
+                    let fs = fs.clone();
+                    cx.spawn(async move |_this, cx| {
+                        if let Ok(content) = fs.load(&abs_path).await {
+                            util::load_env(&content);
+                            cx.update(|cx| {
+                                cx.update_global::<SettingsStore, _>(|store, cx| {
+                                    store.reload(cx);
+                                });
+                            });
+                        }
+                    })
+                    .detach();
+                }
+                continue;
+            }
+
             let (settings_dir, kind) = if path.ends_with(local_settings_file_relative_path()) {
                 let settings_dir = path
                     .ancestors()
