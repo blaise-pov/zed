@@ -4507,18 +4507,23 @@ impl Thread {
 
     /// The set of skill names this thread's profile is restricted to, if any.
     /// `None` means the profile has no `skills` filter and all skills are
-    /// visible.
+    /// visible (applicable only to built-in profiles).
     pub(crate) fn allowed_skill_names(&self, cx: &App) -> Option<HashSet<String>> {
-        AgentSettings::get_global(cx)
+        let profile = AgentSettings::get_global(cx)
             .profiles
-            .get(&self.profile_id)
-            .and_then(|profile| profile.skills.as_ref())
-            .map(|skills| {
+            .get(&self.profile_id)?;
+        if let Some(skills) = &profile.skills {
+            Some(
                 skills
                     .iter()
                     .map(|name| name.to_string())
-                    .collect::<HashSet<_>>()
-            })
+                    .collect::<HashSet<_>>(),
+            )
+        } else if !agent_settings::builtin_profiles::is_builtin(&self.profile_id) {
+            Some(HashSet::default())
+        } else {
+            None
+        }
     }
 
     /// A system-prompt note for sub-agents that just hit the nesting depth

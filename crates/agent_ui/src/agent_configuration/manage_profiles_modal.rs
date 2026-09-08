@@ -51,6 +51,7 @@ enum Mode {
     ConfigureSkills {
         profile_id: AgentProfileId,
         skills_editor: Entity<SkillsEditor>,
+        _subscription: Subscription,
     },
     ConfigureCustomPrompt {
         profile_id: AgentProfileId,
@@ -149,6 +150,9 @@ impl ManageProfilesModal {
     ) {
         workspace.register_action(|workspace, action: &ManageProfiles, window, cx| {
             if let Some(panel) = workspace.panel::<AgentPanel>(cx) {
+                panel.update(cx, |panel, cx| {
+                    panel.refresh_skills(cx);
+                });
                 let fs = workspace.app_state().fs.clone();
                 let active_model = panel
                     .read(cx)
@@ -490,10 +494,17 @@ impl ManageProfilesModal {
         );
         let skills_editor =
             cx.new(|cx| SkillsEditor::new(profile_id.clone(), self.fs.clone(), window, cx));
+        let dismiss_subscription = cx.subscribe_in(&skills_editor, window, {
+            let profile_id = profile_id.clone();
+            move |this, _skills_editor, _: &DismissEvent, window, cx| {
+                this.view_profile(profile_id.clone(), window, cx);
+            }
+        });
 
         self.mode = Mode::ConfigureSkills {
             profile_id,
             skills_editor,
+            _subscription: dismiss_subscription,
         };
         self.focus_handle(cx).focus(window, cx);
     }
@@ -529,6 +540,7 @@ impl ManageProfilesModal {
             editor
         });
 
+        let initial_prompt = prompt.to_string();
         let fs = self.fs.clone();
         let target_profile_id = profile_id.clone();
         let subscription = cx.subscribe(&prompt_editor, move |_this, editor, event, cx| {
@@ -537,6 +549,9 @@ impl ManageProfilesModal {
             if matches!(event, editor::EditorEvent::Blurred) {
                 let text = editor.read(cx).text(cx);
                 let text = text.trim().to_string();
+                if text == initial_prompt.trim() {
+                    return;
+                }
                 let fs = fs.clone();
                 let profile_id = target_profile_id.clone();
                 let origin = AgentSettings::get_global(cx)
@@ -555,6 +570,7 @@ impl ManageProfilesModal {
                         return;
                     };
                     profile.custom_prompt = (!text.is_empty()).then(|| Arc::from(text.as_str()));
+                    profile.custom_prompt_path = None;
                 });
             }
         });
@@ -840,6 +856,7 @@ impl Focusable for ManageProfilesModal {
             Mode::ConfigureSkills {
                 skills_editor,
                 profile_id: _,
+                _subscription: _,
             } => skills_editor.focus_handle(cx),
             Mode::ConfigureCustomPrompt {
                 prompt_editor,
@@ -871,33 +888,28 @@ impl ManageProfilesModal {
             .get(&profile.id)
             .map(|p| &p.origin);
 
-        div()
-            .id(format!("profile-{}", profile.id))
-            .track_focus(&profile.navigation.focus_handle)
-            .on_action({
-                let profile_id = profile.id.clone();
-                cx.listener(move |this, _: &menu::Confirm, window, cx| {
-                    this.view_profile(profile_id.clone(), window, cx);
-                })
-            })
-            .child(
-                ListItem::new(format!("profile-{}", profile.id))
-                    .toggle_state(is_focused)
-                    .inset(true)
-                    .spacing(ListItemSpacing::Sparse)
-                    .child(Label::new(profile.name.clone()))
-                    .when(
-                        matches!(origin, Some(ProfileOrigin::Project { .. })),
-                        |this| {
-                            this.end_slot(
-                                Label::new("Project")
-                                    .size(LabelSize::XSmall)
-                                    .color(Color::Accent),
-                            )
-                        },
-                    )
+        let is_project = matches!(origin, Some(ProfileOrigin::Project { .. }));
+
+        let mut list_item = ListItem::new(format!("profile-{}", profile.id))
+            .toggle_state(is_focused)
+            .inset(true)
+            .spacing(ListItemSpacing::Sparse)
+            .child(Label::new(profile.name.clone()));
+
+        if is_project || is_focused {
+            list_item = list_item.end_slot::<Div>(
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .when(is_project, |this| {
+                        this.child(
+                            Label::new("Project")
+                                .size(LabelSize::XSmall)
+                                .color(Color::Accent),
+                        )
+                    })
                     .when(is_focused, |this| {
-                        this.end_slot(
+                        this.child(
                             h_flex()
                                 .gap_1()
                                 .child(
@@ -911,14 +923,25 @@ impl ManageProfilesModal {
                                     cx,
                                 )),
                         )
-                    })
-                    .on_click({
-                        let profile_id = profile.id.clone();
-                        cx.listener(move |this, _, window, cx| {
-                            this.view_profile(profile_id.clone(), window, cx);
-                        })
                     }),
-            )
+            );
+        }
+
+        div()
+            .id(format!("profile-{}", profile.id))
+            .track_focus(&profile.navigation.focus_handle)
+            .on_action({
+                let profile_id = profile.id.clone();
+                cx.listener(move |this, _: &menu::Confirm, window, cx| {
+                    this.view_profile(profile_id.clone(), window, cx);
+                })
+            })
+            .child(list_item.on_click({
+                let profile_id = profile.id.clone();
+                cx.listener(move |this, _, window, cx| {
+                    this.view_profile(profile_id.clone(), window, cx);
+                })
+            }))
     }
 
     fn render_choose_profile(
@@ -1697,6 +1720,7 @@ impl Render for ManageProfilesModal {
                         Mode::ConfigureSkills {
                             profile_id,
                             skills_editor,
+                            _subscription: _,
                         } => {
                             let profile = settings.profiles.get(profile_id);
                             let profile_name = profile
@@ -1926,5 +1950,64 @@ mod tests {
                 }
             },
         );
+    }
+
+    #[gpui::test]
+    fn test_custom_prompt_displays_file_content_in_ui(cx: &mut gpui::App) {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "zed_ui_test_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let prompt_file = temp_dir.join("agent_prompt.md");
+        std::fs::write(&prompt_file, "System prompt loaded from file").unwrap();
+        let prompt_path_str = prompt_file.to_str().unwrap().replace('\\', "/");
+
+        let store = SettingsStore::test(cx);
+        cx.set_global(store);
+        project::DisableAiSettings::register(cx);
+        AgentSettings::register(cx);
+
+        SettingsStore::update_global(cx, |store, cx| {
+            store
+                .set_user_settings(
+                    &format!(
+                        r#"{{
+                            "agent": {{
+                                "profiles": {{
+                                    "file_agent": {{
+                                        "name": "File Agent",
+                                        "custom_prompt": "Fallback prompt",
+                                        "custom_prompt_path": "{prompt_path_str}"
+                                    }}
+                                }}
+                            }}
+                        }}"#
+                    ),
+                    cx,
+                )
+                .unwrap();
+        });
+
+        let settings = AgentSettings::get_global(cx);
+        let profile = settings
+            .profiles
+            .get(&AgentProfileId("file_agent".into()))
+            .unwrap();
+
+        // Check that custom_prompt in profile contains the file's text content (priority over inline text)
+        assert_eq!(
+            profile.custom_prompt.as_deref(),
+            Some("System prompt loaded from file")
+        );
+        assert_eq!(
+            profile.custom_prompt_path.as_deref(),
+            Some(prompt_path_str.as_str())
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }

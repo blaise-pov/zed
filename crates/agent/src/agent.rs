@@ -55,8 +55,8 @@ use futures::channel::{mpsc, oneshot};
 use futures::future::Shared;
 use futures::{FutureExt as _, StreamExt as _, future};
 use gpui::{
-    App, AppContext, AsyncApp, Context, Entity, EntityId, SharedString, Subscription, Task,
-    TaskExt, WeakEntity,
+    App, AppContext, AsyncApp, BorrowAppContext, Context, Entity, EntityId, SharedString,
+    Subscription, Task, TaskExt, WeakEntity,
 };
 use language_model::{
     IconOrSvg, LanguageModel, LanguageModelId, LanguageModelProvider, LanguageModelProviderId,
@@ -71,7 +71,7 @@ use rand::Rng as _;
 use serde::{Deserialize, Serialize};
 use settings::{LanguageModelSelection, Settings as _, update_settings_file};
 use std::any::Any;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
@@ -613,7 +613,7 @@ impl NativeAgent {
                 cx.set_global(SkillIndex::default());
             }
 
-            Self {
+            let mut agent = Self {
                 sessions: HashMap::default(),
                 pending_sessions: HashMap::default(),
                 thread_store,
@@ -624,7 +624,9 @@ impl NativeAgent {
                 fs,
                 _subscriptions: subscriptions,
                 skills_state: SkillsState::default(),
-            }
+            };
+            agent.ensure_skills_scan_started(cx);
+            agent
         })
     }
 
@@ -664,10 +666,17 @@ impl NativeAgent {
             return;
         }
 
+        let global_skills = loaded_global_skills(&fs, &skills_dir).await;
+
         // Skills directory exists. Start a watch and trigger a refresh
         // of every project's context so the freshly-discovered skills
         // get loaded.
         let _ = this.update(cx, |this, cx| {
+            if cx.has_global::<SkillIndex>() {
+                cx.update_global::<SkillIndex, _>(|index, _cx| {
+                    index.global_skills = global_skills;
+                });
+            }
             cx.spawn({
                 let fs = fs.clone();
                 let skills_dir = skills_dir.clone();
@@ -730,7 +739,18 @@ impl NativeAgent {
                 event.path == skills_dir && event.kind == Some(fs::PathEventKind::Removed)
             });
 
-            let updated = this.update(cx, |this, _cx| {
+            let global_skills = if !watched_root_removed {
+                loaded_global_skills(&fs, &skills_dir).await
+            } else {
+                Vec::new()
+            };
+
+            let updated = this.update(cx, |this, cx| {
+                if cx.has_global::<SkillIndex>() {
+                    cx.update_global::<SkillIndex, _>(|index, _cx| {
+                        index.global_skills = global_skills;
+                    });
+                }
                 for state in this.projects.values_mut() {
                     state.project_context_needs_refresh.send(()).ok();
                 }
@@ -1530,10 +1550,19 @@ impl NativeAgent {
             }
         }
 
-        cx.set_global(SkillIndex {
-            global_skills,
-            project_skills: project_groups,
-        });
+        if cx.has_global::<SkillIndex>() {
+            cx.update_global::<SkillIndex, _>(|index, _cx| {
+                if !global_skills.is_empty() {
+                    index.global_skills = global_skills;
+                }
+                index.project_skills = project_groups;
+            });
+        } else {
+            cx.set_global(SkillIndex {
+                global_skills,
+                project_skills: project_groups,
+            });
+        }
     }
 
     fn update_available_commands_for_project(&self, project_id: EntityId, cx: &mut Context<Self>) {
@@ -3841,11 +3870,16 @@ pub fn skills_resolver_for_project(
 /// apply without re-registering tools.
 fn thread_skill_filter(thread: &Entity<Thread>, cx: &App) -> Option<HashSet<String>> {
     let profile_id = thread.read(cx).profile().clone();
-    agent_settings::AgentSettings::get_global(cx)
+    let profile = agent_settings::AgentSettings::get_global(cx)
         .profiles
-        .get(&profile_id)
-        .and_then(|profile| profile.skills.as_ref())
-        .map(|skills| skills.iter().map(|name| name.to_string()).collect())
+        .get(&profile_id)?;
+    if let Some(skills) = &profile.skills {
+        Some(skills.iter().map(|name| name.to_string()).collect())
+    } else if !agent_settings::builtin_profiles::is_builtin(&profile_id) {
+        Some(HashSet::default())
+    } else {
+        None
+    }
 }
 
 /// Like [`skills_resolver_for_project`], but additionally restricts the
@@ -3917,6 +3951,27 @@ pub fn skill_body_resolver_for_project(
             })
         }
     }
+}
+
+/// Load the global skills directory, discarding entries that fail to parse
+/// so a single malformed `SKILL.md` can't blank out the whole global catalog.
+/// Failures are logged rather than silently dropped.
+async fn loaded_global_skills(fs: &Arc<dyn Fs>, skills_dir: &Path) -> Vec<Skill> {
+    load_skills_from_directory(fs, skills_dir, SkillSource::Global)
+        .await
+        .into_iter()
+        .filter_map(|result| match result {
+            Ok(skill) => Some(skill),
+            Err(error) => {
+                log::warn!(
+                    "Skipping global skill at {}: {}",
+                    error.path.display(),
+                    error.message
+                );
+                None
+            }
+        })
+        .collect()
 }
 
 /// Collect successfully-loaded global and project-local skills into a
@@ -5575,10 +5630,7 @@ mod internal_tests {
             fs.create_dir(&dir).await.unwrap();
             fs.insert_file(
                 dir.join("SKILL.md"),
-                format!(
-                    "---\nname: {name}\ndescription: {description}\n---\n\nbody"
-                )
-                .into_bytes(),
+                format!("---\nname: {name}\ndescription: {description}\n---\n\nbody").into_bytes(),
             )
             .await;
         }
@@ -5615,13 +5667,14 @@ mod internal_tests {
         let session_id = acp_thread.read_with(cx, |thread, _cx| thread.session_id().clone());
 
         // Switch the session's thread to the restricted profile.
-        agent.read_with(cx, |agent, _cx| {
-            let session = agent.sessions.get(&session_id).unwrap();
-            session.thread.clone()
-        })
-        .update(cx, |thread, cx| {
-            thread.set_profile(agent_settings::AgentProfileId("restricted".into()), cx);
-        });
+        agent
+            .read_with(cx, |agent, _cx| {
+                let session = agent.sessions.get(&session_id).unwrap();
+                session.thread.clone()
+            })
+            .update(cx, |thread, cx| {
+                thread.set_profile(agent_settings::AgentProfileId("restricted".into()), cx);
+            });
 
         // The catalog the model sees (`available_skills`) is filtered.
         cx.update(|cx| {
@@ -5648,10 +5701,143 @@ mod internal_tests {
         cx.update(|cx| {
             let skills = resolve(cx);
             let names: Vec<&str> = skills.iter().map(|s| s.name.as_str()).collect();
-            assert!(names.contains(&"skill-a"), "resolver missing skill-a: {names:?}");
+            assert!(
+                names.contains(&"skill-a"),
+                "resolver missing skill-a: {names:?}"
+            );
             assert!(
                 !names.contains(&"skill-b"),
                 "resolver leaked skill-b: {names:?}"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_custom_profile_without_skills_defaults_to_no_skills(cx: &mut TestAppContext) {
+        use gpui::UpdateGlobal as _;
+
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let skills_dir = global_skills_dir();
+
+        for (name, description) in [("skill-a", "First"), ("skill-b", "Second")] {
+            let dir = skills_dir.join(name);
+            fs.create_dir(&dir).await.unwrap();
+            fs.insert_file(
+                dir.join("SKILL.md"),
+                format!("---\nname: {name}\ndescription: {description}\n---\n\nbody").into_bytes(),
+            )
+            .await;
+        }
+
+        cx.update(|cx| {
+            SettingsStore::update_global(cx, |store, cx| {
+                store
+                    .set_user_settings(
+                        r#"{ "agent": { "profiles": { "custom-no-skills": { "name": "Custom No Skills" }, "custom-empty-skills": { "name": "Custom Empty Skills", "skills": [] } } } }"#,
+                        cx,
+                    )
+                    .unwrap();
+            });
+        });
+
+        let project = Project::test(fs.clone(), [], cx).await;
+        let thread_store = cx.new(|cx| ThreadStore::new(cx));
+        let agent =
+            cx.update(|cx| NativeAgent::new(thread_store, Templates::new(), fs.clone(), cx));
+
+        let connection = NativeAgentConnection(agent.clone());
+        let acp_thread = cx
+            .update(|cx| {
+                Rc::new(connection.clone()).new_session(
+                    project.clone(),
+                    PathList::new(&[Path::new("/")]),
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+        cx.run_until_parked();
+
+        let session_id = acp_thread.read_with(cx, |thread, _cx| thread.session_id().clone());
+
+        // Custom profile with no `skills` configured defaults to NO skills allowed.
+        agent
+            .read_with(cx, |agent, _cx| {
+                let session = agent.sessions.get(&session_id).unwrap();
+                session.thread.clone()
+            })
+            .update(cx, |thread, cx| {
+                thread.set_profile(
+                    agent_settings::AgentProfileId("custom-no-skills".into()),
+                    cx,
+                );
+            });
+
+        cx.update(|cx| {
+            let skills = connection.available_skills(&session_id, cx);
+            assert!(
+                skills.is_empty(),
+                "custom profile without explicit skills must not see any skills: {skills:?}"
+            );
+        });
+
+        let (thread, project_id) = agent.read_with(cx, |agent, _cx| {
+            let session = agent.sessions.get(&session_id).unwrap();
+            (session.thread.clone(), session.project_id)
+        });
+        let resolve = cx.update(|_cx| {
+            super::skills_resolver_for_thread(agent.downgrade(), thread.downgrade(), project_id)
+        });
+        cx.update(|cx| {
+            let skills = resolve(cx);
+            assert!(
+                skills.is_empty(),
+                "custom profile resolver must not return any skills: {skills:?}"
+            );
+        });
+
+        // Custom profile with empty `skills` list also has NO skills allowed.
+        agent
+            .read_with(cx, |agent, _cx| {
+                let session = agent.sessions.get(&session_id).unwrap();
+                session.thread.clone()
+            })
+            .update(cx, |thread, cx| {
+                thread.set_profile(
+                    agent_settings::AgentProfileId("custom-empty-skills".into()),
+                    cx,
+                );
+            });
+
+        cx.update(|cx| {
+            let skills = connection.available_skills(&session_id, cx);
+            assert!(
+                skills.is_empty(),
+                "custom profile with empty skills list must not see any skills: {skills:?}"
+            );
+            let skills = resolve(cx);
+            assert!(
+                skills.is_empty(),
+                "custom profile resolver with empty skills list must not return any skills: {skills:?}"
+            );
+        });
+
+        // Builtin profile (e.g. "write") with no explicit skills restriction sees all skills.
+        agent
+            .read_with(cx, |agent, _cx| {
+                let session = agent.sessions.get(&session_id).unwrap();
+                session.thread.clone()
+            })
+            .update(cx, |thread, cx| {
+                thread.set_profile(agent_settings::AgentProfileId("write".into()), cx);
+            });
+
+        cx.update(|cx| {
+            let skills = connection.available_skills(&session_id, cx);
+            assert!(
+                skills.len() >= 2,
+                "builtin write profile must see all skills: {skills:?}"
             );
         });
     }

@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Result, bail};
@@ -80,10 +81,7 @@ impl AgentProfile {
             .as_ref()
             .map(|profile| profile.tools.clone())
             .unwrap_or_default();
-        let enable_all_context_servers = base_profile
-            .as_ref()
-            .map(|profile| profile.enable_all_context_servers)
-            .unwrap_or_default();
+        let enable_all_context_servers = false;
         let context_servers = base_profile
             .as_ref()
             .map(|profile| profile.context_servers.clone())
@@ -96,12 +94,16 @@ impl AgentProfile {
         let custom_prompt = base_profile
             .as_ref()
             .and_then(|profile| profile.custom_prompt.clone());
+        let custom_prompt_path = base_profile
+            .as_ref()
+            .and_then(|profile| profile.custom_prompt_path.clone());
         let description = base_profile
             .as_ref()
             .and_then(|profile| profile.description.clone());
         let skills = base_profile
             .as_ref()
-            .and_then(|profile| profile.skills.clone());
+            .and_then(|profile| profile.skills.clone())
+            .or_else(|| Some(Vec::new()));
         let delegation = base_profile
             .as_ref()
             .and_then(|profile| profile.delegation.clone());
@@ -117,6 +119,7 @@ impl AgentProfile {
             context_servers,
             default_model,
             custom_prompt,
+            custom_prompt_path,
             description,
             skills,
             delegation,
@@ -168,11 +171,14 @@ pub struct AgentProfileSettings {
     pub default_model: Option<LanguageModelSelection>,
     /// Custom system prompt instructions for this profile.
     pub custom_prompt: Option<SharedString>,
+    /// Path to a file containing custom system prompt instructions for this profile.
+    pub custom_prompt_path: Option<SharedString>,
     /// What this profile is for; shown to the parent agent in the delegation
     /// catalog.
     pub description: Option<SharedString>,
     /// When set, only the listed skills are visible to sessions using this
-    /// profile.
+    /// profile. When unset, built-in profiles see all skills while custom
+    /// profiles see none.
     pub skills: Option<Vec<Arc<str>>>,
     /// When present, this profile may delegate via `spawn_agent`; a profile
     /// without it is a solo agent.
@@ -243,6 +249,14 @@ impl AgentProfileSettings {
         }
     }
 
+    pub fn is_skill_allowed(&self, profile_id: &AgentProfileId, skill_name: &str) -> bool {
+        if let Some(skills) = &self.skills {
+            skills.iter().any(|s| s.as_ref() == skill_name)
+        } else {
+            builtin_profiles::is_builtin(profile_id)
+        }
+    }
+
     pub fn is_context_server_tool_enabled(&self, server_id: &str, tool_name: &str) -> bool {
         match self.context_servers.get(server_id) {
             Some(preset) => match preset.enabled {
@@ -296,6 +310,7 @@ impl AgentProfileSettings {
                     .collect(),
                 default_model: self.default_model.clone(),
                 custom_prompt: self.custom_prompt.clone().map(|s| s.into()),
+                custom_prompt_path: self.custom_prompt_path.clone().map(|s| s.into()),
                 description: self.description.clone().map(|s| s.into()),
                 skills: self.skills.clone(),
                 delegation: self
@@ -320,6 +335,111 @@ impl AgentProfileSettings {
     }
 }
 
+/// Reads prompt content from a file path.
+/// Handles absolute paths, `~` home directory prefix, and relative paths
+/// (checked against cwd, `.zed` in cwd, and Zed config/prompts directories).
+pub fn read_prompt_file(path_str: &str) -> Option<String> {
+    let trimmed = path_str.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let path = if let Some(rest) = trimmed
+        .strip_prefix("~/")
+        .or_else(|| trimmed.strip_prefix("~\\"))
+    {
+        paths::home_dir().join(rest)
+    } else if trimmed == "~" {
+        paths::home_dir().to_path_buf()
+    } else {
+        PathBuf::from(trimmed)
+    };
+
+    if path.is_absolute() {
+        match std::fs::read_to_string(&path) {
+            Ok(content) => return Some(content),
+            Err(err) => {
+                log::warn!(
+                    "failed to read custom prompt from absolute path {}: {err}",
+                    path.display()
+                );
+                return None;
+            }
+        }
+    }
+
+    // Relative path resolution candidates:
+    // 1. Current working directory
+    if let Ok(cwd) = std::env::current_dir() {
+        let candidate = cwd.join(&path);
+        if candidate.is_file() {
+            match std::fs::read_to_string(&candidate) {
+                Ok(content) => return Some(content),
+                Err(err) => log::warn!(
+                    "failed to read custom prompt from {}: {err}",
+                    candidate.display()
+                ),
+            }
+        }
+        let candidate_zed = cwd.join(".zed").join(&path);
+        if candidate_zed.is_file() {
+            match std::fs::read_to_string(&candidate_zed) {
+                Ok(content) => return Some(content),
+                Err(err) => log::warn!(
+                    "failed to read custom prompt from {}: {err}",
+                    candidate_zed.display()
+                ),
+            }
+        }
+    }
+
+    // 2. Zed config directory
+    let candidate = paths::config_dir().join(&path);
+    if candidate.is_file() {
+        match std::fs::read_to_string(&candidate) {
+            Ok(content) => return Some(content),
+            Err(err) => log::warn!(
+                "failed to read custom prompt from {}: {err}",
+                candidate.display()
+            ),
+        }
+    }
+
+    // 3. Zed prompts directory
+    let candidate = paths::prompts_dir().join(&path);
+    if candidate.is_file() {
+        match std::fs::read_to_string(&candidate) {
+            Ok(content) => return Some(content),
+            Err(err) => log::warn!(
+                "failed to read custom prompt from {}: {err}",
+                candidate.display()
+            ),
+        }
+    }
+
+    // 4. Fallback direct read (e.g. relative to process working directory)
+    if let Ok(content) = std::fs::read_to_string(&path) {
+        return Some(content);
+    }
+
+    log::warn!("custom prompt file not found at: {}", path.display());
+    None
+}
+
+/// Resolves the custom prompt text given optional prompt text and prompt file path.
+/// If both are specified, the file has priority. If the file cannot be read, falls back to text.
+pub fn resolve_custom_prompt(
+    custom_prompt: Option<&str>,
+    custom_prompt_path: Option<&str>,
+) -> Option<SharedString> {
+    if let Some(path_str) = custom_prompt_path {
+        if let Some(file_content) = read_prompt_file(path_str) {
+            return Some(file_content.into());
+        }
+    }
+    custom_prompt.map(Into::into)
+}
+
 impl From<AgentProfileContent> for AgentProfileSettings {
     fn from(content: AgentProfileContent) -> Self {
         let origin = content.origin.map(Into::into).unwrap_or_default();
@@ -331,11 +451,18 @@ impl From<AgentProfileContent> for AgentProfileSettings {
             context_servers,
             default_model,
             custom_prompt,
+            custom_prompt_path,
             description,
             skills,
             delegation,
             tool_permissions,
         } = content;
+
+        let custom_prompt_path_shared = custom_prompt_path
+            .as_ref()
+            .map(|p| SharedString::from(p.to_string()));
+        let resolved_prompt =
+            resolve_custom_prompt(custom_prompt.as_deref(), custom_prompt_path.as_deref());
 
         Self {
             name: name.into(),
@@ -346,8 +473,9 @@ impl From<AgentProfileContent> for AgentProfileSettings {
                 .into_iter()
                 .map(|(server_id, preset)| (server_id, preset.into()))
                 .collect(),
-            default_model,
-            custom_prompt: custom_prompt.map(|s| s.into()),
+            default_model: default_model.map(crate::expand_model_selection),
+            custom_prompt: resolved_prompt,
+            custom_prompt_path: custom_prompt_path_shared,
             description: description.map(|s| s.into()),
             skills,
             delegation: delegation.map(|delegation| delegation.into()),
@@ -395,6 +523,7 @@ mod tests {
             context_servers,
             default_model: None,
             custom_prompt: None,
+            custom_prompt_path: None,
             description: None,
             skills: None,
             delegation: None,
@@ -410,6 +539,80 @@ mod tests {
                 .map(|(name, enabled)| (Arc::from(*name), *enabled))
                 .collect(),
         }
+    }
+
+    #[test]
+    fn test_resolve_custom_prompt_file_priority_over_text() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "zed_test_profile_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let prompt_file = temp_dir.join("prompt.md");
+        std::fs::write(&prompt_file, "Prompt content from file").unwrap();
+
+        let prompt_path_str = prompt_file.to_str().unwrap();
+
+        // 1. Both file and text specified -> file has priority
+        let resolved = resolve_custom_prompt(Some("Inline text prompt"), Some(prompt_path_str));
+        assert_eq!(resolved.as_deref(), Some("Prompt content from file"));
+
+        // 2. Only file specified -> file is read
+        let resolved = resolve_custom_prompt(None, Some(prompt_path_str));
+        assert_eq!(resolved.as_deref(), Some("Prompt content from file"));
+
+        // 3. Only text specified -> text is used
+        let resolved = resolve_custom_prompt(Some("Inline text prompt"), None);
+        assert_eq!(resolved.as_deref(), Some("Inline text prompt"));
+
+        // 4. File does not exist -> fallback to text
+        let non_existent = temp_dir.join("non_existent.md");
+        let non_existent_str = non_existent.to_str().unwrap();
+        let resolved = resolve_custom_prompt(Some("Fallback text prompt"), Some(non_existent_str));
+        assert_eq!(resolved.as_deref(), Some("Fallback text prompt"));
+
+        // 5. File does not exist and no text -> None
+        let resolved = resolve_custom_prompt(None, Some(non_existent_str));
+        assert_eq!(resolved, None);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_agent_profile_content_from_json_with_prompt_path() {
+        let json = r#"{
+            "name": "Custom Agent",
+            "custom_prompt": "Inline prompt",
+            "custom_prompt_path": "nonexistent_file.md"
+        }"#;
+
+        let content: AgentProfileContent = serde_json::from_str(json).unwrap();
+        assert_eq!(content.name.as_ref(), "Custom Agent");
+        assert_eq!(content.custom_prompt.as_deref(), Some("Inline prompt"));
+        assert_eq!(
+            content.custom_prompt_path.as_deref(),
+            Some("nonexistent_file.md")
+        );
+    }
+
+    #[test]
+    fn test_agent_profile_content_aliases() {
+        let json1 = r#"{
+            "name": "Alias Agent 1",
+            "custom_prompt_file": "path1.md"
+        }"#;
+        let content1: AgentProfileContent = serde_json::from_str(json1).unwrap();
+        assert_eq!(content1.custom_prompt_path.as_deref(), Some("path1.md"));
+
+        let json2 = r#"{
+            "name": "Alias Agent 2",
+            "prompt_path": "path2.md"
+        }"#;
+        let content2: AgentProfileContent = serde_json::from_str(json2).unwrap();
+        assert_eq!(content2.custom_prompt_path.as_deref(), Some("path2.md"));
     }
 
     #[test]

@@ -587,11 +587,19 @@ pub struct AgentProfileContent {
     pub default_model: Option<LanguageModelSelection>,
     /// Custom system prompt instructions for this profile.
     pub custom_prompt: Option<Arc<str>>,
+    /// Path to a file containing custom system prompt instructions for this profile.
+    /// If both `custom_prompt` and `custom_prompt_path` are specified, the file takes priority.
+    #[serde(
+        alias = "custom_prompt_file",
+        alias = "prompt_path",
+        alias = "prompt_file"
+    )]
+    pub custom_prompt_path: Option<Arc<str>>,
     /// Free-form description of what this profile is for. Surfaced to the
     /// parent agent in the catalog of delegatable agents.
     pub description: Option<Arc<str>>,
-    /// Restricts which skills are visible to this profile. When omitted, all
-    /// skills remain visible.
+    /// Skills whitelist for this profile. When omitted, built-in profiles
+    /// see all skills while custom profiles see none.
     pub skills: Option<Vec<Arc<str>>>,
     /// Declares that this profile may delegate to other profiles via
     /// `spawn_agent`. A profile without this block is a solo agent.

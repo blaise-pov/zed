@@ -52,3 +52,125 @@ fn diagnose_profiles_parse() {
         "some profiles were dropped: {profiles:?}"
     );
 }
+
+#[test]
+fn test_profiles_with_custom_prompt_path() {
+    let temp_dir = std::env::temp_dir().join(format!(
+        "zed_test_profiles_parse_{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&temp_dir).unwrap();
+    let prompt_file = temp_dir.join("system_prompt.txt");
+    std::fs::write(&prompt_file, "System prompt from external file").unwrap();
+
+    let file_path_str = prompt_file.to_str().unwrap().replace('\\', "/");
+
+    let json = format!(
+        r#"{{
+        "agent": {{
+            "profiles": {{
+                "file-priority": {{
+                    "name": "File Priority",
+                    "custom_prompt": "Ignored inline text",
+                    "custom_prompt_path": "{file_path_str}"
+                }},
+                "text-only": {{
+                    "name": "Text Only",
+                    "custom_prompt": "Direct inline prompt"
+                }},
+                "file-only": {{
+                    "name": "File Only",
+                    "custom_prompt_path": "{file_path_str}"
+                }}
+            }}
+        }}
+    }}"#
+    );
+
+    let (content, status) = SettingsContent::parse_json(&json);
+    assert_eq!(status, settings::ParseStatus::Success);
+
+    let content = content.unwrap();
+    let agent_content = content.agent.as_ref().unwrap();
+    let profiles_content = agent_content.profiles.as_ref().unwrap();
+
+    // 1. Check file-priority: both specified, file wins
+    let file_priority_content = profiles_content.get("file-priority").unwrap();
+    let profile_settings =
+        agent_settings::AgentProfileSettings::from(file_priority_content.clone());
+    assert_eq!(
+        profile_settings.custom_prompt.as_deref(),
+        Some("System prompt from external file")
+    );
+    assert_eq!(
+        profile_settings.custom_prompt_path.as_deref(),
+        Some(file_path_str.as_str())
+    );
+
+    // 2. Check text-only: only text specified
+    let text_only_content = profiles_content.get("text-only").unwrap();
+    let profile_settings = agent_settings::AgentProfileSettings::from(text_only_content.clone());
+    assert_eq!(
+        profile_settings.custom_prompt.as_deref(),
+        Some("Direct inline prompt")
+    );
+    assert_eq!(profile_settings.custom_prompt_path, None);
+
+    // 3. Check file-only: only file specified
+    let file_only_content = profiles_content.get("file-only").unwrap();
+    let profile_settings = agent_settings::AgentProfileSettings::from(file_only_content.clone());
+    assert_eq!(
+        profile_settings.custom_prompt.as_deref(),
+        Some("System prompt from external file")
+    );
+    assert_eq!(
+        profile_settings.custom_prompt_path.as_deref(),
+        Some(file_path_str.as_str())
+    );
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn test_model_env_vars_expansion() {
+    unsafe {
+        std::env::set_var("ZED_TEST_MODEL_PROVIDER", "TestProvider");
+        std::env::set_var("ZED_TEST_MODEL_NAME", "test-model-4");
+    }
+
+    let json = r#"{
+        "agent": {
+            "default_model": {
+                "provider": "${ZED_TEST_MODEL_PROVIDER}",
+                "model": "${ZED_TEST_MODEL_NAME}"
+            },
+            "profiles": {
+                "custom": {
+                    "name": "Custom Profile",
+                    "default_model": {
+                        "provider": "${ZED_TEST_FALLBACK_PROVIDER:-FallbackProvider}",
+                        "model": "${ZED_TEST_MODEL_NAME}"
+                    }
+                }
+            }
+        }
+    }"#;
+
+    let (content, status) = SettingsContent::parse_json(json);
+    assert_eq!(status, settings::ParseStatus::Success);
+
+    let content = content.unwrap();
+    let agent_content = content.agent.as_ref().unwrap();
+    let profiles_content = agent_content.profiles.as_ref().unwrap();
+
+    let custom_profile_content = profiles_content.get("custom").unwrap();
+    let profile_settings =
+        agent_settings::AgentProfileSettings::from(custom_profile_content.clone());
+
+    let profile_model = profile_settings.default_model.unwrap();
+    assert_eq!(profile_model.provider.0, "FallbackProvider");
+    assert_eq!(profile_model.model, "test-model-4");
+}

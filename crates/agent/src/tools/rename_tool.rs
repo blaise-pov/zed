@@ -189,6 +189,7 @@ mod tests {
             context_servers: collections::IndexMap::default(),
             default_model: None,
             custom_prompt: None,
+            custom_prompt_path: None,
             description: None,
             skills: None,
             delegation: None,
