@@ -2329,6 +2329,7 @@ fn run_tool_permissions_visual_tests(
                 always_allow: vec![CompiledRegex::new("hi", false).unwrap()],
                 always_deny: vec![CompiledRegex::new("hi", false).unwrap()],
                 always_confirm: vec![],
+                write_scopes: None,
                 invalid_patterns: vec![],
             },
         );

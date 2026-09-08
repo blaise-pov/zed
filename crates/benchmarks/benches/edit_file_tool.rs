@@ -324,6 +324,7 @@ fn init_context() -> TestAppContext {
                 always_allow: vec![],
                 always_deny: vec![],
                 always_confirm: vec![],
+                write_scopes: None,
                 invalid_patterns: vec![],
             },
         );
