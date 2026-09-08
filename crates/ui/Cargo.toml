@@ -42,4 +42,4 @@ ignored = ["log"]
 
 [features]
 default = []
-derive_inspector_reflection = []
+derive_inspector_reflection = ["gpui/inspector"]
