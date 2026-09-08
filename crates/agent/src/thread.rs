@@ -239,8 +239,9 @@ enum RetryStrategy {
         delay: Duration,
         max_attempts: u8,
     },
-    /// The provider rate-limited the request: poll adaptively with an
-    /// exponentially growing delay until the budget is spent.
+    /// The provider rate-limited the request or the connection to it was
+    /// interrupted: poll adaptively with an exponentially growing delay
+    /// until the budget is spent.
     ParkedPolling {
         policy: language_model::RateLimitParkingPolicy,
     },
@@ -4865,21 +4866,24 @@ impl Thread {
                     None => RetryStrategy::ExponentialBackoff,
                 })
             }
-            ApiReadResponseError { .. } | HttpSend { .. } | DeserializeResponse { .. } => {
-                Some(RetryStrategy::FixedDelay {
-                    delay: BASE_RETRY_DELAY,
-                    max_attempts: 3,
-                })
-            }
+            // Connection and stream failures (network drops, interrupted
+            // responses, truncated payloads) point to a transient outage on
+            // the provider's side: park the turn and poll adaptively within
+            // the same budget used for rate limits, instead of failing the
+            // turn after a few quick retries.
+            ApiReadResponseError { .. }
+            | HttpSend { .. }
+            | DeserializeResponse { .. }
+            | StreamEndedUnexpectedly { .. } => Some(RetryStrategy::ParkedPolling {
+                policy: rate_limit_policy,
+            }),
             // Retrying these errors definitely shouldn't help.
             NoApiKey { .. } => None,
             // These errors might be transient, so retry them
-            SerializeRequest { .. } | BuildRequestBody { .. } | StreamEndedUnexpectedly { .. } => {
-                Some(RetryStrategy::FixedDelay {
-                    delay: BASE_RETRY_DELAY,
-                    max_attempts: 1,
-                })
-            }
+            SerializeRequest { .. } | BuildRequestBody { .. } => Some(RetryStrategy::FixedDelay {
+                delay: BASE_RETRY_DELAY,
+                max_attempts: 1,
+            }),
             // Retrying won't help until the user consents to data retention
             // or switches models.
             DataRetentionConsentRequired { .. } => None,
@@ -8902,6 +8906,41 @@ mod tests {
                 policy: parking_policy(),
             })
         );
+    }
+
+    #[test]
+    fn test_retry_strategy_parks_stream_errors() {
+        // Connection and stream failures surface to the user as
+        // "The connection to <provider>'s API was interrupted"; they should
+        // park the turn adaptively instead of failing after a few retries.
+        let provider = language_model::LanguageModelProviderName::new("z.ai");
+        let stream_ended = LanguageModelCompletionError::StreamEndedUnexpectedly {
+            provider: provider.clone(),
+        };
+        let http_send = LanguageModelCompletionError::HttpSend {
+            provider: provider.clone(),
+            host: "api.z.ai".to_string(),
+            error: anyhow::anyhow!("connection reset by peer"),
+        };
+        let read_response = LanguageModelCompletionError::ApiReadResponseError {
+            provider: provider.clone(),
+            error: std::io::Error::new(std::io::ErrorKind::ConnectionAborted, "aborted"),
+        };
+        let deserialize = LanguageModelCompletionError::DeserializeResponse {
+            provider,
+            error: serde_json::from_str::<serde_json::Value>("{")
+                .expect_err("truncated JSON should fail to parse"),
+        };
+
+        for error in [&stream_ended, &http_send, &read_response, &deserialize] {
+            assert_eq!(
+                Thread::retry_strategy_for(error, parking_policy()),
+                Some(RetryStrategy::ParkedPolling {
+                    policy: parking_policy(),
+                }),
+                "{error:?} should park adaptively like a rate limit"
+            );
+        }
     }
 
     #[test]

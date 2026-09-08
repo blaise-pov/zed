@@ -30,7 +30,8 @@ pub fn init(cx: &mut App) {
 }
 
 /// How a turn should park when its provider rate-limits it (HTTP 429 /
-/// rate-limit rejection).
+/// rate-limit rejection) or when the connection to it fails transiently
+/// (interrupted stream, network error).
 ///
 /// Parking polls with an exponentially growing delay up to `max_wait`, until
 /// the total budget in `max_total_wait` is spent.
@@ -150,7 +151,8 @@ pub trait LanguageModel: Send + Sync {
     }
 
     /// How turns using this model should park when the provider rate-limits
-    /// them. Providers override this to expose provider-specific settings.
+    /// them or the connection to it is interrupted. Providers override this
+    /// to expose provider-specific settings.
     fn rate_limit_parking_policy(&self, _cx: &App) -> RateLimitParkingPolicy {
         RateLimitParkingPolicy::default()
     }
