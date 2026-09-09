@@ -1163,24 +1163,25 @@ impl SettingsStore {
                     }),
                 }?;
                 if let Some(mut new_settings) = new_settings {
-                    let mut new_agent = new_settings.agent.clone();
-                    if let Some(agent) = new_agent.as_mut() {
+                    // Layout keys are window-placement state and stay
+                    // user-scoped: project-local files must not set them.
+                    if let Some(agent) = new_settings.agent.as_mut() {
                         agent.clear_layout_keys();
-                        if let Some(profiles) = agent.profiles.as_mut() {
-                            let file_rel_path: Arc<RelPath> = directory_path
-                                .join(local_settings_file_relative_path())
-                                .into();
-                            for profile in profiles.values_mut() {
-                                profile.origin =
-                                    Some(settings_content::ProfileOriginContent::Project {
-                                        worktree_id: root_id,
-                                        path: file_rel_path.clone(),
-                                    });
-                            }
-                        }
                     }
-                    if let Some(project_agent) = new_settings.agent.as_mut() {
-                        project_agent.clear_layout_keys();
+                    let mut new_agent = new_settings.agent.clone();
+                    if let Some(profiles) =
+                        new_agent.as_mut().and_then(|agent| agent.profiles.as_mut())
+                    {
+                        let file_rel_path: Arc<RelPath> = directory_path
+                            .join(local_settings_file_relative_path())
+                            .into();
+                        for profile in profiles.values_mut() {
+                            profile.origin =
+                                Some(settings_content::ProfileOriginContent::Project {
+                                    worktree_id: root_id,
+                                    path: file_rel_path.clone(),
+                                });
+                        }
                     }
                     let mut new_content = SettingsContent {
                         project: new_settings,
@@ -1471,10 +1472,11 @@ impl SettingsStore {
             // key over user settings. Layout keys (e.g. dock, task_dock) are
             // excluded so project settings cannot override user window placement.
             for local_settings in self.local_settings.values() {
-                if let Some(mut local_agent) = local_settings.agent.clone() {
-                    local_agent.clear_layout_keys();
-                    merged.agent.merge_from(&Some(local_agent));
-                }
+                let local_agent = local_settings.agent.clone().map(|mut agent| {
+                    agent.clear_layout_keys();
+                    agent
+                });
+                merged.agent.merge_from(&local_agent);
             }
 
             self.merged_settings = Rc::new(merged);
@@ -1545,10 +1547,11 @@ impl SettingsStore {
                 merged.agent.merge_from(&server.agent);
             }
             for local_settings in self.local_settings.values() {
-                if let Some(mut local_agent) = local_settings.agent.clone() {
-                    local_agent.clear_layout_keys();
-                    merged.agent.merge_from(&Some(local_agent));
-                }
+                let local_agent = local_settings.agent.clone().map(|mut agent| {
+                    agent.clear_layout_keys();
+                    agent
+                });
+                merged.agent.merge_from(&local_agent);
             }
 
             self.merged_settings = Rc::new(merged);
