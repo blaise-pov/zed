@@ -1194,14 +1194,17 @@ impl SettingsObserver {
                 if change != &PathChange::Removed {
                     let abs_path = worktree.read(cx).absolutize(path);
                     let fs = fs.clone();
-                    cx.spawn(async move |_this, cx| {
-                        if let Ok(content) = fs.load(&abs_path).await {
+                    cx.spawn(async move |_this, cx| match fs.load(&abs_path).await {
+                        Ok(content) => {
                             util::load_env(&content);
                             cx.update(|cx| {
                                 cx.update_global::<SettingsStore, _>(|store, cx| {
                                     store.reload(cx);
                                 });
                             });
+                        }
+                        Err(error) => {
+                            log::warn!("failed to load {}: {error}", abs_path.display());
                         }
                     })
                     .detach();

@@ -12,8 +12,8 @@ use collections::HashMap;
 use fs::{Fs, copy_recursive};
 use futures::{FutureExt, future::Shared};
 use gpui::{
-    App, AppContext as _, AsyncApp, Context, Entity, EntityId, EventEmitter, Global, Task, TaskExt,
-    WeakEntity,
+    App, AppContext as _, AsyncApp, BorrowAppContext, Context, Entity, EntityId, EventEmitter,
+    Global, Task, TaskExt, WeakEntity,
 };
 use itertools::Either;
 use postage::{prelude::Stream as _, watch};
@@ -21,6 +21,7 @@ use rpc::{
     AnyProtoClient, ErrorExt, TypedEnvelope,
     proto::{self, REMOTE_SERVER_PROJECT_ID},
 };
+use settings::SettingsStore;
 use text::ReplicaId;
 use util::{
     ResultExt,
@@ -935,8 +936,25 @@ impl WorktreeStore {
         cx.spawn(async move |this, cx| {
             let worktree_id = next_worktree_id.await?;
             let dot_env_path = abs_path.as_path().join(".env");
-            if let Ok(content) = fs.load(&dot_env_path).await {
-                util::load_env(&content);
+            if fs.is_file(&dot_env_path).await {
+                match fs.load(&dot_env_path).await {
+                    Ok(content) => {
+                        util::load_env(&content);
+                        // Re-expand `${VAR}` references in already-parsed
+                        // settings (e.g. model ids) now that the environment
+                        // has been seeded from the project's `.env` file.
+                        cx.update(|cx| {
+                            if cx.has_global::<SettingsStore>() {
+                                cx.update_global::<SettingsStore, _>(|store, cx| {
+                                    store.reload(cx);
+                                });
+                            }
+                        });
+                    }
+                    Err(error) => {
+                        log::warn!("failed to load {}: {error}", dot_env_path.display());
+                    }
+                }
             }
             let worktree = Worktree::local(
                 SanitizedPath::cast_arc(abs_path.clone()),
