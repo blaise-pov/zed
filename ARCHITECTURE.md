@@ -1,14 +1,14 @@
-# Архитектура: Zed Agent Runtime + Task Graph Runtime
+# Архитектура: Zed Agent Runtime + Task Graph Service (TGS)
 
 Форк превращает Zed в IDE и runtime для иерархии автономных coding-агентов. Ответственность жёстко разделена между тремя слоями:
 
 | Слой | Отвечает за |
 |---|---|
 | **Zed** (Execution Layer) | Профили агентов, жизненный цикл сессий (`Thread` / `AcpThread` / `NativeAgent`), иерархическое делегирование (`spawn_agent`), безопасность (`tool_permissions`, `write_scopes`, fail-closed), изоляция задач в Git Worktree, песочница терминала, UI панелей |
-| **TGR** (Control Plane) | Цели (Goals), DAG задач с валидацией циклов, стейт-машина задач, контракты, лизинг с heartbeat, двухфазное ревью, неизменяемые артефакты, append-only аудит |
+| **TGS** (Control Plane) | Цели (Goals), DAG задач с валидацией циклов, стейт-машина задач, контракты, лизинг с heartbeat, двухфазное ревью, неизменяемые артефакты, append-only аудит |
 | **LLM** (Reasoning Engine) | Понимание контекста, декомпозиция задач, выбор целевого профиля агента, архитектура и реализация кода |
 
-Zed и TGR общаются по протоколу MCP (JSON-RPC 2.0, stdio). [TGR](https://github.com/blaise-pov/tgr) — независимый демон на Go с хранилищем SQLite WAL; ключ сервера в `context_servers` задаётся настройкой `agent.task_graph_server_id` (по умолчанию `tgs`) и применяется без перезапуска.
+Zed и TGS общаются по протоколу MCP (JSON-RPC 2.0, stdio). [TGS](https://github.com/blaise-pov/tgr) — независимый демон на Go с хранилищем SQLite WAL; ключ сервера в `context_servers` задаётся настройкой `agent.task_graph_server_id` (по умолчанию `tgs`) и применяется без перезапуска.
 
 ```text
 USER ──► Zed UI (Agent Panel / Agent Task Panel)
@@ -16,7 +16,7 @@ USER ──► Zed UI (Agent Panel / Agent Task Panel)
               ├── Agent Runtime: профили, сессии, spawn_agent,
               │   tool_permissions, write_scopes, worktrees, песочница
               │
-              └── McpAgentTaskProvider ──► TGR MCP Server:
+              └── McpAgentTaskProvider ──► TGS MCP Server:
                   задачи, DAG, лизинг, ревью, артефакты, события
 ```
 
@@ -69,7 +69,7 @@ USER ──► Zed UI (Agent Panel / Agent Task Panel)
 | `delegation` | Правила делегирования: `allowed` профили и `max_depth` (1–5); профиль без блока — соло-агент |
 | `tool_permissions` | Политики инструментов: `default`, `always_allow` / `always_deny` (regex), `write_scopes` (glob) |
 
-TGR не хранит содержимое профилей — задача в графе ссылается на целевой профиль полем `assigned_profile = "backend"`.
+TGS не хранит содержимое профилей — задача в графе ссылается на целевой профиль полем `assigned_profile = "backend"`.
 
 **Ключи раскладки окон (`dock`, `task_dock`, `flexible`) — всегда пользовательские:** проектные настройки их игнорируют, чтобы файл `.zed/settings.json` в репозитории не двигал окна у всех участников.
 
@@ -77,7 +77,7 @@ TGR не хранит содержимое профилей — задача в 
 
 ## 2. Делегирование: две независимые операции
 
-1. **Регистрация подзадачи в TGR** (MCP): `task_create` с контрактом, `assigned_profile`, `write_scope` и `depends_on`. TGR валидирует DAG и переводит задачу в `READY`.
+1. **Регистрация подзадачи в TGS** (MCP): `task_create` с контрактом, `assigned_profile`, `write_scope` и `depends_on`. TGS валидирует DAG и переводит задачу в `READY`.
 2. **Запуск агента в Zed** (встроенный инструмент): `spawn_agent(profile, task_id, label, message)`.
 
 Runtime Flow при `spawn_agent`:
@@ -89,10 +89,10 @@ Runtime Flow при `spawn_agent`:
 
 ```text
 Root (orchestrator)
-  ├── TGR: task_create(assigned_profile="backend")  ──► TASK-1
+  ├── TGS: task_create(assigned_profile="backend")  ──► TASK-1
   └── Zed: spawn_agent(profile="backend", task_id="TASK-1")
-        ├── TGR: task_create(parent=TASK-1, profile="repository-engineer") ──► TASK-2
-        └── TGR: task_create(parent=TASK-1, profile="transport-engineer",
+        ├── TGS: task_create(parent=TASK-1, profile="repository-engineer") ──► TASK-2
+        └── TGS: task_create(parent=TASK-1, profile="transport-engineer",
                              depends_on=["TASK-2"])                      ──► TASK-3
 ```
 
@@ -104,9 +104,9 @@ Root (orchestrator)
 
 ---
 
-## 4. Task Graph Runtime (Control Plane)
+## 4. Task Graph Service (Control Plane)
 
-TGR — легковесный демон на Go (`cmd/taskgraph`), MCP-сервер по JSON-RPC 2.0 (stdio) на SQLite WAL с ACID-транзакциями.
+TGS — легковесный демон на Go (`cmd/taskgraph`), MCP-сервер по JSON-RPC 2.0 (stdio) на SQLite WAL с ACID-транзакциями.
 
 Доменная модель: `goals` (цели), `tasks` (задачи с `contract`, `assigned_profile`, `write_scopes`), `task_dependencies` (рёбра DAG с проверкой ацикличности), `artifacts` (неизменяемые версионированные результаты с `supersedes`), `events` (append-only аудит), `leases` (аренда с TTL и heartbeat).
 
@@ -152,7 +152,7 @@ stateDiagram-v2
 
 ## 6. Панель задач и изоляция в Git Worktree
 
-- **`McpAgentTaskProvider` + `AgentTaskStore`** — реактивное получение графа задач и ленты событий из TGR.
+- **`McpAgentTaskProvider` + `AgentTaskStore`** — реактивное получение графа задач и ленты событий из TGS.
 - **Дерево задач**: Goal → Task → Subtasks со статусами (`Ready`, `Blocked`, `Running`, `Stale`, `Review`, `Completed`, `Failed`) и номером попытки (`#attempt`).
 - **Действия**: `Run Task`, `Force Approve`, `Request Changes`, `Reject`, `Retry`, `View Task Diff` (изменения относительно базовой ветки), лента `AgentTaskTimeline`.
 - **Изоляция**: при запуске задачи создаётся ветка `agent-task/{task_id}` и отдельный worktree `agent-task-{task_id}` — параллельные воркеры работают в независимых файловых деревьях.

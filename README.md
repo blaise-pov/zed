@@ -7,9 +7,9 @@
 
 Форк превращает Zed в IDE и Execution Runtime для **иерархии специализированных автономных агентов**. Все настройки определяются декларативно в `settings.json` (пользовательском или `.zed/settings.json` проекта; настройки проекта дополняют и переопределяют глобальные).
 
-Полное описание архитектуры и разделения ответственности между Zed, Task Graph Runtime и LLM — в [ARCHITECTURE.md](./ARCHITECTURE.md).
+Полное описание архитектуры и разделения ответственности между Zed, Task Graph Service (TGS) и LLM — в [ARCHITECTURE.md](./ARCHITECTURE.md).
 
-В качестве Control Plane для управления целями, графом задач, ревью и координацией используется [**Task Graph Runtime (TGR)**](https://github.com/blaise-pov/tgr) — автономный MCP-сервер.
+В качестве Control Plane для управления целями, графом задач, ревью и координацией используется [**Task Graph Service (TGS)**](https://github.com/blaise-pov/tgr) — автономный MCP-сервер.
 
 ---
 
@@ -55,7 +55,7 @@
 
 ### 4. Панель задач (Agent Task Panel) и изоляция в Git Worktree
 
-Интегрированный UI для работы с задачами TGR:
+Интегрированный UI для работы с задачами TGS:
 
 - **Дерево задач**: визуализация иерархии Goal → Task → Subtasks со статусами (`Ready`, `Claimed`, `Running`, `Review`, `Waiting for Approval`, `Completed`, `Failed`, `Stale`, `Blocked`) и номером текущей попытки (`#attempt`).
 - **Действия**: запуск (`Run Task`), утверждение (`Force Approve`), запрос доработок (`Request Changes`), отклонение (`Reject`), повтор (`Retry`).
@@ -65,9 +65,9 @@
 
 ---
 
-### 5. Интеграция с Task Graph Runtime (TGR)
+### 5. Интеграция с Task Graph Service (TGS)
 
-[**TGR (Task Graph Runtime)**](https://github.com/blaise-pov/tgr) — легковесный, независимый Control Plane демон на Go (`cmd/taskgraph`), предоставляющий MCP-сервер по протоколу JSON-RPC 2.0 (stdio) на базе SQLite WAL:
+[**TGS (Task Graph Service)**](https://github.com/blaise-pov/tgr) — легковесный, независимый Control Plane демон на Go (`cmd/taskgraph`), предоставляющий MCP-сервер по протоколу JSON-RPC 2.0 (stdio) на базе SQLite WAL:
 
 - **Задачи и DAG**: 12-состояний жизненного цикла, проверка ацикличности, pull-based планировщик с учетом приоритетов.
 - **Лизинг и Recovery**: атомарный захват задач (`task_claim`), аренда с heartbeat и автоматический сборщик зависших воркеров при сбоях (`recovery.Worker`).
@@ -75,7 +75,7 @@
 - **База знаний и обучение**: фиксация выводов (`lessons`) и предложений новых навыков (`skill_candidates`).
 - **Артефакты**: версионируемые неизменяемые результаты работы.
 
-Zed взаимодействует с TGR через встроенный `McpAgentTaskProvider` и реактивный `AgentTaskStore`. Ключ сервера настраивается через `agent.task_graph_server_id` (по умолчанию `tgs`) и должен совпадать с ключом в `context_servers`; смена применяется без перезапуска.
+Zed взаимодействует с TGS через встроенный `McpAgentTaskProvider` и реактивный `AgentTaskStore`. Ключ сервера настраивается через `agent.task_graph_server_id` (по умолчанию `tgs`) и должен совпадать с ключом в `context_servers`; смена применяется без перезапуска.
 
 ---
 
