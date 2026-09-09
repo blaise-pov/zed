@@ -1035,10 +1035,13 @@ pub fn parse_env(content: &str) -> Vec<(String, String)> {
                 continue;
             }
             let mut value = value.trim();
-            if (value.starts_with('"') && value.ends_with('"') && value.len() >= 2)
-                || (value.starts_with('\'') && value.ends_with('\'') && value.len() >= 2)
+            if let Some(quote) = value.chars().next().filter(|c| *c == '"' || *c == '\'')
+                && value.len() >= 2
+                && let Some(close) = value[1..].rfind(quote)
             {
-                value = &value[1..value.len() - 1];
+                // Unquote up to the last matching quote; anything after it
+                // (e.g. an inline comment) is discarded.
+                value = &value[1..1 + close];
             } else if let Some((uncommented, _)) = value.split_once(" #") {
                 value = uncommented.trim_end();
             }
@@ -1114,6 +1117,8 @@ SINGLE='quoted value'
 EMPTY=
   SPACED_KEY  =  spaced_value
 WITH_COMMENT=value_here # this is an inline comment
+QUOTED_WITH_COMMENT="quoted value" # this is an inline comment
+QUOTED_WITH_HASH="kept # hash"
 "#;
         let vars = parse_env(content);
         assert_eq!(
@@ -1125,6 +1130,11 @@ WITH_COMMENT=value_here # this is an inline comment
                 ("EMPTY".to_string(), "".to_string()),
                 ("SPACED_KEY".to_string(), "spaced_value".to_string()),
                 ("WITH_COMMENT".to_string(), "value_here".to_string()),
+                (
+                    "QUOTED_WITH_COMMENT".to_string(),
+                    "quoted value".to_string()
+                ),
+                ("QUOTED_WITH_HASH".to_string(), "kept # hash".to_string()),
             ]
         );
     }
