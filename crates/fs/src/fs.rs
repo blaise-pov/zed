@@ -3565,7 +3565,8 @@ fn atomic_replace<P: AsRef<Path>>(
     let replacement_path = HSTRING::from(replacement_file.as_ref().to_string_lossy().into_owned());
 
     const MAX_RETRIES: u32 = 4;
-    for attempt in 0..MAX_RETRIES {
+    let mut attempt = 0;
+    loop {
         let result = unsafe {
             ReplaceFileW(
                 &replaced_path,
@@ -3583,14 +3584,13 @@ fn atomic_replace<P: AsRef<Path>>(
                 let code = error.code();
                 let is_sharing_conflict = code == ERROR_SHARING_VIOLATION.to_hresult()
                     || code == ERROR_ACCESS_DENIED.to_hresult();
-                if is_sharing_conflict && attempt + 1 < MAX_RETRIES {
-                    std::thread::sleep(std::time::Duration::from_millis(50 * (attempt as u64 + 1)));
-                    continue;
+                if !is_sharing_conflict || attempt + 1 >= MAX_RETRIES {
+                    return Err(error);
                 }
-                return Err(error);
             }
         }
-    }
 
-    Ok(())
+        attempt += 1;
+        std::thread::sleep(std::time::Duration::from_millis(50 * attempt as u64));
+    }
 }
