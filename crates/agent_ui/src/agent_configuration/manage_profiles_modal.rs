@@ -8,11 +8,9 @@ use agent_settings::{
 };
 use editor::Editor;
 use fs::Fs;
-use gpui::{
-    DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, Subscription, WeakEntity,
-    prelude::*,
-};
+use gpui::{DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, Subscription, prelude::*};
 use language_model::{LanguageModel, LanguageModelRegistry};
+use project::Project;
 use settings::SettingsStore;
 use settings::{LanguageModelProviderSetting, LanguageModelSelection, Settings as _};
 use ui::{
@@ -144,7 +142,7 @@ pub struct ManageProfilesModal {
     fs: Arc<dyn Fs>,
     context_server_registry: Entity<ContextServerRegistry>,
     active_model: Option<Arc<dyn LanguageModel>>,
-    workspace: Option<WeakEntity<Workspace>>,
+    project: Option<Entity<Project>>,
     focus_handle: FocusHandle,
     mode: Mode,
     _settings_subscription: Subscription,
@@ -168,13 +166,13 @@ impl ManageProfilesModal {
                     .and_then(|thread| thread.read(cx).model().cloned());
 
                 let context_server_registry = panel.read(cx).context_server_registry().clone();
-                let workspace_handle = cx.entity().downgrade();
+                let project = workspace.project().clone();
                 workspace.toggle_modal(window, cx, |window, cx| {
                     let mut this = Self::new(
                         fs,
                         active_model,
                         context_server_registry,
-                        Some(workspace_handle),
+                        Some(project),
                         window,
                         cx,
                     );
@@ -193,13 +191,12 @@ impl ManageProfilesModal {
         fs: Arc<dyn Fs>,
         active_model: Option<Arc<dyn LanguageModel>>,
         context_server_registry: Entity<ContextServerRegistry>,
-        workspace: Option<WeakEntity<Workspace>>,
+        project: Option<Entity<Project>>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let focus_handle = cx.focus_handle();
-        let location = workspace.as_ref().and_then(|w| w.upgrade()).and_then(|w| {
-            let project = w.read(cx).project();
+        let location = project.as_ref().and_then(|project| {
             let worktree_id = project
                 .read(cx)
                 .visible_worktrees(cx)
@@ -225,7 +222,7 @@ impl ManageProfilesModal {
             fs,
             active_model,
             context_server_registry,
-            workspace,
+            project,
             focus_handle,
             mode: Mode::choose_profile(location, window, cx),
             _settings_subscription: settings_subscription,
@@ -233,8 +230,7 @@ impl ManageProfilesModal {
     }
 
     pub fn settings_location(&self, cx: &App) -> Option<settings::SettingsLocation<'static>> {
-        let workspace = self.workspace.as_ref()?.upgrade()?;
-        let project = workspace.read(cx).project();
+        let project = self.project.as_ref()?;
         let worktree_id = project
             .read(cx)
             .visible_worktrees(cx)
@@ -283,14 +279,7 @@ impl ManageProfilesModal {
         });
 
         let mut available_origins = vec![ProfileOrigin::Global];
-        let app_state = workspace::AppState::global(cx);
-        for workspace in app_state
-            .workspace_store
-            .read(cx)
-            .workspaces()
-            .filter_map(|w| w.upgrade())
-        {
-            let project = workspace.read(cx).project();
+        if let Some(project) = self.project.as_ref() {
             for worktree in project.read(cx).worktrees(cx) {
                 let worktree_read = worktree.read(cx);
                 if worktree_read.is_visible() {

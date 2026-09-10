@@ -39,6 +39,7 @@ use gpui::{
     Stateful, Task, WeakEntity, Window, actions, prelude::*,
 };
 use markdown::{Markdown, MarkdownElement, MarkdownFont, MarkdownStyle};
+use project::Project;
 use settings::{Settings, SettingsStore};
 use ui::{
     Button, ButtonStyle, Color, Icon, IconButton, IconName, IconSize, Label, LabelSize, Tooltip,
@@ -74,8 +75,15 @@ pub fn init(file_system: Arc<dyn Fs>, cx: &mut App) {
         ));
         let store = cx.new(|cx| agent::AgentTaskStore::new(provider, cx));
 
-        let panel = cx
-            .new(|cx| AgentTaskPanel::new(store, workspace.weak_handle(), file_system.clone(), cx));
+        let panel = cx.new(|cx| {
+            AgentTaskPanel::new(
+                store,
+                workspace.weak_handle(),
+                project,
+                file_system.clone(),
+                cx,
+            )
+        });
 
         if let Some(window) = window {
             workspace.add_panel(panel, window, cx);
@@ -95,6 +103,7 @@ pub struct AgentTaskPanel {
     artifacts: Vec<(AgentTaskArtifact, Entity<Markdown>)>,
     focus_handle: FocusHandle,
     workspace: WeakEntity<Workspace>,
+    project: Entity<Project>,
     file_system: Arc<dyn Fs>,
     _fetch_detail_task: Option<Task<()>>,
     _action_task: Option<Task<()>>,
@@ -104,6 +113,7 @@ impl AgentTaskPanel {
     pub fn new(
         store: Entity<AgentTaskStore>,
         workspace: WeakEntity<Workspace>,
+        project: Entity<Project>,
         file_system: Arc<dyn Fs>,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -124,6 +134,7 @@ impl AgentTaskPanel {
             artifacts: Vec::new(),
             focus_handle: cx.focus_handle(),
             workspace,
+            project,
             file_system,
             _fetch_detail_task: None,
             _action_task: None,
@@ -134,18 +145,14 @@ impl AgentTaskPanel {
     /// setting changes, so the panel talks to a different MCP server without
     /// a restart.
     fn sync_task_server(&mut self, cx: &mut Context<Self>) {
-        let Some(workspace) = self.workspace.upgrade() else {
-            return;
-        };
-        let project = workspace.read(cx).project();
-        let server_name = AgentSettings::get_for_project(project.read(cx), cx)
+        let server_name = AgentSettings::get_for_project(self.project.read(cx), cx)
             .task_graph_server_id
             .clone();
         if self.store.read(cx).provider().server_id().0.as_ref() == server_name {
             return;
         }
 
-        let context_server_store = project.read(cx).context_server_store();
+        let context_server_store = self.project.read(cx).context_server_store();
         let provider = Arc::new(agent::McpAgentTaskProvider::new(
             context_server_store,
             context_server::ContextServerId(server_name.into()),
@@ -357,7 +364,7 @@ impl AgentTaskPanel {
             return;
         };
 
-        let project = workspace.read(cx).project().clone();
+        let project = self.project.clone();
         let ensure_task = ensure_task_worktree(project, &summary, cx);
 
         let mut prompt = format!("## Task: {}\n\n", summary.title);
@@ -435,10 +442,7 @@ impl AgentTaskPanel {
     /// Removes the task's isolated worktree once the task has reached a
     /// terminal state and the user no longer needs its checkout.
     fn remove_task_worktree(&mut self, task_id: &AgentTaskId, cx: &mut Context<Self>) {
-        let Some(workspace) = self.workspace.upgrade() else {
-            return;
-        };
-        let project = workspace.read(cx).project().clone();
+        let project = self.project.clone();
         let remove_task = crate::agent_task_worktree::remove_task_worktree(project, task_id, cx);
         remove_task.detach_and_log_err(cx);
     }
@@ -973,14 +977,14 @@ mod tests {
     async fn test_agent_task_panel_offline_rendering(cx: &mut TestAppContext) {
         init_test(cx);
         let file_system = FakeFs::new(cx.executor());
-        let _project = Project::test(file_system.clone(), [], cx).await;
+        let project = Project::test(file_system.clone(), [], cx).await;
         let provider = Arc::new(TestProvider { offline: true });
         let store = cx.update(|cx| cx.new(|cx| AgentTaskStore::new(provider, cx)));
 
         // Opening a window with the panel as its root view exercises
         // `render`: the offline banner must draw without panicking.
         let (panel, cx) = cx.add_window_view(|_window, cx| {
-            AgentTaskPanel::new(store, WeakEntity::new_invalid(), file_system, cx)
+            AgentTaskPanel::new(store, WeakEntity::new_invalid(), project, file_system, cx)
         });
         cx.run_until_parked();
 
@@ -994,12 +998,12 @@ mod tests {
     async fn test_agent_task_panel_online_tree_rendering(cx: &mut TestAppContext) {
         init_test(cx);
         let file_system = FakeFs::new(cx.executor());
-        let _project = Project::test(file_system.clone(), [], cx).await;
+        let project = Project::test(file_system.clone(), [], cx).await;
         let provider = Arc::new(TestProvider { offline: false });
         let store = cx.update(|cx| cx.new(|cx| AgentTaskStore::new(provider, cx)));
 
         let (panel, cx) = cx.add_window_view(|_window, cx| {
-            AgentTaskPanel::new(store, WeakEntity::new_invalid(), file_system, cx)
+            AgentTaskPanel::new(store, WeakEntity::new_invalid(), project, file_system, cx)
         });
         cx.run_until_parked();
 
@@ -1033,12 +1037,12 @@ mod tests {
     ) {
         init_test(cx);
         let file_system = FakeFs::new(cx.executor());
-        let _project = Project::test(file_system.clone(), [], cx).await;
+        let project = Project::test(file_system.clone(), [], cx).await;
         let provider = Arc::new(TestProvider { offline: false });
         let store = cx.update(|cx| cx.new(|cx| AgentTaskStore::new(provider, cx)));
 
         let (panel, cx) = cx.add_window_view(|_window, cx| {
-            AgentTaskPanel::new(store, WeakEntity::new_invalid(), file_system, cx)
+            AgentTaskPanel::new(store, WeakEntity::new_invalid(), project, file_system, cx)
         });
         cx.run_until_parked();
 
