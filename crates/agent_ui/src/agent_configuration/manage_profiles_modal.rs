@@ -8,7 +8,10 @@ use agent_settings::{
 };
 use editor::Editor;
 use fs::Fs;
-use gpui::{DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, Subscription, prelude::*};
+use gpui::{
+    DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, Subscription, WeakEntity,
+    prelude::*,
+};
 use language_model::{LanguageModel, LanguageModelRegistry};
 use settings::SettingsStore;
 use settings::{LanguageModelProviderSetting, LanguageModelSelection, Settings as _};
@@ -66,8 +69,12 @@ enum Mode {
 }
 
 impl Mode {
-    pub fn choose_profile(_window: &mut Window, cx: &mut Context<ManageProfilesModal>) -> Self {
-        let settings = AgentSettings::get_global(cx);
+    pub fn choose_profile(
+        location: Option<settings::SettingsLocation>,
+        _window: &mut Window,
+        cx: &mut Context<ManageProfilesModal>,
+    ) -> Self {
+        let settings = AgentSettings::get(location, cx);
 
         let mut builtin_profiles = Vec::new();
         let mut custom_profiles = Vec::new();
@@ -137,6 +144,7 @@ pub struct ManageProfilesModal {
     fs: Arc<dyn Fs>,
     context_server_registry: Entity<ContextServerRegistry>,
     active_model: Option<Arc<dyn LanguageModel>>,
+    workspace: Option<WeakEntity<Workspace>>,
     focus_handle: FocusHandle,
     mode: Mode,
     _settings_subscription: Subscription,
@@ -160,8 +168,16 @@ impl ManageProfilesModal {
                     .and_then(|thread| thread.read(cx).model().cloned());
 
                 let context_server_registry = panel.read(cx).context_server_registry().clone();
+                let workspace_handle = cx.entity().downgrade();
                 workspace.toggle_modal(window, cx, |window, cx| {
-                    let mut this = Self::new(fs, active_model, context_server_registry, window, cx);
+                    let mut this = Self::new(
+                        fs,
+                        active_model,
+                        context_server_registry,
+                        Some(workspace_handle),
+                        window,
+                        cx,
+                    );
 
                     if let Some(profile_id) = action.customize_tools.clone() {
                         this.configure_builtin_tools(profile_id, window, cx);
@@ -177,16 +193,29 @@ impl ManageProfilesModal {
         fs: Arc<dyn Fs>,
         active_model: Option<Arc<dyn LanguageModel>>,
         context_server_registry: Entity<ContextServerRegistry>,
+        workspace: Option<WeakEntity<Workspace>>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let focus_handle = cx.focus_handle();
+        let location = workspace.as_ref().and_then(|w| w.upgrade()).and_then(|w| {
+            let project = w.read(cx).project();
+            let worktree_id = project
+                .read(cx)
+                .visible_worktrees(cx)
+                .next()
+                .map(|w| w.read(cx).id())?;
+            Some(settings::SettingsLocation {
+                worktree_id,
+                path: util::rel_path::RelPath::empty(),
+            })
+        });
 
         // Keep this modal in sync with settings changes (including profile deletion).
         let settings_subscription =
             cx.observe_global_in::<SettingsStore>(window, |this, window, cx| {
                 if matches!(this.mode, Mode::ChooseProfile(_)) {
-                    this.mode = Mode::choose_profile(window, cx);
+                    this.mode = Mode::choose_profile(this.settings_location(cx), window, cx);
                     this.focus_handle(cx).focus(window, cx);
                     cx.notify();
                 }
@@ -196,10 +225,29 @@ impl ManageProfilesModal {
             fs,
             active_model,
             context_server_registry,
+            workspace,
             focus_handle,
-            mode: Mode::choose_profile(window, cx),
+            mode: Mode::choose_profile(location, window, cx),
             _settings_subscription: settings_subscription,
         }
+    }
+
+    pub fn settings_location(&self, cx: &App) -> Option<settings::SettingsLocation<'static>> {
+        let workspace = self.workspace.as_ref()?.upgrade()?;
+        let project = workspace.read(cx).project();
+        let worktree_id = project
+            .read(cx)
+            .visible_worktrees(cx)
+            .next()
+            .map(|w| w.read(cx).id())?;
+        Some(settings::SettingsLocation {
+            worktree_id,
+            path: util::rel_path::RelPath::empty(),
+        })
+    }
+
+    pub fn agent_settings<'a>(&self, cx: &'a App) -> &'a AgentSettings {
+        AgentSettings::get(self.settings_location(cx), cx)
     }
 
     pub fn save_profile_change_by_origin(
@@ -219,7 +267,7 @@ impl ManageProfilesModal {
     }
 
     fn choose_profile(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.mode = Mode::choose_profile(window, cx);
+        self.mode = Mode::choose_profile(self.settings_location(cx), window, cx);
         self.focus_handle(cx).focus(window, cx);
     }
 
@@ -259,7 +307,7 @@ impl ManageProfilesModal {
 
         let target_origin = base_profile_id
             .as_ref()
-            .and_then(|id| AgentSettings::get_global(cx).profiles.get(id))
+            .and_then(|id| self.agent_settings(cx).profiles.get(id))
             .map(|p| p.origin.clone())
             .unwrap_or_default();
 
@@ -307,11 +355,9 @@ impl ManageProfilesModal {
         );
         let fs = self.fs.clone();
         let profile_id_for_closure = profile_id.clone();
+        let settings_location = self.settings_location(cx);
 
-        let profile = AgentSettings::get_global(cx)
-            .profiles
-            .get(&profile_id)
-            .cloned();
+        let profile = self.agent_settings(cx).profiles.get(&profile_id).cloned();
         let origin = profile
             .as_ref()
             .map(|p| p.origin.clone())
@@ -324,7 +370,7 @@ impl ManageProfilesModal {
                 {
                     let profile_id = profile_id.clone();
                     move |cx| {
-                        let settings = AgentSettings::get_global(cx);
+                        let settings = AgentSettings::get(settings_location, cx);
 
                         settings
                             .profiles
@@ -423,7 +469,7 @@ impl ManageProfilesModal {
             profile_id = profile_id.as_str(),
             is_builtin = builtin_profiles::is_builtin(&profile_id)
         );
-        let settings = AgentSettings::get_global(cx);
+        let settings = self.agent_settings(cx);
         let Some(profile) = settings.profiles.get(&profile_id).cloned() else {
             return;
         };
@@ -464,8 +510,16 @@ impl ManageProfilesModal {
             profile_id = profile_id.as_str(),
             is_builtin = builtin_profiles::is_builtin(&profile_id)
         );
-        let delegation_editor =
-            cx.new(|cx| DelegationEditor::new(profile_id.clone(), self.fs.clone(), window, cx));
+        let settings_location = self.settings_location(cx);
+        let delegation_editor = cx.new(|cx| {
+            DelegationEditor::new(
+                profile_id.clone(),
+                self.fs.clone(),
+                settings_location,
+                window,
+                cx,
+            )
+        });
         let dismiss_subscription = cx.subscribe_in(&delegation_editor, window, {
             let profile_id = profile_id.clone();
             move |this, _delegation_editor, _: &DismissEvent, window, cx| {
@@ -492,8 +546,16 @@ impl ManageProfilesModal {
             profile_id = profile_id.as_str(),
             is_builtin = builtin_profiles::is_builtin(&profile_id)
         );
-        let skills_editor =
-            cx.new(|cx| SkillsEditor::new(profile_id.clone(), self.fs.clone(), window, cx));
+        let settings_location = self.settings_location(cx);
+        let skills_editor = cx.new(|cx| {
+            SkillsEditor::new(
+                profile_id.clone(),
+                self.fs.clone(),
+                settings_location,
+                window,
+                cx,
+            )
+        });
         let dismiss_subscription = cx.subscribe_in(&skills_editor, window, {
             let profile_id = profile_id.clone();
             move |this, _skills_editor, _: &DismissEvent, window, cx| {
@@ -520,7 +582,7 @@ impl ManageProfilesModal {
             profile_id = profile_id.as_str(),
             is_builtin = builtin_profiles::is_builtin(&profile_id)
         );
-        let settings = AgentSettings::get_global(cx);
+        let settings = self.agent_settings(cx);
         let prompt = settings
             .profiles
             .get(&profile_id)
@@ -542,6 +604,7 @@ impl ManageProfilesModal {
 
         let initial_prompt = prompt.to_string();
         let fs = self.fs.clone();
+        let settings_location = self.settings_location(cx);
         let target_profile_id = profile_id.clone();
         let subscription = cx.subscribe(&prompt_editor, move |_this, editor, event, cx| {
             // Persist only on blur: saving on every keystroke would rewrite
@@ -554,7 +617,7 @@ impl ManageProfilesModal {
                 }
                 let fs = fs.clone();
                 let profile_id = target_profile_id.clone();
-                let origin = AgentSettings::get_global(cx)
+                let origin = AgentSettings::get(settings_location, cx)
                     .profiles
                     .get(&profile_id)
                     .map(|p| p.origin.clone())
@@ -594,7 +657,7 @@ impl ManageProfilesModal {
             profile_id = profile_id.as_str(),
             is_builtin = builtin_profiles::is_builtin(&profile_id)
         );
-        let settings = AgentSettings::get_global(cx);
+        let settings = self.agent_settings(cx);
         let description = settings
             .profiles
             .get(&profile_id)
@@ -615,6 +678,7 @@ impl ManageProfilesModal {
         });
 
         let fs = self.fs.clone();
+        let settings_location = self.settings_location(cx);
         let target_profile_id = profile_id.clone();
         let subscription = cx.subscribe(&description_editor, move |_this, editor, event, cx| {
             // Persist only on blur: saving on every keystroke would rewrite
@@ -624,7 +688,7 @@ impl ManageProfilesModal {
                 let text = text.trim().to_string();
                 let fs = fs.clone();
                 let profile_id = target_profile_id.clone();
-                let origin = AgentSettings::get_global(cx)
+                let origin = AgentSettings::get(settings_location, cx)
                     .profiles
                     .get(&profile_id)
                     .map(|p| p.origin.clone())
@@ -663,7 +727,7 @@ impl ManageProfilesModal {
             profile_id = profile_id.as_str(),
             is_builtin = builtin_profiles::is_builtin(&profile_id)
         );
-        let settings = AgentSettings::get_global(cx);
+        let settings = self.agent_settings(cx);
         let Some(profile) = settings.profiles.get(&profile_id).cloned() else {
             return;
         };
@@ -756,7 +820,8 @@ impl ManageProfilesModal {
 
         telemetry::event!("Agent Profile Deleted", profile_id = profile_id.as_str());
 
-        let origin = AgentSettings::get_global(cx)
+        let origin = self
+            .agent_settings(cx)
             .profiles
             .get(&profile_id)
             .map(|p| p.origin.clone())
@@ -883,7 +948,8 @@ impl ManageProfilesModal {
     ) -> impl IntoElement + use<> {
         let is_focused = profile.navigation.focus_handle.contains_focused(window, cx);
 
-        let origin = AgentSettings::get_global(cx)
+        let origin = self
+            .agent_settings(cx)
             .profiles
             .get(&profile.id)
             .map(|p| &p.origin);
@@ -1027,7 +1093,7 @@ impl ManageProfilesModal {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let settings = AgentSettings::get_global(cx);
+        let settings = self.agent_settings(cx);
 
         let base_profile_name = mode.base_profile_id.as_ref().map(|base_profile_id| {
             settings
@@ -1125,7 +1191,7 @@ impl ManageProfilesModal {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let settings = AgentSettings::get_global(cx);
+        let settings = self.agent_settings(cx);
         let profile = settings.profiles.get(&mode.profile_id);
 
         let profile_name = profile
@@ -1552,7 +1618,7 @@ impl ManageProfilesModal {
 
 impl Render for ManageProfilesModal {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let settings = AgentSettings::get_global(cx);
+        let settings = self.agent_settings(cx);
 
         let go_back_item = div()
             .id("cancel-item")
@@ -1864,17 +1930,19 @@ mod tests {
         });
 
         // 2. Setup local project settings with a project profile
-        let root = std::sync::Arc::from(util::rel_path::RelPath::from_unix_str("").unwrap());
+        let root: Arc<util::rel_path::RelPath> =
+            std::sync::Arc::from(util::rel_path::RelPath::from_unix_str("").unwrap());
         let worktree_id = WorktreeId::from_usize(1);
         let project_path: Arc<util::rel_path::RelPath> = std::sync::Arc::from(
             util::rel_path::RelPath::from_unix_str(".zed/settings.json").unwrap(),
         );
 
-        SettingsStore::update_global(cx, |store, cx| {
+        let root_for_closure = root.clone();
+        SettingsStore::update_global(cx, move |store, cx| {
             store
                 .set_local_settings(
                     worktree_id,
-                    LocalSettingsPath::InWorktree(root),
+                    LocalSettingsPath::InWorktree(root_for_closure),
                     LocalSettingsKind::Settings,
                     Some(
                         r#"{
@@ -1890,7 +1958,11 @@ mod tests {
                 .unwrap();
         });
 
-        let settings = AgentSettings::get_global(cx);
+        let location = Some(settings::SettingsLocation {
+            worktree_id,
+            path: root.as_ref(),
+        });
+        let settings = AgentSettings::get(location, cx);
         let global_profile = settings
             .profiles
             .get(&AgentProfileId("global_agent".into()))

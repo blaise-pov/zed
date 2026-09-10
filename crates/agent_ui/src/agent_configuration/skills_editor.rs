@@ -27,10 +27,17 @@ impl SkillsEditor {
     pub fn new(
         profile_id: AgentProfileId,
         fs: Arc<dyn Fs>,
+        settings_location: Option<settings::SettingsLocation<'static>>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let delegate = SkillsPickerDelegate::new(cx.entity().downgrade(), profile_id, fs, cx);
+        let delegate = SkillsPickerDelegate::new(
+            cx.entity().downgrade(),
+            profile_id,
+            fs,
+            settings_location,
+            cx,
+        );
         let picker = cx.new(|cx| Picker::list(delegate, window, cx).embedded());
         Self { picker }
     }
@@ -61,6 +68,7 @@ pub struct SkillsPickerDelegate {
     skills_editor: WeakEntity<SkillsEditor>,
     fs: Arc<dyn Fs>,
     profile_id: AgentProfileId,
+    settings_location: Option<settings::SettingsLocation<'static>>,
     all_skills: Vec<SkillListEntry>,
     filtered_skills: Vec<SkillListEntry>,
     selected_index: usize,
@@ -73,6 +81,7 @@ impl SkillsPickerDelegate {
         skills_editor: WeakEntity<SkillsEditor>,
         profile_id: AgentProfileId,
         fs: Arc<dyn Fs>,
+        settings_location: Option<settings::SettingsLocation<'static>>,
         cx: &mut Context<SkillsEditor>,
     ) -> Self {
         let all_skills = collect_skills_with_source(cx);
@@ -148,6 +157,7 @@ impl SkillsPickerDelegate {
             skills_editor,
             fs,
             profile_id,
+            settings_location,
             all_skills,
             filtered_skills,
             selected_index: 0,
@@ -172,7 +182,10 @@ impl SkillsPickerDelegate {
     }
 
     fn is_skill_allowed(&self, skill_name: &str, cx: &App) -> bool {
-        let Some(profile) = AgentSettings::get_global(cx).profiles.get(&self.profile_id) else {
+        let Some(profile) = AgentSettings::get(self.settings_location, cx)
+            .profiles
+            .get(&self.profile_id)
+        else {
             return false;
         };
         profile.is_skill_allowed(&self.profile_id, skill_name)
@@ -198,7 +211,7 @@ impl SkillsPickerDelegate {
     }
 
     fn write_filter(&mut self, filter: Option<Vec<Arc<str>>>, cx: &App) {
-        let origin = AgentSettings::get_global(cx)
+        let origin = AgentSettings::get(self.settings_location, cx)
             .profiles
             .get(&self.profile_id)
             .map(|p| p.origin.clone())

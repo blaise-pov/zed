@@ -80,9 +80,13 @@ where
 /// Ensures the profile requested via `spawn_agent` exists, so a subagent is
 /// never silently spawned with an empty toolset (`enabled_tools` fails closed
 /// for unknown profiles). Returns a model-facing error message on failure.
-fn validate_profile(profile: Option<&agent_settings::AgentProfileId>, cx: &App) -> Option<String> {
+fn validate_profile(
+    profile: Option<&agent_settings::AgentProfileId>,
+    location: Option<settings::SettingsLocation>,
+    cx: &App,
+) -> Option<String> {
     let profile = profile?;
-    let settings = agent_settings::AgentSettings::get_global(cx);
+    let settings = agent_settings::AgentSettings::get(location, cx);
     if settings.profiles.contains_key(profile) {
         return None;
     }
@@ -195,7 +199,8 @@ impl AgentTool for SpawnAgentTool {
                 })?;
 
             let (subagent, mut session_info) = cx.update(|cx| {
-                if let Some(error) = validate_profile(input.profile.as_ref(), cx) {
+                let location = event_stream.settings_location(cx);
+                if let Some(error) = validate_profile(input.profile.as_ref(), location, cx) {
                     return Err(SpawnAgentToolOutput::Error {
                         session_id: input.session_id.clone(),
                         error,
@@ -366,14 +371,19 @@ mod tests {
         let store = settings::SettingsStore::test(cx);
         cx.set_global(store);
 
-        assert_eq!(validate_profile(None, cx), None);
+        assert_eq!(validate_profile(None, None, cx), None);
         assert_eq!(
-            validate_profile(Some(&agent_settings::AgentProfileId("write".into())), cx),
+            validate_profile(
+                Some(&agent_settings::AgentProfileId("write".into())),
+                None,
+                cx,
+            ),
             None
         );
 
         let error = validate_profile(
             Some(&agent_settings::AgentProfileId("nonexistent".into())),
+            None,
             cx,
         )
         .expect("unknown profile should be rejected");

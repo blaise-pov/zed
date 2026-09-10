@@ -152,10 +152,18 @@ impl AgentTool for CreateDirectoryTool {
             }
 
             let decision = cx.update(|cx| {
+                let location = project
+                    .read(cx)
+                    .visible_worktrees(cx)
+                    .next()
+                    .map(|w| settings::SettingsLocation {
+                        worktree_id: w.read(cx).id(),
+                        path: util::rel_path::RelPath::empty(),
+                    });
                 decide_permission_for_path_with_profile(
                     Self::NAME,
                     &input.path,
-                    AgentSettings::get_global(cx),
+                    AgentSettings::get(location, cx),
                     profile.as_ref(),
                 )
             });

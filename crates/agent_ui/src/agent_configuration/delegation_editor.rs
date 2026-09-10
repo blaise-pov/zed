@@ -29,10 +29,17 @@ impl DelegationEditor {
     pub fn new(
         profile_id: AgentProfileId,
         fs: Arc<dyn Fs>,
+        settings_location: Option<settings::SettingsLocation<'static>>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let delegate = DelegationPickerDelegate::new(cx.entity().downgrade(), profile_id, fs, cx);
+        let delegate = DelegationPickerDelegate::new(
+            cx.entity().downgrade(),
+            profile_id,
+            fs,
+            settings_location,
+            cx,
+        );
         let picker = cx.new(|cx| Picker::list(delegate, window, cx).embedded());
         Self { picker }
     }
@@ -66,6 +73,7 @@ pub struct DelegationPickerDelegate {
     delegation_editor: WeakEntity<DelegationEditor>,
     fs: Arc<dyn Fs>,
     profile_id: AgentProfileId,
+    settings_location: Option<settings::SettingsLocation<'static>>,
     all_profiles: Vec<(AgentProfileId, SharedString, Option<SharedString>)>,
     filtered_items: Vec<DelegationPickerItem>,
     selected_index: usize,
@@ -73,13 +81,15 @@ pub struct DelegationPickerDelegate {
 }
 
 impl DelegationPickerDelegate {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         delegation_editor: WeakEntity<DelegationEditor>,
         profile_id: AgentProfileId,
         fs: Arc<dyn Fs>,
+        settings_location: Option<settings::SettingsLocation<'static>>,
         cx: &mut Context<DelegationEditor>,
     ) -> Self {
-        let settings = AgentSettings::get_global(cx);
+        let settings = AgentSettings::get(settings_location, cx);
         let mut all_profiles = Vec::new();
         for (id, profile) in settings.profiles.iter() {
             if id != &profile_id {
@@ -101,6 +111,7 @@ impl DelegationPickerDelegate {
             delegation_editor,
             fs,
             profile_id,
+            settings_location,
             all_profiles,
             filtered_items: initial_items,
             selected_index: 0,
@@ -142,7 +153,7 @@ impl DelegationPickerDelegate {
     }
 
     fn toggle_allowed(&mut self, target: AgentProfileId, cx: &mut App) {
-        let profile = AgentSettings::get_global(cx)
+        let profile = AgentSettings::get(self.settings_location, cx)
             .profiles
             .get(&self.profile_id)
             .cloned();
@@ -199,7 +210,7 @@ impl DelegationPickerDelegate {
     }
 
     fn cycle_max_depth(&mut self, cx: &mut App) {
-        let profile = AgentSettings::get_global(cx)
+        let profile = AgentSettings::get(self.settings_location, cx)
             .profiles
             .get(&self.profile_id)
             .cloned();
@@ -324,7 +335,7 @@ impl PickerDelegate for DelegationPickerDelegate {
         cx: &mut Context<Picker<Self>>,
     ) -> Option<Self::ListItem> {
         let item = self.filtered_items.get(ix)?;
-        let settings = AgentSettings::get_global(cx);
+        let settings = AgentSettings::get(self.settings_location, cx);
         let delegation = settings
             .profiles
             .get(&self.profile_id)

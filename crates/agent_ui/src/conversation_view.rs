@@ -273,6 +273,10 @@ impl ProfileProvider for Entity<agent::Thread> {
     fn profile_downgraded(&self, cx: &App) -> bool {
         self.read(cx).profile_was_downgraded()
     }
+
+    fn settings_location(&self, cx: &App) -> Option<settings::SettingsLocation<'static>> {
+        self.read(cx).settings_location(cx)
+    }
 }
 
 #[derive(Default)]

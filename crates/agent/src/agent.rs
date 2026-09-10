@@ -3234,7 +3234,10 @@ impl NativeThreadEnvironment {
         let Some(parent_thread_entity) = self.thread.upgrade() else {
             anyhow::bail!("Parent thread no longer exists".to_string());
         };
-        let nested = agent_settings::AgentSettings::get_global(cx).nested_sub_agents;
+        let nested = parent_thread_entity
+            .read(cx)
+            .agent_settings(cx)
+            .nested_sub_agents;
         let (current_depth, parent_session_id, slot_pool) = {
             let parent_thread = parent_thread_entity.read(cx);
             (
@@ -3272,7 +3275,8 @@ impl NativeThreadEnvironment {
             let (parent_profile_id, parent_profile) = {
                 let parent_thread = parent_thread_entity.read(cx);
                 let profile_id = parent_thread.profile().clone();
-                let profile = agent_settings::AgentSettings::get_global(cx)
+                let profile = parent_thread
+                    .agent_settings(cx)
                     .profiles
                     .get(&profile_id)
                     .cloned();
@@ -3324,7 +3328,9 @@ impl NativeThreadEnvironment {
         // that can only report failures.
         if subagent_thread.read(cx).enabled_tool_names(cx).is_empty() {
             let profile_id = subagent_thread.read(cx).profile().clone();
-            let requested = agent_settings::AgentSettings::get_global(cx)
+            let requested = subagent_thread
+                .read(cx)
+                .agent_settings(cx)
                 .profiles
                 .get(&profile_id)
                 .map(|profile| {
@@ -3380,7 +3386,10 @@ impl NativeThreadEnvironment {
 
         // A follow-up keeps running the resumed agent, so it holds a
         // concurrency slot for as long as the tool call is in flight.
-        let nested = agent_settings::AgentSettings::get_global(cx).nested_sub_agents;
+        let nested = subagent_thread
+            .read(cx)
+            .agent_settings(cx)
+            .nested_sub_agents;
         let slot_pool = subagent_thread.read(cx).subagent_slot_pool();
         if !slot_pool.try_acquire(nested.max_concurrent) {
             anyhow::bail!(
@@ -3398,7 +3407,9 @@ impl NativeThreadEnvironment {
                     let parent_thread = parent_thread_entity.read(cx);
                     (parent_thread.profile().clone(), parent_thread.depth())
                 };
-                let parent_profile = agent_settings::AgentSettings::get_global(cx)
+                let parent_profile = parent_thread_entity
+                    .read(cx)
+                    .agent_settings(cx)
                     .profiles
                     .get(&parent_profile_id)
                     .cloned();
@@ -3904,7 +3915,9 @@ pub fn skills_resolver_for_project(
 /// apply without re-registering tools.
 fn thread_skill_filter(thread: &Entity<Thread>, cx: &App) -> Option<HashSet<String>> {
     let profile_id = thread.read(cx).profile().clone();
-    let profile = agent_settings::AgentSettings::get_global(cx)
+    let profile = thread
+        .read(cx)
+        .agent_settings(cx)
         .profiles
         .get(&profile_id)?;
     if let Some(skills) = &profile.skills {
@@ -7308,10 +7321,10 @@ mod internal_tests {
         };
 
         let first_subagent = cx
-            .update(|cx| environment.create_subagent_thread("first".to_string(), cx))
+            .update(|cx| environment.create_subagent_thread("first".to_string(), None, cx))
             .unwrap();
         let second_subagent = cx
-            .update(|cx| environment.create_subagent_thread("second".to_string(), cx))
+            .update(|cx| environment.create_subagent_thread("second".to_string(), None, cx))
             .unwrap();
         cx.run_until_parked();
 

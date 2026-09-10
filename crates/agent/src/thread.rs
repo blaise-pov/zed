@@ -54,7 +54,8 @@ use schemars::{JsonSchema, Schema};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use settings::{
-    LanguageModelSelection, Settings, SettingsStore, ToolPermissionMode, update_settings_file,
+    LanguageModelSelection, Settings, SettingsLocation, SettingsStore, ToolPermissionMode,
+    update_settings_file,
 };
 use std::fmt::Write;
 use std::{cell::RefCell, ops::ControlFlow};
@@ -1431,6 +1432,23 @@ pub struct Thread {
 }
 
 impl Thread {
+    pub fn settings_location(&self, cx: &App) -> Option<SettingsLocation<'static>> {
+        let worktree_id = self
+            .project
+            .read(cx)
+            .visible_worktrees(cx)
+            .next()
+            .map(|w| w.read(cx).id())?;
+        Some(SettingsLocation {
+            worktree_id,
+            path: util::rel_path::RelPath::empty(),
+        })
+    }
+
+    pub fn agent_settings<'a>(&self, cx: &'a App) -> &'a AgentSettings {
+        AgentSettings::get(self.settings_location(cx), cx)
+    }
+
     fn prompt_capabilities(model: Option<&dyn LanguageModel>) -> acp::PromptCapabilities {
         let image = model.map_or(true, |model| model.supports_images());
         acp::PromptCapabilities::new()
@@ -1471,10 +1489,10 @@ impl Thread {
         // A subagent pinned to a profile that specifies its own model keeps that
         // model even when the parent's model changes later.
         if thread.pinned_profile().is_some()
-            && Self::profile_specifies_model(&thread.profile_id, cx)
+            && Self::profile_specifies_model(&thread.profile_id, thread.settings_location(cx), cx)
         {
             thread.inherits_parent_model_settings = false;
-        } else if let Some(subagent_model) = AgentSettings::get_global(cx).subagent_model.clone() {
+        } else if let Some(subagent_model) = thread.agent_settings(cx).subagent_model.clone() {
             thread.inherits_parent_model_settings = false;
             thread.apply_model_selection(&subagent_model, cx);
         }
@@ -1511,7 +1529,16 @@ impl Thread {
         profile: Option<AgentProfileId>,
         cx: &mut Context<Self>,
     ) -> Self {
-        let settings = AgentSettings::get_global(cx);
+        let settings_location =
+            project
+                .read(cx)
+                .visible_worktrees(cx)
+                .next()
+                .map(|w| SettingsLocation {
+                    worktree_id: w.read(cx).id(),
+                    path: util::rel_path::RelPath::empty(),
+                });
+        let settings = AgentSettings::get(settings_location, cx);
         // Honor an explicitly requested profile (e.g. one passed via `spawn_agent`),
         // then apply the restricted-workspace downgrade so a subagent spawned into a
         // partially-trusted project lands on the minimal profile when appropriate.
@@ -1528,7 +1555,7 @@ impl Thread {
         // default, falling back to the model passed in by the caller.
         let model = if profile_id != default_profile {
             // A specific profile was requested, try to use its model
-            Self::resolve_profile_model(&profile_id, cx).or(model)
+            Self::resolve_profile_model_with_location(&profile_id, settings_location, cx).or(model)
         } else {
             model
         };
@@ -1637,8 +1664,12 @@ impl Thread {
 
     /// Whether the given profile configures its own default model, meaning
     /// parent model changes must not propagate to a subagent using it.
-    fn profile_specifies_model(profile_id: &AgentProfileId, cx: &App) -> bool {
-        AgentSettings::get_global(cx)
+    fn profile_specifies_model(
+        profile_id: &AgentProfileId,
+        location: Option<SettingsLocation>,
+        cx: &App,
+    ) -> bool {
+        AgentSettings::get(location, cx)
             .profiles
             .get(profile_id)
             .is_some_and(|profile| profile.default_model.is_some())
@@ -1927,7 +1958,16 @@ impl Thread {
         templates: Arc<Templates>,
         cx: &mut Context<Self>,
     ) -> Self {
-        let settings = AgentSettings::get_global(cx);
+        let settings_location =
+            project
+                .read(cx)
+                .visible_worktrees(cx)
+                .next()
+                .map(|w| SettingsLocation {
+                    worktree_id: w.read(cx).id(),
+                    path: util::rel_path::RelPath::empty(),
+                });
+        let settings = AgentSettings::get(settings_location, cx);
         let profile_id = db_thread
             .profile
             .unwrap_or_else(|| settings.default_profile.clone());
@@ -1947,13 +1987,15 @@ impl Thread {
         let model = match (resolved_saved_model, saved_selection) {
             (Some(model), _) => ThreadModel::Ready(model),
             (None, Some(selection)) => ThreadModel::Unresolved(selection),
-            (None, None) => Self::resolve_profile_model(&profile_id, cx)
-                .or_else(|| {
-                    LanguageModelRegistry::global(cx).update(cx, |registry, _cx| {
-                        registry.default_model().map(|model| model.model)
+            (None, None) => {
+                Self::resolve_profile_model_with_location(&profile_id, settings_location, cx)
+                    .or_else(|| {
+                        LanguageModelRegistry::global(cx).update(cx, |registry, _cx| {
+                            registry.default_model().map(|model| model.model)
+                        })
                     })
-                })
-                .map_or(ThreadModel::Unset, ThreadModel::Ready),
+                    .map_or(ThreadModel::Unset, ThreadModel::Ready)
+            }
         };
 
         let (prompt_capabilities_tx, prompt_capabilities_rx) = watch::channel(
@@ -2020,7 +2062,7 @@ impl Thread {
         if !self.sandboxing_available(cx) {
             return None;
         }
-        let persistent = AgentSettings::get_global(cx).sandbox_permissions.clone();
+        let persistent = self.agent_settings(cx).sandbox_permissions.clone();
         let git_dirs = sandbox_git_dirs(self.project.read(cx), cx);
         let grants = self.sandbox_grants.borrow();
         let settings = crate::sandboxing::settings_thread_sandbox(&persistent)
@@ -2037,7 +2079,7 @@ impl Thread {
             return None;
         }
 
-        let persistent = AgentSettings::get_global(cx).sandbox_permissions.clone();
+        let persistent = self.agent_settings(cx).sandbox_permissions.clone();
         let settings_sandbox = crate::sandboxing::settings_thread_sandbox(&persistent);
         let grants = self.sandbox_grants.borrow();
         let thread_sandbox = grants.thread_sandbox();
@@ -2457,7 +2499,7 @@ impl Thread {
         self.profile_id = profile_id.clone();
 
         // Swap to the profile's preferred model when available.
-        if let Some(model) = Self::resolve_profile_model(&self.profile_id, cx) {
+        if let Some(model) = self.resolve_profile_model(&self.profile_id, cx) {
             self.set_model(model, cx);
         }
 
@@ -2485,7 +2527,7 @@ impl Thread {
             if let Some(context) = self.subagent_context.as_mut() {
                 context.explicit_profile = Some(profile_id.clone());
             }
-            if Self::profile_specifies_model(&profile_id, cx) {
+            if Self::profile_specifies_model(&profile_id, self.settings_location(cx), cx) {
                 self.inherits_parent_model_settings = false;
             }
         }
@@ -2671,10 +2713,20 @@ impl Thread {
 
     /// Look up the active profile and resolve its preferred model if one is configured.
     fn resolve_profile_model(
+        &self,
         profile_id: &AgentProfileId,
         cx: &mut Context<Self>,
     ) -> Option<Arc<dyn LanguageModel>> {
-        let selection = AgentSettings::get_global(cx)
+        let location = self.settings_location(cx);
+        Self::resolve_profile_model_with_location(profile_id, location, cx)
+    }
+
+    fn resolve_profile_model_with_location(
+        profile_id: &AgentProfileId,
+        location: Option<SettingsLocation<'static>>,
+        cx: &mut Context<Self>,
+    ) -> Option<Arc<dyn LanguageModel>> {
+        let selection = AgentSettings::get(location, cx)
             .profiles
             .get(profile_id)?
             .default_model
@@ -4346,7 +4398,8 @@ impl Thread {
         let Some(model) = self.model() else {
             return BTreeMap::new();
         };
-        let Some(profile) = AgentSettings::get_global(cx).profiles.get(&self.profile_id) else {
+        let settings = self.agent_settings(cx);
+        let Some(profile) = settings.profiles.get(&self.profile_id) else {
             return BTreeMap::new();
         };
         // Terminal variants are configured by users under the canonical
@@ -4395,7 +4448,7 @@ impl Thread {
             .filter(|(tool_name, _)| crate::tools::tool_feature_flag_enabled(tool_name, cx))
             .filter(|(tool_name, _)| {
                 tool_name.as_ref() != SpawnAgentTool::NAME
-                    || AgentSettings::get_global(cx)
+                    || settings
                         .nested_sub_agents
                         .spawn_agent_enabled_for_depth(self.depth())
             })
@@ -4510,9 +4563,7 @@ impl Thread {
     /// `None` means the profile has no `skills` filter and all skills are
     /// visible (applicable only to built-in profiles).
     pub(crate) fn allowed_skill_names(&self, cx: &App) -> Option<HashSet<String>> {
-        let profile = AgentSettings::get_global(cx)
-            .profiles
-            .get(&self.profile_id)?;
+        let profile = self.agent_settings(cx).profiles.get(&self.profile_id)?;
         if let Some(skills) = &profile.skills {
             Some(
                 skills
@@ -4535,7 +4586,7 @@ impl Thread {
     /// "taken away"), and not when the active profile doesn't enable the tool
     /// anyway.
     pub(crate) fn subagent_delegation_note(&self, cx: &App) -> Option<&'static str> {
-        let settings = AgentSettings::get_global(cx);
+        let settings = self.agent_settings(cx);
         let nested = settings.nested_sub_agents;
         if !nested.enabled
             || nested.max_depth <= 1
@@ -4608,15 +4659,16 @@ impl Thread {
             }
             None => shared_project_context,
         };
+        let settings = self.agent_settings(cx);
         // Custom instructions from the active agent profile, if any.
-        let custom_instructions = AgentSettings::get_global(cx)
+        let custom_instructions = settings
             .profiles
             .get(&self.profile_id)
             .and_then(|profile| profile.custom_prompt.as_ref())
             .map(|prompt| prompt.to_string());
         // Catalog of agents this profile may delegate to, rendered into the
         // delegation section of the system prompt.
-        let available_agents = AgentSettings::get_global(cx)
+        let available_agents = settings
             .profiles
             .get(&self.profile_id)
             .and_then(|profile| profile.delegation.as_ref())
@@ -4625,7 +4677,7 @@ impl Thread {
                     .allowed
                     .iter()
                     .filter_map(|id| {
-                        let target = AgentSettings::get_global(cx).profiles.get(id)?;
+                        let target = settings.profiles.get(id)?;
                         let description = target
                             .description
                             .as_ref()
@@ -4685,7 +4737,7 @@ impl Thread {
         cx: &App,
     ) -> Option<CompactionTelemetry> {
         let model = self.model()?;
-        let auto_compact = AgentSettings::get_global(cx).auto_compact;
+        let auto_compact = self.agent_settings(cx).auto_compact;
         let max_tokens = model.max_token_count();
         let max_input_tokens = max_tokens.saturating_sub(model.max_output_tokens().unwrap_or(0));
         let tokens_before = self
@@ -4721,7 +4773,7 @@ impl Thread {
     }
 
     fn compaction_message_target_ix(&self, cx: &App) -> Option<usize> {
-        let auto_compact = AgentSettings::get_global(cx).auto_compact;
+        let auto_compact = self.agent_settings(cx).auto_compact;
         if !auto_compact.enabled {
             return None;
         }
@@ -5894,10 +5946,19 @@ impl ToolCallEventStream {
         self.profile_id.clone()
     }
 
+    pub fn settings_location(&self, cx: &App) -> Option<SettingsLocation<'static>> {
+        self.thread
+            .as_ref()?
+            .upgrade()?
+            .read(cx)
+            .settings_location(cx)
+    }
+
     /// Profile settings for the owning thread.
     pub fn profile_settings(&self, cx: &App) -> Option<agent_settings::AgentProfileSettings> {
         let profile_id = self.profile_id.as_ref()?;
-        agent_settings::AgentSettings::get_global(cx)
+        let location = self.settings_location(cx);
+        agent_settings::AgentSettings::get(location, cx)
             .profiles
             .get(profile_id)
             .cloned()
@@ -6034,9 +6095,14 @@ impl ToolCallEventStream {
         // matching), so we pass a single empty input value just to satisfy
         // `decide_permission_for_profile`' signature.
         let profile_id = self.profile_id.clone();
+        let thread = self.thread.clone();
         let check_settings: Box<dyn Fn(&App) -> ToolPermissionDecision> =
             Box::new(move |cx: &App| {
-                let settings = agent_settings::AgentSettings::get_global(cx);
+                let location = thread
+                    .as_ref()
+                    .and_then(|t| t.upgrade())
+                    .and_then(|t| t.read(cx).settings_location(cx));
+                let settings = agent_settings::AgentSettings::get(location, cx);
                 let profile = profile_id.as_ref().and_then(|id| settings.profiles.get(id));
                 decide_permission_for_profile(
                     &tool_id,
@@ -6079,9 +6145,14 @@ impl ToolCallEventStream {
         let tool_name = context.tool_name.clone();
         let input_values = context.input_values.clone();
         let profile_id = self.profile_id.clone();
+        let thread = self.thread.clone();
         let check_settings: Box<dyn Fn(&App) -> ToolPermissionDecision> =
             Box::new(move |cx: &App| {
-                let settings = agent_settings::AgentSettings::get_global(cx);
+                let location = thread
+                    .as_ref()
+                    .and_then(|t| t.upgrade())
+                    .and_then(|t| t.read(cx).settings_location(cx));
+                let settings = agent_settings::AgentSettings::get(location, cx);
                 let profile = profile_id.as_ref().and_then(|id| settings.profiles.get(id));
                 decide_permission_for_profile(
                     &tool_name,
@@ -6125,7 +6196,8 @@ impl ToolCallEventStream {
         reason: String,
         cx: &mut App,
     ) -> Task<Result<()>> {
-        if Self::sandbox_request_covered_by_grants(&request, &self.sandbox_grants, cx) {
+        let location = self.settings_location(cx);
+        if Self::sandbox_request_covered_by_grants(&request, &self.sandbox_grants, location, cx) {
             return Task::ready(Ok(()));
         }
 
@@ -6251,11 +6323,18 @@ impl ToolCallEventStream {
                         );
                     }
                     _ = settings_changed.fuse() => {
-                        if cx.update(|cx| Self::sandbox_request_covered_by_grants(
-                            &request,
-                            &sandbox_grants,
-                            cx,
-                        )) {
+                        if cx.update(|cx| {
+                            let location = thread
+                                .as_ref()
+                                .and_then(|t| t.upgrade())
+                                .and_then(|t| t.read(cx).settings_location(cx));
+                            Self::sandbox_request_covered_by_grants(
+                                &request,
+                                &sandbox_grants,
+                                location,
+                                cx,
+                            )
+                        }) {
                             drop(response_rx);
                             stream.resolve_tool_call_authorization(
                                 &tool_call_id,
@@ -6278,7 +6357,8 @@ impl ToolCallEventStream {
     /// caller proceeds to any escalation prompt) and `Err` on "Abort".
     pub(crate) fn authorize_windows_fs_warning(&self, cx: &mut App) -> Task<Result<()>> {
         // If the warning is already disabled, don't prompt.
-        if !AgentSettings::get_global(cx)
+        let location = self.settings_location(cx);
+        if !AgentSettings::get(location, cx)
             .sandbox_permissions
             .warn_ntfs_grants
         {
@@ -6356,9 +6436,10 @@ impl ToolCallEventStream {
     fn sandbox_request_covered_by_grants(
         request: &SandboxRequest,
         sandbox_grants: &Rc<RefCell<ThreadSandboxGrants>>,
+        location: Option<SettingsLocation>,
         cx: &App,
     ) -> bool {
-        let settings = AgentSettings::get_global(cx);
+        let settings = AgentSettings::get(location, cx);
         sandbox_grants
             .borrow()
             .covers_with_persistent(request, &settings.sandbox_permissions)
@@ -6502,9 +6583,10 @@ impl ToolCallEventStream {
     /// no longer provide isolation and callers may skip host authorization
     /// entirely.
     pub(crate) fn unsandboxed_access_granted(&self, cx: &App) -> bool {
+        let location = self.settings_location(cx);
         self.unsandboxed_granted_for_thread()
             || self.sandbox_fallback_granted_for_thread()
-            || AgentSettings::get_global(cx)
+            || AgentSettings::get(location, cx)
                 .sandbox_permissions
                 .allow_unsandboxed
     }

@@ -1467,18 +1467,6 @@ impl SettingsStore {
                     .merge_from(&local_settings.project.disable_ai);
             }
 
-            // Merge agent settings from project-local settings files into the
-            // global value, with the project's entries taking precedence per
-            // key over user settings. Layout keys (e.g. dock, task_dock) are
-            // excluded so project settings cannot override user window placement.
-            for local_settings in self.local_settings.values() {
-                let local_agent = local_settings.agent.clone().map(|mut agent| {
-                    agent.clear_layout_keys();
-                    agent
-                });
-                merged.agent.merge_from(&local_agent);
-            }
-
             self.merged_settings = Rc::new(merged);
 
             for setting_value in self.setting_values.values_mut() {
@@ -1514,44 +1502,6 @@ impl SettingsStore {
                     .project
                     .disable_ai
                     .merge_from(&local_settings.project.disable_ai);
-            }
-
-            // Recompute agent settings the same way, since they now also
-            // depend on all local settings.
-            merged.agent = self.default_settings.agent.clone();
-            if let Some(global) = &self.global_settings {
-                merged.agent.merge_from(&global.agent);
-            }
-            if let Some(user_settings) = self.user_settings.as_ref() {
-                let active_profile = user_settings.for_profile(cx);
-                let should_merge_user_settings =
-                    active_profile.is_none_or(|profile| profile.base == ProfileBase::User);
-
-                if should_merge_user_settings {
-                    merged.agent.merge_from(&user_settings.content.agent);
-                    merged.agent.merge_from_option(
-                        user_settings
-                            .for_release_channel()
-                            .map(|content| &content.agent),
-                    );
-                    merged
-                        .agent
-                        .merge_from_option(user_settings.for_os().map(|content| &content.agent));
-                }
-
-                if let Some(profile) = active_profile {
-                    merged.agent.merge_from(&profile.settings.agent);
-                }
-            }
-            if let Some(server) = &self.server_settings {
-                merged.agent.merge_from(&server.agent);
-            }
-            for local_settings in self.local_settings.values() {
-                let local_agent = local_settings.agent.clone().map(|mut agent| {
-                    agent.clear_layout_keys();
-                    agent
-                });
-                merged.agent.merge_from(&local_agent);
             }
 
             self.merged_settings = Rc::new(merged);

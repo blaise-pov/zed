@@ -1191,6 +1191,10 @@ pub struct AgentPanel {
 }
 
 impl AgentPanel {
+    fn agent_settings<'a>(&self, cx: &'a App) -> &'a AgentSettings {
+        AgentSettings::get_for_project(self.project.read(cx), cx)
+    }
+
     fn serialize(&mut self, cx: &mut App) {
         let Some(workspace_id) = self.workspace_id else {
             return;
@@ -2074,7 +2078,7 @@ impl AgentPanel {
         cx: &mut Context<Self>,
     ) {
         let terminal_working_directory = working_directory.clone();
-        let init_command = Self::terminal_init_command(run_init_command, cx);
+        let init_command = Self::terminal_init_command(&self.project, run_init_command, cx);
         let terminal_task = self.project.update(cx, |project, cx| {
             project.create_terminal_shell(working_directory, cx)
         });
@@ -2128,9 +2132,17 @@ impl AgentPanel {
         .detach_and_log_err(cx);
     }
 
-    fn terminal_init_command(run_init_command: bool, cx: &App) -> Option<String> {
+    fn terminal_init_command(
+        project: &Entity<Project>,
+        run_init_command: bool,
+        cx: &App,
+    ) -> Option<String> {
         run_init_command
-            .then(|| AgentSettings::get_global(cx).terminal_init_command.clone())
+            .then(|| {
+                AgentSettings::get_for_project(project.read(cx), cx)
+                    .terminal_init_command
+                    .clone()
+            })
             .flatten()
             .filter(|command| !command.trim().is_empty())
     }
@@ -2686,7 +2698,7 @@ impl AgentPanel {
         if self.terminal_status_visible(terminal_id, window, cx) {
             return;
         }
-        let settings = AgentSettings::get_global(cx);
+        let settings = self.agent_settings(cx);
         match settings.notify_when_agent_waiting {
             NotifyWhenAgentWaiting::PrimaryScreen => {
                 window.request_attention();
@@ -2935,7 +2947,7 @@ impl AgentPanel {
 
     #[cfg(feature = "audio")]
     fn play_terminal_notification_sound(&self, visible: bool, cx: &mut App) {
-        let settings = AgentSettings::get_global(cx);
+        let settings = self.agent_settings(cx);
         if settings.play_sound_when_agent_done.should_play(visible) {
             Audio::play_sound(Sound::AgentDone, cx);
         }
@@ -6149,7 +6161,7 @@ impl AgentPanel {
                 this.toggle_zoom(&ToggleZoom, window, cx);
             }));
 
-        let max_content_width = AgentSettings::get_global(cx).max_content_width;
+        let max_content_width = self.agent_settings(cx).max_content_width;
 
         let base_container = h_flex()
             .size_full()
@@ -6826,7 +6838,7 @@ impl AgentPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Result<()> {
-        let init_command = Self::terminal_init_command(run_init_command, cx);
+        let init_command = Self::terminal_init_command(&self.project, run_init_command, cx);
         let settings = TerminalSettings::get_global(cx).clone();
         let path_style = self.project.read(cx).path_style(cx);
         let builder = terminal::TerminalBuilder::new_display_only(

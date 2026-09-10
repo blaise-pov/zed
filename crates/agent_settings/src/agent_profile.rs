@@ -8,7 +8,7 @@ use fs::Fs;
 use gpui::{App, SharedString};
 use settings::{
     AgentProfileContent, ContextServerPresetContent, DelegationContent, LanguageModelSelection,
-    Settings as _, SettingsContent, SettingsStore, update_settings_file,
+    Settings as _, SettingsContent, SettingsLocation, SettingsStore, update_settings_file,
 };
 use util::ResultExt as _;
 
@@ -148,11 +148,33 @@ impl AgentProfile {
         id
     }
 
-    /// Returns a map of AgentProfileIds to their names
-    pub fn available_profiles(cx: &App) -> AvailableProfiles {
+    /// Returns a map of AgentProfileIds to their names for the given settings location (falling back to global).
+    pub fn available_profiles(location: Option<SettingsLocation>, cx: &App) -> AvailableProfiles {
         let mut profiles = AvailableProfiles::default();
-        for (id, profile) in AgentSettings::get_global(cx).profiles.iter() {
+        for (id, profile) in AgentSettings::get(location, cx).profiles.iter() {
             profiles.insert(id.clone(), profile.name.clone());
+        }
+        profiles
+    }
+
+    /// Returns a map of AgentProfileIds to their names across all visible worktrees of the project.
+    pub fn available_profiles_for_project(
+        project: &project::Project,
+        cx: &App,
+    ) -> AvailableProfiles {
+        let mut profiles = AvailableProfiles::default();
+        let worktrees: Vec<_> = project.visible_worktrees(cx).collect();
+        if worktrees.is_empty() {
+            return Self::available_profiles(None, cx);
+        }
+        for worktree in worktrees {
+            let location = settings::SettingsLocation {
+                worktree_id: worktree.read(cx).id(),
+                path: util::rel_path::RelPath::empty(),
+            };
+            for (id, name) in Self::available_profiles(Some(location), cx) {
+                profiles.entry(id).or_insert(name);
+            }
         }
         profiles
     }
@@ -689,12 +711,13 @@ mod tests {
                 .unwrap();
         });
 
-        let root = std::sync::Arc::from(util::rel_path::RelPath::from_unix_str("root").unwrap());
+        let root: Arc<util::rel_path::RelPath> =
+            std::sync::Arc::from(util::rel_path::RelPath::from_unix_str("root").unwrap());
         SettingsStore::update_global(cx, |store, cx| {
             store
                 .set_local_settings(
                     WorktreeId::from_usize(1),
-                    LocalSettingsPath::InWorktree(root),
+                    LocalSettingsPath::InWorktree(root.clone()),
                     LocalSettingsKind::Settings,
                     Some(
                         r#"{
@@ -718,7 +741,11 @@ mod tests {
                 .unwrap();
         });
 
-        let profiles = AgentProfile::available_profiles(cx);
+        let location = Some(settings::SettingsLocation {
+            worktree_id: WorktreeId::from_usize(1),
+            path: &root,
+        });
+        let profiles = AgentProfile::available_profiles(location, cx);
         // The project's entry overrides the user's profile of the same id.
         assert_eq!(
             profiles.get(&AgentProfileId("orchestrator".into())),
@@ -730,7 +757,7 @@ mod tests {
             Some(&"Backend".into())
         );
 
-        let settings = AgentSettings::get_global(cx);
+        let settings = AgentSettings::get(location, cx);
         assert_eq!(
             settings.default_profile,
             AgentProfileId("orchestrator".into())
@@ -747,9 +774,29 @@ mod tests {
         // Server definitions under `agent.context_servers` are surfaced
         // through the project context server settings.
         assert!(
-            project::project_settings::ProjectSettings::get_global(cx)
+            project::project_settings::ProjectSettings::get(location, cx)
                 .context_servers
                 .contains_key("demo")
+        );
+
+        // Global settings remain unpolluted:
+        let global_settings = AgentSettings::get_global(cx);
+        assert_eq!(
+            global_settings.default_profile,
+            AgentProfileId("write".into())
+        );
+        assert_eq!(
+            global_settings
+                .profiles
+                .get(&AgentProfileId("orchestrator".into()))
+                .unwrap()
+                .name,
+            "User Orchestrator"
+        );
+        assert!(
+            !global_settings
+                .profiles
+                .contains_key(&AgentProfileId("backend".into()))
         );
 
         // Check origins:
@@ -818,12 +865,13 @@ mod tests {
         assert_eq!(initial_settings.task_dock, DockPosition::Right);
         assert_eq!(initial_settings.flexible, false);
 
-        let root = std::sync::Arc::from(util::rel_path::RelPath::from_unix_str("root").unwrap());
+        let root: Arc<util::rel_path::RelPath> =
+            std::sync::Arc::from(util::rel_path::RelPath::from_unix_str("root").unwrap());
         SettingsStore::update_global(cx, |store, cx| {
             store
                 .set_local_settings(
                     WorktreeId::from_usize(1),
-                    LocalSettingsPath::InWorktree(root),
+                    LocalSettingsPath::InWorktree(root.clone()),
                     LocalSettingsKind::Settings,
                     Some(
                         r#"{
@@ -840,7 +888,11 @@ mod tests {
                 .unwrap();
         });
 
-        let updated_settings = AgentSettings::get_global(cx);
+        let location = Some(settings::SettingsLocation {
+            worktree_id: WorktreeId::from_usize(1),
+            path: &root,
+        });
+        let updated_settings = AgentSettings::get(location, cx);
         assert_eq!(
             updated_settings.default_profile,
             AgentProfileId("project-profile".into())
@@ -1112,6 +1164,104 @@ mod tests {
             edit_rules.invalid_patterns[0]
                 .pattern
                 .contains("backend/**")
+        );
+    }
+
+    #[gpui::test]
+    fn test_multiple_projects_local_agent_settings_isolation(cx: &mut gpui::App) {
+        use gpui::UpdateGlobal as _;
+        use settings::{LocalSettingsKind, LocalSettingsPath, SettingsLocation, WorktreeId};
+
+        let store = SettingsStore::test(cx);
+        cx.set_global(store);
+        project::DisableAiSettings::register(cx);
+        AgentSettings::register(cx);
+
+        // Global user settings:
+        SettingsStore::update_global(cx, |store, cx| {
+            store
+                .set_user_settings(
+                    r#"{ "agent": { "default_profile": "user-default", "profiles": { "global_prof": { "name": "Global" } } } }"#,
+                    cx,
+                )
+                .unwrap();
+        });
+
+        // Project 1 settings (worktree 1):
+        let root: Arc<util::rel_path::RelPath> =
+            std::sync::Arc::from(util::rel_path::RelPath::from_unix_str("").unwrap());
+        SettingsStore::update_global(cx, |store, cx| {
+            store
+                .set_local_settings(
+                    WorktreeId::from_usize(1),
+                    LocalSettingsPath::InWorktree(root.clone()),
+                    LocalSettingsKind::Settings,
+                    Some(
+                        r#"{
+                            "agent": {
+                                "default_profile": "project1-profile",
+                                "profiles": {
+                                    "project1-profile": { "name": "Project 1 Profile" }
+                                }
+                            }
+                        }"#,
+                    ),
+                    cx,
+                )
+                .unwrap();
+        });
+
+        // Project 2 settings (worktree 2) - has NO agent settings:
+        SettingsStore::update_global(cx, |store, cx| {
+            store
+                .set_local_settings(
+                    WorktreeId::from_usize(2),
+                    LocalSettingsPath::InWorktree(root),
+                    LocalSettingsKind::Settings,
+                    Some(r#"{ "languages": { "Rust": { "tab_size": 2 } } }"#),
+                    cx,
+                )
+                .unwrap();
+        });
+
+        let loc1 = Some(SettingsLocation {
+            worktree_id: WorktreeId::from_usize(1),
+            path: &util::rel_path::RelPath::empty(),
+        });
+        let loc2 = Some(SettingsLocation {
+            worktree_id: WorktreeId::from_usize(2),
+            path: &util::rel_path::RelPath::empty(),
+        });
+
+        // Project 1 sees its own settings:
+        let s1 = AgentSettings::get(loc1, cx);
+        assert_eq!(
+            s1.default_profile,
+            AgentProfileId("project1-profile".into())
+        );
+        assert!(
+            s1.profiles
+                .contains_key(&AgentProfileId("project1-profile".into()))
+        );
+
+        // Project 2 DOES NOT see Project 1's settings! It gets user settings:
+        let s2 = AgentSettings::get(loc2, cx);
+        assert_eq!(s2.default_profile, AgentProfileId("user-default".into()));
+        assert!(
+            !s2.profiles
+                .contains_key(&AgentProfileId("project1-profile".into()))
+        );
+
+        // Global settings are clean:
+        let global = AgentSettings::get_global(cx);
+        assert_eq!(
+            global.default_profile,
+            AgentProfileId("user-default".into())
+        );
+        assert!(
+            !global
+                .profiles
+                .contains_key(&AgentProfileId("project1-profile".into()))
         );
     }
 }

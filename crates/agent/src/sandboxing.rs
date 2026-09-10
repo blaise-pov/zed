@@ -31,7 +31,7 @@ use gpui::App;
 use http_proxy::HostPattern;
 use project::Project;
 use sandbox::{HostFilesystemLocation, SandboxFsPolicy, SandboxNetPolicy, SandboxPolicy};
-use settings::{GrantedWritePath, Settings};
+use settings::GrantedWritePath;
 use std::path::PathBuf;
 
 /// The directory subtrees the sandbox always grants write access to for a
@@ -202,7 +202,7 @@ pub fn settings_sandbox_policy(persistent: &SandboxPermissions) -> SandboxPolicy
 /// only escaping individual commands (tracked in `ThreadSandboxGrants`).
 pub(crate) fn sandboxing_enabled_for_project(project: &Project, cx: &App) -> bool {
     sandboxing_available_for_project(project, cx)
-        && !AgentSettings::get_global(cx)
+        && !AgentSettings::get_for_project(project, cx)
             .sandbox_permissions
             .allow_unsandboxed
 }

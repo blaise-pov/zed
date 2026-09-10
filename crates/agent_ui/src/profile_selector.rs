@@ -51,6 +51,11 @@ pub trait ProfileProvider {
     fn profile_downgraded(&self, _cx: &App) -> bool {
         false
     }
+
+    /// Settings location for this provider, if tied to a worktree/project.
+    fn settings_location(&self, _cx: &App) -> Option<settings::SettingsLocation<'static>> {
+        None
+    }
 }
 
 pub struct ProfileSelector {
@@ -77,7 +82,7 @@ impl ProfileSelector {
         });
 
         Self {
-            profiles: AgentProfile::available_profiles(cx),
+            profiles: AgentProfile::available_profiles(provider.settings_location(cx), cx),
             pending_refresh: false,
             fs,
             provider,
@@ -97,7 +102,7 @@ impl ProfileSelector {
             return;
         }
 
-        let profiles = AgentProfile::available_profiles(cx);
+        let profiles = AgentProfile::available_profiles(self.provider.settings_location(cx), cx);
         if profiles.is_empty() {
             return;
         }
@@ -150,7 +155,8 @@ impl ProfileSelector {
         // settings change that happened while this selector was already
         // deployed (or a missed store notification) would otherwise leave a
         // stale profile list in the popover.
-        let live_profiles = AgentProfile::available_profiles(cx);
+        let live_profiles =
+            AgentProfile::available_profiles(self.provider.settings_location(cx), cx);
         if self.profiles != live_profiles || self.pending_refresh {
             self.profiles = live_profiles.clone();
             if let Some(picker) = &self.picker {
@@ -201,7 +207,8 @@ impl Render for ProfileSelector {
 
         let picker = self.ensure_picker(window, cx);
 
-        let settings = AgentSettings::get_global(cx);
+        let location = self.provider.settings_location(cx);
+        let settings = AgentSettings::get(location, cx);
         let profile_id = self.provider.profile_id(cx);
         let profile = settings.profiles.get(&profile_id);
 
@@ -220,7 +227,8 @@ impl Render for ProfileSelector {
         // are forbidden while restricted.
         let show_warning = self.provider.is_restricted(cx)
             && (self.provider.profile_downgraded(cx)
-                || !ProfilePickerDelegate::restricted_forbidden_tools(&profile_id, cx).is_empty());
+                || !ProfilePickerDelegate::restricted_forbidden_tools(&profile_id, location, cx)
+                    .is_empty());
 
         let trigger_button = Button::new("profile-selector", selected_profile)
             .label_size(LabelSize::Small)
@@ -270,7 +278,7 @@ impl Render for ProfileSelector {
 }
 
 #[derive(Clone)]
-struct ProfileCandidate {
+pub(crate) struct ProfileCandidate {
     id: AgentProfileId,
     name: SharedString,
     is_builtin: bool,
@@ -313,7 +321,8 @@ impl ProfilePickerDelegate {
         focus_handle: FocusHandle,
         cx: &mut Context<ProfileSelector>,
     ) -> Self {
-        let candidates = Self::candidates_from(profiles, cx);
+        let location = provider.settings_location(cx);
+        let candidates = Self::candidates_from(profiles, location, cx);
         let string_candidates = Arc::new(Self::string_candidates(&candidates));
         let filtered_entries = Self::entries_from_candidates(&candidates);
 
@@ -345,7 +354,8 @@ impl ProfilePickerDelegate {
         query: String,
         cx: &mut Context<Picker<Self>>,
     ) {
-        self.candidates = Self::candidates_from(profiles, cx);
+        let location = self.provider.settings_location(cx);
+        self.candidates = Self::candidates_from(profiles, location, cx);
         self.string_candidates = Arc::new(Self::string_candidates(&self.candidates));
         self.query = query;
 
@@ -362,8 +372,12 @@ impl ProfilePickerDelegate {
         cx.notify();
     }
 
-    fn candidates_from(profiles: AvailableProfiles, cx: &App) -> Vec<ProfileCandidate> {
-        let settings = AgentSettings::get_global(cx);
+    fn candidates_from(
+        profiles: AvailableProfiles,
+        location: Option<settings::SettingsLocation>,
+        cx: &App,
+    ) -> Vec<ProfileCandidate> {
+        let settings = AgentSettings::get(location, cx);
         let mut builtins = Vec::new();
         let mut customs = Vec::new();
 
@@ -401,8 +415,12 @@ impl ProfilePickerDelegate {
 
     /// Tools enabled by a profile that are forbidden while the workspace is
     /// restricted. Returns an empty list for profiles that are safe to use.
-    fn restricted_forbidden_tools(profile_id: &AgentProfileId, cx: &App) -> Vec<SharedString> {
-        let Some(profile) = AgentSettings::get_global(cx).profiles.get(profile_id) else {
+    fn restricted_forbidden_tools(
+        profile_id: &AgentProfileId,
+        location: Option<settings::SettingsLocation>,
+        cx: &App,
+    ) -> Vec<SharedString> {
+        let Some(profile) = AgentSettings::get(location, cx).profiles.get(profile_id) else {
             return Vec::new();
         };
         profile
@@ -671,8 +689,9 @@ impl PickerDelegate for ProfilePickerDelegate {
                 let has_documentation = Self::documentation(candidate).is_some();
                 let is_project = matches!(candidate.origin, ProfileOrigin::Project { .. });
 
+                let location = self.provider.settings_location(cx);
                 let has_warning = self.provider.is_restricted(cx)
-                    && !Self::restricted_forbidden_tools(&candidate.id, cx).is_empty();
+                    && !Self::restricted_forbidden_tools(&candidate.id, location, cx).is_empty();
                 // The warning details are merged into the documentation aside,
                 // so hovering either the row or the icon shows a single popup.
                 let track_hover = has_documentation || has_warning;
@@ -760,8 +779,9 @@ impl PickerDelegate for ProfilePickerDelegate {
 
         let candidate = self.candidates.get(entry.candidate_index)?;
         let description = Self::documentation(candidate).map(|docs| docs.to_string());
+        let location = self.provider.settings_location(cx);
         let forbidden_tools = if self.provider.is_restricted(cx) {
-            Self::restricted_forbidden_tools(&candidate.id, cx)
+            Self::restricted_forbidden_tools(&candidate.id, location, cx)
         } else {
             Vec::new()
         };
@@ -1020,12 +1040,14 @@ mod tests {
             project::DisableAiSettings::register(cx);
             AgentSettings::register(cx);
 
-            let root = std::sync::Arc::from(util::rel_path::RelPath::from_unix_str("").unwrap());
-            SettingsStore::update_global(cx, |store, cx| {
+            let root: Arc<util::rel_path::RelPath> =
+                std::sync::Arc::from(util::rel_path::RelPath::from_unix_str("").unwrap());
+            let root_for_closure = root.clone();
+            SettingsStore::update_global(cx, move |store, cx| {
                 store
                     .set_local_settings(
                         settings::WorktreeId::from_usize(1),
-                        settings::LocalSettingsPath::InWorktree(root),
+                        settings::LocalSettingsPath::InWorktree(root_for_closure),
                         settings::LocalSettingsKind::Settings,
                         Some(
                             r#"{
@@ -1051,7 +1073,11 @@ mod tests {
             );
             profiles.insert(AgentProfileId("write".into()), SharedString::from("Write"));
 
-            let candidates = ProfilePickerDelegate::candidates_from(profiles, cx);
+            let location = Some(settings::SettingsLocation {
+                worktree_id: settings::WorktreeId::from_usize(1),
+                path: &root,
+            });
+            let candidates = ProfilePickerDelegate::candidates_from(profiles, location, cx);
 
             assert_eq!(candidates.len(), 2);
             assert_eq!(candidates[0].id.as_str(), "write");

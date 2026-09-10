@@ -22,9 +22,9 @@ use serde::{Deserialize, Serialize};
 use settings::{
     DockPosition, DockSide, IntoGpui, LanguageModelParameters, LanguageModelSelection,
     NestedSubAgentsSettingsContent, NotifyWhenAgentWaiting, PlaySoundWhenAgentDone,
-    RegisterSetting, Settings, SettingsContent, SettingsStore, SidebarDockPosition, SidebarSide,
-    ThinkingBlockDisplay, ToolPermissionMode, update_settings_file,
-    update_settings_file_with_completion,
+    RegisterSetting, Settings, SettingsContent, SettingsLocation, SettingsStore,
+    SidebarDockPosition, SidebarSide, ThinkingBlockDisplay, ToolPermissionMode, WorktreeId,
+    update_settings_file, update_settings_file_with_completion,
 };
 use util::ResultExt as _;
 
@@ -433,6 +433,28 @@ impl AgentSettings {
         }
 
         WindowLayout::Custom(user_layout)
+    }
+
+    /// Returns the agent settings scoped to the project's visible worktrees,
+    /// or global settings if the project has no worktrees.
+    pub fn get_for_project<'a>(project: &project::Project, cx: &'a gpui::App) -> &'a Self {
+        let location = project
+            .visible_worktrees(cx)
+            .next()
+            .map(|w| SettingsLocation {
+                worktree_id: w.read(cx).id(),
+                path: util::rel_path::RelPath::empty(),
+            });
+        Self::get(location, cx)
+    }
+
+    /// Returns the agent settings for a specific worktree, or global settings if None.
+    pub fn get_for_worktree(worktree_id: Option<WorktreeId>, cx: &gpui::App) -> &Self {
+        let location = worktree_id.map(|worktree_id| SettingsLocation {
+            worktree_id,
+            path: util::rel_path::RelPath::empty(),
+        });
+        Self::get(location, cx)
     }
 
     pub fn backfill_editor_layout(fs: Arc<dyn Fs>, cx: &App) {

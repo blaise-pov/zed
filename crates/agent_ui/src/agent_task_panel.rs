@@ -63,7 +63,7 @@ pub fn init(file_system: Arc<dyn Fs>, cx: &mut App) {
         let project = workspace.project().clone();
         let context_server_store = project.read(cx).context_server_store();
         let server_id = context_server::ContextServerId(
-            AgentSettings::get_global(cx)
+            AgentSettings::get_for_project(project.read(cx), cx)
                 .task_graph_server_id
                 .clone()
                 .into(),
@@ -134,15 +134,18 @@ impl AgentTaskPanel {
     /// setting changes, so the panel talks to a different MCP server without
     /// a restart.
     fn sync_task_server(&mut self, cx: &mut Context<Self>) {
-        let server_name = AgentSettings::get_global(cx).task_graph_server_id.clone();
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        let project = workspace.read(cx).project();
+        let server_name = AgentSettings::get_for_project(project.read(cx), cx)
+            .task_graph_server_id
+            .clone();
         if self.store.read(cx).provider().server_id().0.as_ref() == server_name {
             return;
         }
 
-        let Some(workspace) = self.workspace.upgrade() else {
-            return;
-        };
-        let context_server_store = workspace.read(cx).project().read(cx).context_server_store();
+        let context_server_store = project.read(cx).context_server_store();
         let provider = Arc::new(agent::McpAgentTaskProvider::new(
             context_server_store,
             context_server::ContextServerId(server_name.into()),
