@@ -7320,11 +7320,35 @@ mod internal_tests {
             acp_thread: acp_thread.downgrade(),
         };
 
+        cx.update(|cx| {
+            let mut settings = agent_settings::AgentSettings::get_global(cx).clone();
+            let default_profile_id = settings.default_profile.clone();
+            if let Some(profile) = settings.profiles.get_mut(&default_profile_id) {
+                profile.delegation = Some(agent_settings::Delegation {
+                    allowed: vec![default_profile_id.clone()],
+                    max_depth: 5,
+                });
+            }
+            agent_settings::AgentSettings::override_global(settings, cx);
+        });
+
         let first_subagent = cx
-            .update(|cx| environment.create_subagent_thread("first".to_string(), None, cx))
+            .update(|cx| {
+                environment.create_subagent_thread(
+                    "first".to_string(),
+                    Some(agent_settings::AgentProfileId("write".into())),
+                    cx,
+                )
+            })
             .unwrap();
         let second_subagent = cx
-            .update(|cx| environment.create_subagent_thread("second".to_string(), None, cx))
+            .update(|cx| {
+                environment.create_subagent_thread(
+                    "second".to_string(),
+                    Some(agent_settings::AgentProfileId("write".into())),
+                    cx,
+                )
+            })
             .unwrap();
         cx.run_until_parked();
 
