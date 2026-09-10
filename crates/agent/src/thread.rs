@@ -1432,9 +1432,11 @@ pub struct Thread {
 }
 
 impl Thread {
-    pub fn settings_location(&self, cx: &App) -> Option<SettingsLocation<'static>> {
-        let worktree_id = self
-            .project
+    pub fn project_settings_location(
+        project: &Entity<Project>,
+        cx: &App,
+    ) -> Option<SettingsLocation<'static>> {
+        let worktree_id = project
             .read(cx)
             .visible_worktrees(cx)
             .next()
@@ -1443,6 +1445,10 @@ impl Thread {
             worktree_id,
             path: util::rel_path::RelPath::empty(),
         })
+    }
+
+    pub fn settings_location(&self, cx: &App) -> Option<SettingsLocation<'static>> {
+        Self::project_settings_location(&self.project, cx)
     }
 
     pub fn agent_settings<'a>(&self, cx: &'a App) -> &'a AgentSettings {
@@ -1529,15 +1535,7 @@ impl Thread {
         profile: Option<AgentProfileId>,
         cx: &mut Context<Self>,
     ) -> Self {
-        let settings_location =
-            project
-                .read(cx)
-                .visible_worktrees(cx)
-                .next()
-                .map(|w| SettingsLocation {
-                    worktree_id: w.read(cx).id(),
-                    path: util::rel_path::RelPath::empty(),
-                });
+        let settings_location = Self::project_settings_location(&project, cx);
         let settings = AgentSettings::get(settings_location, cx);
         // Honor an explicitly requested profile (e.g. one passed via `spawn_agent`),
         // then apply the restricted-workspace downgrade so a subagent spawned into a
@@ -1883,6 +1881,7 @@ impl Thread {
                 cancellation_rx,
                 self.sandbox_grants.clone(),
                 Some(cx.weak_entity()),
+                Some(self.project.clone()),
                 Some(self.profile().clone()),
                 self.is_subagent(),
             );
@@ -1958,15 +1957,7 @@ impl Thread {
         templates: Arc<Templates>,
         cx: &mut Context<Self>,
     ) -> Self {
-        let settings_location =
-            project
-                .read(cx)
-                .visible_worktrees(cx)
-                .next()
-                .map(|w| SettingsLocation {
-                    worktree_id: w.read(cx).id(),
-                    path: util::rel_path::RelPath::empty(),
-                });
+        let settings_location = Self::project_settings_location(&project, cx);
         let settings = AgentSettings::get(settings_location, cx);
         let profile_id = db_thread
             .profile
@@ -3891,6 +3882,7 @@ impl Thread {
             cancellation_rx,
             self.sandbox_grants.clone(),
             Some(cx.weak_entity()),
+            Some(self.project.clone()),
             Some(self.profile().clone()),
             self.is_subagent(),
         );
@@ -5838,6 +5830,7 @@ pub struct ToolCallEventStream {
     /// sandbox grant is recorded so it survives reopening. `None` in tests and
     /// for streams not tied to a live thread.
     thread: Option<WeakEntity<Thread>>,
+    project: Option<Entity<Project>>,
     profile_id: Option<agent_settings::AgentProfileId>,
     is_subagent: bool,
 }
@@ -5872,6 +5865,7 @@ impl ToolCallEventStream {
             sandbox_grants,
             None,
             None,
+            None,
             false,
         );
 
@@ -5893,6 +5887,7 @@ impl ToolCallEventStream {
             None,
             cancellation_rx,
             Rc::new(RefCell::new(ThreadSandboxGrants::default())),
+            None,
             None,
             None,
             false,
@@ -5919,6 +5914,7 @@ impl ToolCallEventStream {
         cancellation_rx: watch::Receiver<bool>,
         sandbox_grants: Rc<RefCell<ThreadSandboxGrants>>,
         thread: Option<WeakEntity<Thread>>,
+        project: Option<Entity<Project>>,
         profile_id: Option<agent_settings::AgentProfileId>,
         is_subagent: bool,
     ) -> Self {
@@ -5930,6 +5926,7 @@ impl ToolCallEventStream {
             cancellation_rx,
             sandbox_grants,
             thread,
+            project,
             profile_id,
             is_subagent,
         }
@@ -5946,12 +5943,14 @@ impl ToolCallEventStream {
         self.profile_id.clone()
     }
 
+    pub fn project(&self) -> Option<&Entity<Project>> {
+        self.project.as_ref()
+    }
+
     pub fn settings_location(&self, cx: &App) -> Option<SettingsLocation<'static>> {
-        self.thread
-            .as_ref()?
-            .upgrade()?
-            .read(cx)
-            .settings_location(cx)
+        self.project
+            .as_ref()
+            .and_then(|project| Thread::project_settings_location(project, cx))
     }
 
     /// Profile settings for the owning thread.
@@ -6095,13 +6094,12 @@ impl ToolCallEventStream {
         // matching), so we pass a single empty input value just to satisfy
         // `decide_permission_for_profile`' signature.
         let profile_id = self.profile_id.clone();
-        let thread = self.thread.clone();
+        let project = self.project.clone();
         let check_settings: Box<dyn Fn(&App) -> ToolPermissionDecision> =
             Box::new(move |cx: &App| {
-                let location = thread
+                let location = project
                     .as_ref()
-                    .and_then(|t| t.upgrade())
-                    .and_then(|t| t.read(cx).settings_location(cx));
+                    .and_then(|project| Thread::project_settings_location(project, cx));
                 let settings = agent_settings::AgentSettings::get(location, cx);
                 let profile = profile_id.as_ref().and_then(|id| settings.profiles.get(id));
                 decide_permission_for_profile(
@@ -6145,13 +6143,12 @@ impl ToolCallEventStream {
         let tool_name = context.tool_name.clone();
         let input_values = context.input_values.clone();
         let profile_id = self.profile_id.clone();
-        let thread = self.thread.clone();
+        let project = self.project.clone();
         let check_settings: Box<dyn Fn(&App) -> ToolPermissionDecision> =
             Box::new(move |cx: &App| {
-                let location = thread
+                let location = project
                     .as_ref()
-                    .and_then(|t| t.upgrade())
-                    .and_then(|t| t.read(cx).settings_location(cx));
+                    .and_then(|project| Thread::project_settings_location(project, cx));
                 let settings = agent_settings::AgentSettings::get(location, cx);
                 let profile = profile_id.as_ref().and_then(|id| settings.profiles.get(id));
                 decide_permission_for_profile(
@@ -6266,6 +6263,7 @@ impl ToolCallEventStream {
         let tool_call_id = self.tool_call_id.clone();
         let sandbox_grants = self.sandbox_grants.clone();
         let thread = self.thread.clone();
+        let project = self.project.clone();
         let auto_allow_outcome = match auto_resolve_permission_outcome(&options, true) {
             Ok(outcome) => outcome,
             Err(error) => return Task::ready(Err(error)),
@@ -6324,10 +6322,9 @@ impl ToolCallEventStream {
                     }
                     _ = settings_changed.fuse() => {
                         if cx.update(|cx| {
-                            let location = thread
+                            let location = project
                                 .as_ref()
-                                .and_then(|t| t.upgrade())
-                                .and_then(|t| t.read(cx).settings_location(cx));
+                                .and_then(|project| Thread::project_settings_location(project, cx));
                             Self::sandbox_request_covered_by_grants(
                                 &request,
                                 &sandbox_grants,
@@ -9547,5 +9544,40 @@ mod tests {
             );
             assert!(last_message.tool_results.contains_key(&tool_use_id));
         })
+    }
+
+    #[gpui::test]
+    async fn test_authorize_third_party_tool_during_thread_update(cx: &mut TestAppContext) {
+        let (thread, event_stream) = setup_thread_for_test(cx).await;
+
+        let (_cancellation_tx, cancellation_rx) = watch::channel(false);
+        let weak_thread = thread.downgrade();
+        let stream = thread.read_with(cx, |this, _cx| {
+            ToolCallEventStream::new(
+                "tool_1".into(),
+                acp::ToolCallId::new("0:tool_1"),
+                event_stream,
+                None,
+                cancellation_rx,
+                this.sandbox_grants.clone(),
+                Some(weak_thread),
+                Some(this.project.clone()),
+                Some(this.profile().clone()),
+                this.is_subagent(),
+            )
+        });
+
+        // Simulates tool execution within thread.update (e.g. MCP context server tools).
+        // Before the fix, this panicked with "Cannot read agent::thread::Thread while it is already being updated".
+        let authorize_task = thread.update(cx, |_this, cx| {
+            stream.authorize_third_party_tool(
+                "title",
+                "custom_mcp_tool".into(),
+                "MCP Tool".into(),
+                cx,
+            )
+        });
+
+        drop(authorize_task);
     }
 }
