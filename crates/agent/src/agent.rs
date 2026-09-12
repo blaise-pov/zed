@@ -3269,8 +3269,9 @@ impl NativeThreadEnvironment {
         let slot_guard = SubagentSlotGuard::new(slot_pool);
 
         // Per-profile delegation rules of the calling agent's profile: which
-        // profiles it may spawn and how deeply. Profiles without a
-        // `delegation` block are solo agents and cannot spawn at all.
+        // profiles it may spawn and how deeply. Any profile with `spawn_agent`
+        // enabled may spawn unprofiled agents; spawning an agent with an explicit
+        // profile requires an explicit grant in `delegation.allowed`.
         {
             let (parent_profile_id, parent_profile) = {
                 let parent_thread = parent_thread_entity.read(cx);

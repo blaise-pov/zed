@@ -64,37 +64,56 @@ pub fn check_delegation(
             parent_profile_id
         ));
     };
+
+    if !profile.is_tool_enabled("spawn_agent") {
+        return Some(format!(
+            "Profile '{}' does not have permission to spawn agents.",
+            parent_profile_id
+        ));
+    }
+
+    let max_depth = profile
+        .delegation
+        .as_ref()
+        .map(|d| d.max_depth)
+        .unwrap_or(1);
+
+    if parent_depth >= max_depth {
+        return Some(format!(
+            "Maximum delegation depth ({}) for profile '{}' reached. Complete the task \
+             yourself instead of delegating further.",
+            max_depth, parent_profile_id
+        ));
+    }
+
+    let Some(target) = requested else {
+        // Any profile with spawn_agent rights may spawn without an explicit profile
+        // (the sub-agent will inherit the parent's profile).
+        return None;
+    };
+
     let Some(delegation) = profile.delegation.as_ref() else {
         return Some(format!(
             "Profile '{}' is a solo agent: it has no 'delegation' block, so it cannot spawn \
-             other agents. Complete the task yourself.",
-            parent_profile_id
+             profile '{}'. Complete the task yourself.",
+            parent_profile_id, target
         ));
     };
-    let Some(target) = requested else {
-        let allowed: Vec<String> = delegation.allowed.iter().map(|id| id.to_string()).collect();
-        return Some(format!(
-            "Profile '{}' must delegate with an explicit profile. Allowed profiles: {}",
-            parent_profile_id,
-            allowed.join(", ")
-        ));
-    };
+
     if !delegation.allowed.contains(target) {
         let allowed: Vec<String> = delegation.allowed.iter().map(|id| id.to_string()).collect();
         return Some(format!(
             "Profile '{}' is not allowed to spawn profile '{}'. Allowed profiles: {}",
             parent_profile_id,
             target,
-            allowed.join(", ")
+            if allowed.is_empty() {
+                "none".to_string()
+            } else {
+                allowed.join(", ")
+            }
         ));
     }
-    if parent_depth >= delegation.max_depth {
-        return Some(format!(
-            "Maximum delegation depth ({}) for profile '{}' reached. Complete the task \
-             yourself instead of delegating further.",
-            delegation.max_depth, parent_profile_id
-        ));
-    }
+
     None
 }
 
@@ -178,15 +197,18 @@ mod tests {
     }
 
     fn test_profile() -> AgentProfileSettings {
+        let mut tools = IndexMap::default();
+        tools.insert("spawn_agent".into(), true);
         AgentProfileSettings {
             name: "test".into(),
             origin: crate::ProfileOrigin::Global,
-            tools: IndexMap::default(),
+            tools,
             enable_all_context_servers: false,
             context_servers: IndexMap::default(),
             default_model: None,
             custom_prompt: None,
             custom_prompt_path: None,
+            system_prompt_template: None,
             description: None,
             skills: None,
             delegation: None,
@@ -322,11 +344,27 @@ mod tests {
     }
 
     #[test]
-    fn check_delegation_requires_explicit_target() {
+    fn check_delegation_allows_unspecified_target_when_spawn_agent_enabled() {
         let parent = profile_with_delegation(&["child"]);
+        assert_eq!(
+            check_delegation(&id("parent"), Some(&parent), 0, None),
+            None
+        );
+
+        let solo = test_profile();
+        assert_eq!(check_delegation(&id("solo"), Some(&solo), 0, None), None);
+    }
+
+    #[test]
+    fn check_delegation_rejects_when_spawn_agent_tool_disabled() {
+        let mut parent = test_profile();
+        parent.tools.insert("spawn_agent".into(), false);
         let error = check_delegation(&id("parent"), Some(&parent), 0, None)
-            .expect("missing target must be rejected");
-        assert!(error.contains("explicit profile"), "unexpected: {error}");
+            .expect("missing permission must be rejected");
+        assert!(
+            error.contains("permission to spawn agents"),
+            "unexpected: {error}"
+        );
     }
 
     #[test]
