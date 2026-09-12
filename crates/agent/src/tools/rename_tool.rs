@@ -197,6 +197,7 @@ mod tests {
             default_model: None,
             custom_prompt: None,
             custom_prompt_path: None,
+            system_prompt_template: None,
             description: None,
             skills: None,
             delegation: None,

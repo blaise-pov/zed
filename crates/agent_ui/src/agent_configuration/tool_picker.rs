@@ -410,6 +410,10 @@ impl PickerDelegate for ToolPickerDelegate {
                         .custom_prompt_path
                         .clone()
                         .map(|s| s.into()),
+                    system_prompt_template: default_profile
+                        .system_prompt_template
+                        .clone()
+                        .map(|s| s.into()),
                     description: default_profile.description.clone().map(|s| s.into()),
                     skills: default_profile.skills.clone(),
                     delegation: default_profile.delegation.as_ref().map(|delegation| {

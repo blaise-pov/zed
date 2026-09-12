@@ -4189,7 +4189,12 @@ impl Thread {
         log::debug!("Generating title with model: {:?}", model.name());
 
         let temperature = AgentSettings::temperature_for_model(&model, cx);
-        let request = build_thread_title_request(&self.id, &self.messages, temperature);
+        let request = build_thread_title_request(
+            &self.id,
+            &self.messages,
+            temperature,
+            self.agent_settings(cx).thread_title_instructions.as_deref(),
+        );
 
         let title_generation = cx.spawn(async move |_this, cx| {
             stream_thread_title(model, request, cx)
@@ -4664,8 +4669,8 @@ impl Thread {
             .profiles
             .get(&self.profile_id)
             .and_then(|profile| profile.delegation.as_ref())
-            .map(|delegation| {
-                delegation
+            .and_then(|delegation| {
+                let agents = delegation
                     .allowed
                     .iter()
                     .filter_map(|id| {
@@ -4678,9 +4683,14 @@ impl Thread {
                         Some(format!("- {id} — {}{description}", target.name))
                     })
                     .collect::<Vec<_>>()
-                    .join("\n")
+                    .join("\n");
+                if agents.is_empty() {
+                    None
+                } else {
+                    Some(agents)
+                }
             });
-        let system_prompt = SystemPromptTemplate {
+        let system_prompt_data = SystemPromptTemplate {
             project: project_context,
             available_tools,
             model_name: self.model().map(|m| m.name().0.to_string()),
@@ -4695,10 +4705,35 @@ impl Thread {
             custom_instructions,
             subagent_delegation_note: self.subagent_delegation_note(cx),
             available_agents,
-        }
-        .render(&self.templates)
-        .context("failed to build system prompt")
-        .expect("Invalid template");
+        };
+        let custom_template_path = settings
+            .profiles
+            .get(&self.profile_id)
+            .and_then(|profile| profile.system_prompt_template.as_deref())
+            .or(settings.system_prompt_template.as_deref());
+        let render_default = || {
+            system_prompt_data
+                .render(&self.templates)
+                .context("failed to build system prompt")
+        };
+        let system_prompt = if let Some(path) = custom_template_path {
+            match agent_settings::read_prompt_file(path).map(|content| {
+                self.templates
+                    .render_custom_template(&content, &system_prompt_data)
+            }) {
+                Some(Ok(rendered)) => rendered,
+                Some(Err(err)) => {
+                    log::warn!("failed to render custom system prompt template from {path}: {err}");
+                    render_default().expect("Invalid template")
+                }
+                None => {
+                    log::warn!("failed to read custom system prompt template file from {path}");
+                    render_default().expect("Invalid template")
+                }
+            }
+        } else {
+            render_default().expect("Invalid template")
+        };
         let mut messages = vec![LanguageModelRequestMessage {
             role: Role::System,
             content: vec![system_prompt.into()],
@@ -5236,6 +5271,7 @@ pub fn build_thread_title_request(
     thread_id: &acp::SessionId,
     messages: &[Arc<Message>],
     temperature: Option<f32>,
+    instructions: Option<&str>,
 ) -> LanguageModelRequest {
     let mut request = LanguageModelRequest {
         thread_id: Some(thread_id.to_string()),
@@ -5244,9 +5280,16 @@ pub fn build_thread_title_request(
         ..Default::default()
     };
     extend_request_history_until(messages, &mut request.messages, messages.len());
+    let prompt = if let Some(instructions) =
+        instructions.filter(|instructions| !instructions.trim().is_empty())
+    {
+        format!("{SUMMARIZE_THREAD_PROMPT}\n\nAdditional instructions:\n{instructions}")
+    } else {
+        SUMMARIZE_THREAD_PROMPT.to_string()
+    };
     request.messages.push(LanguageModelRequestMessage {
         role: Role::User,
-        content: vec![SUMMARIZE_THREAD_PROMPT.into()],
+        content: vec![prompt.into()],
         cache: false,
         reasoning_details: None,
     });
@@ -7477,8 +7520,12 @@ mod tests {
             agent_text_message("after assistant"),
         ];
 
-        let request =
-            build_thread_title_request(&acp::SessionId::new("thread-id"), &messages, Some(0.2));
+        let request = build_thread_title_request(
+            &acp::SessionId::new("thread-id"),
+            &messages,
+            Some(0.2),
+            None,
+        );
 
         assert_eq!(request.thread_id.as_deref(), Some("thread-id"));
         assert_eq!(request.intent, Some(CompletionIntent::ThreadSummarization));
@@ -7493,6 +7540,42 @@ mod tests {
                 "after assistant".to_string(),
                 SUMMARIZE_THREAD_PROMPT.to_string(),
             ]
+        );
+    }
+
+    #[test]
+    fn test_thread_title_request_appends_instructions() {
+        let messages = [user_text_message(ClientUserMessageId::new(), "hello")];
+
+        let with_instructions = build_thread_title_request(
+            &acp::SessionId::new("thread-id"),
+            &messages,
+            None,
+            Some("Use French"),
+        );
+        let expected = format!("{SUMMARIZE_THREAD_PROMPT}\n\nAdditional instructions:\nUse French");
+        assert_eq!(
+            request_texts(&with_instructions.messages).last(),
+            Some(&expected)
+        );
+
+        let without_instructions =
+            build_thread_title_request(&acp::SessionId::new("thread-id"), &messages, None, None);
+        assert_eq!(
+            request_texts(&without_instructions.messages).last(),
+            Some(&SUMMARIZE_THREAD_PROMPT.to_string())
+        );
+
+        // Blank instructions are treated as absent.
+        let blank_instructions = build_thread_title_request(
+            &acp::SessionId::new("thread-id"),
+            &messages,
+            None,
+            Some("   "),
+        );
+        assert_eq!(
+            request_texts(&blank_instructions.messages).last(),
+            Some(&SUMMARIZE_THREAD_PROMPT.to_string())
         );
     }
 

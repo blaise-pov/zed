@@ -306,6 +306,8 @@ pub struct AgentSettings {
     pub commit_message_model: Option<LanguageModelSelection>,
     pub commit_message_include_project_rules: bool,
     pub commit_message_instructions: Option<String>,
+    pub thread_title_instructions: Option<String>,
+    pub system_prompt_template: Option<String>,
     pub thread_summary_model: Option<LanguageModelSelection>,
     pub compaction_model: Option<LanguageModelSelection>,
     pub inline_alternatives: Vec<LanguageModelSelection>,
@@ -1001,7 +1003,9 @@ impl Settings for AgentSettings {
                 .commit_message_include_project_rules
                 .unwrap(),
             commit_message_model: agent.commit_message_model.map(expand_model_selection),
-            commit_message_instructions: agent.commit_message_instructions,
+            commit_message_instructions: agent.commit_message_instructions.clone(),
+            thread_title_instructions: agent.thread_title_instructions.clone(),
+            system_prompt_template: agent.system_prompt_template.clone(),
             thread_summary_model: agent.thread_summary_model.map(expand_model_selection),
             compaction_model: agent.compaction_model.map(expand_model_selection),
             inline_alternatives: agent

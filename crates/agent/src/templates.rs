@@ -23,6 +23,14 @@ impl Templates {
         handlebars.register_embed_templates::<Assets>().unwrap();
         Arc::new(Self(handlebars))
     }
+
+    pub fn render_custom_template<T: serde::Serialize>(
+        &self,
+        template_str: &str,
+        data: &T,
+    ) -> anyhow::Result<String> {
+        Ok(self.0.render_template(template_str, data)?)
+    }
 }
 
 pub trait Template: Sized {
@@ -107,6 +115,34 @@ fn contains(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_render_custom_template() {
+        #[derive(serde::Serialize)]
+        struct Data {
+            name: String,
+        }
+
+        let templates = Templates::new();
+        let rendered = templates
+            .render_custom_template(
+                "Hello, {{name}}!",
+                &Data {
+                    name: "Zed".to_string(),
+                },
+            )
+            .unwrap();
+        assert_eq!(rendered, "Hello, Zed!");
+
+        // Strict mode rejects templates referencing fields the data doesn't have.
+        let err = templates.render_custom_template(
+            "{{missing_field}}",
+            &Data {
+                name: "Zed".to_string(),
+            },
+        );
+        assert!(err.is_err());
+    }
 
     #[test]
     fn test_system_prompt_template() {

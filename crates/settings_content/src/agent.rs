@@ -285,6 +285,10 @@ pub struct AgentSettingsContent {
     /// Custom instructions to include in the prompt when generating git commit messages.
     /// Applied in addition to any project rules files (such as `.rules` or `AGENTS.md`).
     pub commit_message_instructions: Option<String>,
+    /// Custom instructions to include in the prompt when generating thread titles.
+    pub thread_title_instructions: Option<String>,
+    /// Path to a custom base Handlebars/Markdown template file for the agent system prompt.
+    pub system_prompt_template: Option<String>,
     /// Model to use for generating thread summaries. Defaults to default_model when not specified.
     pub thread_summary_model: Option<LanguageModelSelection>,
     /// Model to use for context compaction (`/compact` and auto-compaction).
@@ -606,6 +610,8 @@ pub struct AgentProfileContent {
         alias = "prompt_file"
     )]
     pub custom_prompt_path: Option<Arc<str>>,
+    /// Path to a custom base Handlebars/Markdown template file for this profile.
+    pub system_prompt_template: Option<Arc<str>>,
     /// Free-form description of what this profile is for. Surfaced to the
     /// parent agent in the catalog of delegatable agents.
     pub description: Option<Arc<str>>,

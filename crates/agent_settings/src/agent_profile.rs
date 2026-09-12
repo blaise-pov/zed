@@ -97,6 +97,9 @@ impl AgentProfile {
         let custom_prompt_path = base_profile
             .as_ref()
             .and_then(|profile| profile.custom_prompt_path.clone());
+        let system_prompt_template = base_profile
+            .as_ref()
+            .and_then(|profile| profile.system_prompt_template.clone());
         let description = base_profile
             .as_ref()
             .and_then(|profile| profile.description.clone());
@@ -120,6 +123,7 @@ impl AgentProfile {
             default_model,
             custom_prompt,
             custom_prompt_path,
+            system_prompt_template,
             description,
             skills,
             delegation,
@@ -195,6 +199,8 @@ pub struct AgentProfileSettings {
     pub custom_prompt: Option<SharedString>,
     /// Path to a file containing custom system prompt instructions for this profile.
     pub custom_prompt_path: Option<SharedString>,
+    /// Path to a custom base Handlebars/Markdown template file for this profile.
+    pub system_prompt_template: Option<SharedString>,
     /// What this profile is for; shown to the parent agent in the delegation
     /// catalog.
     pub description: Option<SharedString>,
@@ -333,6 +339,7 @@ impl AgentProfileSettings {
                 default_model: self.default_model.clone(),
                 custom_prompt: self.custom_prompt.clone().map(|s| s.into()),
                 custom_prompt_path: self.custom_prompt_path.clone().map(|s| s.into()),
+                system_prompt_template: self.system_prompt_template.clone().map(|s| s.into()),
                 description: self.description.clone().map(|s| s.into()),
                 skills: self.skills.clone(),
                 delegation: self
@@ -474,6 +481,7 @@ impl From<AgentProfileContent> for AgentProfileSettings {
             default_model,
             custom_prompt,
             custom_prompt_path,
+            system_prompt_template,
             description,
             skills,
             delegation,
@@ -498,6 +506,7 @@ impl From<AgentProfileContent> for AgentProfileSettings {
             default_model: default_model.map(crate::expand_model_selection),
             custom_prompt: resolved_prompt,
             custom_prompt_path: custom_prompt_path_shared,
+            system_prompt_template: system_prompt_template.map(|s| s.to_string().into()),
             description: description.map(|s| s.into()),
             skills,
             delegation: delegation.map(|delegation| delegation.into()),
@@ -546,6 +555,7 @@ mod tests {
             default_model: None,
             custom_prompt: None,
             custom_prompt_path: None,
+            system_prompt_template: None,
             description: None,
             skills: None,
             delegation: None,
