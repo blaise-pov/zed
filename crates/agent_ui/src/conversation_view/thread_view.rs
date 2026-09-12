@@ -10646,6 +10646,27 @@ impl ThreadView {
             "Spawning Agent…".into()
         };
 
+        let profile_label = {
+            let raw_profile = tool_call
+                .raw_input
+                .as_ref()
+                .and_then(|input| input.get("profile"))
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty());
+
+            match raw_profile {
+                Some(id_str) => {
+                    let profile_id = AgentProfileId(id_str.into());
+                    AgentSettings::get_global(cx)
+                        .profiles
+                        .get(&profile_id)
+                        .map(|profile| profile.name.to_string())
+                        .unwrap_or_else(|| id_str.to_string())
+                }
+                None => "no profile".to_string(),
+            }
+        };
+
         let card_header_id = format!("subagent-header-{}", entry_ix);
         let status_icon = format!("status-icon-{}", entry_ix);
         let diff_stat_id = format!("subagent-diff-{}", entry_ix);
@@ -10733,6 +10754,12 @@ impl ThreadView {
                                             .size(LabelSize::Custom(self.tool_name_font_size()))
                                             .truncate(),
                                     )
+                                    .child(
+                                        Label::new(format!("({profile_label})"))
+                                            .size(LabelSize::Custom(self.tool_name_font_size()))
+                                            .color(Color::Muted)
+                                            .truncate(),
+                                    )
                                     .when(files_changed > 0, |this| {
                                         this.child(
                                             Label::new(format!(
@@ -10756,9 +10783,10 @@ impl ThreadView {
                                     }),
                             )
                             .when(!has_no_title_or_canceled && !is_pending_tool_call, |this| {
+                                let tooltip_title = format!("{title} ({profile_label})");
                                 this.tooltip(move |_, cx| {
                                     Tooltip::with_meta(
-                                        title.to_string(),
+                                        tooltip_title.clone(),
                                         None,
                                         tooltip_meta_description,
                                         cx,
