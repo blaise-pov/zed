@@ -760,7 +760,7 @@ impl Panel for AgentTaskPanel {
     }
 
     fn icon(&self, _window: &Window, _cx: &App) -> Option<IconName> {
-        Some(IconName::Check)
+        Some(IconName::ListTodo)
     }
 
     fn icon_tooltip(&self, _window: &Window, _cx: &App) -> Option<&'static str> {
