@@ -3833,16 +3833,12 @@ impl Sidebar {
 
         let model = configured_model.model;
         let temperature = AgentSettings::temperature_for_model(&model, cx);
-        let title_instructions = match self.active_workspace(cx) {
+        let title_prompt = match self.active_workspace(cx) {
             Some(workspace) => {
                 let project = workspace.read(cx).project().clone();
-                AgentSettings::get_for_project(project.read(cx), cx)
-                    .thread_title_instructions
-                    .clone()
+                AgentSettings::get_for_project(project.read(cx), cx).thread_title_prompt()
             }
-            None => AgentSettings::get_global(cx)
-                .thread_title_instructions
-                .clone(),
+            None => AgentSettings::get_global(cx).thread_title_prompt(),
         };
 
         let thread_store = ThreadStore::global(cx);
@@ -3862,7 +3858,7 @@ impl Sidebar {
                     &session_id,
                     &db_thread.messages,
                     temperature,
-                    title_instructions.as_deref(),
+                    title_prompt.as_deref(),
                 );
                 let title =
                     SharedString::from(agent::stream_thread_title(model, request, cx).await?);

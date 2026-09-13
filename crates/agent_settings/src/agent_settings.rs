@@ -306,7 +306,7 @@ pub struct AgentSettings {
     pub commit_message_model: Option<LanguageModelSelection>,
     pub commit_message_include_project_rules: bool,
     pub commit_message_instructions: Option<String>,
-    pub thread_title_instructions: Option<String>,
+    pub thread_title_template: Option<String>,
     pub system_prompt_template: Option<String>,
     pub thread_summary_model: Option<LanguageModelSelection>,
     pub compaction_model: Option<LanguageModelSelection>,
@@ -356,6 +356,28 @@ impl AgentSettings {
             return setting.temperature;
         }
         return None;
+    }
+
+    /// Returns the fully resolved prompt used for thread title generation.
+    ///
+    /// A custom template (`thread_title_template`) that is successfully read
+    /// completely replaces the default prompt. If the template cannot be read,
+    /// a warning is logged and the default prompt is used instead.
+    pub fn thread_title_prompt(&self) -> Option<String> {
+        if let Some(template_path) = self
+            .thread_title_template
+            .as_deref()
+            .filter(|path| !path.trim().is_empty())
+        {
+            match crate::read_prompt_file(template_path) {
+                Some(content) if !content.trim().is_empty() => {
+                    return Some(content.trim().to_string());
+                }
+                _ => log::warn!("failed to read custom thread title template from {template_path}"),
+            }
+        }
+
+        None
     }
 
     pub fn sidebar_side(&self) -> SidebarSide {
@@ -1004,7 +1026,7 @@ impl Settings for AgentSettings {
                 .unwrap(),
             commit_message_model: agent.commit_message_model.map(expand_model_selection),
             commit_message_instructions: agent.commit_message_instructions.clone(),
-            thread_title_instructions: agent.thread_title_instructions.clone(),
+            thread_title_template: agent.thread_title_template.clone(),
             system_prompt_template: agent.system_prompt_template.clone(),
             thread_summary_model: agent.thread_summary_model.map(expand_model_selection),
             compaction_model: agent.compaction_model.map(expand_model_selection),
@@ -2309,5 +2331,70 @@ mod tests {
             assert_eq!(user_layout.agent_dock, Some(DockPosition::Right));
             assert_eq!(user_layout.project_panel_dock, Some(DockSide::Right));
         });
+    }
+
+    #[gpui::test]
+    fn test_thread_title_prompt_default(cx: &mut gpui::App) {
+        let store = SettingsStore::test(cx);
+        cx.set_global(store);
+        project::DisableAiSettings::register(cx);
+        AgentSettings::register(cx);
+
+        let settings = AgentSettings::get_global(cx);
+        assert_eq!(settings.thread_title_template, None);
+        assert_eq!(settings.thread_title_prompt(), None);
+    }
+
+    #[gpui::test]
+    fn test_thread_title_prompt_template_missing_file(cx: &mut gpui::App) {
+        let store = SettingsStore::test(cx);
+        cx.set_global(store);
+        project::DisableAiSettings::register(cx);
+        AgentSettings::register(cx);
+
+        SettingsStore::update_global(cx, |store, cx| {
+            store
+                .set_user_settings(
+                    r#"{ "agent": { "thread_title_template": "nonexistent/path.txt" } }"#,
+                    cx,
+                )
+                .unwrap();
+        });
+
+        let settings = AgentSettings::get_global(cx);
+        assert_eq!(settings.thread_title_prompt(), None);
+    }
+
+    #[gpui::test]
+    fn test_thread_title_prompt_template_takes_precedence(cx: &mut gpui::App) {
+        let store = SettingsStore::test(cx);
+        cx.set_global(store);
+        project::DisableAiSettings::register(cx);
+        AgentSettings::register(cx);
+
+        let template_path = std::env::temp_dir().join(format!(
+            "zed-agent-settings-thread-title-prompt-{}.txt",
+            std::process::id()
+        ));
+        std::fs::write(&template_path, "custom title template").unwrap();
+
+        SettingsStore::update_global(cx, |store, cx| {
+            let user_settings = json!({
+                "agent": {
+                    "thread_title_template": template_path.to_string_lossy(),
+                }
+            });
+            store
+                .set_user_settings(&user_settings.to_string(), cx)
+                .unwrap();
+        });
+
+        let settings = AgentSettings::get_global(cx);
+        assert_eq!(
+            settings.thread_title_prompt(),
+            Some("custom title template".to_string())
+        );
+
+        std::fs::remove_file(&template_path).log_err();
     }
 }

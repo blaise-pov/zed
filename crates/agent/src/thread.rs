@@ -4193,7 +4193,7 @@ impl Thread {
             &self.id,
             &self.messages,
             temperature,
-            self.agent_settings(cx).thread_title_instructions.as_deref(),
+            self.agent_settings(cx).thread_title_prompt().as_deref(),
         );
 
         let title_generation = cx.spawn(async move |_this, cx| {
@@ -5271,7 +5271,7 @@ pub fn build_thread_title_request(
     thread_id: &acp::SessionId,
     messages: &[Arc<Message>],
     temperature: Option<f32>,
-    instructions: Option<&str>,
+    title_prompt: Option<&str>,
 ) -> LanguageModelRequest {
     let mut request = LanguageModelRequest {
         thread_id: Some(thread_id.to_string()),
@@ -5280,12 +5280,9 @@ pub fn build_thread_title_request(
         ..Default::default()
     };
     extend_request_history_until(messages, &mut request.messages, messages.len());
-    let prompt = if let Some(instructions) =
-        instructions.filter(|instructions| !instructions.trim().is_empty())
-    {
-        format!("{SUMMARIZE_THREAD_PROMPT}\n\nAdditional instructions:\n{instructions}")
-    } else {
-        SUMMARIZE_THREAD_PROMPT.to_string()
+    let prompt = match title_prompt.filter(|prompt| !prompt.trim().is_empty()) {
+        Some(prompt) => prompt.to_string(),
+        None => SUMMARIZE_THREAD_PROMPT.to_string(),
     };
     request.messages.push(LanguageModelRequestMessage {
         role: Role::User,
@@ -7544,37 +7541,37 @@ mod tests {
     }
 
     #[test]
-    fn test_thread_title_request_appends_instructions() {
+    fn test_thread_title_request_custom_prompt() {
         let messages = [user_text_message(ClientUserMessageId::new(), "hello")];
 
-        let with_instructions = build_thread_title_request(
+        // A resolved custom prompt (from a template file) is used verbatim.
+        let with_custom_prompt = build_thread_title_request(
             &acp::SessionId::new("thread-id"),
             &messages,
             None,
             Some("Use French"),
         );
-        let expected = format!("{SUMMARIZE_THREAD_PROMPT}\n\nAdditional instructions:\nUse French");
         assert_eq!(
-            request_texts(&with_instructions.messages).last(),
-            Some(&expected)
+            request_texts(&with_custom_prompt.messages).last(),
+            Some(&"Use French".to_string())
         );
 
-        let without_instructions =
+        let without_prompt =
             build_thread_title_request(&acp::SessionId::new("thread-id"), &messages, None, None);
         assert_eq!(
-            request_texts(&without_instructions.messages).last(),
+            request_texts(&without_prompt.messages).last(),
             Some(&SUMMARIZE_THREAD_PROMPT.to_string())
         );
 
-        // Blank instructions are treated as absent.
-        let blank_instructions = build_thread_title_request(
+        // A blank prompt is treated as absent.
+        let blank_prompt = build_thread_title_request(
             &acp::SessionId::new("thread-id"),
             &messages,
             None,
             Some("   "),
         );
         assert_eq!(
-            request_texts(&blank_instructions.messages).last(),
+            request_texts(&blank_prompt.messages).last(),
             Some(&SUMMARIZE_THREAD_PROMPT.to_string())
         );
     }

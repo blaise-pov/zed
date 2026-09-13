@@ -682,7 +682,7 @@ mod tests {
             commit_message_model: None,
             commit_message_include_project_rules: true,
             commit_message_instructions: None,
-            thread_title_instructions: None,
+            thread_title_template: None,
             system_prompt_template: None,
             thread_summary_model: None,
             compaction_model: None,

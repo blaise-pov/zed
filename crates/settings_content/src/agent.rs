@@ -285,8 +285,10 @@ pub struct AgentSettingsContent {
     /// Custom instructions to include in the prompt when generating git commit messages.
     /// Applied in addition to any project rules files (such as `.rules` or `AGENTS.md`).
     pub commit_message_instructions: Option<String>,
-    /// Custom instructions to include in the prompt when generating thread titles.
-    pub thread_title_instructions: Option<String>,
+    /// Path to a custom template or prompt file for generating thread titles.
+    /// When specified and successfully read, completely replaces the default
+    /// title generation prompt.
+    pub thread_title_template: Option<String>,
     /// Path to a custom base Handlebars/Markdown template file for the agent system prompt.
     pub system_prompt_template: Option<String>,
     /// Model to use for generating thread summaries. Defaults to default_model when not specified.
