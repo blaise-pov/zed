@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Result, bail};
@@ -364,13 +364,54 @@ impl AgentProfileSettings {
     }
 }
 
-/// Reads prompt content from a file path.
-/// Handles absolute paths, `~` home directory prefix, and relative paths
-/// (checked against cwd, `.zed` in cwd, and Zed config/prompts directories).
-pub fn read_prompt_file(path_str: &str) -> Option<String> {
+#[derive(Debug, PartialEq, Eq)]
+pub enum PromptResolveError {
+    EmptyPath,
+    ReadFailed { path: PathBuf, error: String },
+    NotFound { attempted_paths: Vec<PathBuf> },
+}
+
+impl std::fmt::Display for PromptResolveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::EmptyPath => write!(f, "prompt path is empty"),
+            Self::ReadFailed { path, error } => {
+                write!(
+                    f,
+                    "failed to read prompt file at {}: {error}",
+                    path.display()
+                )
+            }
+            Self::NotFound { attempted_paths } => {
+                let candidates = attempted_paths
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                write!(
+                    f,
+                    "prompt file not found. Checked candidate paths: [{candidates}]"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for PromptResolveError {}
+
+pub fn prompt_search_roots(worktree_root: Option<&Path>) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let Some(worktree) = worktree_root {
+        roots.push(worktree.to_path_buf());
+    }
+    roots.push(paths::config_dir().to_path_buf());
+    roots
+}
+
+pub fn resolve_prompt(path_str: &str, anchors: &[PathBuf]) -> Result<String, PromptResolveError> {
     let trimmed = path_str.trim();
     if trimmed.is_empty() {
-        return None;
+        return Err(PromptResolveError::EmptyPath);
     }
 
     let path = if let Some(rest) = trimmed
@@ -385,74 +426,47 @@ pub fn read_prompt_file(path_str: &str) -> Option<String> {
     };
 
     if path.is_absolute() {
-        match std::fs::read_to_string(&path) {
-            Ok(content) => return Some(content),
-            Err(err) => {
-                log::warn!(
-                    "failed to read custom prompt from absolute path {}: {err}",
-                    path.display()
-                );
-                return None;
-            }
+        if path.is_file() {
+            return std::fs::read_to_string(&path).map_err(|err| PromptResolveError::ReadFailed {
+                path: path.clone(),
+                error: err.to_string(),
+            });
+        } else {
+            return Err(PromptResolveError::NotFound {
+                attempted_paths: vec![path],
+            });
         }
     }
 
-    // Relative path resolution candidates:
-    // 1. Current working directory
-    if let Ok(cwd) = std::env::current_dir() {
-        let candidate = cwd.join(&path);
+    let mut attempted_paths = Vec::with_capacity(anchors.len());
+    for anchor in anchors {
+        let candidate = anchor.join(&path);
         if candidate.is_file() {
-            match std::fs::read_to_string(&candidate) {
-                Ok(content) => return Some(content),
-                Err(err) => log::warn!(
-                    "failed to read custom prompt from {}: {err}",
-                    candidate.display()
-                ),
-            }
+            return std::fs::read_to_string(&candidate).map_err(|err| {
+                PromptResolveError::ReadFailed {
+                    path: candidate,
+                    error: err.to_string(),
+                }
+            });
         }
-        let candidate_zed = cwd.join(".zed").join(&path);
-        if candidate_zed.is_file() {
-            match std::fs::read_to_string(&candidate_zed) {
-                Ok(content) => return Some(content),
-                Err(err) => log::warn!(
-                    "failed to read custom prompt from {}: {err}",
-                    candidate_zed.display()
-                ),
-            }
-        }
+        attempted_paths.push(candidate);
     }
 
-    // 2. Zed config directory
-    let candidate = paths::config_dir().join(&path);
-    if candidate.is_file() {
-        match std::fs::read_to_string(&candidate) {
-            Ok(content) => return Some(content),
-            Err(err) => log::warn!(
-                "failed to read custom prompt from {}: {err}",
-                candidate.display()
-            ),
+    Err(PromptResolveError::NotFound { attempted_paths })
+}
+
+/// Reads prompt content from a file path.
+/// Handles absolute paths, `~` home directory prefix, and relative paths
+/// resolved against worktree root and Zed config directory.
+pub fn read_prompt_file(path_str: &str, worktree_root: Option<&Path>) -> Option<String> {
+    let anchors = prompt_search_roots(worktree_root);
+    match resolve_prompt(path_str, &anchors) {
+        Ok(content) => Some(content),
+        Err(err) => {
+            log::warn!("failed to read custom prompt from {path_str}: {err}");
+            None
         }
     }
-
-    // 3. Zed prompts directory
-    let candidate = paths::prompts_dir().join(&path);
-    if candidate.is_file() {
-        match std::fs::read_to_string(&candidate) {
-            Ok(content) => return Some(content),
-            Err(err) => log::warn!(
-                "failed to read custom prompt from {}: {err}",
-                candidate.display()
-            ),
-        }
-    }
-
-    // 4. Fallback direct read (e.g. relative to process working directory)
-    if let Ok(content) = std::fs::read_to_string(&path) {
-        return Some(content);
-    }
-
-    log::warn!("custom prompt file not found at: {}", path.display());
-    None
 }
 
 /// Resolves the custom prompt text given optional prompt text and prompt file path.
@@ -460,9 +474,10 @@ pub fn read_prompt_file(path_str: &str) -> Option<String> {
 pub fn resolve_custom_prompt(
     custom_prompt: Option<&str>,
     custom_prompt_path: Option<&str>,
+    worktree_root: Option<&Path>,
 ) -> Option<SharedString> {
     if let Some(path_str) = custom_prompt_path {
-        if let Some(file_content) = read_prompt_file(path_str) {
+        if let Some(file_content) = read_prompt_file(path_str, worktree_root) {
             return Some(file_content.into());
         }
     }
@@ -491,8 +506,11 @@ impl From<AgentProfileContent> for AgentProfileSettings {
         let custom_prompt_path_shared = custom_prompt_path
             .as_ref()
             .map(|p| SharedString::from(p.to_string()));
-        let resolved_prompt =
-            resolve_custom_prompt(custom_prompt.as_deref(), custom_prompt_path.as_deref());
+        let resolved_prompt = resolve_custom_prompt(
+            custom_prompt.as_deref(),
+            custom_prompt_path.as_deref(),
+            None,
+        );
 
         Self {
             name: name.into(),
@@ -589,28 +607,187 @@ mod tests {
         let prompt_path_str = prompt_file.to_str().unwrap();
 
         // 1. Both file and text specified -> file has priority
-        let resolved = resolve_custom_prompt(Some("Inline text prompt"), Some(prompt_path_str));
+        let resolved =
+            resolve_custom_prompt(Some("Inline text prompt"), Some(prompt_path_str), None);
         assert_eq!(resolved.as_deref(), Some("Prompt content from file"));
 
         // 2. Only file specified -> file is read
-        let resolved = resolve_custom_prompt(None, Some(prompt_path_str));
+        let resolved = resolve_custom_prompt(None, Some(prompt_path_str), None);
         assert_eq!(resolved.as_deref(), Some("Prompt content from file"));
 
         // 3. Only text specified -> text is used
-        let resolved = resolve_custom_prompt(Some("Inline text prompt"), None);
+        let resolved = resolve_custom_prompt(Some("Inline text prompt"), None, None);
         assert_eq!(resolved.as_deref(), Some("Inline text prompt"));
 
         // 4. File does not exist -> fallback to text
         let non_existent = temp_dir.join("non_existent.md");
         let non_existent_str = non_existent.to_str().unwrap();
-        let resolved = resolve_custom_prompt(Some("Fallback text prompt"), Some(non_existent_str));
+        let resolved =
+            resolve_custom_prompt(Some("Fallback text prompt"), Some(non_existent_str), None);
         assert_eq!(resolved.as_deref(), Some("Fallback text prompt"));
 
         // 5. File does not exist and no text -> None
-        let resolved = resolve_custom_prompt(None, Some(non_existent_str));
+        let resolved = resolve_custom_prompt(None, Some(non_existent_str), None);
         assert_eq!(resolved, None);
 
-        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::remove_dir_all(&temp_dir).log_err();
+    }
+
+    #[test]
+    fn test_resolve_prompt_absolute_path() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "zed_test_prompt_abs_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let prompt_file = temp_dir.join("prompt.md");
+        std::fs::write(&prompt_file, "custom absolute prompt").unwrap();
+
+        let anchors = vec![];
+        let result = resolve_prompt(prompt_file.to_str().unwrap(), &anchors);
+        assert_eq!(result, Ok("custom absolute prompt".to_string()));
+
+        std::fs::remove_dir_all(&temp_dir).log_err();
+    }
+
+    #[test]
+    fn test_resolve_prompt_relative_path_from_worktree() {
+        let worktree_dir = std::env::temp_dir().join(format!(
+            "zed_test_prompt_wt_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let config_dir = std::env::temp_dir().join(format!(
+            "zed_test_prompt_cfg_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let prompt_subdir = worktree_dir.join(".zed").join("prompts");
+        std::fs::create_dir_all(&prompt_subdir).unwrap();
+        std::fs::create_dir_all(&config_dir).unwrap();
+
+        let prompt_file = prompt_subdir.join("custom.md");
+        std::fs::write(&prompt_file, "worktree prompt content").unwrap();
+
+        let anchors = vec![worktree_dir.clone(), config_dir.clone()];
+        let result = resolve_prompt(".zed/prompts/custom.md", &anchors);
+        assert_eq!(result, Ok("worktree prompt content".to_string()));
+
+        std::fs::remove_dir_all(&worktree_dir).log_err();
+        std::fs::remove_dir_all(&config_dir).log_err();
+    }
+
+    #[test]
+    fn test_resolve_prompt_fallback_to_config_dir() {
+        let worktree_dir = std::env::temp_dir().join(format!(
+            "zed_test_prompt_wt_fallback_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let config_dir = std::env::temp_dir().join(format!(
+            "zed_test_prompt_cfg_fallback_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&worktree_dir).unwrap();
+        let prompt_subdir = config_dir.join("prompts");
+        std::fs::create_dir_all(&prompt_subdir).unwrap();
+
+        let prompt_file = prompt_subdir.join("global.md");
+        std::fs::write(&prompt_file, "global prompt content").unwrap();
+
+        let anchors = vec![worktree_dir.clone(), config_dir.clone()];
+        let result = resolve_prompt("prompts/global.md", &anchors);
+        assert_eq!(result, Ok("global prompt content".to_string()));
+
+        std::fs::remove_dir_all(&worktree_dir).log_err();
+        std::fs::remove_dir_all(&config_dir).log_err();
+    }
+
+    #[test]
+    fn test_resolve_prompt_not_found_lists_candidates() {
+        let worktree_dir = std::env::temp_dir().join(format!(
+            "zed_test_prompt_wt_nf_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let config_dir = std::env::temp_dir().join(format!(
+            "zed_test_prompt_cfg_nf_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&worktree_dir).unwrap();
+        std::fs::create_dir_all(&config_dir).unwrap();
+
+        let anchors = vec![worktree_dir.clone(), config_dir.clone()];
+        let result = resolve_prompt("missing/prompt.md", &anchors);
+
+        let expected_candidates = vec![
+            worktree_dir.join("missing/prompt.md"),
+            config_dir.join("missing/prompt.md"),
+        ];
+
+        match result {
+            Err(PromptResolveError::NotFound { attempted_paths }) => {
+                assert_eq!(attempted_paths, expected_candidates);
+            }
+            other => panic!("expected NotFound error, got: {:?}", other),
+        }
+
+        std::fs::remove_dir_all(&worktree_dir).log_err();
+        std::fs::remove_dir_all(&config_dir).log_err();
+    }
+
+    #[test]
+    fn test_resolve_prompt_empty_path() {
+        let anchors = vec![std::env::temp_dir()];
+        assert_eq!(
+            resolve_prompt("", &anchors),
+            Err(PromptResolveError::EmptyPath)
+        );
+        assert_eq!(
+            resolve_prompt("   ", &anchors),
+            Err(PromptResolveError::EmptyPath)
+        );
+        assert_eq!(
+            resolve_prompt("\t\n", &anchors),
+            Err(PromptResolveError::EmptyPath)
+        );
+    }
+
+    #[test]
+    fn test_prompt_search_roots() {
+        let wt = Path::new("/some/worktree");
+        let roots_with_wt = prompt_search_roots(Some(wt));
+        assert_eq!(
+            roots_with_wt,
+            vec![wt.to_path_buf(), paths::config_dir().to_path_buf()]
+        );
+
+        let roots_without_wt = prompt_search_roots(None);
+        assert_eq!(roots_without_wt, vec![paths::config_dir().to_path_buf()]);
     }
 
     #[test]

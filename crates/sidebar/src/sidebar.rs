@@ -3836,9 +3836,16 @@ impl Sidebar {
         let title_prompt = match self.active_workspace(cx) {
             Some(workspace) => {
                 let project = workspace.read(cx).project().clone();
-                AgentSettings::get_for_project(project.read(cx), cx).thread_title_prompt()
+                let worktree_root = project
+                    .read(cx)
+                    .visible_worktrees(cx)
+                    .next()
+                    .or_else(|| project.read(cx).worktrees(cx).next())
+                    .map(|w| w.read(cx).abs_path());
+                AgentSettings::get_for_project(project.read(cx), cx)
+                    .thread_title_prompt(worktree_root.as_deref())
             }
-            None => AgentSettings::get_global(cx).thread_title_prompt(),
+            None => AgentSettings::get_global(cx).thread_title_prompt(None),
         };
 
         let thread_store = ThreadStore::global(cx);

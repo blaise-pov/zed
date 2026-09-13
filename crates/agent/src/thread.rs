@@ -1455,6 +1455,15 @@ impl Thread {
         AgentSettings::get(self.settings_location(cx), cx)
     }
 
+    pub fn worktree_root_path(&self, cx: &App) -> Option<Arc<Path>> {
+        let project = self.project.read(cx);
+        project
+            .visible_worktrees(cx)
+            .next()
+            .or_else(|| project.worktrees(cx).next())
+            .map(|w| w.read(cx).abs_path())
+    }
+
     fn prompt_capabilities(model: Option<&dyn LanguageModel>) -> acp::PromptCapabilities {
         let image = model.map_or(true, |model| model.supports_images());
         acp::PromptCapabilities::new()
@@ -4189,11 +4198,14 @@ impl Thread {
         log::debug!("Generating title with model: {:?}", model.name());
 
         let temperature = AgentSettings::temperature_for_model(&model, cx);
+        let worktree_root = self.worktree_root_path(cx);
         let request = build_thread_title_request(
             &self.id,
             &self.messages,
             temperature,
-            self.agent_settings(cx).thread_title_prompt().as_deref(),
+            self.agent_settings(cx)
+                .thread_title_prompt(worktree_root.as_deref())
+                .as_deref(),
         );
 
         let title_generation = cx.spawn(async move |_this, cx| {
@@ -4657,11 +4669,20 @@ impl Thread {
             None => shared_project_context,
         };
         let settings = self.agent_settings(cx);
+        let worktree_root = self.worktree_root_path(cx);
+        let worktree_root = worktree_root.as_deref();
+
         // Custom instructions from the active agent profile, if any.
         let custom_instructions = settings
             .profiles
             .get(&self.profile_id)
-            .and_then(|profile| profile.custom_prompt.as_ref())
+            .and_then(|profile| {
+                agent_settings::resolve_custom_prompt(
+                    profile.custom_prompt.as_deref(),
+                    profile.custom_prompt_path.as_deref(),
+                    worktree_root,
+                )
+            })
             .map(|prompt| prompt.to_string());
         // Catalog of agents this profile may delegate to, rendered into the
         // delegation section of the system prompt.
@@ -4717,7 +4738,7 @@ impl Thread {
                 .context("failed to build system prompt")
         };
         let system_prompt = if let Some(path) = custom_template_path {
-            match agent_settings::read_prompt_file(path).map(|content| {
+            match agent_settings::read_prompt_file(path, worktree_root).map(|content| {
                 self.templates
                     .render_custom_template(&content, &system_prompt_data)
             }) {

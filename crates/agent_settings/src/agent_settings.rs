@@ -363,13 +363,13 @@ impl AgentSettings {
     /// A custom template (`thread_title_template`) that is successfully read
     /// completely replaces the default prompt. If the template cannot be read,
     /// a warning is logged and the default prompt is used instead.
-    pub fn thread_title_prompt(&self) -> Option<String> {
+    pub fn thread_title_prompt(&self, worktree_root: Option<&Path>) -> Option<String> {
         if let Some(template_path) = self
             .thread_title_template
             .as_deref()
             .filter(|path| !path.trim().is_empty())
         {
-            match crate::read_prompt_file(template_path) {
+            match crate::read_prompt_file(template_path, worktree_root) {
                 Some(content) if !content.trim().is_empty() => {
                     return Some(content.trim().to_string());
                 }
@@ -2342,7 +2342,7 @@ mod tests {
 
         let settings = AgentSettings::get_global(cx);
         assert_eq!(settings.thread_title_template, None);
-        assert_eq!(settings.thread_title_prompt(), None);
+        assert_eq!(settings.thread_title_prompt(None), None);
     }
 
     #[gpui::test]
@@ -2362,7 +2362,7 @@ mod tests {
         });
 
         let settings = AgentSettings::get_global(cx);
-        assert_eq!(settings.thread_title_prompt(), None);
+        assert_eq!(settings.thread_title_prompt(None), None);
     }
 
     #[gpui::test]
@@ -2391,10 +2391,51 @@ mod tests {
 
         let settings = AgentSettings::get_global(cx);
         assert_eq!(
-            settings.thread_title_prompt(),
+            settings.thread_title_prompt(None),
             Some("custom title template".to_string())
         );
 
         std::fs::remove_file(&template_path).log_err();
+    }
+
+    #[gpui::test]
+    fn test_thread_title_prompt_relative_path_with_worktree(cx: &mut gpui::App) {
+        let store = SettingsStore::test(cx);
+        cx.set_global(store);
+        project::DisableAiSettings::register(cx);
+        AgentSettings::register(cx);
+
+        let worktree_dir = std::env::temp_dir().join(format!(
+            "zed-test-wt-title-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let prompt_dir = worktree_dir.join(".zed").join("prompts");
+        std::fs::create_dir_all(&prompt_dir).unwrap();
+        let prompt_file = prompt_dir.join("thread_title.txt");
+        std::fs::write(&prompt_file, "worktree title prompt").unwrap();
+
+        SettingsStore::update_global(cx, |store, cx| {
+            store
+                .set_user_settings(
+                    r#"{ "agent": { "thread_title_template": ".zed/prompts/thread_title.txt" } }"#,
+                    cx,
+                )
+                .unwrap();
+        });
+
+        let settings = AgentSettings::get_global(cx);
+        // Without worktree root -> fails
+        assert_eq!(settings.thread_title_prompt(None), None);
+        // With worktree root -> succeeds
+        assert_eq!(
+            settings.thread_title_prompt(Some(&worktree_dir)),
+            Some("worktree title prompt".to_string())
+        );
+
+        std::fs::remove_dir_all(&worktree_dir).log_err();
     }
 }
