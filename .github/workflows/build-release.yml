@@ -1,0 +1,164 @@
+name: Build Release (macOS & Linux)
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (leave empty for latest git tag)'
+        required: false
+        type: string
+      upload_to_release:
+        description: 'Upload assets to GitHub Release'
+        required: true
+        default: true
+        type: boolean
+  push:
+    tags:
+      - 'v*-fork*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-macos:
+    name: Build macOS (${{ matrix.arch }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            arch: aarch64
+            triple: aarch64-apple-darwin
+          - os: macos-14
+            arch: x86_64
+            triple: x86_64-apple-darwin
+    timeout-minutes: 360
+    env:
+      CARGO_INCREMENTAL: 0
+      ALLOW_MISSING_LICENSES: '1'
+      RUST_BACKTRACE: '1'
+      CARGO_TERM_COLOR: always
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+          fetch-depth: 0
+
+      - name: Setup Rust
+        run: |
+          rustup show
+          rustup target add ${{ matrix.triple }} wasm32-wasip2 wasm32-unknown-unknown
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.triple }}
+
+      - name: Download WASI SDK
+        run: ./script/download-wasi-sdk
+
+      - name: Bundle macOS App & DMG
+        run: |
+          ./script/bundle-mac ${{ matrix.triple }}
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: zed-macos-${{ matrix.arch }}
+          path: |
+            target/${{ matrix.triple }}/release/Zed-${{ matrix.arch }}.dmg
+            target/zed-remote-server-macos-${{ matrix.arch }}.gz
+          if-no-files-found: error
+
+      - name: Upload to GitHub Release
+        if: ${{ github.event_name == 'push' || inputs.upload_to_release != false }}
+        env:
+          TAG_INPUT: ${{ inputs.tag }}
+          REF_NAME: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${TAG_INPUT:-$REF_NAME}"
+          if [[ "$TAG" == "main" || "$TAG" == "master" || -z "$TAG" ]]; then
+            TAG="$(git describe --tags --match 'v*-fork*' --abbrev=0 2>/dev/null || git describe --tags --abbrev=0)"
+          fi
+          echo "Target release tag: $TAG"
+          gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1 || \
+            gh release create "$TAG" --draft --title "$TAG" --generate-notes --repo "$REPO" || true
+          gh release upload "$TAG" \
+            "target/${{ matrix.triple }}/release/Zed-${{ matrix.arch }}.dmg" \
+            "target/zed-remote-server-macos-${{ matrix.arch }}.gz" \
+            --clobber --repo "$REPO"
+
+  build-linux:
+    name: Build Linux (x86_64)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+    env:
+      CARGO_INCREMENTAL: 0
+      ALLOW_MISSING_LICENSES: '1'
+      RUST_BACKTRACE: '1'
+      CARGO_TERM_COLOR: always
+      CC: clang
+      CXX: clang++
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force || true
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+          fetch-depth: 0
+
+      - name: Install system dependencies
+        run: ./script/linux
+
+      - name: Setup Rust
+        run: |
+          rustup show
+          rustup target add x86_64-unknown-linux-musl wasm32-wasip2 wasm32-unknown-unknown
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: x86_64-unknown-linux-gnu
+
+      - name: Download WASI SDK
+        run: ./script/download-wasi-sdk
+
+      - name: Bundle Linux Package
+        run: ./script/bundle-linux
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: zed-linux-x86_64
+          path: |
+            target/release/zed-linux-x86_64.tar.gz
+            target/zed-remote-server-linux-x86_64.gz
+          if-no-files-found: error
+
+      - name: Upload to GitHub Release
+        if: ${{ github.event_name == 'push' || inputs.upload_to_release != false }}
+        env:
+          TAG_INPUT: ${{ inputs.tag }}
+          REF_NAME: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${TAG_INPUT:-$REF_NAME}"
+          if [[ "$TAG" == "main" || "$TAG" == "master" || -z "$TAG" ]]; then
+            TAG="$(git describe --tags --match 'v*-fork*' --abbrev=0 2>/dev/null || git describe --tags --abbrev=0)"
+          fi
+          echo "Target release tag: $TAG"
+          gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1 || \
+            gh release create "$TAG" --draft --title "$TAG" --generate-notes --repo "$REPO" || true
+          gh release upload "$TAG" \
+            target/release/zed-linux-x86_64.tar.gz \
+            target/zed-remote-server-linux-x86_64.gz \
+            --clobber --repo "$REPO"
