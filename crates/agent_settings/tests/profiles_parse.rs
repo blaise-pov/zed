@@ -9,7 +9,7 @@ fn diagnose_profiles_parse() {
                 "orchestrator": {
                     "name": "Orchestrator",
                     "description": "desc",
-                    "custom_prompt": "prompt",
+                    "custom_prompt_path": "prompt.md",
                     "delegation": { "allowed": ["backend"], "max_depth": 2 },
                     "context_servers": { "postgres": true, "docker": false }
                 },
@@ -72,18 +72,12 @@ fn test_profiles_with_custom_prompt_path() {
         r#"{{
         "agent": {{
             "profiles": {{
-                "file-priority": {{
-                    "name": "File Priority",
-                    "custom_prompt": "Ignored inline text",
+                "file-path": {{
+                    "name": "File Path",
                     "custom_prompt_path": "{file_path_str}"
                 }},
-                "text-only": {{
-                    "name": "Text Only",
-                    "custom_prompt": "Direct inline prompt"
-                }},
-                "file-only": {{
-                    "name": "File Only",
-                    "custom_prompt_path": "{file_path_str}"
+                "no-prompt": {{
+                    "name": "No Prompt"
                 }}
             }}
         }}
@@ -97,39 +91,23 @@ fn test_profiles_with_custom_prompt_path() {
     let agent_content = content.agent.as_ref().unwrap();
     let profiles_content = agent_content.profiles.as_ref().unwrap();
 
-    // 1. Check file-priority: both specified, file wins
-    let file_priority_content = profiles_content.get("file-priority").unwrap();
-    let profile_settings =
-        agent_settings::AgentProfileSettings::from(file_priority_content.clone());
-    assert_eq!(
-        profile_settings.custom_prompt.as_deref(),
-        Some("System prompt from external file")
-    );
+    let file_path_content = profiles_content.get("file-path").unwrap();
+    let profile_settings = agent_settings::AgentProfileSettings::from(file_path_content.clone());
     assert_eq!(
         profile_settings.custom_prompt_path.as_deref(),
         Some(file_path_str.as_str())
     );
 
-    // 2. Check text-only: only text specified
-    let text_only_content = profiles_content.get("text-only").unwrap();
-    let profile_settings = agent_settings::AgentProfileSettings::from(text_only_content.clone());
-    assert_eq!(
-        profile_settings.custom_prompt.as_deref(),
-        Some("Direct inline prompt")
-    );
+    let no_prompt_content = profiles_content.get("no-prompt").unwrap();
+    let profile_settings = agent_settings::AgentProfileSettings::from(no_prompt_content.clone());
     assert_eq!(profile_settings.custom_prompt_path, None);
 
-    // 3. Check file-only: only file specified
-    let file_only_content = profiles_content.get("file-only").unwrap();
-    let profile_settings = agent_settings::AgentProfileSettings::from(file_only_content.clone());
-    assert_eq!(
-        profile_settings.custom_prompt.as_deref(),
-        Some("System prompt from external file")
-    );
-    assert_eq!(
+    let resolved = agent_settings::resolve_custom_prompt(
+        None,
         profile_settings.custom_prompt_path.as_deref(),
-        Some(file_path_str.as_str())
+        None,
     );
+    assert_eq!(resolved, None);
 
     let _ = std::fs::remove_dir_all(&temp_dir);
 }

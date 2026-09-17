@@ -16,6 +16,7 @@ use settings::{LanguageModelProviderSetting, LanguageModelSelection, Settings as
 use ui::{
     KeyBinding, ListItem, ListItemSpacing, ListSeparator, Navigable, NavigableEntry, prelude::*,
 };
+use util::ResultExt as _;
 use workspace::{ModalView, Workspace};
 
 use crate::agent_configuration::delegation_editor::DelegationEditor;
@@ -52,11 +53,6 @@ enum Mode {
     ConfigureSkills {
         profile_id: AgentProfileId,
         skills_editor: Entity<SkillsEditor>,
-        _subscription: Subscription,
-    },
-    ConfigureCustomPrompt {
-        profile_id: AgentProfileId,
-        prompt_editor: Entity<Editor>,
         _subscription: Subscription,
     },
     ConfigureDescription {
@@ -143,6 +139,7 @@ pub struct ManageProfilesModal {
     context_server_registry: Entity<ContextServerRegistry>,
     active_model: Option<Arc<dyn LanguageModel>>,
     project: Option<Entity<Project>>,
+    workspace: Option<gpui::WeakEntity<Workspace>>,
     focus_handle: FocusHandle,
     mode: Mode,
     _settings_subscription: Subscription,
@@ -167,12 +164,14 @@ impl ManageProfilesModal {
 
                 let context_server_registry = panel.read(cx).context_server_registry().clone();
                 let project = workspace.project().clone();
+                let workspace_handle = workspace.weak_handle();
                 workspace.toggle_modal(window, cx, |window, cx| {
                     let mut this = Self::new(
                         fs,
                         active_model,
                         context_server_registry,
                         Some(project),
+                        Some(workspace_handle),
                         window,
                         cx,
                     );
@@ -192,6 +191,7 @@ impl ManageProfilesModal {
         active_model: Option<Arc<dyn LanguageModel>>,
         context_server_registry: Entity<ContextServerRegistry>,
         project: Option<Entity<Project>>,
+        workspace: Option<gpui::WeakEntity<Workspace>>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -223,6 +223,7 @@ impl ManageProfilesModal {
             active_model,
             context_server_registry,
             project,
+            workspace,
             focus_handle,
             mode: Mode::choose_profile(location, window, cx),
             _settings_subscription: settings_subscription,
@@ -571,68 +572,78 @@ impl ManageProfilesModal {
             profile_id = profile_id.as_str(),
             is_builtin = builtin_profiles::is_builtin(&profile_id)
         );
+
         let settings = self.agent_settings(cx);
-        let prompt = settings
-            .profiles
-            .get(&profile_id)
-            .and_then(|profile| profile.custom_prompt.clone())
-            .unwrap_or_default();
+        let profile = settings.profiles.get(&profile_id);
+        let custom_prompt_path = profile.and_then(|profile| profile.custom_prompt_path.as_deref());
+        let is_global = profile
+            .map(|p| matches!(p.origin, ProfileOrigin::Global))
+            .unwrap_or(false);
 
-        let prompt_editor = cx.new(|cx| {
-            let mut editor = Editor::auto_height(6, 16, window, cx);
-            editor.set_placeholder_text(
-                "Custom prompt / instructions for this profile…",
-                window,
-                cx,
-            );
-            if !prompt.is_empty() {
-                editor.set_text(prompt.to_string(), window, cx);
-            }
-            editor
-        });
-
-        let initial_prompt = prompt.to_string();
-        let fs = self.fs.clone();
-        let settings_location = self.settings_location(cx);
-        let target_profile_id = profile_id.clone();
-        let subscription = cx.subscribe(&prompt_editor, move |_this, editor, event, cx| {
-            // Persist only on blur: saving on every keystroke would rewrite
-            // the settings file per character typed.
-            if matches!(event, editor::EditorEvent::Blurred) {
-                let text = editor.read(cx).text(cx);
-                let text = text.trim().to_string();
-                if text == initial_prompt.trim() {
-                    return;
-                }
-                let fs = fs.clone();
-                let profile_id = target_profile_id.clone();
-                let origin = AgentSettings::get(settings_location, cx)
-                    .profiles
-                    .get(&profile_id)
-                    .map(|p| p.origin.clone())
-                    .unwrap_or_default();
-                Self::save_profile_change_by_origin(fs, &origin, cx, move |settings, _cx| {
-                    let Some(profile) = settings
-                        .agent
-                        .get_or_insert_default()
-                        .profiles
-                        .get_or_insert_default()
-                        .get_mut(profile_id.0.as_ref())
-                    else {
-                        return;
-                    };
-                    profile.custom_prompt = (!text.is_empty()).then(|| Arc::from(text.as_str()));
-                    profile.custom_prompt_path = None;
-                });
-            }
-        });
-
-        self.mode = Mode::ConfigureCustomPrompt {
-            profile_id,
-            prompt_editor,
-            _subscription: subscription,
+        let worktree = match profile.map(|p| &p.origin) {
+            Some(ProfileOrigin::Project { worktree_id, .. }) => self
+                .project
+                .as_ref()
+                .and_then(|project| project.read(cx).worktree_for_id(*worktree_id, cx)),
+            _ => self
+                .project
+                .as_ref()
+                .and_then(|project| project.read(cx).visible_worktrees(cx).next()),
         };
-        self.focus_handle(cx).focus(window, cx);
+
+        let id_str = profile_id.as_str();
+        // The id is used directly as a file name under `prompts/`, so refuse
+        // ids that could escape that directory via path traversal.
+        let id_is_safe = !id_str.is_empty()
+            && !id_str.contains("..")
+            && !id_str.contains('/')
+            && !id_str.contains('\\');
+
+        let target_path = if let Some(path_str) = custom_prompt_path {
+            let path = std::path::Path::new(path_str);
+            if path.is_absolute() {
+                path.to_path_buf()
+            } else if let Some(rest) = path_str
+                .strip_prefix("~/")
+                .or_else(|| path_str.strip_prefix("~\\"))
+            {
+                paths::home_dir().join(rest)
+            } else if let Some(worktree) = worktree.as_ref().filter(|_| !is_global) {
+                worktree.read(cx).abs_path().join(path)
+            } else {
+                paths::config_dir().join(path)
+            }
+        } else if !id_is_safe {
+            log::warn!("refusing to manage custom prompt for unsafe profile id: {id_str:?}");
+            return;
+        } else if let Some(worktree) = worktree.as_ref().filter(|_| !is_global) {
+            worktree
+                .read(cx)
+                .abs_path()
+                .join(".zed")
+                .join("prompts")
+                .join(format!("{id_str}.md"))
+        } else {
+            paths::config_dir()
+                .join("prompts")
+                .join(format!("{id_str}.md"))
+        };
+
+        if let Some(parent) = target_path.parent() {
+            std::fs::create_dir_all(parent).log_err();
+        }
+        if !target_path.exists() {
+            std::fs::write(&target_path, "").log_err();
+        }
+
+        if let Some(workspace) = self.workspace.as_ref().and_then(|w| w.upgrade()) {
+            workspace.update(cx, |workspace, cx| {
+                workspace
+                    .open_abs_path(target_path, workspace::OpenOptions::default(), window, cx)
+                    .detach_and_log_err(cx);
+            });
+            cx.emit(DismissEvent);
+        }
     }
 
     fn configure_description(
@@ -791,7 +802,6 @@ impl ManageProfilesModal {
             Mode::ConfigureDefaultModel { .. } => {}
             Mode::ConfigureDelegation { .. } => {}
             Mode::ConfigureSkills { .. } => {}
-            Mode::ConfigureCustomPrompt { .. } => {}
             Mode::ConfigureDescription { .. } => {}
         }
     }
@@ -869,9 +879,6 @@ impl ManageProfilesModal {
             Mode::ConfigureSkills { profile_id, .. } => {
                 self.view_profile(profile_id.clone(), window, cx)
             }
-            Mode::ConfigureCustomPrompt { profile_id, .. } => {
-                self.view_profile(profile_id.clone(), window, cx)
-            }
             Mode::ConfigureDescription { profile_id, .. } => {
                 self.view_profile(profile_id.clone(), window, cx)
             }
@@ -912,11 +919,6 @@ impl Focusable for ManageProfilesModal {
                 profile_id: _,
                 _subscription: _,
             } => skills_editor.focus_handle(cx),
-            Mode::ConfigureCustomPrompt {
-                prompt_editor,
-                profile_id: _,
-                _subscription: _,
-            } => prompt_editor.focus_handle(cx),
             Mode::ConfigureDescription {
                 description_editor,
                 profile_id: _,
@@ -1308,6 +1310,35 @@ impl ManageProfilesModal {
                                                 .color(Color::Muted),
                                         )
                                         .child(Label::new("Configure Custom Prompt"))
+                                        .end_slot({
+                                            let profile = settings.profiles.get(&mode.profile_id);
+                                            let is_global = profile
+                                                .map(|p| matches!(p.origin, ProfileOrigin::Global))
+                                                .unwrap_or(false);
+                                            let prompt_path_display = profile
+                                                .and_then(|profile| {
+                                                    profile
+                                                        .custom_prompt_path
+                                                        .as_ref()
+                                                        .map(|p| p.to_string())
+                                                })
+                                                .unwrap_or_else(|| {
+                                                    if is_global {
+                                                        format!(
+                                                            "prompts/{}.md",
+                                                            mode.profile_id.as_str()
+                                                        )
+                                                    } else {
+                                                        format!(
+                                                            ".zed/prompts/{}.md",
+                                                            mode.profile_id.as_str()
+                                                        )
+                                                    }
+                                                });
+                                            Label::new(prompt_path_display)
+                                                .size(LabelSize::XSmall)
+                                                .color(Color::Muted)
+                                        })
                                         .on_click({
                                             let profile_id = mode.profile_id.clone();
                                             cx.listener(move |this, _, window, cx| {
@@ -1798,51 +1829,6 @@ impl Render for ManageProfilesModal {
                                 .child(go_back_item)
                                 .into_any_element()
                         }
-                        Mode::ConfigureCustomPrompt {
-                            profile_id,
-                            prompt_editor,
-                            _subscription: _,
-                        } => {
-                            let profile = settings.profiles.get(profile_id);
-                            let profile_name = profile
-                                .map(|profile| profile.name.clone())
-                                .unwrap_or_else(|| "Unknown".into());
-                            let profile_origin = profile.map(|p| p.origin.clone());
-
-                            v_flex()
-                                .pb_1()
-                                .child(
-                                    ProfileModalHeader::new(
-                                        format!("{profile_name} — Configure Custom Prompt"),
-                                        Some(IconName::Quote),
-                                    )
-                                    .with_origin(profile_origin),
-                                )
-                                .child(ListSeparator)
-                                .child(
-                                    v_flex()
-                                        .p_2()
-                                        .gap_1()
-                                        .child(
-                                            Label::new(
-                                                "Custom system instructions injected for this profile",
-                                            )
-                                            .size(LabelSize::XSmall)
-                                            .color(Color::Muted),
-                                        )
-                                        .child(
-                                            div()
-                                                .p_1()
-                                                .border_1()
-                                                .border_color(cx.theme().colors().border)
-                                                .rounded_md()
-                                                .child(prompt_editor.clone()),
-                                        ),
-                                )
-                                .child(ListSeparator)
-                                .child(go_back_item)
-                                .into_any_element()
-                        }
                         Mode::ConfigureDescription {
                             profile_id,
                             description_editor,
@@ -1979,7 +1965,7 @@ mod tests {
                 let agent = settings.agent.get_or_insert_default();
                 let profiles = agent.profiles.get_or_insert_default();
                 if let Some(profile) = profiles.get_mut("global_agent") {
-                    profile.custom_prompt = Some(Arc::from("Global Custom Prompt"));
+                    profile.custom_prompt_path = Some(Arc::from("prompts/global.md"));
                 }
             },
         );
@@ -1993,7 +1979,7 @@ mod tests {
                 let agent = settings.agent.get_or_insert_default();
                 let profiles = agent.profiles.get_or_insert_default();
                 if let Some(profile) = profiles.get_mut("project_agent") {
-                    profile.custom_prompt = Some(Arc::from("Project Custom Prompt"));
+                    profile.custom_prompt_path = Some(Arc::from("prompts/project.md"));
                 }
             },
         );
@@ -2014,7 +2000,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn test_custom_prompt_displays_file_content_in_ui(cx: &mut gpui::App) {
+    fn test_custom_prompt_resolves_from_file(cx: &mut gpui::App) {
         let temp_dir = std::env::temp_dir().join(format!(
             "zed_ui_test_{}",
             std::time::SystemTime::now()
@@ -2041,7 +2027,6 @@ mod tests {
                                 "profiles": {{
                                     "file_agent": {{
                                         "name": "File Agent",
-                                        "custom_prompt": "Fallback prompt",
                                         "custom_prompt_path": "{prompt_path_str}"
                                     }}
                                 }}
@@ -2059,15 +2044,17 @@ mod tests {
             .get(&AgentProfileId("file_agent".into()))
             .unwrap();
 
-        // Check that custom_prompt in profile contains the file's text content (priority over inline text)
-        assert_eq!(
-            profile.custom_prompt.as_deref(),
-            Some("System prompt loaded from file")
-        );
         assert_eq!(
             profile.custom_prompt_path.as_deref(),
             Some(prompt_path_str.as_str())
         );
+
+        let resolved = agent_settings::resolve_custom_prompt(
+            Some(&AgentProfileId("file_agent".into())),
+            profile.custom_prompt_path.as_deref(),
+            None,
+        );
+        assert_eq!(resolved.as_deref(), Some("System prompt loaded from file"));
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }

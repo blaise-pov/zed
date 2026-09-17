@@ -4678,7 +4678,7 @@ impl Thread {
             .get(&self.profile_id)
             .and_then(|profile| {
                 agent_settings::resolve_custom_prompt(
-                    profile.custom_prompt.as_deref(),
+                    Some(&self.profile_id),
                     profile.custom_prompt_path.as_deref(),
                     worktree_root,
                 )

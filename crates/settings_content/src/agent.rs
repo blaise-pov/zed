@@ -602,10 +602,7 @@ pub struct AgentProfileContent {
     pub context_servers: IndexMap<Arc<str>, ContextServerPresetContent>,
     /// The default language model selected when using this profile.
     pub default_model: Option<LanguageModelSelection>,
-    /// Custom system prompt instructions for this profile.
-    pub custom_prompt: Option<Arc<str>>,
     /// Path to a file containing custom system prompt instructions for this profile.
-    /// If both `custom_prompt` and `custom_prompt_path` are specified, the file takes priority.
     #[serde(
         alias = "custom_prompt_file",
         alias = "prompt_path",

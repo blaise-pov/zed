@@ -405,7 +405,6 @@ impl PickerDelegate for ToolPickerDelegate {
                         })
                         .collect(),
                     default_model: default_profile.default_model.clone(),
-                    custom_prompt: default_profile.custom_prompt.clone().map(|s| s.into()),
                     custom_prompt_path: default_profile
                         .custom_prompt_path
                         .clone()

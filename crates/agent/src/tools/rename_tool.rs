@@ -195,7 +195,6 @@ mod tests {
             enable_all_context_servers: false,
             context_servers: collections::IndexMap::default(),
             default_model: None,
-            custom_prompt: None,
             custom_prompt_path: None,
             system_prompt_template: None,
             description: None,
