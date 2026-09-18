@@ -7,6 +7,15 @@ on:
         description: 'Release tag (leave empty for latest git tag)'
         required: false
         type: string
+      target_os:
+        description: 'Target OS to build'
+        required: false
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - macos
+          - linux
       upload_to_release:
         description: 'Upload assets to GitHub Release'
         required: true
@@ -22,16 +31,15 @@ permissions:
 jobs:
   build-macos:
     name: Build macOS (${{ matrix.arch }})
-    runs-on: ${{ matrix.os }}
+    if: ${{ inputs.target_os == null || inputs.target_os == 'all' || inputs.target_os == 'macos' || github.event_name == 'push' }}
+    runs-on: macos-15
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: macos-14
-            arch: aarch64
+          - arch: aarch64
             triple: aarch64-apple-darwin
-          - os: macos-14
-            arch: x86_64
+          - arch: x86_64
             triple: x86_64-apple-darwin
     timeout-minutes: 360
     env:
@@ -40,6 +48,19 @@ jobs:
       RUST_BACKTRACE: '1'
       CARGO_TERM_COLOR: always
     steps:
+      - name: Select Xcode
+        run: |
+          if [ -d "/Applications/Xcode_16.2.app" ]; then
+            sudo xcode-select -s /Applications/Xcode_16.2.app
+          elif [ -d "/Applications/Xcode_16.1.app" ]; then
+            sudo xcode-select -s /Applications/Xcode_16.1.app
+          elif [ -d "/Applications/Xcode_16.0.app" ]; then
+            sudo xcode-select -s /Applications/Xcode_16.0.app
+          elif [ -d "/Applications/Xcode_16.app" ]; then
+            sudo xcode-select -s /Applications/Xcode_16.app
+          fi
+          xcodebuild -version
+
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
@@ -94,6 +115,7 @@ jobs:
 
   build-linux:
     name: Build Linux (x86_64)
+    if: ${{ inputs.target_os == null || inputs.target_os == 'all' || inputs.target_os == 'linux' || github.event_name == 'push' }}
     runs-on: ubuntu-22.04
     timeout-minutes: 360
     env:
