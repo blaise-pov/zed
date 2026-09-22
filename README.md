@@ -1,3 +1,6 @@
+> [!IMPORTANT]
+> Remove this line to confirm you've reviewed this PR before submitting.
+
 # Zed: Multi-Agent Software Engineering IDE & Runtime
 
 ## Возможности этого форка
