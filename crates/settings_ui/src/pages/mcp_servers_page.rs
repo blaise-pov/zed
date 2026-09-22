@@ -12,8 +12,8 @@ use project::context_server_store::{
 };
 use project::project_settings::ContextServerSettings;
 use settings::{
-    ContextServerCommand, ContextServerSettingsContent, OAuthClientSettings, SettingsStore,
-    WorktreeId,
+    ContextServerCommand, ContextServerSettingsContent, OAuthClientSettings, PlatformOverride,
+    SettingsStore, WorktreeId,
 };
 use ui::{
     AiSettingItem, AiSettingItemSource, AiSettingItemStatus, ContextMenu, Divider, PopoverMenu,
@@ -827,6 +827,7 @@ pub(crate) struct McpServerForm {
     original_id: Option<ContextServerId>,
     /// Where the edited server is defined, so saving writes to the same file.
     origin: McpServerSettingsOrigin,
+    platforms: HashMap<String, PlatformOverride>,
     name: Entity<Editor>,
     command: Entity<Editor>,
     args: Entity<Editor>,
@@ -857,6 +858,7 @@ impl McpServerForm {
         let mut oauth_initial = None;
         let mut env = Vec::new();
         let mut headers = Vec::new();
+        let mut platforms = HashMap::default();
 
         // Pre-fill from the raw settings so invalid values (e.g. a malformed URL
         // the user typed directly into settings.json) still load into the form
@@ -874,6 +876,7 @@ impl McpServerForm {
                             env.push(new_kv_row(Some(&key), Some(&value), window, cx));
                         }
                     }
+                    platforms = command.platforms.clone();
                 }
                 ContextServerSettings::Http {
                     url,
@@ -897,6 +900,7 @@ impl McpServerForm {
             transport,
             original_id,
             origin,
+            platforms,
             name: new_input("my-mcp-server", name_initial.as_deref(), window, cx),
             command: new_input("/path/to/server", command_initial.as_deref(), window, cx),
             args: new_input("--flag value", args_initial.as_deref(), window, cx),
@@ -1312,6 +1316,7 @@ struct McpServerFormValues {
     oauth_client_id: String,
     env: Vec<(String, String)>,
     headers: Vec<(String, String)>,
+    platforms: HashMap<String, PlatformOverride>,
 }
 
 fn build_settings_from_form(
@@ -1336,6 +1341,7 @@ fn build_settings_from_form(
         oauth_client_id: form.oauth_client_id.read(cx).text(cx),
         env: read_kv(&form.env, cx),
         headers: read_kv(&form.headers, cx),
+        platforms: form.platforms.clone(),
     };
     build_settings_from_values(&values)
 }
@@ -1383,6 +1389,7 @@ fn build_settings_from_values(
                     args,
                     env: (!env.is_empty()).then_some(env),
                     timeout,
+                    platforms: values.platforms.clone(),
                 },
             }
         }
@@ -1487,6 +1494,7 @@ mod tests {
             oauth_client_id: String::new(),
             env: Vec::new(),
             headers: Vec::new(),
+            platforms: HashMap::default(),
         }
     }
 
@@ -1613,6 +1621,7 @@ mod tests {
                     args: vec!["--flag".into(), "value".into()],
                     env: Some(expected_env),
                     timeout: Some(30),
+                    platforms: Default::default(),
                 },
             }
         );
@@ -1695,5 +1704,27 @@ mod tests {
             Some(&id("foo")),
             &existing
         ));
+    }
+
+    #[test]
+    fn carries_platforms_for_local_server() {
+        let mut values = values(McpTransport::Stdio);
+        values.name = "local".into();
+        values.command = "/usr/bin/server".into();
+        values.platforms.insert(
+            "linux".into(),
+            PlatformOverride {
+                path: Some("/usr/bin/server-linux".into()),
+                args: Some(vec!["--linux".into()]),
+                env: None,
+                timeout: Some(10),
+            },
+        );
+
+        let (_, _, content) = build_settings_from_values(&values).unwrap();
+        let ContextServerSettingsContent::Stdio { command, .. } = content else {
+            panic!("expected stdio server");
+        };
+        assert_eq!(command.platforms, values.platforms);
     }
 }

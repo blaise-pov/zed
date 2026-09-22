@@ -54,9 +54,7 @@ fn expand_env_vars(value: &str) -> Result<String> {
         };
         let name = &after[..end];
         let resolved = std::env::var(name).with_context(|| {
-            format!(
-                "environment variable {name:?} referenced by a context server is not set"
-            )
+            format!("environment variable {name:?} referenced by a context server is not set")
         })?;
         expanded.push_str(&resolved);
         rest = &after[end + 1..];
@@ -66,14 +64,10 @@ fn expand_env_vars(value: &str) -> Result<String> {
 }
 
 fn expand_env_vars_in_args(args: &[String]) -> Result<Vec<String>> {
-    args.iter()
-        .map(|arg| expand_env_vars(arg))
-        .collect()
+    args.iter().map(|arg| expand_env_vars(arg)).collect()
 }
 
-fn expand_env_vars_in_env(
-    env: &HashMap<String, String>,
-) -> Result<HashMap<String, String>> {
+fn expand_env_vars_in_env(env: &HashMap<String, String>) -> Result<HashMap<String, String>> {
     env.iter()
         .map(|(key, value)| Ok((key.clone(), expand_env_vars(value)?)))
         .collect()
@@ -165,6 +159,7 @@ impl ContextServer {
     fn new_client(&self, cx: &AsyncApp) -> Result<Client> {
         Ok(match &self.configuration {
             ContextServerTransport::Stdio(command, working_directory) => {
+                let command = command.resolve()?;
                 let args = expand_env_vars_in_args(&command.args)?;
                 let env = match &command.env {
                     Some(env) => Some(expand_env_vars_in_env(env)?),
@@ -269,11 +264,9 @@ mod env_expansion_tests {
         unsafe { std::env::set_var("ZED_TEST_EXPAND_ARG", "--flag") };
         unsafe { std::env::set_var("ZED_TEST_EXPAND_TOKEN", "tok") };
 
-        let args = expand_env_vars_in_args(&[
-            "run".to_string(),
-            "${ZED_TEST_EXPAND_ARG}".to_string(),
-        ])
-        .unwrap();
+        let args =
+            expand_env_vars_in_args(&["run".to_string(), "${ZED_TEST_EXPAND_ARG}".to_string()])
+                .unwrap();
         assert_eq!(args, vec!["run", "--flag"]);
 
         let mut env = HashMap::default();

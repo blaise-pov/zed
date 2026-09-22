@@ -514,15 +514,159 @@ pub struct OAuthClientSettings {
 }
 
 #[with_fallible_options]
-#[derive(Deserialize, Serialize, Clone, PartialEq, Eq, JsonSchema, MergeFrom)]
-pub struct ContextServerCommand {
+#[derive(Deserialize, Serialize, Clone, PartialEq, Eq, JsonSchema, MergeFrom, Default)]
+pub struct PlatformOverride {
     #[serde(rename = "command")]
+    pub path: Option<PathBuf>,
+    pub args: Option<Vec<String>>,
+    pub env: Option<HashMap<String, String>>,
+    pub timeout: Option<u64>,
+}
+
+impl std::fmt::Debug for PlatformOverride {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let filtered_env = self.env.as_ref().map(|env| {
+            env.iter()
+                .map(|(k, v)| {
+                    (
+                        k,
+                        if util::redact::should_redact(k) {
+                            "[REDACTED]"
+                        } else {
+                            v
+                        },
+                    )
+                })
+                .collect::<Vec<_>>()
+        });
+
+        f.debug_struct("PlatformOverride")
+            .field("path", &self.path)
+            .field("args", &self.args)
+            .field("env", &filtered_env)
+            .field("timeout", &self.timeout)
+            .finish()
+    }
+}
+
+#[with_fallible_options]
+#[derive(Serialize, Clone, PartialEq, Eq, JsonSchema, MergeFrom, Default)]
+pub struct ContextServerCommand {
+    #[serde(default, rename = "command", skip_serializing_if = "is_empty_path")]
     pub path: PathBuf,
     #[serde(default)]
     pub args: Vec<String>,
     pub env: Option<HashMap<String, String>>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub platforms: HashMap<String, PlatformOverride>,
     /// Timeout for tool calls in seconds. Defaults to 60 if not specified.
     pub timeout: Option<u64>,
+}
+
+fn is_empty_path(path: &Path) -> bool {
+    path.as_os_str().is_empty()
+}
+
+#[with_fallible_options]
+#[derive(Deserialize)]
+struct ContextServerCommandHelper {
+    #[serde(rename = "command")]
+    path: Option<PathBuf>,
+    #[serde(default)]
+    args: Vec<String>,
+    env: Option<HashMap<String, String>>,
+    #[serde(default)]
+    platforms: HashMap<String, PlatformOverride>,
+    timeout: Option<u64>,
+}
+
+impl<'de> Deserialize<'de> for ContextServerCommand {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let helper = ContextServerCommandHelper::deserialize(deserializer)?;
+        if helper.path.is_none() && helper.platforms.is_empty() {
+            return Err(serde::de::Error::custom(
+                "expected at least 'command' or 'platforms' for context server",
+            ));
+        }
+        Ok(ContextServerCommand {
+            path: helper.path.unwrap_or_default(),
+            args: helper.args,
+            env: helper.env,
+            platforms: helper.platforms,
+            timeout: helper.timeout,
+        })
+    }
+}
+
+impl ContextServerCommand {
+    pub fn resolve(&self) -> anyhow::Result<Self> {
+        self.resolve_for_target(std::env::consts::OS, std::env::consts::ARCH)
+    }
+
+    pub fn resolve_for_target(&self, os: &str, arch: &str) -> anyhow::Result<Self> {
+        let os_fallback = [os];
+        let os_aliases: &[&str] = match os {
+            "macos" | "darwin" => &["darwin", "macos"],
+            "windows" | "win32" => &["windows", "win32"],
+            "linux" => &["linux"],
+            _ => &os_fallback,
+        };
+
+        let arch_fallback = [arch];
+        let arch_aliases: &[&str] = match arch {
+            "x86_64" | "x64" | "amd64" => &["x64", "x86_64", "amd64"],
+            "aarch64" | "arm64" => &["arm64", "aarch64"],
+            _ => &arch_fallback,
+        };
+
+        let mut matched_override = None;
+        'outer: for os_alias in os_aliases {
+            for arch_alias in arch_aliases {
+                let key = format!("{os_alias}-{arch_alias}");
+                if let Some(platform_override) = self.platforms.get(&key) {
+                    matched_override = Some(platform_override);
+                    break 'outer;
+                }
+            }
+        }
+
+        if matched_override.is_none() {
+            for os_alias in os_aliases {
+                if let Some(platform_override) = self.platforms.get(*os_alias) {
+                    matched_override = Some(platform_override);
+                    break;
+                }
+            }
+        }
+
+        let mut resolved = self.clone();
+        if let Some(platform_override) = matched_override {
+            if let Some(path) = &platform_override.path {
+                resolved.path = path.clone();
+            }
+            if let Some(args) = &platform_override.args {
+                resolved.args = args.clone();
+            }
+            if let Some(override_env) = &platform_override.env {
+                let env = resolved.env.get_or_insert_with(HashMap::default);
+                for (key, value) in override_env {
+                    env.insert(key.clone(), value.clone());
+                }
+            }
+            if let Some(timeout) = platform_override.timeout {
+                resolved.timeout = Some(timeout);
+            }
+        }
+
+        if resolved.path.as_os_str().is_empty() {
+            anyhow::bail!("no command specified for context server on platform {os}-{arch}");
+        }
+
+        Ok(resolved)
+    }
 }
 
 impl std::fmt::Debug for ContextServerCommand {
@@ -546,6 +690,7 @@ impl std::fmt::Debug for ContextServerCommand {
             .field("path", &self.path)
             .field("args", &self.args)
             .field("env", &filtered_env)
+            .field("platforms", &self.platforms)
             .finish()
     }
 }
@@ -1066,5 +1211,256 @@ mod tests {
             panic!("expected Stdio variant, got {settings:?}");
         };
         assert_eq!(command.args, vec!["hello".to_string()]);
+    }
+
+    #[test]
+    fn test_context_server_command_backward_compat() {
+        let cmd = ContextServerCommand {
+            path: PathBuf::from("my-server"),
+            args: vec!["--port".to_string(), "8080".to_string()],
+            env: Some(
+                [("KEY".to_string(), "VAL".to_string())]
+                    .into_iter()
+                    .collect(),
+            ),
+            timeout: Some(42),
+            platforms: HashMap::default(),
+        };
+
+        let resolved = cmd.resolve_for_target("linux", "x86_64").unwrap();
+        assert_eq!(resolved.path, PathBuf::from("my-server"));
+        assert_eq!(resolved.args, vec!["--port", "8080"]);
+        assert_eq!(
+            resolved.env.as_ref().and_then(|e| e.get("KEY")),
+            Some(&"VAL".to_string())
+        );
+        assert_eq!(resolved.timeout, Some(42));
+    }
+
+    #[test]
+    fn test_context_server_command_platform_override_os_arch() {
+        let mut platforms = HashMap::default();
+        platforms.insert(
+            "darwin-arm64".to_string(),
+            PlatformOverride {
+                path: Some(PathBuf::from("my-server-darwin-arm64")),
+                args: Some(vec!["--darwin-arg".to_string()]),
+                env: None,
+                timeout: Some(100),
+            },
+        );
+
+        let cmd = ContextServerCommand {
+            path: PathBuf::from("my-server-default"),
+            args: vec!["--default-arg".to_string()],
+            platforms,
+            ..Default::default()
+        };
+
+        // Test with aliases: "macos" and "aarch64" normalizes to darwin and arm64
+        let resolved = cmd.resolve_for_target("macos", "aarch64").unwrap();
+        assert_eq!(resolved.path, PathBuf::from("my-server-darwin-arm64"));
+        assert_eq!(resolved.args, vec!["--darwin-arg"]);
+        assert_eq!(resolved.timeout, Some(100));
+    }
+
+    #[test]
+    fn test_context_server_command_platform_fallback_os() {
+        let mut platforms = HashMap::default();
+        platforms.insert(
+            "windows".to_string(),
+            PlatformOverride {
+                path: Some(PathBuf::from("my-server.exe")),
+                args: Some(vec!["--win-arg".to_string()]),
+                env: None,
+                timeout: None,
+            },
+        );
+
+        let cmd = ContextServerCommand {
+            path: PathBuf::from("my-server-default"),
+            platforms,
+            ..Default::default()
+        };
+
+        // Test with "win32" alias and x64 arch, which should fall back to "windows"
+        let resolved = cmd.resolve_for_target("win32", "x64").unwrap();
+        assert_eq!(resolved.path, PathBuf::from("my-server.exe"));
+        assert_eq!(resolved.args, vec!["--win-arg"]);
+    }
+
+    #[test]
+    fn test_context_server_command_os_arch_precedence() {
+        let mut platforms = HashMap::default();
+        platforms.insert(
+            "linux".to_string(),
+            PlatformOverride {
+                path: Some(PathBuf::from("my-server-linux")),
+                ..Default::default()
+            },
+        );
+        platforms.insert(
+            "linux-x64".to_string(),
+            PlatformOverride {
+                path: Some(PathBuf::from("my-server-linux-x64")),
+                ..Default::default()
+            },
+        );
+
+        let cmd = ContextServerCommand {
+            platforms,
+            ..Default::default()
+        };
+
+        let resolved = cmd.resolve_for_target("linux", "x86_64").unwrap();
+        assert_eq!(resolved.path, PathBuf::from("my-server-linux-x64"));
+    }
+
+    #[test]
+    fn test_context_server_command_env_merge() {
+        let mut platforms = HashMap::default();
+        let mut override_env = HashMap::default();
+        override_env.insert("BASE_VAR".to_string(), "overridden".to_string());
+        override_env.insert("NEW_VAR".to_string(), "added".to_string());
+        platforms.insert(
+            "linux".to_string(),
+            PlatformOverride {
+                env: Some(override_env),
+                ..Default::default()
+            },
+        );
+
+        let mut base_env = HashMap::default();
+        base_env.insert("BASE_VAR".to_string(), "initial".to_string());
+        base_env.insert("KEEP_VAR".to_string(), "preserved".to_string());
+
+        let cmd = ContextServerCommand {
+            path: PathBuf::from("server"),
+            env: Some(base_env),
+            platforms,
+            ..Default::default()
+        };
+
+        let resolved = cmd.resolve_for_target("linux", "x86_64").unwrap();
+        let env = resolved.env.unwrap();
+        assert_eq!(env.get("BASE_VAR").map(|s| s.as_str()), Some("overridden"));
+        assert_eq!(env.get("KEEP_VAR").map(|s| s.as_str()), Some("preserved"));
+        assert_eq!(env.get("NEW_VAR").map(|s| s.as_str()), Some("added"));
+    }
+
+    #[test]
+    fn test_context_server_command_empty_path_error() {
+        let cmd = ContextServerCommand::default();
+        let result = cmd.resolve_for_target("freebsd", "x86_64");
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "no command specified for context server on platform freebsd-x86_64"
+        );
+    }
+
+    #[test]
+    fn test_context_server_command_deserialization() {
+        // Without platforms
+        let json_without = r#"{ "command": "echo", "args": ["hello"] }"#;
+        let cmd_without: ContextServerCommand = serde_json::from_str(json_without).unwrap();
+        assert_eq!(cmd_without.path, PathBuf::from("echo"));
+        assert_eq!(cmd_without.args, vec!["hello".to_string()]);
+        assert!(cmd_without.platforms.is_empty());
+
+        // With platforms
+        let json_with = r#"{
+            "platforms": {
+                "macos": {
+                    "command": "echo-mac",
+                    "args": ["hello-mac"],
+                    "timeout": 30
+                }
+            }
+        }"#;
+        let cmd_with: ContextServerCommand = serde_json::from_str(json_with).unwrap();
+        assert_eq!(cmd_with.path, PathBuf::from(""));
+        let resolved = cmd_with.resolve_for_target("darwin", "arm64").unwrap();
+        assert_eq!(resolved.path, PathBuf::from("echo-mac"));
+        assert_eq!(resolved.args, vec!["hello-mac".to_string()]);
+        assert_eq!(resolved.timeout, Some(30));
+
+        let serialized_with = serde_json::to_value(&cmd_with).unwrap();
+        assert!(
+            serialized_with.get("command").is_none(),
+            "expected platforms-only config not to serialize a 'command' key, got: {serialized_with}"
+        );
+        let roundtrip_with: ContextServerCommand = serde_json::from_value(serialized_with).unwrap();
+        assert_eq!(roundtrip_with, cmd_with);
+
+        let serialized_without = serde_json::to_value(&cmd_without).unwrap();
+        assert_eq!(serialized_without.get("command").unwrap(), "echo");
+        let roundtrip_without: ContextServerCommand =
+            serde_json::from_value(serialized_without).unwrap();
+        assert_eq!(roundtrip_without, cmd_without);
+
+        // Flattened via ContextServerSettingsContent
+        let settings: ContextServerSettingsContent = serde_json::from_str(
+            r#"{
+            "platforms": {
+                "windows": {
+                    "command": "cmd.exe"
+                }
+            }
+        }"#,
+        )
+        .unwrap();
+        let ContextServerSettingsContent::Stdio { command, .. } = settings else {
+            panic!("expected Stdio");
+        };
+        let resolved = command.resolve_for_target("windows", "x86_64").unwrap();
+        assert_eq!(resolved.path, PathBuf::from("cmd.exe"));
+    }
+
+    #[test]
+    fn test_context_server_settings_content_deserialization() {
+        let http: ContextServerSettingsContent =
+            serde_json::from_str(r#"{"url": "https://example.com/mcp"}"#).unwrap();
+        assert!(
+            matches!(http, ContextServerSettingsContent::Http { ref url, .. } if url == "https://example.com/mcp")
+        );
+
+        let ext: ContextServerSettingsContent =
+            serde_json::from_str(r#"{"settings": {"key": "val"}}"#).unwrap();
+        assert!(matches!(
+            ext,
+            ContextServerSettingsContent::Extension { .. }
+        ));
+
+        let stdio_cmd: ContextServerSettingsContent =
+            serde_json::from_str(r#"{"command": "foo"}"#).unwrap();
+        assert!(
+            matches!(stdio_cmd, ContextServerSettingsContent::Stdio { ref command, .. } if command.path == Path::new("foo"))
+        );
+
+        let stdio_platforms: ContextServerSettingsContent =
+            serde_json::from_str(r#"{"platforms": {"linux": {"command": "foo"}}}"#).unwrap();
+        assert!(
+            matches!(stdio_platforms, ContextServerSettingsContent::Stdio { ref command, .. } if command.platforms.contains_key("linux"))
+        );
+    }
+
+    #[test]
+    fn test_platform_override_debug_redacts_env() {
+        let mut env = HashMap::default();
+        env.insert("SECRET_KEY".to_string(), "supersecret".to_string());
+        env.insert("PUBLIC_NAME".to_string(), "zed".to_string());
+
+        let override_cfg = PlatformOverride {
+            path: Some(PathBuf::from("my-cmd")),
+            args: None,
+            env: Some(env),
+            timeout: None,
+        };
+
+        let debug_str = format!("{override_cfg:?}");
+        assert!(!debug_str.contains("supersecret"));
+        assert!(debug_str.contains("[REDACTED]"));
+        assert!(debug_str.contains("zed"));
     }
 }

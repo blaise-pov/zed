@@ -757,6 +757,7 @@ impl VsCodeSettings {
                                 args: cmd.args.unwrap_or_default(),
                                 env: cmd.env,
                                 timeout: None,
+                                platforms: Default::default(),
                             })?,
                     },
                 ))

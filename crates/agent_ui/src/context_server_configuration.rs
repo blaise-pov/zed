@@ -133,6 +133,7 @@ mod tests {
                         args: Vec::new(),
                         env: None,
                         timeout: None,
+                        platforms: Default::default(),
                     },
                 },
             );

@@ -444,6 +444,7 @@ impl ContextServerStore {
                 args: vec![],
                 env: None,
                 timeout: None,
+                platforms: Default::default(),
             },
             remote: false,
         });
@@ -972,6 +973,7 @@ impl ContextServerStore {
                 args: remote_command.args,
                 env: Some(remote_command.env.into_iter().collect()),
                 timeout: None,
+                platforms: Default::default(),
             };
 
             Arc::new(ContextServerConfiguration::Custom { command, remote })
@@ -1117,7 +1119,8 @@ impl ContextServerStore {
 
         let command = configuration
             .command()
-            .context("context server has no command (HTTP servers don't need RPC)")?;
+            .context("context server has no command (HTTP servers don't need RPC)")?
+            .resolve()?;
 
         Ok(proto::ContextServerCommand {
             path: command.path.display().to_string(),

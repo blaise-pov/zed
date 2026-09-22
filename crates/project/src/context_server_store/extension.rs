@@ -70,6 +70,7 @@ impl registry::ContextServerDescriptor for ContextServerDescriptor {
                 args: command.args,
                 env: Some(command.env.into_iter().collect()),
                 timeout: None,
+                platforms: Default::default(),
             })
         })
     }
