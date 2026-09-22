@@ -429,6 +429,7 @@ impl PickerDelegate for ToolPickerDelegate {
                         .tool_permissions
                         .as_ref()
                         .map(|tool_permissions| tool_permissions.to_content()),
+                    permission_mode: default_profile.permission_mode,
                 });
 
             match item {

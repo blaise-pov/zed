@@ -1,14 +1,15 @@
 use super::tool_permissions::{
     authorize_symlink_escapes, canonicalize_worktree_roots, check_profile_write_scope,
-    collect_symlink_escapes, resolve_creatable_global_skill_descendant_path,
-    resolve_global_skill_descendant_path, resolves_to_global_skills_dir, sensitive_settings_kind,
+    collect_symlink_escapes, is_path_in_profile_write_scope,
+    resolve_creatable_global_skill_descendant_path, resolve_global_skill_descendant_path,
+    resolves_to_global_skills_dir, sensitive_settings_kind,
 };
 use crate::{
     AgentTool, ToolCallEventStream, ToolInput, ToolPermissionDecision,
     authorize_with_sensitive_settings, decide_permission_for_paths_with_profile,
 };
 use agent_client_protocol::schema::v1 as acp;
-use agent_settings::AgentSettings;
+use agent_settings::{AgentPermissionMode, AgentSettings};
 use futures::FutureExt as _;
 use gpui::{App, Entity, SharedString, Task};
 use project::Project;
@@ -174,8 +175,14 @@ impl AgentTool for MovePathTool {
             )
             .await;
 
+            let mode = profile
+                .as_ref()
+                .map_or(AgentPermissionMode::Interactive, |p| {
+                    p.effective_permission_mode()
+                });
+
             if let Some(profile) = &profile {
-                if profile.tool_permissions.is_some()
+                if mode == AgentPermissionMode::Autonomous
                     && (global_source_path.is_some() || global_destination_path.is_some())
                 {
                     return Err(format!(
@@ -196,21 +203,22 @@ impl AgentTool for MovePathTool {
                     )
                 });
 
-            let sensitive_kind = sensitive_settings_kind(
+            let source_sensitive = sensitive_settings_kind(
                 Path::new(&input.source_path),
                 &canonical_roots,
                 fs.as_ref(),
             )
-            .await
-            .or(sensitive_settings_kind(
+            .await;
+            let dest_sensitive = sensitive_settings_kind(
                 Path::new(&input.destination_path),
                 &canonical_roots,
                 fs.as_ref(),
             )
-            .await);
+            .await;
+            let sensitive_kind = source_sensitive.or(dest_sensitive);
 
             if let Some(profile) = &profile {
-                if profile.tool_permissions.is_some() {
+                if mode == AgentPermissionMode::Autonomous {
                     if !symlink_escapes.is_empty() {
                         return Err(format!(
                             "PolicyDenied: Moving path '{}' escapes project boundaries via symlink (disallowed for autonomous profile '{}')",
@@ -218,17 +226,44 @@ impl AgentTool for MovePathTool {
                         ));
                     }
                     if sensitive_kind.is_some() {
-                        return Err(format!(
-                            "PolicyDenied: Accessing sensitive settings is disallowed for autonomous profile '{}'",
-                            profile.name
-                        ));
+                        let in_write_scope = cx.update(|cx| {
+                            let source_ok = if source_sensitive.is_some() {
+                                is_path_in_profile_write_scope(
+                                    Self::NAME,
+                                    Path::new(&input.source_path),
+                                    &project,
+                                    &canonical_roots,
+                                    Some(profile),
+                                    cx,
+                                )
+                            } else {
+                                true
+                            };
+                            let dest_ok = if dest_sensitive.is_some() {
+                                is_path_in_profile_write_scope(
+                                    Self::NAME,
+                                    Path::new(&input.destination_path),
+                                    &project,
+                                    &canonical_roots,
+                                    Some(profile),
+                                    cx,
+                                )
+                            } else {
+                                true
+                            };
+                            source_ok && dest_ok
+                        });
+                        if !in_write_scope {
+                            return Err(format!(
+                                "PolicyDenied: Accessing sensitive settings is disallowed for autonomous profile '{}' without explicit write_scope",
+                                profile.name
+                            ));
+                        }
                     }
                 }
             }
 
-            let needs_confirmation = profile
-                .as_ref()
-                .map_or(true, |p| p.tool_permissions.is_none())
+            let needs_confirmation = (mode == AgentPermissionMode::Interactive)
                 && (matches!(decision, ToolPermissionDecision::Confirm)
                     || (matches!(decision, ToolPermissionDecision::Allow)
                         && sensitive_kind.is_some()));

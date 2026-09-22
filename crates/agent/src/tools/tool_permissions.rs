@@ -3,7 +3,7 @@ use crate::{
     decide_permission_for_path_with_profile,
 };
 use agent_client_protocol::schema::v1 as acp;
-use agent_settings::AgentProfileSettings;
+use agent_settings::{AgentPermissionMode, AgentProfileSettings};
 use agent_skills::is_agents_skills_path;
 use anyhow::{Result, anyhow, bail};
 use fs::Fs;
@@ -14,6 +14,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use util::{normalize_path, paths::component_matches_ignore_ascii_case};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SensitiveSettingsKind {
     Local,
     Global,
@@ -612,6 +613,48 @@ pub fn collect_symlink_escapes<'a>(
     escapes
 }
 
+pub fn is_path_in_profile_write_scope(
+    tool_name: &str,
+    path: &Path,
+    project: &Entity<Project>,
+    canonical_worktree_roots: &[PathBuf],
+    profile: Option<&AgentProfileSettings>,
+    cx: &App,
+) -> bool {
+    let Some(profile) = profile else {
+        return false;
+    };
+    let Some(tool_permissions) = &profile.tool_permissions else {
+        return false;
+    };
+    let Some(tool_rules) = tool_permissions.tools.get(tool_name) else {
+        return false;
+    };
+    let Some(write_scopes) = &tool_rules.write_scopes else {
+        return false;
+    };
+
+    let Ok(ResolvedProjectPath::Safe(project_path)) =
+        resolve_project_path(project.read(cx), path, canonical_worktree_roots, cx)
+    else {
+        return false;
+    };
+
+    let worktree = project
+        .read(cx)
+        .worktree_for_id(project_path.worktree_id, cx);
+    let matched_with_root = worktree
+        .as_ref()
+        .map(|w| {
+            let root_name = w.read(cx).root_name();
+            let combined = root_name.join(&project_path.path);
+            write_scopes.is_match(&combined)
+        })
+        .unwrap_or(false);
+
+    write_scopes.is_match(&project_path.path) || matched_with_root
+}
+
 /// Validates that `path` is permitted by the profile's `write_scopes` filesystem policy.
 pub fn check_profile_write_scope(
     tool_name: &str,
@@ -624,6 +667,9 @@ pub fn check_profile_write_scope(
     let Some(profile) = profile else {
         return Ok(());
     };
+    if profile.effective_permission_mode() == AgentPermissionMode::Unrestricted {
+        return Ok(());
+    }
     let Some(tool_permissions) = &profile.tool_permissions else {
         return Ok(());
     };
@@ -742,6 +788,16 @@ pub fn authorize_file_edit(
         let canonical_roots = canonicalize_worktree_roots(&project_entity, &fs, cx).await;
 
         let profile = cx.update(|cx| event_stream.profile_settings(cx));
+        let mode = profile
+            .as_ref()
+            .map_or(AgentPermissionMode::Interactive, |p| {
+                p.effective_permission_mode()
+            });
+
+        if mode == AgentPermissionMode::Unrestricted {
+            return Ok(());
+        }
+
         cx.update(|cx| {
             check_profile_write_scope(
                 &tool_name,
@@ -761,15 +817,13 @@ pub fn authorize_file_edit(
             canonical_target, ..
         }) = &resolved
         {
-            if let Some(profile) = &profile {
-                if profile.tool_permissions.is_some() {
-                    bail!(
-                        "PolicyDenied: Path '{}' escapes project boundaries via symlink to '{}' (disallowed for autonomous profile '{}')",
-                        path_owned.display(),
-                        canonical_target.display(),
-                        profile.name
-                    );
-                }
+            if mode == AgentPermissionMode::Autonomous {
+                bail!(
+                    "PolicyDenied: Path '{}' escapes project boundaries via symlink to '{}' (disallowed for autonomous profile '{}')",
+                    path_owned.display(),
+                    canonical_target.display(),
+                    profile.as_ref().map_or("unknown", |p| &p.name)
+                );
             }
 
             let authorize = cx.update(|cx| {
@@ -796,15 +850,13 @@ pub fn authorize_file_edit(
                     canonical_target, ..
                 }) = &parent_resolved
                 {
-                    if let Some(profile) = &profile {
-                        if profile.tool_permissions.is_some() {
-                            bail!(
-                                "PolicyDenied: Path '{}' escapes project boundaries via symlink to '{}' (disallowed for autonomous profile '{}')",
-                                path_owned.display(),
-                                canonical_target.display(),
-                                profile.name
-                            );
-                        }
+                    if mode == AgentPermissionMode::Autonomous {
+                        bail!(
+                            "PolicyDenied: Path '{}' escapes project boundaries via symlink to '{}' (disallowed for autonomous profile '{}')",
+                            path_owned.display(),
+                            canonical_target.display(),
+                            profile.as_ref().map_or("unknown", |p| &p.name)
+                        );
                     }
 
                     let authorize = cx.update(|cx| {
@@ -834,20 +886,35 @@ pub fn authorize_file_edit(
             sensitive_settings_kind(&path_owned, &canonical_roots, fs.as_ref()).await
         };
 
-        if let Some(profile) = &profile {
-            if profile.tool_permissions.is_some() {
-                if settings_kind.is_some() {
-                    bail!(
-                        "PolicyDenied: Editing sensitive settings is disallowed for autonomous profile '{}'",
-                        profile.name
-                    );
-                }
+        let is_sensitive = settings_kind.is_some();
+        if is_sensitive {
+            let in_write_scope = cx.update(|cx| {
+                is_path_in_profile_write_scope(
+                    &tool_name,
+                    &path_owned,
+                    &project_entity,
+                    &canonical_roots,
+                    profile.as_ref(),
+                    cx,
+                )
+            });
+            if in_write_scope {
                 return Ok(());
+            }
+            if mode == AgentPermissionMode::Autonomous {
+                bail!(
+                    "PolicyDenied: Editing sensitive settings at '{}' is disallowed for autonomous profile '{}' without explicit write_scope",
+                    path_owned.display(),
+                    profile.as_ref().map_or("unknown", |p| &p.name)
+                );
             }
         }
 
+        if mode == AgentPermissionMode::Autonomous {
+            return Ok(());
+        }
+
         let explicitly_allowed = matches!(decision, ToolPermissionDecision::Allow);
-        let is_sensitive = settings_kind.is_some();
         if explicitly_allowed && !is_sensitive {
             return Ok(());
         }
@@ -1000,7 +1067,7 @@ pub fn authorize_dirty_buffer(
 mod tests {
     use super::*;
     use fs::Fs;
-    use gpui::TestAppContext;
+    use gpui::{AppContext, TestAppContext};
     use project::{FakeFs, Project};
     use serde_json::json;
     use settings::SettingsStore;
@@ -1592,5 +1659,328 @@ mod tests {
                 resolved
             );
         });
+    }
+
+    async fn setup_thread_and_project(
+        fs: Arc<FakeFs>,
+        cx: &mut TestAppContext,
+    ) -> (Entity<Project>, Entity<Thread>) {
+        let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
+        cx.run_until_parked();
+
+        let (_project_context, _context_server_registry, thread) = cx.update(|cx| {
+            let project_context = cx.new(|_cx| crate::ProjectContext::default());
+            let context_server_store = project.read(cx).context_server_store();
+            let context_server_registry =
+                cx.new(|cx| crate::tools::ContextServerRegistry::new(context_server_store, cx));
+            let thread = cx.new(|cx| {
+                Thread::new(
+                    project.clone(),
+                    project_context.clone(),
+                    context_server_registry.clone(),
+                    crate::Templates::new(),
+                    None,
+                    cx,
+                )
+            });
+            (project_context, context_server_registry, thread)
+        });
+        (project, thread)
+    }
+
+    #[gpui::test]
+    async fn test_authorize_file_edit_autonomous_explicit_write_scope_succeeds(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/root"),
+            json!({
+                ".zed": {
+                    "settings.json": "{\n}\n"
+                }
+            }),
+        )
+        .await;
+
+        let (_project, thread) = setup_thread_and_project(fs, cx).await;
+
+        let profile_id = agent_settings::AgentProfileId("autonomous_allowed".into());
+        let mut tools = collections::HashMap::default();
+        tools.insert(
+            Arc::from("edit_file"),
+            agent_settings::ToolRules {
+                default: Some(settings::ToolPermissionMode::Allow),
+                always_allow: vec![],
+                always_deny: vec![],
+                always_confirm: vec![],
+                write_scopes: Some(
+                    agent_settings::WriteScopes::new(vec![Arc::from(".zed/settings.json")])
+                        .unwrap(),
+                ),
+                invalid_patterns: vec![],
+            },
+        );
+        let profile = AgentProfileSettings {
+            name: "autonomous_allowed".into(),
+            origin: Default::default(),
+            tools: collections::IndexMap::default(),
+            enable_all_context_servers: false,
+            context_servers: collections::IndexMap::default(),
+            default_model: None,
+            custom_prompt_path: None,
+            system_prompt_template: None,
+            description: None,
+            skills: None,
+            delegation: None,
+            tool_permissions: Some(agent_settings::ToolPermissions {
+                default: settings::ToolPermissionMode::Deny,
+                tools,
+            }),
+            permission_mode: Some(AgentPermissionMode::Autonomous),
+        };
+
+        cx.update(|cx| {
+            let mut settings = agent_settings::AgentSettings::get_global(cx).clone();
+            settings.profiles.insert(profile_id.clone(), profile);
+            agent_settings::AgentSettings::override_global(settings, cx);
+        });
+
+        let (event_stream, _rx) = ToolCallEventStream::test_with_profile(profile_id);
+        let auth_task = cx.update(|cx| {
+            authorize_file_edit(
+                "edit_file",
+                Path::new("root/.zed/settings.json"),
+                &thread.downgrade(),
+                &event_stream,
+                cx,
+            )
+        });
+
+        let result = auth_task.await;
+        assert!(result.is_ok(), "expected Ok(()), got: {:?}", result);
+    }
+
+    #[gpui::test]
+    async fn test_authorize_file_edit_autonomous_crates_write_scope_fails(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/root"),
+            json!({
+                ".zed": {
+                    "settings.json": "{\n}\n"
+                }
+            }),
+        )
+        .await;
+
+        let (_project, thread) = setup_thread_and_project(fs, cx).await;
+
+        let profile_id = agent_settings::AgentProfileId("autonomous_crates_only".into());
+        let mut tools = collections::HashMap::default();
+        tools.insert(
+            Arc::from("edit_file"),
+            agent_settings::ToolRules {
+                default: Some(settings::ToolPermissionMode::Allow),
+                always_allow: vec![],
+                always_deny: vec![],
+                always_confirm: vec![],
+                write_scopes: Some(
+                    agent_settings::WriteScopes::new(vec![Arc::from("crates/**")]).unwrap(),
+                ),
+                invalid_patterns: vec![],
+            },
+        );
+        let profile = AgentProfileSettings {
+            name: "autonomous_crates_only".into(),
+            origin: Default::default(),
+            tools: collections::IndexMap::default(),
+            enable_all_context_servers: false,
+            context_servers: collections::IndexMap::default(),
+            default_model: None,
+            custom_prompt_path: None,
+            system_prompt_template: None,
+            description: None,
+            skills: None,
+            delegation: None,
+            tool_permissions: Some(agent_settings::ToolPermissions {
+                default: settings::ToolPermissionMode::Deny,
+                tools,
+            }),
+            permission_mode: Some(AgentPermissionMode::Autonomous),
+        };
+
+        cx.update(|cx| {
+            let mut settings = agent_settings::AgentSettings::get_global(cx).clone();
+            settings.profiles.insert(profile_id.clone(), profile);
+            agent_settings::AgentSettings::override_global(settings, cx);
+        });
+
+        let (event_stream, _rx) = ToolCallEventStream::test_with_profile(profile_id);
+        let auth_task = cx.update(|cx| {
+            authorize_file_edit(
+                "edit_file",
+                Path::new("root/.zed/settings.json"),
+                &thread.downgrade(),
+                &event_stream,
+                cx,
+            )
+        });
+
+        let result = auth_task.await;
+        assert!(result.is_err(), "expected error, got: {:?}", result);
+        let err_str = result.unwrap_err().to_string();
+        assert!(
+            err_str.contains("PolicyDenied"),
+            "expected PolicyDenied in error, got: {err_str}"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_authorize_file_edit_interactive_prompts_confirmation(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/root"),
+            json!({
+                ".zed": {
+                    "settings.json": "{\n}\n"
+                }
+            }),
+        )
+        .await;
+
+        let (_project, thread) = setup_thread_and_project(fs, cx).await;
+
+        let profile_id = agent_settings::AgentProfileId("interactive_agent".into());
+        let profile = AgentProfileSettings {
+            name: "interactive_agent".into(),
+            origin: Default::default(),
+            tools: collections::IndexMap::default(),
+            enable_all_context_servers: false,
+            context_servers: collections::IndexMap::default(),
+            default_model: None,
+            custom_prompt_path: None,
+            system_prompt_template: None,
+            description: None,
+            skills: None,
+            delegation: None,
+            tool_permissions: None,
+            permission_mode: Some(AgentPermissionMode::Interactive),
+        };
+
+        cx.update(|cx| {
+            let mut settings = agent_settings::AgentSettings::get_global(cx).clone();
+            settings.profiles.insert(profile_id.clone(), profile);
+            agent_settings::AgentSettings::override_global(settings, cx);
+        });
+
+        let (event_stream, mut rx) = ToolCallEventStream::test_with_profile(profile_id);
+        let auth_task = cx.update(|cx| {
+            authorize_file_edit(
+                "edit_file",
+                Path::new("root/.zed/settings.json"),
+                &thread.downgrade(),
+                &event_stream,
+                cx,
+            )
+        });
+
+        let auth = rx.expect_authorization().await;
+        auth.response
+            .send(acp_thread::SelectedPermissionOutcome::new(
+                acp::PermissionOptionId::new("allow"),
+                acp::PermissionOptionKind::AllowOnce,
+            ))
+            .ok();
+
+        let result = auth_task.await;
+        assert!(result.is_ok(), "expected Ok(()), got: {:?}", result);
+    }
+
+    #[gpui::test]
+    async fn test_authorize_file_edit_autonomous_default_allow_without_explicit_scope_fails(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/root"),
+            json!({
+                ".zed": {
+                    "settings.json": "{\n}\n"
+                }
+            }),
+        )
+        .await;
+
+        let (_project, thread) = setup_thread_and_project(fs, cx).await;
+
+        let profile_id = agent_settings::AgentProfileId("autonomous_default_allow".into());
+        let mut tools = collections::HashMap::default();
+        tools.insert(
+            Arc::from("edit_file"),
+            agent_settings::ToolRules {
+                default: Some(settings::ToolPermissionMode::Allow),
+                always_allow: vec![],
+                always_deny: vec![],
+                always_confirm: vec![],
+                write_scopes: None,
+                invalid_patterns: vec![],
+            },
+        );
+        let profile = AgentProfileSettings {
+            name: "autonomous_default_allow".into(),
+            origin: Default::default(),
+            tools: collections::IndexMap::default(),
+            enable_all_context_servers: false,
+            context_servers: collections::IndexMap::default(),
+            default_model: None,
+            custom_prompt_path: None,
+            system_prompt_template: None,
+            description: None,
+            skills: None,
+            delegation: None,
+            tool_permissions: Some(agent_settings::ToolPermissions {
+                default: settings::ToolPermissionMode::Allow,
+                tools,
+            }),
+            permission_mode: Some(AgentPermissionMode::Autonomous),
+        };
+
+        cx.update(|cx| {
+            let mut settings = agent_settings::AgentSettings::get_global(cx).clone();
+            settings.profiles.insert(profile_id.clone(), profile);
+            agent_settings::AgentSettings::override_global(settings, cx);
+        });
+
+        let (event_stream, _rx) = ToolCallEventStream::test_with_profile(profile_id);
+        let auth_task = cx.update(|cx| {
+            authorize_file_edit(
+                "edit_file",
+                Path::new("root/.zed/settings.json"),
+                &thread.downgrade(),
+                &event_stream,
+                cx,
+            )
+        });
+
+        let result = auth_task.await;
+        assert!(result.is_err(), "expected error, got: {:?}", result);
+        let err_str = result.unwrap_err().to_string();
+        assert!(
+            err_str.contains("without explicit write_scope"),
+            "expected error containing 'without explicit write_scope', got: {err_str}"
+        );
+        assert!(
+            err_str.contains("PolicyDenied"),
+            "expected PolicyDenied in error, got: {err_str}"
+        );
     }
 }

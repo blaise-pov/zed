@@ -13,7 +13,7 @@ use crate::{
     AgentTool, ToolCallEventStream, ToolInput, ToolPermissionDecision,
     decide_permission_for_path_with_profile,
 };
-use agent_settings::{AgentProfileSettings, AgentSettings};
+use agent_settings::{AgentPermissionMode, AgentProfileSettings, AgentSettings};
 use settings::Settings as _;
 
 /// Renames a symbol across the project using the language server.
@@ -165,7 +165,7 @@ fn check_rename_permissions(
     decision: ToolPermissionDecision,
 ) -> Result<(), String> {
     if let Some(profile) = profile
-        && profile.tool_permissions.is_some()
+        && profile.effective_permission_mode() == AgentPermissionMode::Autonomous
     {
         return Err(format!(
             "PolicyDenied: rename_symbol performs language-server-wide edits across an \
@@ -201,6 +201,7 @@ mod tests {
             skills: None,
             delegation: None,
             tool_permissions: Some(ToolPermissions::default()),
+            permission_mode: None,
         }
     }
 

@@ -1,7 +1,8 @@
 use crate::AgentTool;
 use crate::tools::TerminalTool;
 use agent_settings::{
-    AgentProfileSettings, AgentSettings, CompiledRegex, ToolPermissions, ToolRules,
+    AgentPermissionMode, AgentProfileSettings, AgentSettings, CompiledRegex, ToolPermissions,
+    ToolRules,
 };
 use settings::ToolPermissionMode;
 use shell_command_parser::{
@@ -546,8 +547,8 @@ pub fn decide_permission_for_path(
 /// Determines permission decision for a tool invocation taking the active profile's
 /// tool_permissions into account.
 ///
-/// Hardcoded security rules are enforced by [`ToolPermissionDecision::from_input`]
-/// for both the global and the profile-level rule sets.
+/// Hardcoded security rules are checked directly at the top of the function to
+/// enforce them unconditionally across all permission modes (including [`AgentPermissionMode::Unrestricted`]).
 pub fn decide_permission_for_profile(
     tool_name: &str,
     inputs: &[String],
@@ -555,6 +556,27 @@ pub fn decide_permission_for_profile(
     profile: Option<&AgentProfileSettings>,
     shell_kind: ShellKind,
 ) -> ToolPermissionDecision {
+    if let Some(denial) = check_hardcoded_security_rules(tool_name, inputs, shell_kind) {
+        return denial;
+    }
+
+    let mode = profile.map_or(AgentPermissionMode::Interactive, |p| {
+        p.effective_permission_mode()
+    });
+
+    if mode == AgentPermissionMode::Unrestricted {
+        return ToolPermissionDecision::Allow;
+    }
+
+    if mode == AgentPermissionMode::Autonomous
+        && profile.is_some_and(|p| p.tool_permissions.is_none())
+    {
+        return ToolPermissionDecision::Deny(
+            "Autonomous agent has no tool_permissions configured: all operations denied by default"
+                .into(),
+        );
+    }
+
     let global_decision = ToolPermissionDecision::from_input(
         tool_name,
         inputs,
@@ -584,10 +606,14 @@ pub fn decide_permission_for_profile(
                     ));
                 }
                 ToolPermissionDecision::Confirm => {
-                    return ToolPermissionDecision::Deny(format!(
-                        "PolicyDenied: Tool '{}' requires human confirmation, which is disallowed for profile '{}'",
-                        tool_name, profile.name
-                    ));
+                    if mode == AgentPermissionMode::Autonomous {
+                        return ToolPermissionDecision::Deny(format!(
+                            "PolicyDenied: Tool '{}' requires human confirmation, which is disallowed for profile '{}'",
+                            tool_name, profile.name
+                        ));
+                    } else {
+                        return ToolPermissionDecision::Confirm;
+                    }
                 }
                 ToolPermissionDecision::Allow => {
                     return ToolPermissionDecision::Allow;
@@ -2567,6 +2593,7 @@ mod tests {
                 default: ToolPermissionMode::Deny,
                 tools,
             }),
+            permission_mode: None,
         };
 
         let settings = test_agent_settings(ToolPermissions::default());
@@ -2687,6 +2714,7 @@ mod tests {
                 default: ToolPermissionMode::Deny,
                 tools: profile_tools,
             }),
+            permission_mode: None,
         };
 
         // Global Deny takes precedence over profile's allow
@@ -2718,6 +2746,7 @@ mod tests {
                 default: ToolPermissionMode::Confirm,
                 tools: collections::HashMap::default(),
             }),
+            permission_mode: None,
         };
 
         let settings = test_agent_settings(ToolPermissions {
@@ -2733,5 +2762,103 @@ mod tests {
             ShellKind::Posix,
         );
         assert!(matches!(decision, ToolPermissionDecision::Deny(_)));
+    }
+
+    #[test]
+    fn test_decide_permission_for_profile_autonomous_without_tool_permissions_denies() {
+        let profile = AgentProfileSettings {
+            name: "strict_agent".into(),
+            origin: Default::default(),
+            tools: collections::IndexMap::default(),
+            enable_all_context_servers: false,
+            context_servers: collections::IndexMap::default(),
+            default_model: None,
+            custom_prompt_path: None,
+            system_prompt_template: None,
+            description: None,
+            skills: None,
+            delegation: None,
+            tool_permissions: None,
+            permission_mode: Some(AgentPermissionMode::Autonomous),
+        };
+
+        let settings = test_agent_settings(ToolPermissions::default());
+
+        let decision = decide_permission_for_profile(
+            "any_tool",
+            &["input".to_string()],
+            &settings,
+            Some(&profile),
+            ShellKind::Posix,
+        );
+        assert_eq!(
+            decision,
+            ToolPermissionDecision::Deny(
+                "Autonomous agent has no tool_permissions configured: all operations denied by default".into()
+            )
+        );
+    }
+
+    #[test]
+    fn test_decide_permission_for_profile_unrestricted_allows() {
+        let profile = AgentProfileSettings {
+            name: "unrestricted_agent".into(),
+            origin: Default::default(),
+            tools: collections::IndexMap::default(),
+            enable_all_context_servers: false,
+            context_servers: collections::IndexMap::default(),
+            default_model: None,
+            custom_prompt_path: None,
+            system_prompt_template: None,
+            description: None,
+            skills: None,
+            delegation: None,
+            tool_permissions: None,
+            permission_mode: Some(AgentPermissionMode::Unrestricted),
+        };
+
+        let settings = test_agent_settings(ToolPermissions::default());
+
+        let decision = decide_permission_for_profile(
+            "any_tool",
+            &["input".to_string()],
+            &settings,
+            Some(&profile),
+            ShellKind::Posix,
+        );
+        assert_eq!(decision, ToolPermissionDecision::Allow);
+    }
+
+    #[test]
+    fn test_decide_permission_for_profile_interactive_without_rules_confirms() {
+        let profile = AgentProfileSettings {
+            name: "interactive_agent".into(),
+            origin: Default::default(),
+            tools: collections::IndexMap::default(),
+            enable_all_context_servers: false,
+            context_servers: collections::IndexMap::default(),
+            default_model: None,
+            custom_prompt_path: None,
+            system_prompt_template: None,
+            description: None,
+            skills: None,
+            delegation: None,
+            tool_permissions: None,
+            permission_mode: Some(AgentPermissionMode::Interactive),
+        };
+
+        let settings = test_agent_settings(ToolPermissions {
+            default: ToolPermissionMode::Confirm,
+            tools: collections::HashMap::default(),
+        });
+
+        let decision = decide_permission_for_profile(
+            "any_tool",
+            &["input".to_string()],
+            &settings,
+            Some(&profile),
+            ShellKind::Posix,
+        );
+        assert_eq!(decision, ToolPermissionDecision::Confirm);
     }
 }

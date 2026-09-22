@@ -1,9 +1,10 @@
 use super::tool_permissions::{
     authorize_symlink_access, canonicalize_worktree_roots, check_profile_write_scope,
-    detect_symlink_escape, resolve_creatable_global_skill_path, sensitive_settings_kind,
+    detect_symlink_escape, is_path_in_profile_write_scope, resolve_creatable_global_skill_path,
+    sensitive_settings_kind,
 };
 use agent_client_protocol::schema::v1 as acp;
-use agent_settings::AgentSettings;
+use agent_settings::{AgentPermissionMode, AgentSettings};
 use futures::FutureExt as _;
 use gpui::{App, AppContext as _, AsyncApp, Entity, SharedString, Task};
 use project::Project;
@@ -124,8 +125,14 @@ impl AgentTool for CreateDirectoryTool {
                 project.find_project_path(&input.path, cx).is_some()
             });
 
+            let mode = profile
+                .as_ref()
+                .map_or(AgentPermissionMode::Interactive, |p| {
+                    p.effective_permission_mode()
+                });
+
             if let Some(profile) = &profile {
-                if profile.tool_permissions.is_some() {
+                if mode == AgentPermissionMode::Autonomous {
                     if global_skill_directory.is_some() {
                         return Err(format!(
                             "PolicyDenied: Creating global skills directory is outside project write scopes for profile '{}'",
@@ -198,7 +205,7 @@ impl AgentTool for CreateDirectoryTool {
                     .await;
 
             if let Some(profile) = &profile {
-                if profile.tool_permissions.is_some() {
+                if mode == AgentPermissionMode::Autonomous {
                     if let Some(target) = symlink_escape_target {
                         return Err(format!(
                             "PolicyDenied: Creating directory '{}' escapes project boundaries via symlink to '{}' (disallowed for autonomous profile '{}')",
@@ -208,10 +215,22 @@ impl AgentTool for CreateDirectoryTool {
                         ));
                     }
                     if sensitive_kind.is_some() {
-                        return Err(format!(
-                            "PolicyDenied: Accessing sensitive settings is disallowed for autonomous profile '{}'",
-                            profile.name
-                        ));
+                        let in_write_scope = cx.update(|cx| {
+                            is_path_in_profile_write_scope(
+                                Self::NAME,
+                                Path::new(&input.path),
+                                &project,
+                                &canonical_roots,
+                                Some(profile),
+                                cx,
+                            )
+                        });
+                        if !in_write_scope {
+                            return Err(format!(
+                                "PolicyDenied: Accessing sensitive settings is disallowed for autonomous profile '{}' without explicit write_scope",
+                                profile.name
+                            ));
+                        }
                     }
                 }
             }
@@ -223,7 +242,7 @@ impl AgentTool for CreateDirectoryTool {
                     decision
                 };
 
-            let authorize = if profile.as_ref().is_some_and(|p| p.tool_permissions.is_some()) {
+            let authorize = if mode == AgentPermissionMode::Autonomous {
                 None
             } else if let Some(canonical_target) = symlink_escape_target {
                 // Symlink escape authorization replaces (rather than supplements)

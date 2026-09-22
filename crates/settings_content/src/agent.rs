@@ -588,6 +588,20 @@ impl crate::merge_from::MergeFrom for ProfileOriginContent {
     }
 }
 
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentPermissionMode {
+    #[default]
+    #[serde(alias = "prompt")]
+    Interactive,
+    #[serde(alias = "strict")]
+    Autonomous,
+    #[serde(alias = "allow_all")]
+    Unrestricted,
+}
+
 #[with_fallible_options]
 #[derive(Debug, PartialEq, Clone, Serialize, Deserialize, JsonSchema, MergeFrom)]
 pub struct AgentProfileContent {
@@ -622,6 +636,8 @@ pub struct AgentProfileContent {
     pub delegation: Option<DelegationContent>,
     /// Permissions for tools invoked by this profile.
     pub tool_permissions: Option<ToolPermissionsContent>,
+    /// Permission mode for this profile.
+    pub permission_mode: Option<AgentPermissionMode>,
 }
 
 #[with_fallible_options]

@@ -212,6 +212,7 @@ mod tests {
             skills: None,
             delegation: None,
             tool_permissions: None,
+            permission_mode: None,
         }
     }
 

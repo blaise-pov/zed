@@ -321,6 +321,7 @@ fn insert_profile(
             skills: None,
             delegation: None,
             tool_permissions: None,
+            permission_mode: None,
         },
     );
     agent_settings::AgentSettings::override_global(settings, cx);
@@ -5110,6 +5111,7 @@ fn setup_context_server(
                     args: Vec::new(),
                     env: None,
                     timeout: None,
+                    platforms: Default::default(),
                 },
             },
         );
@@ -9579,6 +9581,7 @@ async fn test_profile_write_scopes_allowed_and_denied(cx: &mut TestAppContext) {
             default: settings::ToolPermissionMode::Deny,
             tools,
         }),
+        permission_mode: None,
     };
 
     // Path inside backend/** write_scope is allowed

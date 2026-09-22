@@ -18,8 +18,8 @@ use crate::sandboxing::{
 };
 use agent_client_protocol::schema::v1 as acp;
 use agent_settings::{
-    AgentProfileId, AgentProfileSettings, AgentSettings, AutoCompactThreshold, COMPACTION_PROMPT,
-    SUMMARIZE_THREAD_DETAILED_PROMPT, SUMMARIZE_THREAD_PROMPT, builtin_profiles,
+    AgentPermissionMode, AgentProfileId, AgentProfileSettings, AgentSettings, AutoCompactThreshold,
+    COMPACTION_PROMPT, SUMMARIZE_THREAD_DETAILED_PROMPT, SUMMARIZE_THREAD_PROMPT, builtin_profiles,
 };
 use anyhow::{Context as _, Result, anyhow};
 use chrono::{DateTime, Local, Utc};
@@ -5903,6 +5903,15 @@ impl ToolCallEventStream {
         (stream, receiver)
     }
 
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn test_with_profile(
+        profile_id: agent_settings::AgentProfileId,
+    ) -> (Self, ToolCallEventStreamReceiver) {
+        let (mut stream, receiver) = Self::test();
+        stream.profile_id = Some(profile_id);
+        (stream, receiver)
+    }
+
     /// Like [`Self::test`], but the returned stream shares the provided
     /// thread-scoped sandbox grants. This mirrors how a real [`Thread`] builds a
     /// distinct event stream per tool call while sharing one set of grants, so
@@ -6260,7 +6269,7 @@ impl ToolCallEventStream {
         }
 
         if let Some(profile) = self.profile_settings(cx) {
-            if profile.tool_permissions.is_some() {
+            if profile.effective_permission_mode() == AgentPermissionMode::Autonomous {
                 return Task::ready(Err(anyhow!(
                     "PolicyDenied: Sandbox escalation is disallowed for profile '{}'",
                     profile.name
@@ -6925,7 +6934,7 @@ impl ToolCallEventStream {
     ) -> Task<Result<()>> {
         if check_settings.is_none() {
             if let Some(profile) = self.profile_settings(cx) {
-                if profile.tool_permissions.is_some() {
+                if profile.effective_permission_mode() == AgentPermissionMode::Autonomous {
                     return Task::ready(Err(anyhow!(
                         "PolicyDenied: Action '{}' requires human confirmation, which is disallowed for autonomous profile '{}'",
                         title,

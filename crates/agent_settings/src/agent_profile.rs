@@ -10,6 +10,8 @@ use settings::{
     AgentProfileContent, ContextServerPresetContent, DelegationContent, LanguageModelSelection,
     Settings as _, SettingsContent, SettingsLocation, SettingsStore, update_settings_file,
 };
+
+pub use settings::AgentPermissionMode;
 use util::ResultExt as _;
 
 use crate::{AgentProfileId, AgentSettings, ToolPermissions, compile_tool_permissions};
@@ -109,6 +111,9 @@ impl AgentProfile {
         let tool_permissions = base_profile
             .as_ref()
             .and_then(|profile| profile.tool_permissions.clone());
+        let permission_mode = base_profile
+            .as_ref()
+            .and_then(|profile| profile.permission_mode);
 
         let profile_settings = AgentProfileSettings {
             name: name.into(),
@@ -123,6 +128,7 @@ impl AgentProfile {
             skills,
             delegation,
             tool_permissions,
+            permission_mode,
         };
 
         match &origin {
@@ -206,6 +212,7 @@ pub struct AgentProfileSettings {
     pub delegation: Option<Delegation>,
     /// Tool permissions and write scopes for this profile.
     pub tool_permissions: Option<ToolPermissions>,
+    pub permission_mode: Option<AgentPermissionMode>,
 }
 
 /// Which sub-agents a profile may spawn, and how deeply they may nest.
@@ -240,6 +247,17 @@ impl From<DelegationContent> for Delegation {
 }
 
 impl AgentProfileSettings {
+    pub fn effective_permission_mode(&self) -> AgentPermissionMode {
+        if let Some(mode) = self.permission_mode {
+            return mode;
+        }
+        if self.tool_permissions.is_some() {
+            AgentPermissionMode::Autonomous
+        } else {
+            AgentPermissionMode::Interactive
+        }
+    }
+
     pub fn is_tool_enabled(&self, tool_name: &str) -> bool {
         self.tools.get(tool_name) == Some(&true)
     }
@@ -349,6 +367,7 @@ impl AgentProfileSettings {
                     .tool_permissions
                     .as_ref()
                     .map(|tool_permissions| tool_permissions.to_content()),
+                permission_mode: self.permission_mode,
             },
         );
 
@@ -524,6 +543,7 @@ impl From<AgentProfileContent> for AgentProfileSettings {
             skills,
             delegation,
             tool_permissions,
+            permission_mode,
         } = content;
 
         let custom_prompt_path_shared = custom_prompt_path
@@ -546,6 +566,7 @@ impl From<AgentProfileContent> for AgentProfileSettings {
             skills,
             delegation: delegation.map(|delegation| delegation.into()),
             tool_permissions: tool_permissions.map(|tp| compile_tool_permissions(Some(tp))),
+            permission_mode,
         }
     }
 }
@@ -594,6 +615,7 @@ mod tests {
             skills: None,
             delegation: None,
             tool_permissions: None,
+            permission_mode: None,
         }
     }
 

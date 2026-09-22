@@ -1,7 +1,7 @@
 use super::tool_permissions::{
     authorize_symlink_access, canonicalize_worktree_roots, check_profile_write_scope,
-    detect_symlink_escape, resolve_global_skill_descendant_path, resolves_to_global_skills_dir,
-    sensitive_settings_kind,
+    detect_symlink_escape, is_path_in_profile_write_scope, resolve_global_skill_descendant_path,
+    resolves_to_global_skills_dir, sensitive_settings_kind,
 };
 use crate::{
     AgentTool, ToolCallEventStream, ToolInput, ToolPermissionDecision,
@@ -9,7 +9,7 @@ use crate::{
 };
 use action_log::ActionLog;
 use agent_client_protocol::schema::v1 as acp;
-use agent_settings::AgentSettings;
+use agent_settings::{AgentPermissionMode, AgentSettings};
 use futures::{FutureExt as _, SinkExt, StreamExt, channel::mpsc};
 use gpui::{App, AppContext, Entity, SharedString, Task};
 use project::{Project, ProjectPath};
@@ -134,8 +134,14 @@ impl AgentTool for DeletePathTool {
             let global_skill_path =
                 resolve_global_skill_descendant_path(Path::new(&path), fs.as_ref()).await;
 
+            let mode = profile
+                .as_ref()
+                .map_or(AgentPermissionMode::Interactive, |p| {
+                    p.effective_permission_mode()
+                });
+
             if let Some(profile) = &profile {
-                if profile.tool_permissions.is_some() && global_skill_path.is_some() {
+                if mode == AgentPermissionMode::Autonomous && global_skill_path.is_some() {
                     return Err(format!(
                         "PolicyDenied: Operating on global skills path is outside project write scopes for profile '{}'",
                         profile.name
@@ -152,7 +158,7 @@ impl AgentTool for DeletePathTool {
                 sensitive_settings_kind(Path::new(&path), &canonical_roots, fs.as_ref()).await;
 
             if let Some(profile) = &profile {
-                if profile.tool_permissions.is_some() {
+                if mode == AgentPermissionMode::Autonomous {
                     if let Some(target) = symlink_escape_target {
                         return Err(format!(
                             "PolicyDenied: Deleting path '{}' escapes project boundaries via symlink to '{}' (disallowed for autonomous profile '{}')",
@@ -162,10 +168,22 @@ impl AgentTool for DeletePathTool {
                         ));
                     }
                     if settings_kind.is_some() {
-                        return Err(format!(
-                            "PolicyDenied: Accessing sensitive settings is disallowed for autonomous profile '{}'",
-                            profile.name
-                        ));
+                        let in_write_scope = cx.update(|cx| {
+                            is_path_in_profile_write_scope(
+                                Self::NAME,
+                                Path::new(&path),
+                                &project,
+                                &canonical_roots,
+                                Some(profile),
+                                cx,
+                            )
+                        });
+                        if !in_write_scope {
+                            return Err(format!(
+                                "PolicyDenied: Accessing sensitive settings is disallowed for autonomous profile '{}' without explicit write_scope",
+                                profile.name
+                            ));
+                        }
                     }
                 }
             }
@@ -177,7 +195,7 @@ impl AgentTool for DeletePathTool {
                     decision
                 };
 
-            let authorize = if profile.as_ref().is_some_and(|p| p.tool_permissions.is_some()) {
+            let authorize = if mode == AgentPermissionMode::Autonomous {
                 None
             } else if let Some(canonical_target) = symlink_escape_target {
                 // Symlink escape authorization replaces (rather than supplements)

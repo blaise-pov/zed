@@ -157,6 +157,7 @@ graph TD
       "orchestrator": {
         "name": "System Architect",
         "description": "Decomposes project requirements into system abstractions and coordinates domain leads",
+        "permission_mode": "autonomous", // "interactive" | "autonomous" | "unrestricted"
         "custom_prompt_path": ".zed/prompts/orchestrator.md",
         "default_model": {
           "provider": "anthropic",
@@ -190,6 +191,7 @@ graph TD
       "backend-lead": {
         "name": "Backend Lead",
         "description": "Designs backend architecture and delegates to layer engineers",
+        "permission_mode": "autonomous",
         "custom_prompt_path": ".zed/prompts/backend_lead.md",
         "default_model": {
           "provider": "anthropic",
@@ -340,7 +342,16 @@ stateDiagram-v2
 
 ## 7. Безопасность автономных агентов: Fail-Closed & Write Scopes
 
-Безопасность автономной работы опирается на строгую эшелонированную защиту (Defense-in-Depth):
+Безопасность автономной работы опирается на строгую эшелонированную защиту (Defense-in-Depth) с явным управлением режимом авторизации (`permission_mode`):
+
+### Режимы авторизации профилей (`AgentPermissionMode`)
+- **`interactive`** (псевдоним `"prompt"`): диалоговый режим парного программирования. Если для инструмента нет явного правила `allow`, рантайм запрашивает подтверждение у пользователя через UI-диалог.
+- **`autonomous`** (псевдоним `"strict"`): полностью автономный режим (Fail-Closed). Запросы к пользователю исключены. Любое действие без явного разрешения или требующее подтверждения немедленно блокируется (`PolicyDenied`). Если секция `tool_permissions` не указана — блокируются все вызовы.
+- **`unrestricted`** (псевдоним `"allow_all"`): режим полного доверия для изолированных окружений. Все вызовы разрешены автоматически без запросов (за исключением неизменяемых системных запретов).
+
+При отсутствии явного `permission_mode` действует автоматический fallback: при наличии `tool_permissions` — `"autonomous"`, при отсутствии — `"interactive"`.
+
+### Поток авторизации вызовов инструментов
 
 ```text
 Входящий вызов инструмента
@@ -349,27 +360,40 @@ stateDiagram-v2
 1. Hardcoded Запреты ────────────► [rm -rf /, ~, .., shell sub-command injection] ──► DENY
        │ (пройдено)
        ▼
-2. Global Deny ──────────────────► [always_deny из настроек пользователя] ─────────► DENY
+2. Проверка Unrestricted ────────► permission_mode == Unrestricted? ───────────────► ALLOW
+       │ (нет)
+       ▼
+3. Autonomous без правил ────────► permission_mode == Autonomous && no tool_perms? ─► DENY
        │ (пройдено)
        ▼
-3. Правила профиля ──────────────► always_deny / always_confirm / always_allow
+4. Global Deny ──────────────────► [always_deny из настроек пользователя] ─────────► DENY
+       │ (пройдено)
+       ▼
+5. Правила профиля ──────────────► always_deny / always_confirm / always_allow
        │
-       ├── Исход "Confirm" ──────► Автономный профиль? ──► [Fail-Closed] ──────────► DENY
+       ├── Исход "Confirm" ──────► Autonomous? ──► [Fail-Closed] ──────────────────► DENY
        │
        ▼ (разрешено)
-4. Write Scopes ─────────────────► Файловый инструмент? (edit, write, copy, move)
-       │                           Совпадает с разрешенным glob?
-       │                           ├── Нет ────────────────────────────────────────► DENY
-       │                           └── Да ─────────────────────────────────────────► ALLOW
+6. Write Scopes ─────────────────► Файловый инструмент? (edit, write, copy, move, etc.)
+       │                           Совпадает с явным write_scopes?
+       │                           ├── Нет и вне write_scopes ─────────────────────► DENY
+       │                           └── Да (входит в write_scopes) ─────────────────► ALLOW (override)
        ▼
-5. Anti-Escape & Sandbox ────────► Симлинки наружу / .zed/settings.json / skills ─► DENY
-       │
+7. Anti-Privilege-Escalation ────► Доступ к .zed/** / global config / skills?
+       │                           ├── Явно разрешён в write_scopes? ──────────────► ALLOW
+       │                           ├── Autonomous (без явного write_scope) ────────► DENY (PolicyDenied)
+       │                           └── Interactive (без явного write_scope) ───────► PROMPT (User UI)
+       ▼
+8. Anti-Escape (Симлинки) ───────► Выход за пределы ворктри через symlink?
+       │                           ├── Autonomous ─────────────────────────────────► DENY (PolicyDenied)
+       │                           └── Interactive ────────────────────────────────► PROMPT (User UI)
        ▼
 Вызов разрешен и отправлен на исполнение
 ```
 
 ### Правила и гарантии:
-- **Fail-Closed для автономных профилей**: если профилю назначены `tool_permissions`, любое действие, требующее интерактивного подтверждения пользователем (`Confirm`), немедленно отклоняется с ошибкой `PolicyDenied`. Автономный агент не повисает бесконечно в фоне.
+- **Fail-Closed для автономных профилей**: если агент работает в режиме `autonomous`, любое действие, требующее интерактивного подтверждения пользователем (`Confirm`), немедленно отклоняется с ошибкой `PolicyDenied`. Автономный агент не повисает бесконечно в фоне.
+- **Explicit Write Scopes Override**: файлы конфигурации (`.zed/**`, глобальный конфиг, skills) по умолчанию строго защищены от модификации автономными агентами. Однако явное указание пути в `write_scopes` профиля (например, `write_scopes: [".zed/**"]` для архитектурного агента) служит легитимным оверрайдом и разрешает модификацию без интерактивных диалогов.
 - **Per-Tool Write Scopes**: glob-шаблоны ограничивают область действия файловых инструментов. Ошибка в шаблоне также вызывает fail-closed блокировку.
 - **Re-entrant Borrow Safety**: валидация прав инструмента выполняется без повторных мутабельных заимствований структур треда через удержание `Entity<Project>`, исключая паники рантайма при фоновых событиях.
 
