@@ -73,7 +73,7 @@ graph TD
 #### 3. Безопасность автономных агентов: Fail-Closed & Write Scopes
 - **Fail-Closed для автономности**: если у профиля настроены `tool_permissions`, любые операции с исходом `Confirm` (требующие подтверждения пользователя) **автоматически отклоняются** (`PolicyDenied`). Автономный агент не зависает в фоне в ожидании клика.
 - **Per-Tool Write Scopes**: файловые инструменты (`edit_file`, `write_file`, `copy_path`, `move_path`, `delete_path`, `create_directory`) ограничены списком glob-шаблонов (например, `["backend/internal/repo/**", "migrations/**"]`). Попытка записи за пределами скоупа блокируется.
-- **Anti-Escape**: блокировка выхода из ворктри через симлинки и защита критических файлов (`.zed/settings.json`, `.cargo/config.toml`, `~/.agents/skills`).
+- **Защита dotfiles и Anti-Escape**: блокировка выхода из ворктри через симлинки и защита всех скрытых файлов и директорий (`.github/`, `.env*`, `.cargo/`, `.husky/`, `.vscode/`, `.zed/`, `~/.agents/skills/`). Модификация dot-путей требует явного `write_scopes` в автономном режиме или UI-подтверждения в интерактивном, а в песочнице терминала существующие dot-файлы монтируются read-only (`protected_paths`).
 - **Re-entrant Safety**: безопасная авторизация вызовов без паник от повторных заимствований мутабельного треда.
 
 #### 4. Control Plane: Интеграция с Task Graph Service (TGS)
