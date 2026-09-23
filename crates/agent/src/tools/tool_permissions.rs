@@ -19,6 +19,19 @@ pub enum SensitiveSettingsKind {
     Local,
     Global,
     AgentSkills,
+    Hidden,
+}
+
+/// Returns true when any normal component of the path is dot-prefixed
+/// (e.g. `.github/`, `.env`). `.` and `..` components never match.
+pub fn is_dot_path(path: &Path) -> bool {
+    path.components().any(|component| match component {
+        std::path::Component::Normal(name) => {
+            let s = name.to_string_lossy();
+            s.starts_with('.') && s.len() > 1
+        }
+        _ => false,
+    })
 }
 
 /// Result of resolving a path within the project with symlink safety checks.
@@ -330,7 +343,50 @@ pub async fn sensitive_settings_kind(
         return Some(SensitiveSettingsKind::AgentSkills);
     }
 
+    let may_be_specific_kind = path.components().any(|component| match component {
+        Component::Normal(name) => {
+            let s = name.to_string_lossy();
+            component_matches_ignore_ascii_case(component.as_os_str(), local_settings_folder)
+                || s.eq_ignore_ascii_case(".agents")
+        }
+        _ => false,
+    });
+
+    if !may_be_specific_kind {
+        if !path.is_absolute() && is_dot_path(path) {
+            return Some(SensitiveSettingsKind::Hidden);
+        } else if path.is_absolute() {
+            for root in canonical_worktree_roots {
+                if let Ok(relative) = path.strip_prefix(root) {
+                    if is_dot_path(relative) {
+                        return Some(SensitiveSettingsKind::Hidden);
+                    }
+                }
+            }
+        }
+    }
+
+    let mut canonical_paths = Vec::new();
     if let Some(canonical_path) = canonicalize_with_ancestors(path, fs).await {
+        canonical_paths.push(canonical_path);
+    } else if path.is_relative() {
+        for root in canonical_worktree_roots {
+            if let Some(root_name) = root.file_name() {
+                if let Ok(suffix) = path.strip_prefix(root_name) {
+                    if let Some(canonical) =
+                        canonicalize_with_ancestors(&root.join(suffix), fs).await
+                    {
+                        canonical_paths.push(canonical);
+                    }
+                }
+            }
+            if let Some(canonical) = canonicalize_with_ancestors(&root.join(path), fs).await {
+                canonical_paths.push(canonical);
+            }
+        }
+    }
+
+    for canonical_path in canonical_paths {
         // Re-check the local protections against the canonical path,
         // restricted to within the project's worktrees, to catch `..`
         // and intra-project-symlink bypasses (see doc comment above).
@@ -346,6 +402,9 @@ pub async fn sensitive_settings_kind(
             }
             if is_agents_skills_path(relative) {
                 return Some(SensitiveSettingsKind::AgentSkills);
+            }
+            if is_dot_path(relative) {
+                return Some(SensitiveSettingsKind::Hidden);
             }
 
             // The canonical path can only live inside one worktree, so
@@ -514,6 +573,11 @@ pub fn authorize_with_sensitive_settings(
         Some(SensitiveSettingsKind::AgentSkills) => event_stream.authorize_always_prompt(
             format!("{title} (agent skills)"),
             context.for_agent_skills(),
+            cx,
+        ),
+        Some(SensitiveSettingsKind::Hidden) => event_stream.authorize_always_prompt(
+            format!("{title} (hidden / configuration file)"),
+            context,
             cx,
         ),
         None => event_stream.authorize(title, context, cx),
@@ -902,6 +966,13 @@ pub fn authorize_file_edit(
                 return Ok(());
             }
             if mode == AgentPermissionMode::Autonomous {
+                if settings_kind == Some(SensitiveSettingsKind::Hidden) {
+                    bail!(
+                        "PolicyDenied: Editing hidden path '{}' is disallowed for autonomous profile '{}' without explicit write_scope",
+                        path_owned.display(),
+                        profile.as_ref().map_or("unknown", |p| &p.name)
+                    );
+                }
                 bail!(
                     "PolicyDenied: Editing sensitive settings at '{}' is disallowed for autonomous profile '{}' without explicit write_scope",
                     path_owned.display(),
@@ -953,6 +1024,20 @@ pub fn authorize_file_edit(
                     .for_agent_skills();
                     event_stream.authorize_always_prompt(
                         format!("{title} (agent skills)"),
+                        context,
+                        cx,
+                    )
+                });
+                return authorize.await;
+            }
+            Some(SensitiveSettingsKind::Hidden) => {
+                let authorize = cx.update(|cx| {
+                    let context = ToolPermissionContext::new(
+                        &tool_name,
+                        vec![path_owned.to_string_lossy().to_string()],
+                    );
+                    event_stream.authorize_always_prompt(
+                        format!("{title} (hidden / configuration file)"),
                         context,
                         cx,
                     )
@@ -1982,5 +2067,416 @@ mod tests {
             err_str.contains("PolicyDenied"),
             "expected PolicyDenied in error, got: {err_str}"
         );
+    }
+
+    #[test]
+    fn test_is_dot_path_matches_files_and_dirs() {
+        assert!(is_dot_path(Path::new(".env")));
+        assert!(is_dot_path(Path::new(".github/workflows/ci.yml")));
+    }
+
+    #[test]
+    fn test_is_dot_path_ignores_normal_paths() {
+        assert!(!is_dot_path(Path::new("src/main.rs")));
+        assert!(!is_dot_path(Path::new("Cargo.toml")));
+    }
+
+    #[test]
+    fn test_is_dot_path_matches_nested_dot_components() {
+        assert!(is_dot_path(Path::new("foo/.bar/baz")));
+    }
+
+    #[test]
+    fn test_is_dot_path_ignores_current_and_parent() {
+        assert!(!is_dot_path(Path::new(".")));
+        assert!(!is_dot_path(Path::new("..")));
+        assert!(!is_dot_path(Path::new("./src/main.rs")));
+        assert!(!is_dot_path(Path::new("../src/main.rs")));
+    }
+
+    #[test]
+    fn test_is_dot_path_matches_through_parent_dir() {
+        assert!(is_dot_path(Path::new("src/../.env")));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_is_dot_path_ignores_windows_prefix() {
+        assert!(is_dot_path(Path::new(r"C:\repo\.env")));
+    }
+
+    #[gpui::test]
+    async fn test_sensitive_settings_kind_prefers_specific_kinds(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/root"),
+            json!({
+                ".zed": {
+                    "settings.json": "{}\n"
+                },
+                ".env": "FOO=bar\n"
+            }),
+        )
+        .await;
+        let (project, _thread) = setup_thread_and_project(fs.clone(), cx).await;
+        let fs_arc: Arc<dyn Fs> = fs;
+        let roots = canonicalize_worktree_roots(&project, &fs_arc, cx).await;
+
+        let zed_kind = sensitive_settings_kind(
+            Path::new("root/.zed/settings.json"),
+            &roots,
+            fs_arc.as_ref(),
+        )
+        .await;
+        assert_eq!(zed_kind, Some(SensitiveSettingsKind::Local));
+
+        let env_kind =
+            sensitive_settings_kind(Path::new("root/.env"), &roots, fs_arc.as_ref()).await;
+        assert_eq!(env_kind, Some(SensitiveSettingsKind::Hidden));
+    }
+
+    #[gpui::test]
+    async fn test_authorize_file_edit_dotfile_interactive_prompts(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/root"),
+            json!({
+                ".env": "SECRET=123\n"
+            }),
+        )
+        .await;
+
+        let (_project, thread) = setup_thread_and_project(fs, cx).await;
+
+        let profile_id = agent_settings::AgentProfileId("interactive_agent".into());
+        let profile = AgentProfileSettings {
+            name: "interactive_agent".into(),
+            origin: Default::default(),
+            tools: collections::IndexMap::default(),
+            enable_all_context_servers: false,
+            context_servers: collections::IndexMap::default(),
+            default_model: None,
+            custom_prompt_path: None,
+            system_prompt_template: None,
+            description: None,
+            skills: None,
+            delegation: None,
+            tool_permissions: None,
+            permission_mode: Some(AgentPermissionMode::Interactive),
+        };
+
+        cx.update(|cx| {
+            let mut settings = agent_settings::AgentSettings::get_global(cx).clone();
+            settings.profiles.insert(profile_id.clone(), profile);
+            agent_settings::AgentSettings::override_global(settings, cx);
+        });
+
+        let (event_stream, mut rx) = ToolCallEventStream::test_with_profile(profile_id);
+        let auth_task = cx.update(|cx| {
+            authorize_file_edit(
+                "edit_file",
+                Path::new("root/.env"),
+                &thread.downgrade(),
+                &event_stream,
+                cx,
+            )
+        });
+
+        let auth = rx.expect_authorization().await;
+        let title = auth.tool_call.fields.title.unwrap_or_default();
+        assert!(
+            title.contains("(hidden / configuration file)"),
+            "expected prompt title to contain '(hidden / configuration file)', got: {title}"
+        );
+        auth.response
+            .send(acp_thread::SelectedPermissionOutcome::new(
+                acp::PermissionOptionId::new("allow"),
+                acp::PermissionOptionKind::AllowOnce,
+            ))
+            .ok();
+
+        let result = auth_task.await;
+        assert!(result.is_ok(), "expected Ok(()), got: {:?}", result);
+    }
+
+    #[gpui::test]
+    async fn test_authorize_file_edit_dotdir_autonomous_without_scope_fails(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/root"),
+            json!({
+                ".github": {
+                    "ci.yml": "name: CI\n"
+                }
+            }),
+        )
+        .await;
+
+        let (_project, thread) = setup_thread_and_project(fs, cx).await;
+
+        let profile_id = agent_settings::AgentProfileId("autonomous_crates_only".into());
+        let mut tools = collections::HashMap::default();
+        tools.insert(
+            Arc::from("edit_file"),
+            agent_settings::ToolRules {
+                default: Some(settings::ToolPermissionMode::Allow),
+                always_allow: vec![],
+                always_deny: vec![],
+                always_confirm: vec![],
+                write_scopes: Some(
+                    agent_settings::WriteScopes::new(vec![Arc::from("crates/**")]).unwrap(),
+                ),
+                invalid_patterns: vec![],
+            },
+        );
+        let profile = AgentProfileSettings {
+            name: "autonomous_crates_only".into(),
+            origin: Default::default(),
+            tools: collections::IndexMap::default(),
+            enable_all_context_servers: false,
+            context_servers: collections::IndexMap::default(),
+            default_model: None,
+            custom_prompt_path: None,
+            system_prompt_template: None,
+            description: None,
+            skills: None,
+            delegation: None,
+            tool_permissions: Some(agent_settings::ToolPermissions {
+                default: settings::ToolPermissionMode::Deny,
+                tools,
+            }),
+            permission_mode: Some(AgentPermissionMode::Autonomous),
+        };
+
+        cx.update(|cx| {
+            let mut settings = agent_settings::AgentSettings::get_global(cx).clone();
+            settings.profiles.insert(profile_id.clone(), profile);
+            agent_settings::AgentSettings::override_global(settings, cx);
+        });
+
+        let (event_stream, _rx) = ToolCallEventStream::test_with_profile(profile_id);
+        let auth_task = cx.update(|cx| {
+            authorize_file_edit(
+                "edit_file",
+                Path::new("root/.github/ci.yml"),
+                &thread.downgrade(),
+                &event_stream,
+                cx,
+            )
+        });
+
+        let result = auth_task.await;
+        assert!(result.is_err(), "expected error, got: {:?}", result);
+        let err_str = result.unwrap_err().to_string();
+        assert!(
+            err_str.contains("PolicyDenied"),
+            "expected PolicyDenied in error, got: {err_str}"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_authorize_file_edit_dotdir_autonomous_with_explicit_scope_succeeds(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/root"),
+            json!({
+                ".github": {
+                    "ci.yml": "name: CI\n"
+                }
+            }),
+        )
+        .await;
+
+        let (_project, thread) = setup_thread_and_project(fs, cx).await;
+
+        let profile_id = agent_settings::AgentProfileId("autonomous_github_allowed".into());
+        let mut tools = collections::HashMap::default();
+        tools.insert(
+            Arc::from("edit_file"),
+            agent_settings::ToolRules {
+                default: Some(settings::ToolPermissionMode::Allow),
+                always_allow: vec![],
+                always_deny: vec![],
+                always_confirm: vec![],
+                write_scopes: Some(
+                    agent_settings::WriteScopes::new(vec![Arc::from(".github/**")]).unwrap(),
+                ),
+                invalid_patterns: vec![],
+            },
+        );
+        let profile = AgentProfileSettings {
+            name: "autonomous_github_allowed".into(),
+            origin: Default::default(),
+            tools: collections::IndexMap::default(),
+            enable_all_context_servers: false,
+            context_servers: collections::IndexMap::default(),
+            default_model: None,
+            custom_prompt_path: None,
+            system_prompt_template: None,
+            description: None,
+            skills: None,
+            delegation: None,
+            tool_permissions: Some(agent_settings::ToolPermissions {
+                default: settings::ToolPermissionMode::Deny,
+                tools,
+            }),
+            permission_mode: Some(AgentPermissionMode::Autonomous),
+        };
+
+        cx.update(|cx| {
+            let mut settings = agent_settings::AgentSettings::get_global(cx).clone();
+            settings.profiles.insert(profile_id.clone(), profile);
+            agent_settings::AgentSettings::override_global(settings, cx);
+        });
+
+        let (event_stream, _rx) = ToolCallEventStream::test_with_profile(profile_id);
+        let auth_task = cx.update(|cx| {
+            authorize_file_edit(
+                "edit_file",
+                Path::new("root/.github/ci.yml"),
+                &thread.downgrade(),
+                &event_stream,
+                cx,
+            )
+        });
+
+        let result = auth_task.await;
+        assert!(result.is_ok(), "expected Ok(()), got: {:?}", result);
+    }
+
+    #[gpui::test]
+    async fn test_authorize_file_edit_dotdir_autonomous_default_allow_without_scope_fails(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/root"),
+            json!({
+                ".github": {
+                    "ci.yml": "name: CI\n"
+                }
+            }),
+        )
+        .await;
+
+        let (_project, thread) = setup_thread_and_project(fs, cx).await;
+
+        let profile_id = agent_settings::AgentProfileId("autonomous_default_allow".into());
+        let mut tools = collections::HashMap::default();
+        tools.insert(
+            Arc::from("edit_file"),
+            agent_settings::ToolRules {
+                default: Some(settings::ToolPermissionMode::Allow),
+                always_allow: vec![],
+                always_deny: vec![],
+                always_confirm: vec![],
+                write_scopes: None,
+                invalid_patterns: vec![],
+            },
+        );
+        let profile = AgentProfileSettings {
+            name: "autonomous_default_allow".into(),
+            origin: Default::default(),
+            tools: collections::IndexMap::default(),
+            enable_all_context_servers: false,
+            context_servers: collections::IndexMap::default(),
+            default_model: None,
+            custom_prompt_path: None,
+            system_prompt_template: None,
+            description: None,
+            skills: None,
+            delegation: None,
+            tool_permissions: Some(agent_settings::ToolPermissions {
+                default: settings::ToolPermissionMode::Allow,
+                tools,
+            }),
+            permission_mode: Some(AgentPermissionMode::Autonomous),
+        };
+
+        cx.update(|cx| {
+            let mut settings = agent_settings::AgentSettings::get_global(cx).clone();
+            settings.profiles.insert(profile_id.clone(), profile);
+            agent_settings::AgentSettings::override_global(settings, cx);
+        });
+
+        let (event_stream, _rx) = ToolCallEventStream::test_with_profile(profile_id);
+        let auth_task = cx.update(|cx| {
+            authorize_file_edit(
+                "edit_file",
+                Path::new("root/.github/ci.yml"),
+                &thread.downgrade(),
+                &event_stream,
+                cx,
+            )
+        });
+
+        let result = auth_task.await;
+        assert!(result.is_err(), "expected error, got: {:?}", result);
+        let err_str = result.unwrap_err().to_string();
+        assert!(
+            err_str.contains("PolicyDenied: Editing hidden path 'root/.github/ci.yml' is disallowed for autonomous profile 'autonomous_default_allow' without explicit write_scope"),
+            "expected exact PolicyDenied message, got: {err_str}"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_authorize_dotfile_traversal_blocked(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/root"),
+            json!({
+                "src": {},
+                ".env": "SECRET=1\n"
+            }),
+        )
+        .await;
+        let (project, _thread) = setup_thread_and_project(fs.clone(), cx).await;
+        let fs_arc: Arc<dyn Fs> = fs;
+        let roots = canonicalize_worktree_roots(&project, &fs_arc, cx).await;
+
+        let kind =
+            sensitive_settings_kind(Path::new("root/src/../.env"), &roots, fs_arc.as_ref()).await;
+        assert_eq!(kind, Some(SensitiveSettingsKind::Hidden));
+    }
+
+    #[gpui::test]
+    async fn test_authorize_dotfile_symlink_blocked(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/root"),
+            json!({
+                ".github": {
+                    "ci.yml": "name: CI\n"
+                }
+            }),
+        )
+        .await;
+        fs.create_symlink(path!("/root/link_dir").as_ref(), PathBuf::from(".github"))
+            .await
+            .expect("create symlink");
+
+        let (project, _thread) = setup_thread_and_project(fs.clone(), cx).await;
+        let fs_arc: Arc<dyn Fs> = fs;
+        let roots = canonicalize_worktree_roots(&project, &fs_arc, cx).await;
+
+        let kind =
+            sensitive_settings_kind(Path::new("root/link_dir/ci.yml"), &roots, fs_arc.as_ref())
+                .await;
+        assert_eq!(kind, Some(SensitiveSettingsKind::Hidden));
     }
 }

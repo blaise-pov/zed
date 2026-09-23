@@ -1,6 +1,6 @@
 use super::tool_permissions::{
-    authorize_symlink_escapes, canonicalize_worktree_roots, check_profile_write_scope,
-    collect_symlink_escapes, is_path_in_profile_write_scope,
+    SensitiveSettingsKind, authorize_symlink_escapes, canonicalize_worktree_roots,
+    check_profile_write_scope, collect_symlink_escapes, is_path_in_profile_write_scope,
     resolve_creatable_global_skill_descendant_path, resolve_global_skill_descendant_path,
     resolves_to_global_skills_dir, sensitive_settings_kind,
 };
@@ -217,6 +217,38 @@ impl AgentTool for MovePathTool {
             .await;
             let sensitive_kind = source_sensitive.or(dest_sensitive);
 
+            let source_in_write_scope = if source_sensitive.is_some() {
+                cx.update(|cx| {
+                    is_path_in_profile_write_scope(
+                        Self::NAME,
+                        Path::new(&input.source_path),
+                        &project,
+                        &canonical_roots,
+                        profile.as_ref(),
+                        cx,
+                    )
+                })
+            } else {
+                true
+            };
+
+            let dest_in_write_scope = if dest_sensitive.is_some() {
+                cx.update(|cx| {
+                    is_path_in_profile_write_scope(
+                        Self::NAME,
+                        Path::new(&input.destination_path),
+                        &project,
+                        &canonical_roots,
+                        profile.as_ref(),
+                        cx,
+                    )
+                })
+            } else {
+                true
+            };
+
+            let in_write_scope = source_in_write_scope && dest_in_write_scope;
+
             if let Some(profile) = &profile {
                 if mode == AgentPermissionMode::Autonomous {
                     if !symlink_escapes.is_empty() {
@@ -225,48 +257,43 @@ impl AgentTool for MovePathTool {
                             input.source_path, profile.name
                         ));
                     }
-                    if sensitive_kind.is_some() {
-                        let in_write_scope = cx.update(|cx| {
-                            let source_ok = if source_sensitive.is_some() {
-                                is_path_in_profile_write_scope(
-                                    Self::NAME,
-                                    Path::new(&input.source_path),
-                                    &project,
-                                    &canonical_roots,
-                                    Some(profile),
-                                    cx,
-                                )
-                            } else {
-                                true
-                            };
-                            let dest_ok = if dest_sensitive.is_some() {
-                                is_path_in_profile_write_scope(
-                                    Self::NAME,
-                                    Path::new(&input.destination_path),
-                                    &project,
-                                    &canonical_roots,
-                                    Some(profile),
-                                    cx,
-                                )
-                            } else {
-                                true
-                            };
-                            source_ok && dest_ok
-                        });
-                        if !in_write_scope {
+                    if source_sensitive.is_some() && !source_in_write_scope {
+                        if source_sensitive == Some(SensitiveSettingsKind::Hidden) {
                             return Err(format!(
-                                "PolicyDenied: Accessing sensitive settings is disallowed for autonomous profile '{}' without explicit write_scope",
-                                profile.name
+                                "PolicyDenied: Editing hidden path '{}' is disallowed for autonomous profile '{}' without explicit write_scope",
+                                input.source_path, profile.name
                             ));
                         }
+                        return Err(format!(
+                            "PolicyDenied: Accessing sensitive settings is disallowed for autonomous profile '{}' without explicit write_scope",
+                            profile.name
+                        ));
+                    }
+                    if dest_sensitive.is_some() && !dest_in_write_scope {
+                        if dest_sensitive == Some(SensitiveSettingsKind::Hidden) {
+                            return Err(format!(
+                                "PolicyDenied: Editing hidden path '{}' is disallowed for autonomous profile '{}' without explicit write_scope",
+                                input.destination_path, profile.name
+                            ));
+                        }
+                        return Err(format!(
+                            "PolicyDenied: Accessing sensitive settings is disallowed for autonomous profile '{}' without explicit write_scope",
+                            profile.name
+                        ));
                     }
                 }
             }
 
+            let sensitive_needs_confirmation = match sensitive_kind {
+                Some(SensitiveSettingsKind::Hidden) => !in_write_scope,
+                Some(_) => true,
+                None => false,
+            };
+
             let needs_confirmation = (mode == AgentPermissionMode::Interactive)
                 && (matches!(decision, ToolPermissionDecision::Confirm)
                     || (matches!(decision, ToolPermissionDecision::Allow)
-                        && sensitive_kind.is_some()));
+                        && sensitive_needs_confirmation));
 
             let authorize = if !symlink_escapes.is_empty() {
                 // Symlink escape authorization replaces (rather than supplements)
@@ -784,6 +811,168 @@ mod tests {
                 Ok(Ok(crate::ThreadEvent::ToolCallAuthorization(_)))
             ),
             "Deny policy should not emit symlink authorization prompt",
+        );
+    }
+
+    #[gpui::test]
+    async fn test_move_path_hidden_destination_autonomous_without_scope_fails(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/root"),
+            json!({
+                "project": {
+                    "src": { "file.txt": "content" },
+                    ".github": {}
+                }
+            }),
+        )
+        .await;
+
+        let project = Project::test(fs.clone(), [path!("/root/project").as_ref()], cx).await;
+        cx.executor().run_until_parked();
+
+        let profile_id = agent_settings::AgentProfileId("autonomous_default_allow".into());
+        let mut tools = collections::HashMap::default();
+        tools.insert(
+            Arc::from("move_path"),
+            agent_settings::ToolRules {
+                default: Some(settings::ToolPermissionMode::Allow),
+                always_allow: vec![],
+                always_deny: vec![],
+                always_confirm: vec![],
+                write_scopes: None,
+                invalid_patterns: vec![],
+            },
+        );
+        let profile = agent_settings::AgentProfileSettings {
+            name: "autonomous_default_allow".into(),
+            origin: Default::default(),
+            tools: collections::IndexMap::default(),
+            enable_all_context_servers: false,
+            context_servers: collections::IndexMap::default(),
+            default_model: None,
+            custom_prompt_path: None,
+            system_prompt_template: None,
+            description: None,
+            skills: None,
+            delegation: None,
+            tool_permissions: Some(agent_settings::ToolPermissions {
+                default: settings::ToolPermissionMode::Allow,
+                tools,
+            }),
+            permission_mode: Some(AgentPermissionMode::Autonomous),
+        };
+
+        cx.update(|cx| {
+            let mut settings = AgentSettings::get_global(cx).clone();
+            settings.profiles.insert(profile_id.clone(), profile);
+            AgentSettings::override_global(settings, cx);
+        });
+
+        let tool = Arc::new(MovePathTool::new(project));
+        let input = MovePathToolInput {
+            source_path: "project/src/file.txt".into(),
+            destination_path: "project/.github/file.txt".into(),
+        };
+
+        let (event_stream, _rx) = ToolCallEventStream::test_with_profile(profile_id);
+        let result = cx
+            .update(|cx| tool.run(ToolInput::resolved(input), event_stream, cx))
+            .await;
+
+        assert!(
+            result.is_err(),
+            "Tool should fail when moving to hidden dest without scope"
+        );
+        let err_str = result.unwrap_err();
+        assert!(
+            err_str.contains("PolicyDenied: Editing hidden path 'project/.github/file.txt' is disallowed for autonomous profile 'autonomous_default_allow' without explicit write_scope"),
+            "expected PolicyDenied message for hidden destination, got: {err_str}"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_move_path_interactive_confirm_prompts_for_ordinary_path(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/root"),
+            json!({
+                "project": {
+                    "src": { "foo.txt": "hello" }
+                }
+            }),
+        )
+        .await;
+
+        let project = Project::test(fs.clone(), [path!("/root/project").as_ref()], cx).await;
+        cx.executor().run_until_parked();
+
+        let profile_id = agent_settings::AgentProfileId("interactive_confirm".into());
+        let mut tools = collections::HashMap::default();
+        tools.insert(
+            Arc::from("move_path"),
+            agent_settings::ToolRules {
+                default: Some(settings::ToolPermissionMode::Confirm),
+                always_allow: vec![],
+                always_deny: vec![],
+                always_confirm: vec![],
+                write_scopes: None,
+                invalid_patterns: vec![],
+            },
+        );
+        let profile = agent_settings::AgentProfileSettings {
+            name: "interactive_confirm".into(),
+            origin: Default::default(),
+            tools: collections::IndexMap::default(),
+            enable_all_context_servers: false,
+            context_servers: collections::IndexMap::default(),
+            default_model: None,
+            custom_prompt_path: None,
+            system_prompt_template: None,
+            description: None,
+            skills: None,
+            delegation: None,
+            tool_permissions: Some(agent_settings::ToolPermissions {
+                default: settings::ToolPermissionMode::Confirm,
+                tools,
+            }),
+            permission_mode: Some(AgentPermissionMode::Interactive),
+        };
+
+        cx.update(|cx| {
+            let mut settings = AgentSettings::get_global(cx).clone();
+            settings.profiles.insert(profile_id.clone(), profile);
+            AgentSettings::override_global(settings, cx);
+        });
+
+        let tool = Arc::new(MovePathTool::new(project));
+        let input = MovePathToolInput {
+            source_path: "project/src/foo.txt".into(),
+            destination_path: "project/src/bar.txt".into(),
+        };
+
+        let (event_stream, mut event_rx) = ToolCallEventStream::test_with_profile(profile_id);
+        let task = cx.update(|cx| tool.run(ToolInput::resolved(input), event_stream, cx));
+
+        let auth = event_rx.expect_authorization().await;
+        auth.response
+            .send(acp_thread::SelectedPermissionOutcome::new(
+                acp::PermissionOptionId::new("allow"),
+                acp::PermissionOptionKind::AllowOnce,
+            ))
+            .unwrap();
+
+        let result = task.await;
+        assert!(
+            result.is_ok(),
+            "Tool should succeed after user confirms: {:?}",
+            result
         );
     }
 }

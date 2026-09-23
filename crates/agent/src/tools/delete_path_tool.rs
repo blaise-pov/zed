@@ -1,7 +1,7 @@
 use super::tool_permissions::{
-    authorize_symlink_access, canonicalize_worktree_roots, check_profile_write_scope,
-    detect_symlink_escape, is_path_in_profile_write_scope, resolve_global_skill_descendant_path,
-    resolves_to_global_skills_dir, sensitive_settings_kind,
+    SensitiveSettingsKind, authorize_symlink_access, canonicalize_worktree_roots,
+    check_profile_write_scope, detect_symlink_escape, is_path_in_profile_write_scope,
+    resolve_global_skill_descendant_path, resolves_to_global_skills_dir, sensitive_settings_kind,
 };
 use crate::{
     AgentTool, ToolCallEventStream, ToolInput, ToolPermissionDecision,
@@ -157,6 +157,21 @@ impl AgentTool for DeletePathTool {
             let settings_kind =
                 sensitive_settings_kind(Path::new(&path), &canonical_roots, fs.as_ref()).await;
 
+            let in_write_scope = if settings_kind.is_some() {
+                cx.update(|cx| {
+                    is_path_in_profile_write_scope(
+                        Self::NAME,
+                        Path::new(&path),
+                        &project,
+                        &canonical_roots,
+                        profile.as_ref(),
+                        cx,
+                    )
+                })
+            } else {
+                false
+            };
+
             if let Some(profile) = &profile {
                 if mode == AgentPermissionMode::Autonomous {
                     if let Some(target) = symlink_escape_target {
@@ -167,33 +182,29 @@ impl AgentTool for DeletePathTool {
                             profile.name
                         ));
                     }
-                    if settings_kind.is_some() {
-                        let in_write_scope = cx.update(|cx| {
-                            is_path_in_profile_write_scope(
-                                Self::NAME,
-                                Path::new(&path),
-                                &project,
-                                &canonical_roots,
-                                Some(profile),
-                                cx,
-                            )
-                        });
-                        if !in_write_scope {
+                    if settings_kind.is_some() && !in_write_scope {
+                        if settings_kind == Some(SensitiveSettingsKind::Hidden) {
                             return Err(format!(
-                                "PolicyDenied: Accessing sensitive settings is disallowed for autonomous profile '{}' without explicit write_scope",
-                                profile.name
+                                "PolicyDenied: Editing hidden path '{}' is disallowed for autonomous profile '{}' without explicit write_scope",
+                                path, profile.name
                             ));
                         }
+                        return Err(format!(
+                            "PolicyDenied: Accessing sensitive settings is disallowed for autonomous profile '{}' without explicit write_scope",
+                            profile.name
+                        ));
                     }
                 }
             }
 
-            let decision =
-                if matches!(decision, ToolPermissionDecision::Allow) && settings_kind.is_some() {
-                    ToolPermissionDecision::Confirm
-                } else {
-                    decision
-                };
+            let decision = if matches!(decision, ToolPermissionDecision::Allow)
+                && settings_kind.is_some()
+                && (settings_kind != Some(SensitiveSettingsKind::Hidden) || !in_write_scope)
+            {
+                ToolPermissionDecision::Confirm
+            } else {
+                decision
+            };
 
             let authorize = if mode == AgentPermissionMode::Autonomous {
                 None
@@ -777,6 +788,170 @@ mod tests {
                 Ok(Ok(crate::ThreadEvent::ToolCallAuthorization(_)))
             ),
             "Deny policy should not emit symlink authorization prompt",
+        );
+    }
+
+    #[gpui::test]
+    async fn test_delete_path_dotfile_autonomous_without_scope_fails(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/root"),
+            json!({
+                "project": {
+                    ".env": "SECRET=1"
+                }
+            }),
+        )
+        .await;
+
+        let project = Project::test(fs.clone(), [path!("/root/project").as_ref()], cx).await;
+        cx.executor().run_until_parked();
+
+        let profile_id = agent_settings::AgentProfileId("autonomous_default_allow".into());
+        let mut tools = collections::HashMap::default();
+        tools.insert(
+            Arc::from("delete_path"),
+            agent_settings::ToolRules {
+                default: Some(settings::ToolPermissionMode::Allow),
+                always_allow: vec![],
+                always_deny: vec![],
+                always_confirm: vec![],
+                write_scopes: None,
+                invalid_patterns: vec![],
+            },
+        );
+        let profile = agent_settings::AgentProfileSettings {
+            name: "autonomous_default_allow".into(),
+            origin: Default::default(),
+            tools: collections::IndexMap::default(),
+            enable_all_context_servers: false,
+            context_servers: collections::IndexMap::default(),
+            default_model: None,
+            custom_prompt_path: None,
+            system_prompt_template: None,
+            description: None,
+            skills: None,
+            delegation: None,
+            tool_permissions: Some(agent_settings::ToolPermissions {
+                default: settings::ToolPermissionMode::Allow,
+                tools,
+            }),
+            permission_mode: Some(AgentPermissionMode::Autonomous),
+        };
+
+        cx.update(|cx| {
+            let mut settings = AgentSettings::get_global(cx).clone();
+            settings.profiles.insert(profile_id.clone(), profile);
+            AgentSettings::override_global(settings, cx);
+        });
+
+        let action_log = cx.new(|_| ActionLog::new(project.clone()));
+        let tool = Arc::new(DeletePathTool::new(project, action_log));
+
+        let (event_stream, _rx) = ToolCallEventStream::test_with_profile(profile_id);
+        let result = cx
+            .update(|cx| {
+                tool.run(
+                    ToolInput::resolved(DeletePathToolInput {
+                        path: "project/.env".into(),
+                    }),
+                    event_stream,
+                    cx,
+                )
+            })
+            .await;
+
+        assert!(
+            result.is_err(),
+            "Tool should fail for dotfile without scope"
+        );
+        let err_str = result.unwrap_err();
+        assert!(
+            err_str.contains("PolicyDenied: Editing hidden path 'project/.env' is disallowed for autonomous profile 'autonomous_default_allow' without explicit write_scope"),
+            "expected PolicyDenied message for hidden path, got: {err_str}"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_delete_path_dotfile_autonomous_with_scope_succeeds(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/root"),
+            json!({
+                "project": {
+                    ".env": "SECRET=1"
+                }
+            }),
+        )
+        .await;
+
+        let project = Project::test(fs.clone(), [path!("/root/project").as_ref()], cx).await;
+        cx.executor().run_until_parked();
+
+        let profile_id = agent_settings::AgentProfileId("autonomous_with_scope".into());
+        let mut tools = collections::HashMap::default();
+        tools.insert(
+            Arc::from("delete_path"),
+            agent_settings::ToolRules {
+                default: Some(settings::ToolPermissionMode::Allow),
+                always_allow: vec![],
+                always_deny: vec![],
+                always_confirm: vec![],
+                write_scopes: Some(
+                    agent_settings::WriteScopes::new(vec![Arc::from(".env*")]).unwrap(),
+                ),
+                invalid_patterns: vec![],
+            },
+        );
+        let profile = agent_settings::AgentProfileSettings {
+            name: "autonomous_with_scope".into(),
+            origin: Default::default(),
+            tools: collections::IndexMap::default(),
+            enable_all_context_servers: false,
+            context_servers: collections::IndexMap::default(),
+            default_model: None,
+            custom_prompt_path: None,
+            system_prompt_template: None,
+            description: None,
+            skills: None,
+            delegation: None,
+            tool_permissions: Some(agent_settings::ToolPermissions {
+                default: settings::ToolPermissionMode::Allow,
+                tools,
+            }),
+            permission_mode: Some(AgentPermissionMode::Autonomous),
+        };
+
+        cx.update(|cx| {
+            let mut settings = AgentSettings::get_global(cx).clone();
+            settings.profiles.insert(profile_id.clone(), profile);
+            AgentSettings::override_global(settings, cx);
+        });
+
+        let action_log = cx.new(|_| ActionLog::new(project.clone()));
+        let tool = Arc::new(DeletePathTool::new(project, action_log));
+
+        let (event_stream, _rx) = ToolCallEventStream::test_with_profile(profile_id);
+        let result = cx
+            .update(|cx| {
+                tool.run(
+                    ToolInput::resolved(DeletePathToolInput {
+                        path: "project/.env".into(),
+                    }),
+                    event_stream,
+                    cx,
+                )
+            })
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "Tool should succeed for dotfile with scope: {:?}",
+            result
         );
     }
 }

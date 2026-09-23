@@ -25,6 +25,7 @@
 //! Naming note: this module is about agent terminal sandboxing specifically.
 //! Other agent operations (e.g. file edits) are gated separately.
 
+use crate::tools::is_dot_path;
 use agent_settings::{AgentSettings, SandboxPermissions};
 use feature_flags::{FeatureFlagAppExt as _, SandboxingFeatureFlag};
 use gpui::App;
@@ -46,12 +47,13 @@ pub fn sandbox_worktree_writable_paths(project: &Project, cx: &App) -> Vec<PathB
         .collect()
 }
 
-/// The candidate `.git` paths the sandbox protects for a project. Locating these
+/// The candidate paths the sandbox protects for a project. Locating these
 /// requires Git knowledge the sandbox layer can't derive itself: a worktree's
 /// `.git`, a linked worktree's common dir (which lives outside the worktree),
-/// and every discovered repository's git/common dirs.
-pub fn sandbox_git_dirs(project: &Project, cx: &App) -> Vec<PathBuf> {
-    let mut git_dirs = Vec::new();
+/// and every discovered repository's git/common dirs, plus existing top-level
+/// dotfiles and dot-directories in each worktree.
+pub fn sandbox_protected_paths(project: &Project, cx: &App) -> Vec<PathBuf> {
+    let mut protected_paths = Vec::new();
 
     for worktree in project.worktrees(cx) {
         let worktree = worktree.read(cx);
@@ -66,22 +68,31 @@ pub fn sandbox_git_dirs(project: &Project, cx: &App) -> Vec<PathBuf> {
         // resolved authoritatively at capture time — the real filesystem
         // reports `NotADirectory`, and `SandboxWrap::to_policy` skips a
         // protected path that can't exist — so it never reaches enforcement.
-        git_dirs.push(worktree_abs_path.join(".git"));
+        protected_paths.push(worktree_abs_path.join(".git"));
         if let Some(root_repo_common_dir) = worktree.root_repo_common_dir() {
-            git_dirs.push(root_repo_common_dir.to_path_buf());
+            protected_paths.push(root_repo_common_dir.to_path_buf());
+        }
+
+        let snapshot = worktree.snapshot();
+        if let Some(root_entry) = snapshot.root_entry() {
+            for child in snapshot.child_entries(&root_entry.path) {
+                if is_dot_path(child.path.as_std_path()) {
+                    protected_paths.push(snapshot.absolutize(&child.path));
+                }
+            }
         }
     }
 
     for repository in project.git_store().read(cx).repositories().values() {
         let repository = repository.read(cx);
-        git_dirs.push(repository.dot_git_abs_path.to_path_buf());
-        git_dirs.push(repository.repository_dir_abs_path.to_path_buf());
-        git_dirs.push(repository.common_dir_abs_path.to_path_buf());
+        protected_paths.push(repository.dot_git_abs_path.to_path_buf());
+        protected_paths.push(repository.repository_dir_abs_path.to_path_buf());
+        protected_paths.push(repository.common_dir_abs_path.to_path_buf());
     }
 
-    git_dirs.sort();
-    git_dirs.dedup();
-    git_dirs
+    protected_paths.sort();
+    protected_paths.dedup();
+    protected_paths
 }
 
 /// What sandbox a thread applies to agent terminal commands, as one value the
@@ -123,8 +134,9 @@ impl ThreadSandbox {
     }
 
     /// Attach the project's protected paths to a sandboxed layer. The settings
-    /// and grants don't know the project's `.git` locations, so the caller
-    /// computes them via [`sandbox_git_dirs`]. A no-op for `Unsandboxed`.
+    /// and grants don't know the project's protected locations (such as `.git`
+    /// and top-level dotfiles/dot-directories), so the caller computes them via
+    /// [`sandbox_protected_paths`]. A no-op for `Unsandboxed`.
     pub fn with_protected_paths(self, protected_paths: Vec<PathBuf>) -> ThreadSandbox {
         match self {
             ThreadSandbox::Unsandboxed => ThreadSandbox::Unsandboxed,
@@ -1220,5 +1232,72 @@ mod tests {
             &request(NetworkRequest::None, false, &["/tmp/build/cache"]),
         );
         assert_eq!(effective.write_paths, granted(&["/tmp/build"]));
+    }
+
+    #[gpui::test]
+    async fn test_sandbox_protected_paths_collects_git_and_top_level_dotfiles(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+        });
+
+        let fs = project::FakeFs::new(cx.executor());
+        fs.insert_tree(
+            util::path!("/root"),
+            serde_json::json!({
+                ".git": {},
+                ".env": "SECRET=1\n",
+                ".github": {
+                    "workflows": {
+                        "ci.yml": "test"
+                    }
+                },
+                "src": {
+                    "main.rs": "fn main() {}\n",
+                    ".hidden_nested": "nested"
+                }
+            }),
+        )
+        .await;
+
+        let project = Project::test(fs.clone(), [util::path!("/root").as_ref()], cx).await;
+        cx.run_until_parked();
+
+        let protected = project.read_with(cx, |project, cx| sandbox_protected_paths(project, cx));
+
+        assert!(
+            protected.contains(&std::path::PathBuf::from(util::path!("/root/.git"))),
+            "expected protected to contain .git, got: {:?}",
+            protected
+        );
+        assert!(
+            protected.contains(&std::path::PathBuf::from(util::path!("/root/.env"))),
+            "expected protected to contain .env, got: {:?}",
+            protected
+        );
+        assert!(
+            protected.contains(&std::path::PathBuf::from(util::path!("/root/.github"))),
+            "expected protected to contain .github, got: {:?}",
+            protected
+        );
+        assert!(
+            !protected.contains(&std::path::PathBuf::from(util::path!("/root/src"))),
+            "expected protected not to contain src, got: {:?}",
+            protected
+        );
+        assert!(
+            !protected.contains(&std::path::PathBuf::from(util::path!(
+                "/root/src/.hidden_nested"
+            ))),
+            "expected protected not to contain nested dotfile, got: {:?}",
+            protected
+        );
+        assert!(
+            !protected.contains(&std::path::PathBuf::from(util::path!("/root/.nonexistent"))),
+            "expected protected not to contain nonexistent dotfile, got: {:?}",
+            protected
+        );
     }
 }

@@ -1,7 +1,7 @@
 use super::tool_permissions::{
-    authorize_symlink_access, canonicalize_worktree_roots, check_profile_write_scope,
-    detect_symlink_escape, is_path_in_profile_write_scope, resolve_creatable_global_skill_path,
-    sensitive_settings_kind,
+    SensitiveSettingsKind, authorize_symlink_access, canonicalize_worktree_roots,
+    check_profile_write_scope, detect_symlink_escape, is_path_in_profile_write_scope,
+    resolve_creatable_global_skill_path, sensitive_settings_kind,
 };
 use agent_client_protocol::schema::v1 as acp;
 use agent_settings::{AgentPermissionMode, AgentSettings};
@@ -204,6 +204,21 @@ impl AgentTool for CreateDirectoryTool {
                 sensitive_settings_kind(Path::new(&input.path), &canonical_roots, fs.as_ref())
                     .await;
 
+            let in_write_scope = if sensitive_kind.is_some() {
+                cx.update(|cx| {
+                    is_path_in_profile_write_scope(
+                        Self::NAME,
+                        Path::new(&input.path),
+                        &project,
+                        &canonical_roots,
+                        profile.as_ref(),
+                        cx,
+                    )
+                })
+            } else {
+                false
+            };
+
             if let Some(profile) = &profile {
                 if mode == AgentPermissionMode::Autonomous {
                     if let Some(target) = symlink_escape_target {
@@ -214,33 +229,29 @@ impl AgentTool for CreateDirectoryTool {
                             profile.name
                         ));
                     }
-                    if sensitive_kind.is_some() {
-                        let in_write_scope = cx.update(|cx| {
-                            is_path_in_profile_write_scope(
-                                Self::NAME,
-                                Path::new(&input.path),
-                                &project,
-                                &canonical_roots,
-                                Some(profile),
-                                cx,
-                            )
-                        });
-                        if !in_write_scope {
+                    if sensitive_kind.is_some() && !in_write_scope {
+                        if sensitive_kind == Some(SensitiveSettingsKind::Hidden) {
                             return Err(format!(
-                                "PolicyDenied: Accessing sensitive settings is disallowed for autonomous profile '{}' without explicit write_scope",
-                                profile.name
+                                "PolicyDenied: Editing hidden path '{}' is disallowed for autonomous profile '{}' without explicit write_scope",
+                                input.path, profile.name
                             ));
                         }
+                        return Err(format!(
+                            "PolicyDenied: Accessing sensitive settings is disallowed for autonomous profile '{}' without explicit write_scope",
+                            profile.name
+                        ));
                     }
                 }
             }
 
-            let decision =
-                if matches!(decision, ToolPermissionDecision::Allow) && sensitive_kind.is_some() {
-                    ToolPermissionDecision::Confirm
-                } else {
-                    decision
-                };
+            let decision = if matches!(decision, ToolPermissionDecision::Allow)
+                && sensitive_kind.is_some()
+                && (sensitive_kind != Some(SensitiveSettingsKind::Hidden) || !in_write_scope)
+            {
+                ToolPermissionDecision::Confirm
+            } else {
+                decision
+            };
 
             let authorize = if mode == AgentPermissionMode::Autonomous {
                 None

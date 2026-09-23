@@ -12,7 +12,7 @@ use action_log::ActionLog;
 use agent_settings::UserAgentsMd;
 
 use crate::sandboxing::{
-    SandboxRequest, ThreadSandbox, ThreadSandboxGrants, sandbox_git_dirs,
+    SandboxRequest, ThreadSandbox, ThreadSandboxGrants, sandbox_protected_paths,
     sandbox_worktree_writable_paths, sandboxing_available_for_project,
     sandboxing_enabled_for_project,
 };
@@ -104,7 +104,7 @@ pub struct SandboxStatusKey {
     pub settings_sandbox: ThreadSandbox,
     pub thread_sandbox: ThreadSandbox,
     pub baseline_writable_paths: Vec<PathBuf>,
-    pub git_paths: Vec<PathBuf>,
+    pub protected_paths: Vec<PathBuf>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2063,11 +2063,13 @@ impl Thread {
             return None;
         }
         let persistent = self.agent_settings(cx).sandbox_permissions.clone();
-        let git_dirs = sandbox_git_dirs(self.project.read(cx), cx);
+        let protected_paths = sandbox_protected_paths(self.project.read(cx), cx);
         let grants = self.sandbox_grants.borrow();
         let settings = crate::sandboxing::settings_thread_sandbox(&persistent)
-            .with_protected_paths(git_dirs.clone());
-        let thread = grants.thread_sandbox().with_protected_paths(git_dirs);
+            .with_protected_paths(protected_paths.clone());
+        let thread = grants
+            .thread_sandbox()
+            .with_protected_paths(protected_paths);
         Some((settings, thread))
     }
 
@@ -2087,20 +2089,20 @@ impl Thread {
 
         let project = self.project.read(cx);
         let baseline_writable_paths = sandbox_worktree_writable_paths(project, cx);
-        let git_paths = sandbox_git_dirs(project, cx);
+        let protected_paths = sandbox_protected_paths(project, cx);
 
         let key = SandboxStatusKey {
             settings_sandbox: settings_sandbox.clone(),
             thread_sandbox: thread_sandbox.clone(),
             baseline_writable_paths: baseline_writable_paths.clone(),
-            git_paths: git_paths.clone(),
+            protected_paths: protected_paths.clone(),
         };
 
         Some((
             key,
             SandboxStatusRefresh::Ready(VerifiedSandboxStatus {
-                settings_sandbox: settings_sandbox.with_protected_paths(git_paths.clone()),
-                thread_sandbox: thread_sandbox.with_protected_paths(git_paths),
+                settings_sandbox: settings_sandbox.with_protected_paths(protected_paths.clone()),
+                thread_sandbox: thread_sandbox.with_protected_paths(protected_paths),
                 baseline_writable_paths,
             }),
         ))

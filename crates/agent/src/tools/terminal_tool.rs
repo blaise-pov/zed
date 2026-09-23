@@ -16,7 +16,7 @@ use std::{
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 use crate::SandboxFallbackDecision;
 use crate::sandboxing::{
-    NetworkRequest, sandbox_git_dirs, sandbox_worktree_writable_paths,
+    NetworkRequest, sandbox_protected_paths, sandbox_worktree_writable_paths,
     sandboxing_enabled_for_project,
 };
 use crate::{AgentTool, ThreadEnvironment, ToolCallEventStream, ToolInput};
@@ -744,7 +744,7 @@ async fn run_terminal_tool(
             let (writable_paths, protected_paths) = cx.update(|cx| {
                 (
                     sandbox_worktree_writable_paths(project.read(cx), cx),
-                    sandbox_git_dirs(project.read(cx), cx),
+                    sandbox_protected_paths(project.read(cx), cx),
                 )
             });
             let wrap = acp_thread::SandboxWrap {
