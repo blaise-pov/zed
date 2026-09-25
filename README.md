@@ -10,6 +10,7 @@
 Система объединяет мощь оригинального **Zed IDE** (сверхбыстрый нативный GPUI на Rust, мгновенный доступ к буферам и синтаксическим деревьям Tree-sitter, прямой контакт с языковыми серверами LSP и песочницей терминала) с многоуровневым рекурсивным оркестратором агентов, внешним Control Plane сервисом ([Task Graph Service](https://github.com/blaise-pov/tgr)) и строгой изоляцией исполнения.
 
 Полное техническое описание архитектуры, стейт-машины и механизмов безопасности доступно в **[ARCHITECTURE.md](./ARCHITECTURE.md)**.
+Подробное практическое руководство по настройке `.zed`, переменных `.env`, профилей агентов и работе с MCP-серверами доступно в **[docs/multi-agent-setup.md](./docs/multi-agent-setup.md)**, а шаблон переменных окружения — в **[docs/.env.example](./docs/.env.example)**.
 
 ---
 
@@ -99,6 +100,11 @@ graph TD
 #### 7. Скиллы (Default-Deny) и переменные `.env`
 - **3-уровневая фильтрация скиллов**: каталог промпта, slash-команды и runtime-инструмент `skill`. Для кастомных профилей без списка `skills` действует политика **default-deny**.
 - **Интеграция с `.env`**: автоматическая загрузка и реактивное обновление переменных окружения из корня проекта. Подстановка `${VAR}` и `${VAR:-default}` в модели и параметры MCP-серверов.
+
+#### 8. Проектная директория `.zed`, файл `.env` и локальные MCP-серверы
+- **Проектная конфигурация в `.zed/`**: настройки редактора и профилей (`.zed/settings.json`), специализированные промпты (`.zed/prompts/`), локальные демоны (`.zed/mcp/`) и задачи (`.zed/tasks.json`).
+- **Файл `.env` и реактивный Hot-Reload**: файл `.env` в корне проекта автоматически считывается при открытии и реактивно обновляется при сохранении. Поддерживает подстановку `${VAR}` и `${VAR:-default}` в `.zed/settings.json`. Шаблон доступен в `docs/.env.example`.
+- **Встроенные MCP-серверы**: `taskgraph` (Control Plane сервис задач с SQLite WAL) и `agent-bus` (шина обмена сообщениями и фидбека между агентами), а также каталоги `skills-hub` и `mcpfinder`.
 
 ---
 
@@ -225,6 +231,85 @@ graph TD
   }
 }
 ```
+
+---
+
+### Руководство пользователя: Настройка `.zed`, `.env`, агентов и MCP
+
+Подробное руководство с детальным описанием всех полей и сценариев доступно в **[docs/multi-agent-setup.md](./docs/multi-agent-setup.md)**.
+
+#### 1. Структура `.zed` директории
+
+```text
+.zed/
+├── settings.json          # Проектные настройки: MCP, профили агентов, tool_permissions
+├── tasks.json             # Задачи запуска и сборки проекта
+├── debug.json             # Конфигурации отладчика DAP
+├── prompts/               # Системные инструкции профилей агентов (*.md)
+│   ├── orchestrator.md
+│   ├── editor_engineer.md
+│   ├── reviewer.md
+│   └── ...
+└── mcp/                   # Встроенные локальные MCP-серверы
+    ├── agent-bus/         # Шина обратной связи и IPC (messages.db, topics.jsonc, bin/)
+    └── taskgraph/         # Control Plane сервис графа задач TGS (taskgraph.db, bin/)
+```
+
+#### 2. Переменные окружения и файл `.env`
+
+Файл `.env` в корне проекта служит источником секретов (API-ключи) и переменных подстановки в `.zed/settings.json`:
+- **Автозагрузка**: считывается автоматически при открытии воркспейса.
+- **Hot-Reload**: при редактировании `.env` изменения подхватываются на лету без перезапуска редактора.
+- **Подстановка**: синтаксис `${VAR}` и `${VAR:-default}` в `.zed/settings.json` для моделей и параметров MCP.
+- **Защита**: скрытый файл, закрыт от прямого чтения LLM (`private_files`), защищен от изменения автономными агентами.
+
+Для начала работы скопируйте шаблон:
+```sh
+cp docs/.env.example .env
+```
+
+Пример содержимого `.env`:
+```bash
+# Модели LLM для агентов (используются в .zed/settings.json)
+FRONTIER_MODEL_PROVIDER=anthropic
+FRONTIER_MODEL=claude-3-7-sonnet-latest
+
+MID_TIER_MODEL_PROVIDER=anthropic
+MID_TIER_MODEL=claude-3-5-haiku-latest
+
+# API-ключи
+ANTHROPIC_API_KEY=sk-ant-api03-...
+OPENAI_API_KEY=sk-proj-...
+
+# Control Plane & Bus
+TGS_PROJECT_ID=zed
+TGS_DB_PATH=.zed/mcp/taskgraph/taskgraph.db
+TGS_LOG_LEVEL=warn
+TGS_LOG_FILE=.zed/mcp/taskgraph/taskgraph.log
+AGENT_BUS_PROJECT_ID=zed
+```
+
+#### 3. Настройка агентов и прав доступа
+
+- **Профили (`agent.profiles`)**: задают роль, используемую модель (`default_model`), доступные инструменты (`tools`), прикрепленные MCP-серверы (`context_servers`), белый список субагентов (`delegation.allowed`) и системные инструкции (`.zed/prompts/<profile_id>.md`).
+- **Права (`tool_permissions`)**:
+  - `default`: `"allow"` (без подтверждения), `"confirm"` (запрос в UI), `"deny"` (запрет).
+  - **Fail-Closed**: для автономных задач любой исход `"confirm"` немедленно отклоняется (`PolicyDenied`), предотвращая зависание.
+  - **Периметры записи (`write_scopes`)**: хирургические glob-шаблоны файлов для модификации (например `["crates/editor/**"]`). Попытка записи вне скоупа блокируется.
+  - **Защита dotfiles**: любые скрытые пути (`.zed/**`, `.env*`, `.github/**` и др.) требуют явного разрешения в `write_scopes` профиля.
+  - **Фильтрация терминала**: списки регулярных выражений `always_allow` и `always_deny` с неудаляемыми запретами `rm -rf /`, `rm -rf ~`, `rm -rf .`.
+
+#### 4. Как работать с добавленными MCP
+
+1. **Task Graph Service (`taskgraph`)**:
+   - Control Plane сервис задач. Агенты используют инструменты `mcp:taskgraph:goal_create`, `task_create`, `task_start`, `task_complete`, `task_fail`, `task_add_dependency`, `artifact_publish` для планирования и отчетности.
+   - Пользователь управляет задачами через графическую панель **Agent Task Panel** (иконка `ListTodo`), просматривая диффы (`View Task Diff`) и историю событий.
+2. **Agent Bus (`agent-bus`)**:
+   - Шина межагентных предложений и фидбека (`send_feedback`, `read_feedback`, `resolve_feedback`) в каноническом формате `impact: ... | problem: ... | proposal: ...`.
+3. **Skills Hub (`skills-hub`)**:
+   - Поиск и установка навыков для агентов (`search_skills`, `get_skill_detail`, `list_installed_skill`).
+4. **MCP Finder (`mcpfinder`)**:
+   - Поиск сторонних MCP-серверов и генерация конфигурации для установки (`search_mcp_servers`, `get_install_config`).
 
 ---
 
