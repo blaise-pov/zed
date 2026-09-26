@@ -8,6 +8,7 @@
         "resolve": "Close a message. Terminal statuses: {{terminal_statuses}}. Optional reply explains what was done."
       },
       "limits": {
+        "content_regex": "^impact:\\s*(quality|resources|speed|bugs|agents)\\s*\\|\\s*problem:.*\\|\\s*proposal:.*",
         "content_min": 1,
         "content_max": 32768,
         "sender_min": 1,
