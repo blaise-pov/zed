@@ -5307,6 +5307,28 @@ impl Project {
                     });
                 }
             }
+
+            let has_parent_component = path
+                .components()
+                .any(|component| matches!(component, std::path::Component::ParentDir))
+                || path
+                    .to_str()
+                    .is_some_and(|path| path.split(['/', '\\']).any(|component| component == ".."));
+            if !has_parent_component && let Ok(rel_path) = RelPath::new(path, path_style) {
+                for worktree in worktree_store.visible_worktrees(cx) {
+                    let worktree = worktree.read(cx);
+                    if worktree.entry_for_path(&rel_path).is_some()
+                        || rel_path
+                            .parent()
+                            .is_some_and(|parent| worktree.entry_for_path(parent).is_some())
+                    {
+                        return Some(ProjectPath {
+                            worktree_id: worktree.id(),
+                            path: rel_path.into_arc(),
+                        });
+                    }
+                }
+            }
         }
 
         None

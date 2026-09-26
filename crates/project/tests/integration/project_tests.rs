@@ -20228,6 +20228,111 @@ async fn test_find_project_path_abs(
 }
 
 #[gpui::test]
+async fn test_find_project_path_rel(
+    background_executor: BackgroundExecutor,
+    cx: &mut gpui::TestAppContext,
+) {
+    init_test(cx);
+
+    let fs = FakeFs::new(background_executor);
+    fs.insert_tree(
+        path!("/root"),
+        json!({
+            "project1": {
+                "file1.txt": "content1",
+                "subdir": {
+                    "file2.txt": "content2"
+                },
+                ".zed": {
+                    "prompts": {
+                        "existing.md": "content"
+                    }
+                }
+            },
+            "project2": {
+                "file3.txt": "content3"
+            }
+        }),
+    )
+    .await;
+
+    let project = Project::test(
+        fs.clone(),
+        [
+            path!("/root/project1").as_ref(),
+            path!("/root/project2").as_ref(),
+        ],
+        cx,
+    )
+    .await;
+
+    project
+        .update(cx, |project, cx| project.git_scans_complete(cx))
+        .await;
+    cx.run_until_parked();
+
+    let (project1_id, project2_id) = project.read_with(cx, |project, cx| {
+        let worktrees: Vec<_> = project.worktrees(cx).collect();
+        (worktrees[0].read(cx).id(), worktrees[1].read(cx).id())
+    });
+
+    project.update(cx, |project, cx| {
+        // 1. Existing file with root-name prefix
+        let found = project.find_project_path("project1/file1.txt", cx).unwrap();
+        assert_eq!(found.worktree_id, project1_id);
+        assert_eq!(&*found.path, rel_path("file1.txt"));
+
+        // 2. Existing file literal worktree-relative
+        let found = project.find_project_path("file1.txt", cx).unwrap();
+        assert_eq!(found.worktree_id, project1_id);
+        assert_eq!(&*found.path, rel_path("file1.txt"));
+
+        let found = project.find_project_path("file3.txt", cx).unwrap();
+        assert_eq!(found.worktree_id, project2_id);
+        assert_eq!(&*found.path, rel_path("file3.txt"));
+
+        // 3. Create-mode with root-name prefix
+        let found = project
+            .find_project_path("project1/new_file.txt", cx)
+            .unwrap();
+        assert_eq!(found.worktree_id, project1_id);
+        assert_eq!(&*found.path, rel_path("new_file.txt"));
+
+        // 4. Create-mode WITHOUT root-name prefix when parent directory exists in snapshot
+        let found = project
+            .find_project_path(".zed/prompts/new.md", cx)
+            .unwrap();
+        assert_eq!(found.worktree_id, project1_id);
+        assert_eq!(&*found.path, rel_path(".zed/prompts/new.md"));
+
+        let found = project.find_project_path("subdir/new.txt", cx).unwrap();
+        assert_eq!(found.worktree_id, project1_id);
+        assert_eq!(&*found.path, rel_path("subdir/new.txt"));
+
+        // Top-level file in root (parent is root directory)
+        let found = project.find_project_path("brand_new.txt", cx).unwrap();
+        assert_eq!(found.worktree_id, project1_id);
+        assert_eq!(&*found.path, rel_path("brand_new.txt"));
+
+        // 5. Create-mode relative path with no existing parent chain returns None
+        assert!(
+            project
+                .find_project_path("nonexistent_dir/new.md", cx)
+                .is_none()
+        );
+        assert!(
+            project
+                .find_project_path(".zed/nonexistent/new.md", cx)
+                .is_none()
+        );
+
+        // 6. Path with `..` components returns None
+        assert!(project.find_project_path("../file1.txt", cx).is_none());
+        assert!(project.find_project_path("subdir/../new.txt", cx).is_none());
+    });
+}
+
+#[gpui::test]
 async fn test_git_worktree_remove(cx: &mut gpui::TestAppContext) {
     init_test(cx);
 
