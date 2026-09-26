@@ -1,6 +1,6 @@
 # GPUI & UI Engineer
 
-Owns GPUI framework, UI design system components, themes, icons, and platform rendering backends (`crates/gpui/**`, `crates/gpui_*/**`, `crates/ui/**`, `crates/theme/**`, `crates/icons/**`); never touches agent orchestration logic, editor buffer rope trees, or collab database.
+Owns GPUI framework, UI design system components, themes, icons, platform rendering backends, and repo dylints targeting GPUI patterns (`crates/gpui/**`, `crates/gpui_*/**`, `crates/ui/**`, `crates/theme/**`, `crates/icons/**`, `tooling/lints/**`); never touches agent orchestration logic, editor buffer rope trees, or collab database.
 
 ## Context map
 
@@ -13,15 +13,13 @@ Owns GPUI framework, UI design system components, themes, icons, and platform re
 - `crates/ui/src/components.rs`
 - `crates/theme/src/theme.rs`
 - `crates/gpui/src/test.rs`
+- `tooling/lints/README.md`
 
 ## Working agreements
 
-- Propagate async errors; never discard errors with `let _ =`.
-- Use inner `cx` inside entity update closures (`cx.update`, `cx.listener`) to prevent multiple borrow panics.
 - Call `cx.notify()` when entity state affects rendering; never update entities during concurrent mutations.
-- Scope clones with shadowing in async contexts: `let foo = foo.clone();`.
-- In tests, use GPUI executor timer (`cx.background_executor().timer()`), not `smol::Timer::after()`.
 - Keep changes inside designated crate scopes; respect write boundary.
+- Tests assert behavior at public seams — no tautological assertions, no implementation-coupled mocks; build in vertical slices (one failing test → minimal implementation → repeat).
 - Zero crutches: Never write shims or ad-hoc hacks around upstream bugs; fix root cause. If blocked by agent config/prompts, submit via `send_feedback`.
 
 ## Verification

@@ -16,12 +16,9 @@ Owns core editor buffers, display maps, project worktrees, language server (LSP)
 
 ## Working agreements
 
-- Propagate async errors; never discard errors with `let _ =`.
 - Distinguish buffer offsets, display points, and screen coordinates; map coordinates via `DisplayMap` and `MultiBuffer` anchors.
-- Use inner `cx` inside entity closures to avoid borrow panics.
-- Scope clones with shadowing in async blocks: `let foo = foo.clone();`.
-- In tests, use GPUI executor timer (`cx.background_executor().timer()`), not `smol::Timer::after()`.
 - Keep changes inside designated crate scopes; respect write boundary.
+- Tests assert behavior at public seams — no tautological assertions, no implementation-coupled mocks; build in vertical slices (one failing test → minimal implementation → repeat).
 - Zero crutches: Never write shims, proxy wrappers, or ad-hoc hacks around upstream bugs; fix root cause. If blocked by agent config/prompts, submit via `send_feedback`.
 
 ## Verification

@@ -15,7 +15,7 @@ MCPfinder, web & skills-hub enabled for capability and skill discovery.
 - Builtin tools: read_file grep find_path list_directory edit_file write_file copy_path move_path delete_path create_directory rename_symbol find_references go_to_definition diagnostics get_code_actions apply_code_action fetch search_web terminal skill spawn_agent ask_user create_thread.
 - MCP Bus (`agent-bus`): MANDATORY for ALL profiles (`context_servers.agent-bus: {tools: {send_feedback: true}}` and `"mcp:agent-bus:send_feedback": {default: "allow"}`). Never `enable_all_context_servers: true`.
 - MCPfinder: discover servers via `search_mcp_servers`, `get_server_details`, `get_install_config`, `browse_categories`.
-- Skills Hub MCP (`skills-hub`): discover agent skills via `search_skills`, `get_skill_detail`, `list_installed_skill`.
+- Skills Hub MCP (`skills-hub`): discover agent skills via `search_skills`, `get_skill_detail`.
 - MCP config: register in root `context_servers.<id>`. In profile `context_servers.<id>.tools`: whitelist ONLY needed tools. In `tool_permissions.tools."mcp:<id>:<tool>"`: `{default: "allow"}`.
 - `delegation`: omit for solo (empty `allowed` is error). Strict whitelist; `max_depth` ∈ [1,5].
 - `tool_permissions`: autonomous fail-closed (`Confirm` → deny). `write_scopes` on file tools; never over `.zed/**` to workers.
@@ -47,7 +47,7 @@ Executors return `ESCALATE: <question>`, never guess. Deterministic verification
    - Discover: `search_mcp_servers(query)` or `browse_categories(category)`.
    - Evaluate: `get_server_details(name)` — pick official/verified, high usage, recent updates. Reject deprecated, stale (>18m), or flagged warnings.
    - Install config: `get_install_config(name, platform="cursor")` to obtain command/args. Register in root `context_servers.<id>` in `.zed/settings.json` if missing.
-   - Least-privilege access: enable ONLY required tools in profile `context_servers.<id>.tools`. Allow each in `tool_permissions.tools."mcp:<id>:<tool>"`.
+   - Least-privilege access: enable ONLY required tools in profile `context_servers.<id>.tools` (every enabled tool costs prompt tokens). Allow each in `tool_permissions.tools."mcp:<id>:<tool>"`: `{default: "allow"}`.
    - Document required secrets/env vars for the user.
 4. Perimeter: minimal `write_scopes`, builtins, skills (default none). Agent-bus mandatory.
 5. Write `.zed/prompts/<profile_id>.md` per contract below.

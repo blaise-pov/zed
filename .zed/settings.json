@@ -85,6 +85,7 @@
       ]
     },
     "agent-bus": {
+      "enabled": true,
       "command": "agent-bus",
       "args": [
         "--db",
@@ -142,21 +143,102 @@
   "agent": {
     "task_graph_server_id": "taskgraph",
     "tool_permissions": {
-      "default": "allow",
+      "default": "deny",
       "tools": {
+        "read_file": {
+          "default": "allow"
+        },
+        "grep": {
+          "default": "allow"
+        },
+        "find_path": {
+          "default": "allow"
+        },
+        "list_directory": {
+          "default": "allow"
+        },
+        "edit_file": {
+          "default": "allow"
+        },
+        "write_file": {
+          "default": "allow"
+        },
+        "copy_path": {
+          "default": "allow"
+        },
+        "move_path": {
+          "default": "allow"
+        },
+        "delete_path": {
+          "default": "allow"
+        },
+        "create_directory": {
+          "default": "allow"
+        },
+        "rename_symbol": {
+          "default": "allow"
+        },
+        "find_references": {
+          "default": "allow"
+        },
+        "go_to_definition": {
+          "default": "allow"
+        },
+        "diagnostics": {
+          "default": "allow"
+        },
+        "get_code_actions": {
+          "default": "allow"
+        },
+        "apply_code_action": {
+          "default": "allow"
+        },
+        "fetch": {
+          "default": "allow"
+        },
+        "search_web": {
+          "default": "allow"
+        },
+        "terminal": {
+          "default": "allow"
+        },
+        "skill": {
+          "default": "allow"
+        },
+        "spawn_agent": {
+          "default": "allow"
+        },
+        "ask_user": {
+          "default": "allow"
+        },
+        "create_thread": {
+          "default": "allow"
+        },
         "mcp:agent-bus:send_feedback": {
           "default": "allow"
         },
-        "send_feedback": {
+        "mcp:agent-bus:read_feedback": {
+          "default": "allow"
+        },
+        "mcp:agent-bus:resolve_feedback": {
+          "default": "allow"
+        },
+        "mcp:mcpfinder:search_mcp_servers": {
+          "default": "allow"
+        },
+        "mcp:mcpfinder:get_server_details": {
+          "default": "allow"
+        },
+        "mcp:mcpfinder:get_install_config": {
+          "default": "allow"
+        },
+        "mcp:mcpfinder:browse_categories": {
           "default": "allow"
         },
         "mcp:skills-hub:search_skills": {
           "default": "allow"
         },
         "mcp:skills-hub:get_skill_detail": {
-          "default": "allow"
-        },
-        "mcp:skills-hub:list_installed_skill": {
           "default": "allow"
         },
         "mcp:taskgraph:goal_create": {
@@ -309,7 +391,9 @@
             "ui_engineer",
             "collab_engineer",
             "reviewer",
-            "git_committer"
+            "git_committer",
+            "ci_runner",
+            "researcher"
           ],
           "max_depth": 3
         },
@@ -453,8 +537,7 @@
           "skills-hub": {
             "tools": {
               "search_skills": true,
-              "get_skill_detail": true,
-              "list_installed_skill": true
+              "get_skill_detail": true
             }
           },
           "mcpfinder": {
@@ -540,31 +623,16 @@
             "search_web": {
               "default": "allow"
             },
-            "send_feedback": {
-              "default": "allow"
-            },
             "mcp:agent-bus:send_feedback": {
-              "default": "allow"
-            },
-            "search_mcp_servers": {
               "default": "allow"
             },
             "mcp:mcpfinder:search_mcp_servers": {
               "default": "allow"
             },
-            "get_server_details": {
-              "default": "allow"
-            },
             "mcp:mcpfinder:get_server_details": {
               "default": "allow"
             },
-            "get_install_config": {
-              "default": "allow"
-            },
             "mcp:mcpfinder:get_install_config": {
-              "default": "allow"
-            },
-            "browse_categories": {
               "default": "allow"
             },
             "mcp:mcpfinder:browse_categories": {
@@ -574,9 +642,6 @@
               "default": "allow"
             },
             "mcp:skills-hub:get_skill_detail": {
-              "default": "allow"
-            },
-            "mcp:skills-hub:list_installed_skill": {
               "default": "allow"
             },
             "mcp:taskgraph:task_get": {
@@ -625,6 +690,41 @@
             "agent_reviewer"
           ],
           "max_depth": 1
+        },
+        "tool_permissions": {
+          "default": "deny",
+          "tools": {
+            "read_file": {
+              "default": "allow"
+            },
+            "grep": {
+              "default": "allow"
+            },
+            "find_path": {
+              "default": "allow"
+            },
+            "list_directory": {
+              "default": "allow"
+            },
+            "spawn_agent": {
+              "default": "allow"
+            },
+            "mcp:agent-bus:send_feedback": {
+              "default": "allow"
+            },
+            "mcp:taskgraph:task_get": {
+              "default": "allow"
+            },
+            "mcp:taskgraph:task_start": {
+              "default": "allow"
+            },
+            "mcp:taskgraph:task_complete": {
+              "default": "allow"
+            },
+            "mcp:taskgraph:task_fail": {
+              "default": "allow"
+            }
+          }
         }
       },
       "agent_tuner": {
@@ -637,14 +737,15 @@
           "list_directory": true,
           "edit_file": true,
           "write_file": true,
+          "fetch": true,
+          "terminal": true,
           "spawn_agent": true
         },
         "context_servers": {
           "skills-hub": {
             "tools": {
               "search_skills": true,
-              "get_skill_detail": true,
-              "list_installed_skill": true
+              "get_skill_detail": true
             }
           },
           "mcpfinder": {
@@ -674,7 +775,9 @@
         "delegation": {
           "allowed": [
             "agent_architect",
-            "agent_fleet_planner"
+            "agent_fleet_planner",
+            "agent_engineer",
+            "e2e_tester"
           ],
           "max_depth": 1
         },
@@ -698,7 +801,11 @@
               "write_scopes": [
                 ".zed/settings.json",
                 ".zed/prompts/**",
-                ".agents/skills/**"
+                ".zed/mcp/**",
+                ".agents/skills/**",
+                "README.md",
+                "docs/*",
+                "docs/**"
               ]
             },
             "write_file": {
@@ -706,7 +813,21 @@
               "write_scopes": [
                 ".zed/settings.json",
                 ".zed/prompts/**",
-                ".agents/skills/**"
+                ".zed/mcp/**",
+                ".agents/skills/**",
+                "README.md",
+                "docs/**"
+              ]
+            },
+            "fetch": {
+              "default": "allow"
+            },
+            "terminal": {
+              "default": "deny",
+              "always_allow": [
+                {
+                  "pattern": "^git\\s+(-C\\s+\\S+\\s+)?(--no-pager\\s+|--no-optional-locks\\s+)*(status|log|diff|show|branch|rev-parse|ls-files|blame|describe|cat-file|tag|remote|version|--version|config\\s+--get|shortlog).*"
+                }
               ]
             },
             "mcp:agent-bus:send_feedback": {
@@ -718,25 +839,13 @@
             "mcp:agent-bus:resolve_feedback": {
               "default": "allow"
             },
-            "search_mcp_servers": {
-              "default": "allow"
-            },
             "mcp:mcpfinder:search_mcp_servers": {
-              "default": "allow"
-            },
-            "get_server_details": {
               "default": "allow"
             },
             "mcp:mcpfinder:get_server_details": {
               "default": "allow"
             },
-            "get_install_config": {
-              "default": "allow"
-            },
             "mcp:mcpfinder:get_install_config": {
-              "default": "allow"
-            },
-            "browse_categories": {
               "default": "allow"
             },
             "mcp:mcpfinder:browse_categories": {
@@ -746,9 +855,6 @@
               "default": "allow"
             },
             "mcp:skills-hub:get_skill_detail": {
-              "default": "allow"
-            },
-            "mcp:skills-hub:list_installed_skill": {
               "default": "allow"
             },
             "mcp:taskgraph:task_get": {
@@ -787,8 +893,7 @@
           "skills-hub": {
             "tools": {
               "search_skills": true,
-              "get_skill_detail": true,
-              "list_installed_skill": true
+              "get_skill_detail": true
             }
           },
           "mcpfinder": {
@@ -861,13 +966,7 @@
             "mcp:agent-bus:resolve_feedback": {
               "default": "allow"
             },
-            "search_mcp_servers": {
-              "default": "allow"
-            },
             "mcp:mcpfinder:search_mcp_servers": {
-              "default": "allow"
-            },
-            "get_server_details": {
               "default": "allow"
             },
             "mcp:mcpfinder:get_server_details": {
@@ -877,9 +976,6 @@
               "default": "allow"
             },
             "mcp:skills-hub:get_skill_detail": {
-              "default": "allow"
-            },
-            "mcp:skills-hub:list_installed_skill": {
               "default": "allow"
             },
             "mcp:taskgraph:task_get": {
@@ -950,13 +1046,33 @@
             "edit_file": {
               "default": "allow",
               "write_scopes": [
-                "crates/**"
+                "crates/agent/**",
+                "crates/agent_ui/**",
+                "crates/agent_settings/**",
+                "crates/agent_servers/**",
+                "crates/agent_skills/**",
+                "crates/acp_thread/**",
+                "crates/acp_tools/**",
+                "crates/prompt_store/**",
+                "crates/language_model/**",
+                "crates/language_models/**",
+                "crates/project/**"
               ]
             },
             "write_file": {
               "default": "allow",
               "write_scopes": [
-                "crates/**"
+                "crates/agent/**",
+                "crates/agent_ui/**",
+                "crates/agent_settings/**",
+                "crates/agent_servers/**",
+                "crates/agent_skills/**",
+                "crates/acp_thread/**",
+                "crates/acp_tools/**",
+                "crates/prompt_store/**",
+                "crates/language_model/**",
+                "crates/language_models/**",
+                "crates/project/**"
               ]
             },
             "terminal": {
@@ -1006,7 +1122,8 @@
           "terminal": true
         },
         "skills": [
-          "gpui-test"
+          "gpui-test",
+          "gpui-bench"
         ],
         "context_servers": {
           "agent-bus": {
@@ -1121,7 +1238,8 @@
         },
         "skills": [
           "gpui-test",
-          "gpui-bench"
+          "gpui-bench",
+          "lint-creator"
         ],
         "context_servers": {
           "agent-bus": {
@@ -1163,7 +1281,8 @@
                 "crates/gpui_*/**",
                 "crates/ui/**",
                 "crates/theme/**",
-                "crates/icons/**"
+                "crates/icons/**",
+                "tooling/lints/**"
               ]
             },
             "write_file": {
@@ -1173,7 +1292,8 @@
                 "crates/gpui_*/**",
                 "crates/ui/**",
                 "crates/theme/**",
-                "crates/icons/**"
+                "crates/icons/**",
+                "tooling/lints/**"
               ]
             },
             "terminal": {
@@ -1433,6 +1553,7 @@
           "list_directory": true,
           "terminal": true
         },
+        "skills": [],
         "context_servers": {
           "agent-bus": {
             "tools": {
@@ -1492,10 +1613,6 @@
           "model": "${MID_TIER_MODEL}"
         },
         "tools": {
-          "read_file": true,
-          "grep": true,
-          "find_path": true,
-          "list_directory": true,
           "terminal": true,
           "spawn_agent": true
         },
@@ -1517,26 +1634,13 @@
         },
         "delegation": {
           "allowed": [
-            "ci_fixer",
-            "orchestrator"
+            "ci_fixer"
           ],
           "max_depth": 2
         },
         "tool_permissions": {
           "default": "deny",
           "tools": {
-            "read_file": {
-              "default": "allow"
-            },
-            "grep": {
-              "default": "allow"
-            },
-            "find_path": {
-              "default": "allow"
-            },
-            "list_directory": {
-              "default": "allow"
-            },
             "terminal": {
               "default": "allow"
             },
@@ -1576,7 +1680,7 @@
           "list_directory": true,
           "terminal": true
         },
-        "skills": [],
+        "skills": ["gpui-test"],
         "context_servers": {
           "agent-bus": {
             "tools": {
@@ -1591,7 +1695,11 @@
               "default": "allow"
             },
             "edit_file": {
-              "default": "allow"
+              "default": "allow",
+              "write_scopes": [
+                "crates/**",
+                "script/**"
+              ]
             },
             "grep": {
               "default": "allow"
@@ -1644,6 +1752,18 @@
             }
           }
         },
+        "delegation": {
+          "allowed": [
+            "agent_engineer",
+            "editor_engineer",
+            "ui_engineer",
+            "collab_engineer",
+            "reviewer",
+            "ci_runner",
+            "agent_tuner"
+          ],
+          "max_depth": 1
+        },
         "tool_permissions": {
           "default": "deny",
           "tools": {
@@ -1690,6 +1810,87 @@
               "default": "allow"
             },
             "mcp:taskgraph:task_fail": {
+              "default": "allow"
+            }
+          }
+        }
+      },
+      "researcher": {
+        "name": "Researcher",
+        "description": "Background research against primary sources; publishes cited Markdown findings as taskgraph artifacts",
+        "default_model": {
+          "provider": "${MID_TIER_MODEL_PROVIDER}",
+          "model": "${MID_TIER_MODEL}"
+        },
+        "tools": {
+          "fetch": true,
+          "search_web": true,
+          "read_file": true,
+          "grep": true,
+          "find_path": true,
+          "list_directory": true
+        },
+        "context_servers": {
+          "agent-bus": {
+            "tools": {
+              "send_feedback": true
+            }
+          },
+          "taskgraph": {
+            "tools": {
+              "task_get": true,
+              "task_start": true,
+              "task_complete": true,
+              "task_fail": true,
+              "artifact_publish": true,
+              "artifact_get": true,
+              "artifact_list": true
+            }
+          }
+        },
+        "tool_permissions": {
+          "default": "deny",
+          "tools": {
+            "fetch": {
+              "default": "allow"
+            },
+            "search_web": {
+              "default": "allow"
+            },
+            "read_file": {
+              "default": "allow"
+            },
+            "grep": {
+              "default": "allow"
+            },
+            "find_path": {
+              "default": "allow"
+            },
+            "list_directory": {
+              "default": "allow"
+            },
+            "mcp:agent-bus:send_feedback": {
+              "default": "allow"
+            },
+            "mcp:taskgraph:task_get": {
+              "default": "allow"
+            },
+            "mcp:taskgraph:task_start": {
+              "default": "allow"
+            },
+            "mcp:taskgraph:task_complete": {
+              "default": "allow"
+            },
+            "mcp:taskgraph:task_fail": {
+              "default": "allow"
+            },
+            "mcp:taskgraph:artifact_publish": {
+              "default": "allow"
+            },
+            "mcp:taskgraph:artifact_get": {
+              "default": "allow"
+            },
+            "mcp:taskgraph:artifact_list": {
               "default": "allow"
             }
           }

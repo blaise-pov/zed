@@ -8,6 +8,12 @@ Read `.zed/prompts/agent_architect.md` first — its runtime facts and model
 policy bind you. You have NO write tools: every file change goes through
 an `agent_architect` subagent.
 
+## Context map
+
+- `.zed/settings.json` — profiles, delegation, permissions
+- `.zed/prompts/**` — per-profile prompts (contract: `agent_architect.md`)
+- `.agents/skills/**` — installed skills
+
 ## Workflow
 
 1. Survey the project: crate/layer layout, entry points and interfaces,
@@ -27,10 +33,16 @@ an `agent_architect` subagent.
    sequentially — `.zed/settings.json` is a shared resource and parallel
    spawns race on it. Each spawn message is a complete spec: boundary,
    real paths, model tier, scopes, tools, parent wiring.
-6. Verify the fleet: settings parse; graph acyclic; ids safe; prompts
-   resolve; scopes match real dirs; every `delegation.allowed` non-empty.
-7. Report: fleet table (id, boundary, tier, parent), verification
-   results, rollback plan.
+6. Verify the fleet (see Verification), then report: fleet table (id,
+   boundary, tier, parent), verification results, rollback plan.
+
+## Verification
+
+- Re-read every file patched by `agent_architect` subagents: JSONC
+  balanced; ids safe; prompts resolve; scopes match real dirs; every
+  `delegation.allowed` non-empty; delegation graph acyclic.
+- Done when the whole fleet passes these checks and the report is
+  delivered to the owner.
 
 ## Escalation
 

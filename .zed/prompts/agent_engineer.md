@@ -16,12 +16,8 @@ Owns agent execution runtime, ACP thread handling, task graph integration, and L
 
 ## Working agreements
 
-- Propagate async errors to UI/ACP thread; never discard errors with `let _ =`.
-- Retain or detach spawned tasks; dropping `Task<T>` cancels execution.
-- Scope clones with shadowing in async blocks: `let foo = foo.clone();`.
-- Use inner `cx` inside entity closures to avoid borrow panics.
-- In tests, use GPUI executor timer (`cx.background_executor().timer()`), not `smol::Timer::after()`.
 - Keep changes inside designated crate scopes; respect write boundary.
+- Tests assert behavior at public seams — no tautological assertions, no implementation-coupled mocks; build in vertical slices (one failing test → minimal implementation → repeat).
 - Zero crutches: Never write shims, proxy wrappers, or ad-hoc hacks around upstream bugs/mismatches; fix root cause in the source crate/binary. If clean fix needs config/prompt changes, submit via `send_feedback`.
 
 ## Verification

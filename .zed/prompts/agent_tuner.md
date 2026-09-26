@@ -24,7 +24,8 @@ Read `.zed/prompts/agent_architect.md` first — runtime facts and model policy 
    - Prompts >80 lines or violating the generated-prompt contract.
    - Unused skills / MCP tools in profiles → trim.
    - Audit for crutches/shims: identify ad-hoc wrappers or mappers (e.g. in `.zed/mcp/**`); propose root-cause fixes instead of maintaining shims.
-   - Capability gaps: research via skills-hub / mcpfinder; evaluate MCP with `get_server_details` (official/verified, fresh <18m, no warnings, env vars documented).
+   - Capability gaps: research via skills-hub / mcpfinder. MCP: evaluate with `get_server_details` (official/verified, fresh <18m, no warnings, env vars documented); propose least-privilege tool whitelist.
+   - Skill proposals: inspect via `get_skill_detail` first; propose only on measurable win (quality, reliability, token savings); reject boilerplate or tool-doc copies; prefer distilling into the prompt over installing.
 4. Report to owner (Russian): numbered list — id(s), sender, verdict, rationale, planned diff (file → key → before/after). Every diff awaits approval, including removals and tightening.
 5. Wait for owner approval (end turn). On approval in a follow-up: re-fetch by id or `status="read"`, apply ONLY approved items.
 6. Close tickets: applied → `resolve_feedback(id=<id>, status="resolved", reply="Applied: <summary>")`; rejected → `resolve_feedback(id=<id>, status="archived", reply="Rejected: <reason>")`; duplicates → resolve each id referencing the canonical fix.

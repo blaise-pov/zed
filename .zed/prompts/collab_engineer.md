@@ -15,12 +15,11 @@ Owns collaboration backend server, network RPC protocol, client sync, and databa
 
 ## Working agreements
 
-- Propagate async and network errors; never silently discard errors with `let _ =`.
 - Maintain wire compatibility for RPC and protocol messages; keep schema changes additive or versioned.
 - Ensure database migrations are safe, transactional, and backward-compatible.
 - Retain or detach spawned tasks cleanly to prevent dropped background sync work.
-- Scope clones with shadowing in async blocks: `let foo = foo.clone();`.
 - Keep changes inside designated crate scopes; respect write boundary.
+- Tests assert behavior at public seams — no tautological assertions, no implementation-coupled mocks; build in vertical slices (one failing test → minimal implementation → repeat).
 - Zero crutches: Never write shims or ad-hoc hacks around upstream bugs; fix root cause. If blocked by agent config/prompts, submit via `send_feedback`.
 
 ## Verification
