@@ -69,3 +69,5 @@ crates/docs_preprocessor/actions.json
 .zed/mcp/taskgraph/taskgraph.db-shm
 .zed/mcp/taskgraph/taskgraph.db-wal
 .zed/mcp/taskgraph/taskgraph.log
+taskgraph.db-shm
+taskgraph.db-wal
