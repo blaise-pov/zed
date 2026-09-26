@@ -276,6 +276,8 @@ AGENT_BUS_PROJECT_ID=zed
 - `delegation` *(object)*: правила порождения субагентов.
 - `tool_permissions` *(object)*: правила авторизации инструментов для данного профиля.
 
+> **Известное ограничение периметра**: `write_scopes` ограничивает только файловые инструменты (`edit_file`, `write_file` и т.п.). Инструмент `terminal` не подчиняется `write_scopes` — профиль с разрешенным `terminal` технически может изменить любой файл через shell-команды. Выдавайте `terminal` только профилям с минимальным списком команд в `always_allow` и осознанным уровнем доверия.
+
 ### Файловые промпты профилей
 
 Инструкции для агента хранятся в формате Markdown в `.zed/prompts/<profile_id>.md`.
@@ -527,7 +529,6 @@ impact: bugs | problem: race condition in buffer save | proposal: use atomic ren
 Сервер `@skills-hub-ai/mcp` предоставляет поиск и установку готовых скиллов для агентов:
 - `search_skills`: поиск скиллов по ключевым словам.
 - `get_skill_detail`: просмотр содержимого `SKILL.md` и зависимостей скилла.
-- `list_installed_skill`: перечень уже установленных в проекте скиллов.
 
 ### Поиск и установка серверов (`mcpfinder`)
 

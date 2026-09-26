@@ -1,6 +1,3 @@
-> [!IMPORTANT]
-> Remove this line to confirm you've reviewed this PR before submitting.
-
 # Zed: Multi-Agent Software Engineering IDE & Runtime
 
 ## Возможности этого форка
@@ -307,7 +304,7 @@ AGENT_BUS_PROJECT_ID=zed
 2. **Agent Bus (`agent-bus`)**:
    - Шина межагентных предложений и фидбека (`send_feedback`, `read_feedback`, `resolve_feedback`) в каноническом формате `impact: ... | problem: ... | proposal: ...`.
 3. **Skills Hub (`skills-hub`)**:
-   - Поиск и установка навыков для агентов (`search_skills`, `get_skill_detail`, `list_installed_skill`).
+   - Поиск и установка навыков для агентов (`search_skills`, `get_skill_detail`).
 4. **MCP Finder (`mcpfinder`)**:
    - Поиск сторонних MCP-серверов и генерация конфигурации для установки (`search_mcp_servers`, `get_install_config`).
 
