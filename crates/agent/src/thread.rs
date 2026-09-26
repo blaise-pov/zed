@@ -1429,6 +1429,8 @@ pub struct Thread {
     /// already-granted permissions skip the approval prompt.
     /// Never persisted — lives and dies with this thread.
     sandbox_grants: Rc<RefCell<ThreadSandboxGrants>>,
+    /// Remaining delegation depth budget for spawning subagents.
+    delegation_budget: u8,
 }
 
 impl Thread {
@@ -1511,6 +1513,13 @@ impl Thread {
             thread.inherits_parent_model_settings = false;
             thread.apply_model_selection(&subagent_model, cx);
         }
+        let parent_budget = parent_thread.read(cx).delegation_budget();
+        let child_profile = thread
+            .pinned_profile()
+            .as_ref()
+            .and_then(|id| thread.agent_settings(cx).profiles.get(id));
+        thread.delegation_budget =
+            agent_settings::child_remaining_budget(parent_budget, child_profile);
         thread
     }
 
@@ -1585,6 +1594,11 @@ impl Thread {
             .and_then(|model| model.speed);
         let (prompt_capabilities_tx, prompt_capabilities_rx) =
             watch::channel(Self::prompt_capabilities(model.as_deref()));
+        let delegation_budget = profile_settings
+            .as_ref()
+            .and_then(|p| p.delegation.as_ref())
+            .map(|d| d.max_depth)
+            .unwrap_or(agent_settings::Delegation::default().max_depth);
         let model = match model {
             Some(model) => ThreadModel::Ready(model),
             None => Self::user_configured_model_selection(cx)
@@ -1637,6 +1651,7 @@ impl Thread {
             inherits_parent_model_settings: true,
             sandboxed_terminal_temp_dir: None,
             sandbox_grants: Rc::new(RefCell::new(ThreadSandboxGrants::default())),
+            delegation_budget,
         }
     }
 
@@ -1967,10 +1982,11 @@ impl Thread {
         cx: &mut Context<Self>,
     ) -> Self {
         let settings_location = Self::project_settings_location(&project, cx);
-        let settings = AgentSettings::get(settings_location, cx);
-        let profile_id = db_thread
-            .profile
-            .unwrap_or_else(|| settings.default_profile.clone());
+        let profile_id = db_thread.profile.unwrap_or_else(|| {
+            AgentSettings::get(settings_location, cx)
+                .default_profile
+                .clone()
+        });
 
         let saved_selection = db_thread.model.map(|model| SelectedModel {
             provider: model.provider.into(),
@@ -2003,6 +2019,17 @@ impl Thread {
         );
 
         let action_log = cx.new(|_| ActionLog::new(project.clone()));
+
+        let delegation_budget = if db_thread.subagent_context.is_some() {
+            0
+        } else {
+            AgentSettings::get(settings_location, cx)
+                .profiles
+                .get(&profile_id)
+                .and_then(|p| p.delegation.as_ref())
+                .map(|d| d.max_depth)
+                .unwrap_or(agent_settings::Delegation::default().max_depth)
+        };
 
         Self {
             id,
@@ -2055,6 +2082,7 @@ impl Thread {
             sandbox_grants: Rc::new(RefCell::new(ThreadSandboxGrants::from_db(
                 &db_thread.sandbox_grants,
             ))),
+            delegation_budget,
         }
     }
 
@@ -2499,6 +2527,14 @@ impl Thread {
         }
 
         self.profile_id = profile_id.clone();
+
+        if self.subagent_context.is_none() {
+            let profile_settings = self.agent_settings(cx).profiles.get(&self.profile_id);
+            self.delegation_budget = profile_settings
+                .and_then(|p| p.delegation.as_ref())
+                .map(|d| d.max_depth)
+                .unwrap_or(agent_settings::Delegation::default().max_depth);
+        }
 
         // Swap to the profile's preferred model when available.
         if let Some(model) = self.resolve_profile_model(&self.profile_id, cx) {
@@ -4563,6 +4599,14 @@ impl Thread {
 
     pub fn depth(&self) -> u8 {
         self.subagent_context.as_ref().map(|c| c.depth).unwrap_or(0)
+    }
+
+    pub fn delegation_budget(&self) -> u8 {
+        self.delegation_budget
+    }
+
+    pub fn set_delegation_budget(&mut self, budget: u8) {
+        self.delegation_budget = budget;
     }
 
     /// The concurrency pool shared by this thread's whole sub-agent tree.

@@ -258,6 +258,7 @@ pub fn sandbox_fallback_authorization_details_from_meta(
 /// serialized [`SandboxNotAppliedReason`]. Surfaced as a warning in the UI and
 /// used to explain the situation to both the user and the agent.
 pub const SANDBOX_NOT_APPLIED_META_KEY: &str = "sandbox_not_applied";
+pub const TERMINAL_WRAPPER_WARNING_META_KEY: &str = "terminal_wrapper_warning";
 
 pub fn meta_with_sandbox_not_applied(reason: &SandboxNotAppliedReason) -> acp::Meta {
     acp::Meta::from_iter([(
@@ -266,10 +267,24 @@ pub fn meta_with_sandbox_not_applied(reason: &SandboxNotAppliedReason) -> acp::M
     )])
 }
 
+pub fn meta_with_terminal_wrapper_warning(message: &str) -> acp::Meta {
+    acp::Meta::from_iter([(
+        TERMINAL_WRAPPER_WARNING_META_KEY.into(),
+        serde_json::to_value(message).unwrap_or_default(),
+    )])
+}
+
 pub fn sandbox_not_applied_from_meta(meta: &Option<acp::Meta>) -> Option<SandboxNotAppliedReason> {
     meta.as_ref()
         .and_then(|m| m.get(SANDBOX_NOT_APPLIED_META_KEY))
         .and_then(|v| serde_json::from_value(v.clone()).ok())
+}
+
+pub fn terminal_wrapper_warning_from_meta(meta: &Option<acp::Meta>) -> Option<SharedString> {
+    meta.as_ref()
+        .and_then(|m| m.get(TERMINAL_WRAPPER_WARNING_META_KEY))
+        .and_then(|v| serde_json::from_value::<String>(v.clone()).ok())
+        .map(SharedString::from)
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -876,6 +891,7 @@ pub struct ToolCall {
     /// sandboxing was active (see [`SANDBOX_NOT_APPLIED_META_KEY`]). `None` when
     /// the command was sandboxed normally (or sandboxing was off).
     pub sandbox_not_applied: Option<SandboxNotAppliedReason>,
+    pub terminal_wrapper_warning: Option<SharedString>,
 }
 
 impl ToolCall {
@@ -922,6 +938,7 @@ impl ToolCall {
         let sandbox_fallback_authorization_details =
             sandbox_fallback_authorization_details_from_meta(&tool_call.meta);
         let sandbox_not_applied = sandbox_not_applied_from_meta(&tool_call.meta);
+        let terminal_wrapper_warning = terminal_wrapper_warning_from_meta(&tool_call.meta);
 
         let label = if tool_call.kind == acp::ToolKind::Execute {
             cx.new(|cx| Markdown::new_text(title.into(), cx))
@@ -945,6 +962,7 @@ impl ToolCall {
             sandbox_authorization_details,
             sandbox_fallback_authorization_details,
             sandbox_not_applied,
+            terminal_wrapper_warning,
         };
         Ok(result)
     }
@@ -992,6 +1010,9 @@ impl ToolCall {
         }
         if let Some(sandbox_not_applied) = sandbox_not_applied_from_meta(&meta) {
             self.sandbox_not_applied = Some(sandbox_not_applied);
+        }
+        if let Some(terminal_wrapper_warning) = terminal_wrapper_warning_from_meta(&meta) {
+            self.terminal_wrapper_warning = Some(terminal_wrapper_warning);
         }
 
         if let Some(title) = title {
@@ -3146,6 +3167,7 @@ impl AcpThread {
                     sandbox_authorization_details: None,
                     sandbox_fallback_authorization_details: None,
                     sandbox_not_applied: None,
+                    terminal_wrapper_warning: None,
                 };
                 self.push_entry(AgentThreadEntry::ToolCall(failed_tool_call), cx);
                 return Ok(());

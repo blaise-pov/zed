@@ -192,6 +192,7 @@ pub(crate) struct FakeThreadEnvironment {
     subagent_handle: Option<Rc<FakeSubagentHandle>>,
     terminal_creations: Arc<AtomicUsize>,
     terminal_output_limits: std::cell::RefCell<Vec<Option<u64>>>,
+    terminal_commands: std::cell::RefCell<Vec<String>>,
 }
 
 impl FakeThreadEnvironment {
@@ -209,12 +210,16 @@ impl FakeThreadEnvironment {
     pub(crate) fn terminal_output_limits(&self) -> Vec<Option<u64>> {
         self.terminal_output_limits.borrow().clone()
     }
+
+    pub(crate) fn terminal_commands(&self) -> Vec<String> {
+        self.terminal_commands.borrow().clone()
+    }
 }
 
 impl crate::ThreadEnvironment for FakeThreadEnvironment {
     fn create_terminal(
         &self,
-        _command: String,
+        command: String,
         _extra_env: Vec<acp::EnvVariable>,
         _cwd: Option<std::path::PathBuf>,
         output_byte_limit: Option<u64>,
@@ -222,6 +227,7 @@ impl crate::ThreadEnvironment for FakeThreadEnvironment {
         _cx: &mut AsyncApp,
     ) -> Task<Result<Rc<dyn crate::TerminalHandle>>> {
         self.terminal_creations.fetch_add(1, Ordering::SeqCst);
+        self.terminal_commands.borrow_mut().push(command);
         self.terminal_output_limits
             .borrow_mut()
             .push(output_byte_limit);
@@ -322,6 +328,43 @@ fn insert_profile(
             delegation: None,
             tool_permissions: None,
             permission_mode: None,
+            terminal_wrapper_command: None,
+        },
+    );
+    agent_settings::AgentSettings::override_global(settings, cx);
+}
+
+fn insert_profile_with_delegation(
+    cx: &mut App,
+    profile_id: &str,
+    tools: &[&str],
+    allowed: &[&str],
+    max_depth: u8,
+) {
+    let mut settings = agent_settings::AgentSettings::get_global(cx).clone();
+    settings.profiles.insert(
+        AgentProfileId(profile_id.into()),
+        agent_settings::AgentProfileSettings {
+            name: profile_id.into(),
+            origin: Default::default(),
+            tools: tools.iter().map(|tool| (Arc::from(*tool), true)).collect(),
+            enable_all_context_servers: false,
+            context_servers: IndexMap::default(),
+            default_model: None,
+            custom_prompt_path: None,
+            system_prompt_template: None,
+            description: None,
+            skills: None,
+            delegation: Some(agent_settings::Delegation {
+                allowed: allowed
+                    .iter()
+                    .map(|id| AgentProfileId((*id).into()))
+                    .collect(),
+                max_depth,
+            }),
+            tool_permissions: None,
+            permission_mode: None,
+            terminal_wrapper_command: None,
         },
     );
     agent_settings::AgentSettings::override_global(settings, cx);
@@ -6795,6 +6838,126 @@ async fn test_spawn_agent_absent_when_nesting_disabled_or_profile_lacks_it(
 }
 
 #[gpui::test]
+async fn test_delegation_chain_budget_exhaustion_blocks_transitive_bypass(cx: &mut TestAppContext) {
+    init_test(cx);
+    cx.update(|cx| {
+        LanguageModelRegistry::test(cx);
+        cx.update_flags(true, vec!["subagents".to_string()]);
+    });
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(path!("/test"), json!({})).await;
+    let project = Project::test(fs.clone(), [path!("/test").as_ref()], cx).await;
+    let thread_store = cx.new(|cx| ThreadStore::new(cx));
+    let agent = cx.update(|cx| NativeAgent::new(thread_store, Templates::new(), fs, cx));
+    let connection = Rc::new(NativeAgentConnection(agent.clone()));
+    let acp_thread = cx
+        .update(|cx| {
+            connection.clone().new_session(
+                project.clone(),
+                PathList::new(&[Path::new("/test")]),
+                cx,
+            )
+        })
+        .await
+        .unwrap();
+
+    let session_id = acp_thread.read_with(cx, |t, _| t.session_id().clone());
+    let root_thread = agent.read_with(cx, |agent, _| {
+        agent.sessions.get(&session_id).unwrap().thread.clone()
+    });
+
+    // Configure global nested_sub_agents so global depth allows up to 5 hops
+    cx.update(|cx| {
+        set_nested_sub_agent_settings(cx, true, 5, 16);
+
+        insert_profile_with_delegation(cx, "e2e_tester", &["spawn_agent"], &["ci_runner"], 1);
+        insert_profile_with_delegation(cx, "ci_runner", &["spawn_agent"], &["orchestrator"], 2);
+        insert_profile_with_delegation(cx, "orchestrator", &["spawn_agent"], &["reviewer"], 3);
+        insert_profile_with_delegation(cx, "reviewer", &[], &[], 1);
+
+        root_thread.update(cx, |thread, cx| {
+            thread.set_profile(AgentProfileId("e2e_tester".into()), cx);
+        });
+    });
+
+    // Root thread (e2e_tester) has delegation_budget 1
+    assert_eq!(root_thread.read_with(cx, |t, _| t.delegation_budget()), 1);
+
+    let root_env = NativeThreadEnvironment {
+        agent: agent.downgrade(),
+        thread: root_thread.downgrade(),
+        acp_thread: acp_thread.downgrade(),
+    };
+
+    // e2e_tester spawns ci_runner: succeeds, child budget is min(1 - 1, 2) = 0
+    let ci_runner_handle = cx
+        .update(|cx| {
+            root_env.create_subagent_thread(
+                "ci_runner".into(),
+                Some(AgentProfileId("ci_runner".into())),
+                cx,
+            )
+        })
+        .unwrap();
+
+    let ci_runner_session_id = ci_runner_handle.id();
+    let (ci_runner_thread, ci_runner_acp) = agent.read_with(cx, |agent, _| {
+        let s = agent.sessions.get(&ci_runner_session_id).unwrap();
+        (s.thread.clone(), s.acp_thread.clone())
+    });
+
+    assert_eq!(ci_runner_thread.read_with(cx, |t, _| t.depth()), 1);
+    assert_eq!(
+        ci_runner_thread.read_with(cx, |t, _| t.delegation_budget()),
+        0
+    );
+
+    let ci_runner_env = NativeThreadEnvironment {
+        agent: agent.downgrade(),
+        thread: ci_runner_thread.downgrade(),
+        acp_thread: ci_runner_acp,
+    };
+
+    // ci_runner attempts to spawn orchestrator: rejected because remaining budget is 0,
+    // even though ci_runner's profile has max_depth 2 and orchestrator is in allowed list!
+    let spawn_result = cx.update(|cx| {
+        ci_runner_env.create_subagent_thread(
+            "orchestrator".into(),
+            Some(AgentProfileId("orchestrator".into())),
+            cx,
+        )
+    });
+
+    let err = match spawn_result {
+        Err(err) => err.to_string(),
+        Ok(_) => panic!("expected spawn_result to fail"),
+    };
+    assert!(
+        err.contains("Maximum delegation depth (2) for profile 'ci_runner' reached. Complete the task yourself instead of delegating further."),
+        "unexpected error: {err}"
+    );
+
+    // Also verify profile switch on resume is rejected under the same budget check
+    let resume_result = cx.update(|cx| {
+        ci_runner_env.resume_subagent_thread(
+            ci_runner_session_id.clone(),
+            Some(AgentProfileId("orchestrator".into())),
+            cx,
+        )
+    });
+
+    let resume_err = match resume_result {
+        Err(err) => err.to_string(),
+        Ok(_) => panic!("expected resume_result to fail"),
+    };
+    assert!(
+        resume_err.contains("Maximum delegation depth (2) for profile 'ci_runner' reached. Complete the task yourself instead of delegating further."),
+        "unexpected error: {resume_err}"
+    );
+}
+
+#[gpui::test]
 async fn test_lsp_tools_gated_by_feature_flag(cx: &mut TestAppContext) {
     init_test(cx);
 
@@ -9551,19 +9714,18 @@ async fn test_profile_write_scopes_allowed_and_denied(cx: &mut TestAppContext) {
     let canonical_roots = crate::canonicalize_worktree_roots(&project, &fs_dyn, cx).await;
 
     let mut tools = collections::HashMap::default();
-    tools.insert(
-        Arc::from("edit_file"),
-        agent_settings::ToolRules {
-            default: Some(settings::ToolPermissionMode::Allow),
-            always_allow: vec![],
-            always_deny: vec![],
-            always_confirm: vec![],
-            write_scopes: Some(
-                agent_settings::WriteScopes::new(vec![Arc::from("backend/**")]).unwrap(),
-            ),
-            invalid_patterns: vec![],
-        },
-    );
+    let tool_rules = agent_settings::ToolRules {
+        default: Some(settings::ToolPermissionMode::Allow),
+        always_allow: vec![],
+        always_deny: vec![],
+        always_confirm: vec![],
+        write_scopes: Some(
+            agent_settings::WriteScopes::new(vec![Arc::from("backend/**")]).unwrap(),
+        ),
+        invalid_patterns: vec![],
+    };
+    tools.insert(Arc::from("edit_file"), tool_rules.clone());
+    tools.insert(Arc::from("write_file"), tool_rules);
 
     let profile = agent_settings::AgentProfileSettings {
         name: "backend_engineer".into(),
@@ -9582,6 +9744,7 @@ async fn test_profile_write_scopes_allowed_and_denied(cx: &mut TestAppContext) {
             tools,
         }),
         permission_mode: None,
+        terminal_wrapper_command: None,
     };
 
     // Path inside backend/** write_scope is allowed
@@ -9625,5 +9788,39 @@ async fn test_profile_write_scopes_allowed_and_denied(cx: &mut TestAppContext) {
     assert!(
         err_msg.contains("outside write_scopes"),
         "error message should state outside write_scopes, got: {err_msg}"
+    );
+
+    // Create-mode relative path without root-name prefix is allowed when parent exists
+    let new_backend_path = std::path::Path::new("backend/src/new_file.rs");
+    let allowed = cx.update(|cx| {
+        crate::check_profile_write_scope(
+            "write_file",
+            new_backend_path,
+            &project,
+            &canonical_roots,
+            Some(&profile),
+            cx,
+        )
+    });
+    assert!(
+        allowed.is_ok(),
+        "backend/src/new_file.rs without root prefix should be within write_scopes"
+    );
+
+    // Create-mode relative path outside write_scopes is denied
+    let new_frontend_path = std::path::Path::new("frontend/src/new_file.rs");
+    let denied = cx.update(|cx| {
+        crate::check_profile_write_scope(
+            "write_file",
+            new_frontend_path,
+            &project,
+            &canonical_roots,
+            Some(&profile),
+            cx,
+        )
+    });
+    assert!(
+        denied.is_err(),
+        "frontend/src/new_file.rs should be outside write_scopes"
     );
 }

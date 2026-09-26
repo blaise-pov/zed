@@ -48,14 +48,12 @@ pub fn validate_profiles(profiles: &IndexMap<AgentProfileId, AgentProfileSetting
 /// rules. Returns a model-facing error message when the call must be
 /// rejected, or `None` when it may proceed.
 ///
-/// `parent_depth` is the depth of the calling thread (0 = root). A profile
-/// may spawn while `parent_depth < delegation.max_depth`, so the default of 1
-/// lets a root agent spawn one level of children that cannot delegate
-/// further.
+/// `parent_remaining` is the remaining delegation depth budget of the calling
+/// thread. An agent may delegate while `parent_remaining > 0`.
 pub fn check_delegation(
     parent_profile_id: &AgentProfileId,
     parent_profile: Option<&AgentProfileSettings>,
-    parent_depth: u8,
+    parent_remaining: u8,
     requested: Option<&AgentProfileId>,
 ) -> Option<String> {
     let Some(profile) = parent_profile else {
@@ -78,7 +76,7 @@ pub fn check_delegation(
         .map(|d| d.max_depth)
         .unwrap_or(1);
 
-    if parent_depth >= max_depth {
+    if parent_remaining == 0 {
         return Some(format!(
             "Maximum delegation depth ({}) for profile '{}' reached. Complete the task \
              yourself instead of delegating further.",
@@ -115,6 +113,23 @@ pub fn check_delegation(
     }
 
     None
+}
+
+/// Computes the remaining delegation depth budget for a child agent.
+///
+/// Clamps `parent_remaining.saturating_sub(1)` to the child profile's `delegation.max_depth`.
+/// If `child_profile` is absent or lacks a delegation block, uses `Delegation::default().max_depth` (1).
+pub fn child_remaining_budget(
+    parent_remaining: u8,
+    child_profile: Option<&AgentProfileSettings>,
+) -> u8 {
+    let child_profile_max_depth = child_profile
+        .and_then(|p| p.delegation.as_ref())
+        .map(|d| d.max_depth)
+        .unwrap_or(crate::Delegation::default().max_depth);
+    parent_remaining
+        .saturating_sub(1)
+        .min(child_profile_max_depth)
 }
 
 /// Finds cycles in the delegation graph via iterative depth-first search,
@@ -213,6 +228,7 @@ mod tests {
             delegation: None,
             tool_permissions: None,
             permission_mode: None,
+            terminal_wrapper_command: None,
         }
     }
 
@@ -318,7 +334,7 @@ mod tests {
     fn check_delegation_allows_listed_target_within_depth() {
         let parent = profile_with_delegation(&["child"]);
         assert_eq!(
-            check_delegation(&id("parent"), Some(&parent), 0, Some(&id("child"))),
+            check_delegation(&id("parent"), Some(&parent), 1, Some(&id("child"))),
             None
         );
     }
@@ -326,7 +342,7 @@ mod tests {
     #[test]
     fn check_delegation_rejects_solo_profile() {
         let parent = test_profile();
-        let error = check_delegation(&id("parent"), Some(&parent), 0, Some(&id("child")))
+        let error = check_delegation(&id("parent"), Some(&parent), 1, Some(&id("child")))
             .expect("solo profile must be rejected");
         assert!(error.contains("solo agent"), "unexpected: {error}");
     }
@@ -334,7 +350,7 @@ mod tests {
     #[test]
     fn check_delegation_rejects_target_not_in_allowed() {
         let parent = profile_with_delegation(&["child"]);
-        let error = check_delegation(&id("parent"), Some(&parent), 0, Some(&id("other")))
+        let error = check_delegation(&id("parent"), Some(&parent), 1, Some(&id("other")))
             .expect("unlisted target must be rejected");
         assert!(error.contains("'other'"), "unexpected: {error}");
         assert!(
@@ -347,19 +363,19 @@ mod tests {
     fn check_delegation_allows_unspecified_target_when_spawn_agent_enabled() {
         let parent = profile_with_delegation(&["child"]);
         assert_eq!(
-            check_delegation(&id("parent"), Some(&parent), 0, None),
+            check_delegation(&id("parent"), Some(&parent), 1, None),
             None
         );
 
         let solo = test_profile();
-        assert_eq!(check_delegation(&id("solo"), Some(&solo), 0, None), None);
+        assert_eq!(check_delegation(&id("solo"), Some(&solo), 1, None), None);
     }
 
     #[test]
     fn check_delegation_rejects_when_spawn_agent_tool_disabled() {
         let mut parent = test_profile();
         parent.tools.insert("spawn_agent".into(), false);
-        let error = check_delegation(&id("parent"), Some(&parent), 0, None)
+        let error = check_delegation(&id("parent"), Some(&parent), 1, None)
             .expect("missing permission must be rejected");
         assert!(
             error.contains("permission to spawn agents"),
@@ -370,8 +386,8 @@ mod tests {
     #[test]
     fn check_delegation_enforces_max_depth() {
         let parent = profile_with_delegation(&["child"]);
-        // max_depth defaults to 1: an agent already at depth 1 cannot spawn.
-        let error = check_delegation(&id("parent"), Some(&parent), 1, Some(&id("child")))
+        // 0 remaining budget: an agent cannot spawn.
+        let error = check_delegation(&id("parent"), Some(&parent), 0, Some(&id("child")))
             .expect("depth limit must be enforced");
         assert!(error.contains("depth"), "unexpected: {error}");
 
@@ -389,8 +405,63 @@ mod tests {
 
     #[test]
     fn check_delegation_rejects_unknown_parent_profile() {
-        let error = check_delegation(&id("ghost"), None, 0, Some(&id("child")))
+        let error = check_delegation(&id("ghost"), None, 1, Some(&id("child")))
             .expect("unknown parent profile must be rejected");
         assert!(error.contains("Unknown profile"), "unexpected: {error}");
+    }
+
+    #[test]
+    fn check_delegation_transitive_budget_exhaustion() {
+        let mut child_profile = test_profile();
+        child_profile.delegation = Some(crate::Delegation {
+            allowed: vec![id("grandchild")],
+            max_depth: 2,
+        });
+
+        // Parent max_depth was 1; child remaining is min(1 - 1, 2) = 0.
+        let child_remaining = child_remaining_budget(1, Some(&child_profile));
+        assert_eq!(child_remaining, 0);
+
+        // Child at depth 1 must NOT be allowed to spawn.
+        let error = check_delegation(
+            &id("child"),
+            Some(&child_profile),
+            child_remaining,
+            Some(&id("grandchild")),
+        )
+        .expect("child with exhausted budget must be rejected");
+        assert!(error.contains("depth"), "unexpected: {error}");
+    }
+
+    #[test]
+    fn check_delegation_min_clamp_blocks_spawn_when_remaining_zero() {
+        let mut high_cap_profile = test_profile();
+        high_cap_profile.delegation = Some(crate::Delegation {
+            allowed: vec![id("target")],
+            max_depth: 5,
+        });
+
+        // Parent remaining 0 blocks spawn even when child profile cap is high.
+        let error = check_delegation(
+            &id("parent"),
+            Some(&high_cap_profile),
+            0,
+            Some(&id("target")),
+        )
+        .expect("parent remaining 0 must be rejected");
+        assert!(error.contains("depth"), "unexpected: {error}");
+    }
+
+    #[test]
+    fn check_delegation_unprofiled_child_receives_default_clamp() {
+        // Parent remaining budget 3: unprofiled child (None) receives min(3 - 1, default 1) = 1.
+        assert_eq!(child_remaining_budget(3, None), 1);
+
+        // Child with no delegation block also receives default clamp 1.
+        let solo = test_profile();
+        assert_eq!(child_remaining_budget(3, Some(&solo)), 1);
+
+        // When parent budget is 1, unprofiled child receives min(1 - 1, 1) = 0.
+        assert_eq!(child_remaining_budget(1, None), 0);
     }
 }

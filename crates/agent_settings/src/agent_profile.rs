@@ -114,6 +114,9 @@ impl AgentProfile {
         let permission_mode = base_profile
             .as_ref()
             .and_then(|profile| profile.permission_mode);
+        let terminal_wrapper_command = base_profile
+            .as_ref()
+            .and_then(|profile| profile.terminal_wrapper_command.clone());
 
         let profile_settings = AgentProfileSettings {
             name: name.into(),
@@ -129,6 +132,7 @@ impl AgentProfile {
             delegation,
             tool_permissions,
             permission_mode,
+            terminal_wrapper_command,
         };
 
         match &origin {
@@ -213,6 +217,7 @@ pub struct AgentProfileSettings {
     /// Tool permissions and write scopes for this profile.
     pub tool_permissions: Option<ToolPermissions>,
     pub permission_mode: Option<AgentPermissionMode>,
+    pub terminal_wrapper_command: Option<SharedString>,
 }
 
 /// Which sub-agents a profile may spawn, and how deeply they may nest.
@@ -368,6 +373,10 @@ impl AgentProfileSettings {
                     .as_ref()
                     .map(|tool_permissions| tool_permissions.to_content()),
                 permission_mode: self.permission_mode,
+                terminal_wrapper_command: self
+                    .terminal_wrapper_command
+                    .clone()
+                    .map(|s| s.to_string()),
             },
         );
 
@@ -544,6 +553,7 @@ impl From<AgentProfileContent> for AgentProfileSettings {
             delegation,
             tool_permissions,
             permission_mode,
+            terminal_wrapper_command,
         } = content;
 
         let custom_prompt_path_shared = custom_prompt_path
@@ -567,6 +577,7 @@ impl From<AgentProfileContent> for AgentProfileSettings {
             delegation: delegation.map(|delegation| delegation.into()),
             tool_permissions: tool_permissions.map(|tp| compile_tool_permissions(Some(tp))),
             permission_mode,
+            terminal_wrapper_command: terminal_wrapper_command.map(SharedString::from),
         }
     }
 }
@@ -616,6 +627,7 @@ mod tests {
             delegation: None,
             tool_permissions: None,
             permission_mode: None,
+            terminal_wrapper_command: None,
         }
     }
 
@@ -835,6 +847,47 @@ mod tests {
 
         let roots_without_wt = prompt_search_roots(None);
         assert_eq!(roots_without_wt, vec![paths::config_dir().to_path_buf()]);
+    }
+
+    #[test]
+    fn test_agent_profile_terminal_wrapper_command_tristate() {
+        let json_set = r#"{
+            "name": "Custom Agent",
+            "terminal_wrapper_command": "rtk --profile x"
+        }"#;
+        let content_set: AgentProfileContent = serde_json::from_str(json_set).unwrap();
+        assert_eq!(
+            content_set.terminal_wrapper_command.as_deref(),
+            Some("rtk --profile x")
+        );
+        let settings_set = AgentProfileSettings::from(content_set);
+        assert_eq!(
+            settings_set.terminal_wrapper_command.as_deref(),
+            Some("rtk --profile x")
+        );
+
+        let json_disabled = r#"{
+            "name": "Custom Agent",
+            "terminal_wrapper_command": ""
+        }"#;
+        let content_disabled: AgentProfileContent = serde_json::from_str(json_disabled).unwrap();
+        assert_eq!(
+            content_disabled.terminal_wrapper_command.as_deref(),
+            Some("")
+        );
+        let settings_disabled = AgentProfileSettings::from(content_disabled);
+        assert_eq!(
+            settings_disabled.terminal_wrapper_command.as_deref(),
+            Some("")
+        );
+
+        let json_unset = r#"{
+            "name": "Custom Agent"
+        }"#;
+        let content_unset: AgentProfileContent = serde_json::from_str(json_unset).unwrap();
+        assert_eq!(content_unset.terminal_wrapper_command, None);
+        let settings_unset = AgentProfileSettings::from(content_unset);
+        assert_eq!(settings_unset.terminal_wrapper_command, None);
     }
 
     #[test]

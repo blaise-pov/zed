@@ -358,6 +358,13 @@ pub struct AgentSettingsContent {
     ///
     /// Default: ""
     pub terminal_init_command: Option<String>,
+    /// Command that rewrites agent terminal tool commands before execution, e.g.
+    /// `rtk`. Contract is `<command> rewrite <command-to-run>` returning the
+    /// rewritten command on stdout; used e.g. to compress output before it
+    /// reaches the model; the wrapper decides which commands to wrap/skip.
+    ///
+    /// Default: null (disabled)
+    pub terminal_wrapper_command: Option<String>,
     /// How thinking blocks should be displayed by default in the agent panel.
     ///
     /// Default: automatic
@@ -638,6 +645,13 @@ pub struct AgentProfileContent {
     pub tool_permissions: Option<ToolPermissionsContent>,
     /// Permission mode for this profile.
     pub permission_mode: Option<AgentPermissionMode>,
+    /// Command to wrap terminal executions with for this profile.
+    ///
+    /// Tri-state:
+    /// - Unset: inherit `agent.terminal_wrapper_command`.
+    /// - Empty string `""`: disable the wrapper for this profile.
+    /// - Non-empty string: use this command instead.
+    pub terminal_wrapper_command: Option<String>,
 }
 
 #[with_fallible_options]

@@ -12,7 +12,7 @@ use project::{Project, ProjectPath};
 use settings::Settings;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
-use util::{normalize_path, paths::component_matches_ignore_ascii_case};
+use util::{normalize_path, paths::component_matches_ignore_ascii_case, rel_path::RelPath};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SensitiveSettingsKind {
@@ -458,6 +458,16 @@ pub fn resolve_project_path(
     let path = path.as_ref();
     let project_path = project
         .find_project_path(path, cx)
+        .or_else(|| {
+            let parent_path = path.parent()?;
+            let parent_project_path = project.find_project_path(parent_path, cx)?;
+            let file_name = path.file_name()?.to_str()?;
+            let file_rel = RelPath::from_unix_str(file_name).ok()?;
+            Some(ProjectPath {
+                worktree_id: parent_project_path.worktree_id,
+                path: parent_project_path.path.join(file_rel).into(),
+            })
+        })
         .ok_or_else(|| anyhow!("Path {} is not in the project", path.display()))?;
 
     let worktree = project
@@ -813,6 +823,17 @@ pub fn authorize_file_edit(
     event_stream: &ToolCallEventStream,
     cx: &mut App,
 ) -> Task<Result<()>> {
+    authorize_file_edit_with_resolved(tool_name, path, None, thread, event_stream, cx)
+}
+
+pub fn authorize_file_edit_with_resolved(
+    tool_name: &str,
+    path: &Path,
+    resolved_path: Option<&Path>,
+    thread: &WeakEntity<Thread>,
+    event_stream: &ToolCallEventStream,
+    cx: &mut App,
+) -> Task<Result<()>> {
     let path_str = path.to_string_lossy();
 
     let settings = agent_settings::AgentSettings::get_global(cx);
@@ -825,6 +846,9 @@ pub fn authorize_file_edit(
     }
 
     let path_owned = path.to_path_buf();
+    let check_path_owned = resolved_path
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| path.to_path_buf());
     let title = format!("Edit {}", util::markdown::MarkdownInlineCode(&path_str));
     let tool_name = tool_name.to_string();
     let thread = thread.clone();
@@ -838,8 +862,10 @@ pub fn authorize_file_edit(
     let local_settings_folder = paths::local_settings_folder_name();
     let is_local_settings = path.components().any(|component| {
         component_matches_ignore_ascii_case(component.as_os_str(), local_settings_folder)
+    }) || check_path_owned.components().any(|component| {
+        component_matches_ignore_ascii_case(component.as_os_str(), local_settings_folder)
     });
-    let is_agents_skills = is_agents_skills_path(path);
+    let is_agents_skills = is_agents_skills_path(path) || is_agents_skills_path(&check_path_owned);
 
     cx.spawn(async move |cx| {
         // Resolve the path and check for symlink escapes.
@@ -865,7 +891,7 @@ pub fn authorize_file_edit(
         cx.update(|cx| {
             check_profile_write_scope(
                 &tool_name,
-                &path_owned,
+                &check_path_owned,
                 &project_entity,
                 &canonical_roots,
                 profile.as_ref(),
@@ -874,7 +900,7 @@ pub fn authorize_file_edit(
         })?;
 
         let resolved = project_entity.read_with(cx, |project, cx| {
-            resolve_project_path(project, &path_owned, &canonical_roots, cx)
+            resolve_project_path(project, &check_path_owned, &canonical_roots, cx)
         });
 
         if let Ok(ResolvedProjectPath::SymlinkEscape {
@@ -905,7 +931,7 @@ pub fn authorize_file_edit(
         // Create-mode paths may not resolve yet, so also inspect the parent path
         // for symlink escapes before applying settings-based allow decisions.
         if resolved.is_err() {
-            if let Some(parent_path) = path_owned.parent() {
+            if let Some(parent_path) = check_path_owned.parent() {
                 let parent_resolved = project_entity.read_with(cx, |project, cx| {
                     resolve_project_path(project, parent_path, &canonical_roots, cx)
                 });
@@ -947,7 +973,7 @@ pub fn authorize_file_edit(
         } else if is_agents_skills {
             Some(SensitiveSettingsKind::AgentSkills)
         } else {
-            sensitive_settings_kind(&path_owned, &canonical_roots, fs.as_ref()).await
+            sensitive_settings_kind(&check_path_owned, &canonical_roots, fs.as_ref()).await
         };
 
         let is_sensitive = settings_kind.is_some();
@@ -955,7 +981,7 @@ pub fn authorize_file_edit(
             let in_write_scope = cx.update(|cx| {
                 is_path_in_profile_write_scope(
                     &tool_name,
-                    &path_owned,
+                    &check_path_owned,
                     &project_entity,
                     &canonical_roots,
                     profile.as_ref(),
@@ -1825,6 +1851,7 @@ mod tests {
                 tools,
             }),
             permission_mode: Some(AgentPermissionMode::Autonomous),
+            terminal_wrapper_command: None,
         };
 
         cx.update(|cx| {
@@ -1897,6 +1924,7 @@ mod tests {
                 tools,
             }),
             permission_mode: Some(AgentPermissionMode::Autonomous),
+            terminal_wrapper_command: None,
         };
 
         cx.update(|cx| {
@@ -1957,6 +1985,7 @@ mod tests {
             delegation: None,
             tool_permissions: None,
             permission_mode: Some(AgentPermissionMode::Interactive),
+            terminal_wrapper_command: None,
         };
 
         cx.update(|cx| {
@@ -2037,6 +2066,7 @@ mod tests {
                 tools,
             }),
             permission_mode: Some(AgentPermissionMode::Autonomous),
+            terminal_wrapper_command: None,
         };
 
         cx.update(|cx| {
@@ -2166,6 +2196,7 @@ mod tests {
             delegation: None,
             tool_permissions: None,
             permission_mode: Some(AgentPermissionMode::Interactive),
+            terminal_wrapper_command: None,
         };
 
         cx.update(|cx| {
@@ -2253,6 +2284,7 @@ mod tests {
                 tools,
             }),
             permission_mode: Some(AgentPermissionMode::Autonomous),
+            terminal_wrapper_command: None,
         };
 
         cx.update(|cx| {
@@ -2332,6 +2364,7 @@ mod tests {
                 tools,
             }),
             permission_mode: Some(AgentPermissionMode::Autonomous),
+            terminal_wrapper_command: None,
         };
 
         cx.update(|cx| {
@@ -2404,6 +2437,7 @@ mod tests {
                 tools,
             }),
             permission_mode: Some(AgentPermissionMode::Autonomous),
+            terminal_wrapper_command: None,
         };
 
         cx.update(|cx| {

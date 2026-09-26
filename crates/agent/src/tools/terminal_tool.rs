@@ -1,5 +1,7 @@
 use agent_client_protocol::schema::v1 as acp;
+use agent_settings::AgentProfileSettings;
 use anyhow::Result;
+use collections::{HashMap, HashSet};
 use futures::FutureExt as _;
 use gpui::{App, AsyncApp, Entity, SharedString, Task};
 use project::Project;
@@ -10,7 +12,7 @@ use std::{
     path::{Path, PathBuf},
     rc::Rc,
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
@@ -262,9 +264,298 @@ impl From<SandboxedTerminalToolInput> for TerminalToolRequest {
     }
 }
 
+/// The shell a command will run in. On Windows the sandboxed shell is WSL's
+/// Linux shell and the unsandboxed shell is the host shell (separate PATHs, so
+/// the wrapper may exist in one and not the other); elsewhere both are the
+/// user's shell, but keying the availability cache by context stays correct.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum TerminalShellContext {
+    Sandboxed,
+    Host,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TerminalWrapperProgram {
+    pub program: String,
+    pub args: Vec<String>,
+}
+
+pub(crate) fn split_wrapper_command(spec: &str) -> Result<Vec<String>, String> {
+    let mut tokens = Vec::new();
+    let mut current_token = String::new();
+    let mut in_quote: Option<char> = None;
+    let mut has_token_content = false;
+
+    for ch in spec.chars() {
+        if let Some(quote_char) = in_quote {
+            if ch == quote_char {
+                in_quote = None;
+            } else {
+                current_token.push(ch);
+                has_token_content = true;
+            }
+        } else if ch == '"' || ch == '\'' {
+            in_quote = Some(ch);
+            has_token_content = true;
+        } else if ch.is_whitespace() {
+            if has_token_content {
+                tokens.push(std::mem::take(&mut current_token));
+                has_token_content = false;
+            }
+        } else {
+            current_token.push(ch);
+            has_token_content = true;
+        }
+    }
+
+    if in_quote.is_some() {
+        return Err("unbalanced quote in wrapper command".to_string());
+    }
+
+    if has_token_content {
+        tokens.push(current_token);
+    }
+
+    if tokens.is_empty() || tokens[0].trim().is_empty() {
+        return Err("empty program token in wrapper command".to_string());
+    }
+
+    Ok(tokens)
+}
+
+fn resolve_wrapper_program(program_token: &str, project_root: Option<&Path>) -> String {
+    let path = Path::new(program_token);
+    let has_separator = program_token.contains('/') || program_token.contains('\\');
+    if has_separator && path.is_relative() {
+        if let Some(root) = project_root {
+            // Windows CreateProcess resolves a relative program path against the
+            // parent process cwd, not Command::current_dir. Resolving explicitly
+            // against the project root is the only deterministic behavior, and
+            // .zed/ lives at the project root, not necessarily the command's cwd.
+            if let Ok(normalized) = util::paths::normalize_lexically(&root.join(path)) {
+                return normalized.to_string_lossy().to_string();
+            }
+        }
+    }
+    program_token.to_string()
+}
+
+#[cfg(target_os = "windows")]
+pub(crate) fn to_wsl_path(path: &Path) -> Option<String> {
+    use std::path::{Component, Prefix};
+
+    let mut components = path.components();
+    let first = components.next()?;
+    let drive_letter = match first {
+        Component::Prefix(prefix) => match prefix.kind() {
+            Prefix::Disk(drive) | Prefix::VerbatimDisk(drive) => {
+                (drive as char).to_ascii_lowercase()
+            }
+            _ => return None,
+        },
+        _ => return None,
+    };
+
+    let mut wsl_path = format!("/mnt/{drive_letter}");
+    for comp in components {
+        match comp {
+            Component::RootDir => {}
+            Component::Normal(c) => {
+                wsl_path.push('/');
+                wsl_path.push_str(c.to_str()?);
+            }
+            Component::CurDir => {}
+            Component::ParentDir => {
+                wsl_path.push_str("/..");
+            }
+            Component::Prefix(_) => return None,
+        }
+    }
+    Some(wsl_path)
+}
+
+pub(crate) const TERMINAL_WRAPPER_UNAVAILABLE_TTL: Duration = Duration::from_secs(60);
+
+pub(crate) type TerminalWrapperRunner = Rc<
+    dyn Fn(
+        &mut AsyncApp,
+        &TerminalWrapperProgram,
+        &str,
+        Option<&Path>,
+        TerminalShellContext,
+    ) -> Task<anyhow::Result<String>>,
+>;
+
+pub(crate) struct TerminalWrapperState {
+    unavailable: parking_lot::Mutex<HashMap<(TerminalShellContext, String), Instant>>,
+    warned: parking_lot::Mutex<HashSet<String>>,
+    runner: TerminalWrapperRunner,
+}
+
+impl TerminalWrapperState {
+    pub(crate) fn new(runner: TerminalWrapperRunner) -> Self {
+        Self {
+            unavailable: parking_lot::Mutex::new(HashMap::default()),
+            warned: parking_lot::Mutex::new(HashSet::default()),
+            runner,
+        }
+    }
+
+    pub(crate) fn is_unavailable_at(
+        &self,
+        context: TerminalShellContext,
+        spec: &str,
+        now: Instant,
+    ) -> bool {
+        let mut unavailable = self.unavailable.lock();
+        unavailable.retain(|_, timestamp| {
+            now.saturating_duration_since(*timestamp) < TERMINAL_WRAPPER_UNAVAILABLE_TTL
+        });
+        unavailable.contains_key(&(context, spec.to_string()))
+    }
+
+    pub(crate) fn is_unavailable(&self, context: TerminalShellContext, spec: &str) -> bool {
+        self.is_unavailable_at(context, spec, Instant::now())
+    }
+
+    pub(crate) fn mark_unavailable_at(
+        &self,
+        context: TerminalShellContext,
+        spec: &str,
+        now: Instant,
+    ) {
+        let mut unavailable = self.unavailable.lock();
+        unavailable.retain(|_, timestamp| {
+            now.saturating_duration_since(*timestamp) < TERMINAL_WRAPPER_UNAVAILABLE_TTL
+        });
+        unavailable.insert((context, spec.to_string()), now);
+    }
+
+    pub(crate) fn mark_unavailable(&self, context: TerminalShellContext, spec: &str) {
+        self.mark_unavailable_at(context, spec, Instant::now());
+    }
+
+    pub(crate) fn mark_available(&self, context: TerminalShellContext, spec: &str) {
+        self.unavailable.lock().remove(&(context, spec.to_string()));
+    }
+
+    pub(crate) fn should_warn(&self, warning_key: &str) -> bool {
+        self.warned.lock().insert(warning_key.to_string())
+    }
+}
+
+impl Default for TerminalWrapperState {
+    fn default() -> Self {
+        Self::new(default_terminal_wrapper_runner())
+    }
+}
+
+fn default_terminal_wrapper_runner() -> TerminalWrapperRunner {
+    Rc::new(|cx, wrapper_program, command, working_dir, shell_context| {
+        let wrapper_program = wrapper_program.clone();
+        let command = command.to_string();
+        let working_dir = working_dir.map(Path::to_path_buf);
+        let timer = cx.background_executor().timer(Duration::from_secs(2));
+
+        cx.background_executor().spawn(async move {
+            let subprocess = async {
+                let is_windows_sandboxed = {
+                    #[cfg(target_os = "windows")]
+                    {
+                        shell_context == TerminalShellContext::Sandboxed
+                    }
+                    #[cfg(not(target_os = "windows"))]
+                    {
+                        let _ = shell_context;
+                        false
+                    }
+                };
+
+                let mut command_builder = if is_windows_sandboxed {
+                    let mut cmd = util::command::Command::new("wsl.exe");
+                    if let Some(dir) = &working_dir {
+                        cmd.args(["--cd", &dir.to_string_lossy()]);
+                    }
+                    let program_for_wsl = {
+                        #[cfg(target_os = "windows")]
+                        {
+                            if wrapper_program.program.starts_with('/') {
+                                wrapper_program.program.clone()
+                            } else if let Some(wsl_path) =
+                                to_wsl_path(Path::new(&wrapper_program.program))
+                            {
+                                wsl_path
+                            } else {
+                                wrapper_program.program.clone()
+                            }
+                        }
+                        #[cfg(not(target_os = "windows"))]
+                        {
+                            wrapper_program.program.clone()
+                        }
+                    };
+                    cmd.args(["--exec", &program_for_wsl]);
+                    cmd.args(&wrapper_program.args);
+                    cmd.args(["rewrite", &command]);
+                    cmd
+                } else {
+                    let mut cmd = util::command::Command::new(&wrapper_program.program);
+                    if let Some(dir) = &working_dir {
+                        cmd.current_dir(dir);
+                    }
+                    cmd.args(&wrapper_program.args);
+                    cmd.args(["rewrite", &command]);
+                    cmd
+                };
+
+                command_builder
+                    .stdin(util::command::Stdio::null())
+                    .stdout(util::command::Stdio::piped())
+                    .stderr(util::command::Stdio::piped())
+                    .kill_on_drop(true);
+
+                let output = command_builder.output().await?;
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let trimmed = stdout.trim();
+
+                if output.status.code() == Some(0) || output.status.code() == Some(3) {
+                    if trimmed.is_empty() {
+                        anyhow::bail!("wrapper returned empty stdout");
+                    }
+                    Ok(trimmed.to_string())
+                } else if (output.status.code() == Some(1) || output.status.code() == Some(2))
+                    && trimmed.is_empty()
+                {
+                    // rtk exits with 1 when there is no rewrite equivalent and 2 on deny;
+                    // both mean pass through unchanged.
+                    Ok(command)
+                } else {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    let stderr_trimmed = stderr.trim();
+                    if stderr_trimmed.is_empty() {
+                        anyhow::bail!("wrapper failed with status: {}", output.status);
+                    } else {
+                        anyhow::bail!(
+                            "wrapper failed with status {}: {}",
+                            output.status,
+                            stderr_trimmed
+                        );
+                    }
+                }
+            };
+
+            futures::select_biased! {
+                result = subprocess.fuse() => result,
+                _ = timer.fuse() => anyhow::bail!("terminal wrapper timed out"),
+            }
+        })
+    })
+}
+
 pub struct TerminalTool {
     project: Entity<Project>,
     environment: Rc<dyn ThreadEnvironment>,
+    wrapper_state: Rc<TerminalWrapperState>,
 }
 
 impl TerminalTool {
@@ -272,13 +563,29 @@ impl TerminalTool {
         Self {
             project,
             environment,
+            wrapper_state: Rc::new(TerminalWrapperState::default()),
         }
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    #[allow(dead_code)]
+    pub(crate) fn with_wrapper_runner(mut self, runner: TerminalWrapperRunner) -> Self {
+        self.wrapper_state = Rc::new(TerminalWrapperState::new(runner));
+        self
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    #[allow(dead_code)]
+    pub(crate) fn with_wrapper_state(mut self, state: Rc<TerminalWrapperState>) -> Self {
+        self.wrapper_state = state;
+        self
     }
 }
 
 pub struct SandboxedTerminalTool {
     project: Entity<Project>,
     environment: Rc<dyn ThreadEnvironment>,
+    wrapper_state: Rc<TerminalWrapperState>,
 }
 
 impl SandboxedTerminalTool {
@@ -286,7 +593,22 @@ impl SandboxedTerminalTool {
         Self {
             project,
             environment,
+            wrapper_state: Rc::new(TerminalWrapperState::default()),
         }
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    #[allow(dead_code)]
+    pub(crate) fn with_wrapper_runner(mut self, runner: TerminalWrapperRunner) -> Self {
+        self.wrapper_state = Rc::new(TerminalWrapperState::new(runner));
+        self
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    #[allow(dead_code)]
+    pub(crate) fn with_wrapper_state(mut self, state: Rc<TerminalWrapperState>) -> Self {
+        self.wrapper_state = state;
+        self
     }
 }
 
@@ -323,6 +645,7 @@ impl AgentTool for TerminalTool {
             run_terminal_tool(
                 self.project.clone(),
                 self.environment.clone(),
+                self.wrapper_state.clone(),
                 input.into(),
                 event_stream,
                 cx,
@@ -365,6 +688,7 @@ impl AgentTool for SandboxedTerminalTool {
             run_terminal_tool(
                 self.project.clone(),
                 self.environment.clone(),
+                self.wrapper_state.clone(),
                 input.into(),
                 event_stream,
                 cx,
@@ -413,9 +737,112 @@ fn wsl_zed_release(_cx: &App) -> Option<(String, String)> {
     None
 }
 
+fn project_root_path(project: &Project, cx: &App) -> Option<PathBuf> {
+    project
+        .active_project_directory(cx)
+        .map(|path| path.to_path_buf())
+        .or_else(|| {
+            project
+                .visible_worktrees(cx)
+                .find_map(|tree| tree.read(cx).root_dir().map(|path| path.to_path_buf()))
+        })
+}
+
+fn effective_terminal_wrapper(
+    global: Option<&str>,
+    profile: Option<&AgentProfileSettings>,
+) -> Option<String> {
+    match profile.and_then(|profile| profile.terminal_wrapper_command.as_deref()) {
+        Some(spec) if !spec.trim().is_empty() => Some(spec.to_string()),
+        Some(_) => None, // explicit off
+        None => global
+            .filter(|spec| !spec.trim().is_empty())
+            .map(String::from),
+    }
+}
+
+async fn wrap_terminal_command(
+    wrapper_state: &Rc<TerminalWrapperState>,
+    effective_spec: Option<String>,
+    command: String,
+    project_root: Option<&Path>,
+    working_dir: Option<&Path>,
+    shell_context: TerminalShellContext,
+    cx: &mut AsyncApp,
+) -> (String, Option<String>) {
+    let spec = match effective_spec {
+        Some(spec) => spec,
+        None => return (command, None),
+    };
+
+    let tokens = match split_wrapper_command(&spec) {
+        Ok(tokens) => tokens,
+        Err(reason) => {
+            log::warn!("Invalid terminal wrapper '{spec}': {reason}");
+            let warning = if wrapper_state.should_warn(&spec) {
+                Some(format!(
+                    "Invalid `terminal_wrapper_command` \"{spec}\": {reason}. Commands run without the wrapper."
+                ))
+            } else {
+                None
+            };
+            return (command, warning);
+        }
+    };
+
+    let program = resolve_wrapper_program(&tokens[0], project_root);
+    let args = tokens[1..].to_vec();
+    let wrapper_program = TerminalWrapperProgram { program, args };
+
+    if wrapper_state.is_unavailable(shell_context, &spec) {
+        return (command, None);
+    }
+
+    let runner = wrapper_state.runner.clone();
+    match runner(cx, &wrapper_program, &command, working_dir, shell_context).await {
+        Ok(rewritten) => {
+            let trimmed = rewritten.trim();
+            if trimmed.is_empty() {
+                log::warn!(
+                    "Terminal wrapper '{spec}' returned empty stdout; falling back to original command"
+                );
+                wrapper_state.mark_unavailable(shell_context, &spec);
+                let warn_key = format!("probe:{:?}:{}", shell_context, spec);
+                let warning = if wrapper_state.should_warn(&warn_key) {
+                    Some(format!(
+                        "Terminal wrapper \"{spec}\" is unavailable (wrapper returned empty stdout); commands run without it. Zed will retry in 60s."
+                    ))
+                } else {
+                    None
+                };
+                (command, warning)
+            } else {
+                wrapper_state.mark_available(shell_context, &spec);
+                (trimmed.to_string(), None)
+            }
+        }
+        Err(error) => {
+            log::warn!(
+                "Terminal wrapper '{spec}' failed: {error:#}; falling back to original command"
+            );
+            wrapper_state.mark_unavailable(shell_context, &spec);
+            let warn_key = format!("probe:{:?}:{}", shell_context, spec);
+            let warning = if wrapper_state.should_warn(&warn_key) {
+                Some(format!(
+                    "Terminal wrapper \"{spec}\" is unavailable ({error:#}); commands run without it. Zed will retry in 60s."
+                ))
+            } else {
+                None
+            };
+            (command, warning)
+        }
+    }
+}
+
 async fn run_terminal_tool(
     project: Entity<Project>,
     environment: Rc<dyn ThreadEnvironment>,
+    wrapper_state: Rc<TerminalWrapperState>,
     input: TerminalToolRequest,
     event_stream: ToolCallEventStream,
     cx: &mut AsyncApp,
@@ -854,6 +1281,33 @@ async fn run_terminal_tool(
         Some(COMMAND_OUTPUT_LIMIT)
     };
 
+    let shell_context = if sandbox_wrap.is_some() {
+        TerminalShellContext::Sandboxed
+    } else {
+        TerminalShellContext::Host
+    };
+    let (effective_wrapper, project_root) = cx.update(|cx| {
+        let global_wrapper = agent_settings::AgentSettings::get_global(cx)
+            .terminal_wrapper_command
+            .clone();
+        let profile = event_stream.profile_settings(cx);
+        let effective = effective_terminal_wrapper(global_wrapper.as_deref(), profile.as_ref());
+        let root = project_root_path(project.read(cx), cx);
+        (effective, root)
+    });
+
+    #[cfg_attr(not(target_os = "windows"), allow(unused_mut))]
+    let (mut command_to_run, wrapper_warning) = wrap_terminal_command(
+        &wrapper_state,
+        effective_wrapper,
+        input.command.clone(),
+        project_root.as_deref(),
+        working_dir.as_deref(),
+        shell_context,
+        cx,
+    )
+    .await;
+
     // Create the terminal. On Windows the WSL sandbox can only report whether
     // it set up the environment once `wsl.exe` actually runs (its probe is
     // async), so — unlike Linux's up-front `can_create_sandbox` loop above —
@@ -869,7 +1323,7 @@ async fn run_terminal_tool(
         loop {
             let error = match environment
                 .create_terminal(
-                    input.command.clone(),
+                    command_to_run.clone(),
                     extra_env.clone(),
                     working_dir.clone(),
                     output_byte_limit,
@@ -921,6 +1375,8 @@ async fn run_terminal_tool(
                         sandbox_error,
                     ));
                     effective_wrap = None;
+                    // Command rewritten for WSL's wrapper may fail in the host shell, so fall back to original.
+                    command_to_run = input.command.clone();
                 }
                 Ok(SandboxFallbackDecision::Deny) | Err(_) => {
                     return Ok(format!(
@@ -935,7 +1391,7 @@ async fn run_terminal_tool(
     #[cfg(not(target_os = "windows"))]
     let terminal = environment
         .create_terminal(
-            input.command.clone(),
+            command_to_run,
             extra_env,
             working_dir.clone(),
             output_byte_limit,
@@ -991,11 +1447,21 @@ async fn run_terminal_tool(
     let fields = acp::ToolCallUpdateFields::new().content(vec![acp::ToolCallContent::Terminal(
         acp::Terminal::new(terminal_id),
     )]);
+    let mut meta_entries = Vec::new();
     if let Some(reason) = &sandbox_not_applied {
-        event_stream.update_fields_with_meta(
-            fields,
-            Some(acp_thread::meta_with_sandbox_not_applied(reason)),
-        );
+        meta_entries.push((
+            acp_thread::SANDBOX_NOT_APPLIED_META_KEY.into(),
+            serde_json::to_value(reason).unwrap_or_default(),
+        ));
+    }
+    if let Some(warning) = &wrapper_warning {
+        meta_entries.push((
+            acp_thread::TERMINAL_WRAPPER_WARNING_META_KEY.into(),
+            serde_json::to_value(warning).unwrap_or_default(),
+        ));
+    }
+    if !meta_entries.is_empty() {
+        event_stream.update_fields_with_meta(fields, Some(acp::Meta::from_iter(meta_entries)));
     } else {
         event_stream.update_fields(fields);
     }
@@ -3819,5 +4285,1102 @@ mod tests {
             acp_thread::SandboxNetworkAccess::None => {}
             other => panic!("unexpected network access for host request, got {other:?}"),
         }
+    }
+
+    #[gpui::test]
+    async fn test_terminal_wrapper_default_off(cx: &mut gpui::TestAppContext) {
+        crate::tests::init_test(cx);
+
+        let fs = fs::FakeFs::new(cx.executor());
+        fs.insert_tree("/root", serde_json::json!({})).await;
+        let project = project::Project::test(fs, ["/root".as_ref()], cx).await;
+
+        let environment = std::rc::Rc::new(cx.update(|cx| {
+            crate::tests::FakeThreadEnvironment::default().with_terminal(
+                crate::tests::FakeTerminalHandle::new_with_immediate_exit(cx, 0),
+            )
+        }));
+
+        let runner_called = std::rc::Rc::new(std::cell::Cell::new(false));
+        let runner = {
+            let runner_called = runner_called.clone();
+            std::rc::Rc::new(
+                move |_cx: &mut gpui::AsyncApp,
+                      _wrapper: &TerminalWrapperProgram,
+                      _cmd: &str,
+                      _cwd: Option<&Path>,
+                      _ctx: TerminalShellContext| {
+                    runner_called.set(true);
+                    Task::ready(Ok("rewritten".to_string()))
+                },
+            )
+        };
+
+        cx.update(|cx| {
+            let mut settings = agent_settings::AgentSettings::get_global(cx).clone();
+            settings.tool_permissions.default = settings::ToolPermissionMode::Allow;
+            settings.terminal_wrapper_command = None;
+            agent_settings::AgentSettings::override_global(settings, cx);
+        });
+
+        #[allow(clippy::arc_with_non_send_sync)]
+        let tool = std::sync::Arc::new(
+            TerminalTool::new(project, environment.clone()).with_wrapper_runner(runner),
+        );
+        let (event_stream, _rx) = crate::ToolCallEventStream::test();
+
+        let task = cx.update(|cx| {
+            tool.run(
+                crate::ToolInput::resolved(TerminalToolInput {
+                    command: "cargo test".to_string(),
+                    cd: "root".to_string(),
+                    timeout_ms: None,
+                    ..Default::default()
+                }),
+                event_stream,
+                cx,
+            )
+        });
+
+        task.await.expect("command should succeed");
+        assert!(
+            !runner_called.get(),
+            "runner should never be invoked when setting is unset"
+        );
+        assert_eq!(
+            environment.terminal_commands(),
+            vec!["cargo test".to_string()]
+        );
+    }
+
+    #[gpui::test]
+    async fn test_terminal_wrapper_rewrite_success(cx: &mut gpui::TestAppContext) {
+        crate::tests::init_test(cx);
+
+        let fs = fs::FakeFs::new(cx.executor());
+        fs.insert_tree("/root", serde_json::json!({})).await;
+        let project = project::Project::test(fs, ["/root".as_ref()], cx).await;
+
+        let environment = std::rc::Rc::new(cx.update(|cx| {
+            crate::tests::FakeThreadEnvironment::default().with_terminal(
+                crate::tests::FakeTerminalHandle::new_with_immediate_exit(cx, 0),
+            )
+        }));
+
+        let runner = std::rc::Rc::new(
+            |_cx: &mut gpui::AsyncApp,
+             _wrapper: &TerminalWrapperProgram,
+             _cmd: &str,
+             _cwd: Option<&Path>,
+             _ctx: TerminalShellContext| {
+                Task::ready(Ok("rtk exec -- cargo test".to_string()))
+            },
+        );
+
+        cx.update(|cx| {
+            let mut settings = agent_settings::AgentSettings::get_global(cx).clone();
+            settings.tool_permissions.default = settings::ToolPermissionMode::Confirm;
+            settings.terminal_wrapper_command = Some("rtk".to_string());
+            agent_settings::AgentSettings::override_global(settings, cx);
+        });
+
+        #[allow(clippy::arc_with_non_send_sync)]
+        let tool = std::sync::Arc::new(
+            TerminalTool::new(project, environment.clone()).with_wrapper_runner(runner),
+        );
+        let (event_stream, mut rx) = crate::ToolCallEventStream::test();
+
+        let task = cx.update(|cx| {
+            tool.run(
+                crate::ToolInput::resolved(TerminalToolInput {
+                    command: "cargo test".to_string(),
+                    cd: "root".to_string(),
+                    timeout_ms: None,
+                    ..Default::default()
+                }),
+                event_stream,
+                cx,
+            )
+        });
+
+        let auth = rx.expect_authorization().await;
+        assert_eq!(
+            auth.tool_call.fields.title.as_deref(),
+            Some("cargo test"),
+            "authorization should show the original command in title"
+        );
+        auth.response
+            .send(acp_thread::SelectedPermissionOutcome::new(
+                acp::PermissionOptionId::new("allow"),
+                acp::PermissionOptionKind::AllowOnce,
+            ))
+            .expect("authorization response should send");
+
+        task.await.expect("command should succeed");
+        assert_eq!(
+            environment.terminal_commands(),
+            vec!["rtk exec -- cargo test".to_string()]
+        );
+    }
+
+    #[gpui::test]
+    async fn test_terminal_wrapper_rewrite_failure_falls_back(cx: &mut gpui::TestAppContext) {
+        crate::tests::init_test(cx);
+
+        let fs = fs::FakeFs::new(cx.executor());
+        fs.insert_tree("/root", serde_json::json!({})).await;
+        let project = project::Project::test(fs, ["/root".as_ref()], cx).await;
+
+        let environment = std::rc::Rc::new(cx.update(|cx| {
+            crate::tests::FakeThreadEnvironment::default().with_terminal(
+                crate::tests::FakeTerminalHandle::new_with_immediate_exit(cx, 0),
+            )
+        }));
+
+        let runner = std::rc::Rc::new(
+            |_cx: &mut gpui::AsyncApp,
+             _wrapper: &TerminalWrapperProgram,
+             _cmd: &str,
+             _cwd: Option<&Path>,
+             _ctx: TerminalShellContext| {
+                Task::ready(Err(anyhow::anyhow!("spawn error or non-zero exit")))
+            },
+        );
+
+        cx.update(|cx| {
+            let mut settings = agent_settings::AgentSettings::get_global(cx).clone();
+            settings.tool_permissions.default = settings::ToolPermissionMode::Allow;
+            settings.terminal_wrapper_command = Some("rtk".to_string());
+            agent_settings::AgentSettings::override_global(settings, cx);
+        });
+
+        #[allow(clippy::arc_with_non_send_sync)]
+        let tool = std::sync::Arc::new(
+            TerminalTool::new(project, environment.clone()).with_wrapper_runner(runner),
+        );
+        let (event_stream, _rx) = crate::ToolCallEventStream::test();
+
+        let task = cx.update(|cx| {
+            tool.run(
+                crate::ToolInput::resolved(TerminalToolInput {
+                    command: "cargo test".to_string(),
+                    cd: "root".to_string(),
+                    timeout_ms: None,
+                    ..Default::default()
+                }),
+                event_stream,
+                cx,
+            )
+        });
+
+        task.await.expect("command should succeed via fallback");
+        assert_eq!(
+            environment.terminal_commands(),
+            vec!["cargo test".to_string()]
+        );
+    }
+
+    #[gpui::test]
+    async fn test_terminal_wrapper_unavailable_cache_and_context_separation(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use feature_flags::FeatureFlagAppExt as _;
+
+        crate::tests::init_test(cx);
+
+        cx.update(|cx| {
+            cx.update_flags(true, vec!["sandboxing".to_string()]);
+            let mut settings = agent_settings::AgentSettings::get_global(cx).clone();
+            settings.tool_permissions.default = settings::ToolPermissionMode::Allow;
+            settings.terminal_wrapper_command = Some("rtk".to_string());
+            agent_settings::AgentSettings::override_global(settings, cx);
+        });
+
+        let fs = fs::FakeFs::new(cx.executor());
+        fs.insert_tree("/root", serde_json::json!({})).await;
+        let project = project::Project::test(fs, ["/root".as_ref()], cx).await;
+
+        let environment = std::rc::Rc::new(cx.update(|cx| {
+            crate::tests::FakeThreadEnvironment::default().with_terminal(
+                crate::tests::FakeTerminalHandle::new_with_immediate_exit(cx, 0),
+            )
+        }));
+
+        let call_counts =
+            std::rc::Rc::new(std::cell::RefCell::new(std::collections::HashMap::new()));
+        let runner = {
+            let call_counts = call_counts.clone();
+            std::rc::Rc::new(
+                move |_cx: &mut gpui::AsyncApp,
+                      _wrapper: &TerminalWrapperProgram,
+                      _cmd: &str,
+                      _cwd: Option<&Path>,
+                      ctx: TerminalShellContext| {
+                    *call_counts.borrow_mut().entry(ctx).or_insert(0usize) += 1;
+                    Task::ready(Err(anyhow::anyhow!("runner failed")))
+                },
+            )
+        };
+
+        let shared_state = std::rc::Rc::new(TerminalWrapperState::new(runner));
+
+        #[allow(clippy::arc_with_non_send_sync)]
+        let host_tool = std::sync::Arc::new(
+            TerminalTool::new(project.clone(), environment.clone())
+                .with_wrapper_state(shared_state.clone()),
+        );
+
+        #[allow(clippy::arc_with_non_send_sync)]
+        let sandboxed_tool = std::sync::Arc::new(
+            SandboxedTerminalTool::new(project.clone(), environment.clone())
+                .with_wrapper_state(shared_state.clone()),
+        );
+
+        // Run 1: Host context -> fails, runner called once for Host
+        let (event_stream, _rx) = crate::ToolCallEventStream::test();
+        let task = cx.update(|cx| {
+            host_tool.clone().run(
+                crate::ToolInput::resolved(TerminalToolInput {
+                    command: "cmd1".to_string(),
+                    cd: "root".to_string(),
+                    timeout_ms: None,
+                    ..Default::default()
+                }),
+                event_stream,
+                cx,
+            )
+        });
+        task.await.expect("run 1 should succeed via fallback");
+        assert_eq!(
+            call_counts.borrow().get(&TerminalShellContext::Host),
+            Some(&1)
+        );
+
+        // Run 2: Host context again -> unavailable cache hits, runner NOT called again
+        let (event_stream, _rx) = crate::ToolCallEventStream::test();
+        let task = cx.update(|cx| {
+            host_tool.clone().run(
+                crate::ToolInput::resolved(TerminalToolInput {
+                    command: "cmd2".to_string(),
+                    cd: "root".to_string(),
+                    timeout_ms: None,
+                    ..Default::default()
+                }),
+                event_stream,
+                cx,
+            )
+        });
+        task.await.expect("run 2 should succeed via fallback");
+        assert_eq!(
+            call_counts.borrow().get(&TerminalShellContext::Host),
+            Some(&1)
+        );
+
+        // Run 3: Sandboxed context -> runner IS called (separate context cache)
+        let (event_stream, _rx) = crate::ToolCallEventStream::test();
+        let task = cx.update(|cx| {
+            sandboxed_tool.clone().run(
+                crate::ToolInput::resolved(SandboxedTerminalToolInput {
+                    command: "cmd3".to_string(),
+                    cd: "root".to_string(),
+                    timeout_ms: None,
+                    ..Default::default()
+                }),
+                event_stream,
+                cx,
+            )
+        });
+        task.await.expect("run 3 should succeed via fallback");
+        assert_eq!(
+            call_counts.borrow().get(&TerminalShellContext::Sandboxed),
+            Some(&1)
+        );
+
+        // Run 4: Sandboxed context again -> unavailable cache hits for Sandboxed
+        let (event_stream, _rx) = crate::ToolCallEventStream::test();
+        let task = cx.update(|cx| {
+            sandboxed_tool.clone().run(
+                crate::ToolInput::resolved(SandboxedTerminalToolInput {
+                    command: "cmd4".to_string(),
+                    cd: "root".to_string(),
+                    timeout_ms: None,
+                    ..Default::default()
+                }),
+                event_stream,
+                cx,
+            )
+        });
+        task.await.expect("run 4 should succeed via fallback");
+        assert_eq!(
+            call_counts.borrow().get(&TerminalShellContext::Sandboxed),
+            Some(&1)
+        );
+
+        assert_eq!(
+            environment.terminal_commands(),
+            vec!["cmd1", "cmd2", "cmd3", "cmd4"]
+        );
+    }
+
+    #[gpui::test]
+    async fn test_terminal_wrapper_compound_command(cx: &mut gpui::TestAppContext) {
+        crate::tests::init_test(cx);
+
+        let fs = fs::FakeFs::new(cx.executor());
+        fs.insert_tree("/root", serde_json::json!({})).await;
+        let project = project::Project::test(fs, ["/root".as_ref()], cx).await;
+
+        let environment = std::rc::Rc::new(cx.update(|cx| {
+            crate::tests::FakeThreadEnvironment::default().with_terminal(
+                crate::tests::FakeTerminalHandle::new_with_immediate_exit(cx, 0),
+            )
+        }));
+
+        let captured_commands = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let runner = {
+            let captured_commands = captured_commands.clone();
+            std::rc::Rc::new(
+                move |_cx: &mut gpui::AsyncApp,
+                      _wrapper: &TerminalWrapperProgram,
+                      cmd: &str,
+                      _cwd: Option<&Path>,
+                      _ctx: TerminalShellContext| {
+                    captured_commands.borrow_mut().push(cmd.to_string());
+                    Task::ready(Ok(format!("rtk {cmd}")))
+                },
+            )
+        };
+
+        cx.update(|cx| {
+            let mut settings = agent_settings::AgentSettings::get_global(cx).clone();
+            settings.tool_permissions.default = settings::ToolPermissionMode::Allow;
+            settings.terminal_wrapper_command = Some("rtk".to_string());
+            agent_settings::AgentSettings::override_global(settings, cx);
+        });
+
+        #[allow(clippy::arc_with_non_send_sync)]
+        let tool = std::sync::Arc::new(
+            TerminalTool::new(project, environment.clone()).with_wrapper_runner(runner),
+        );
+        let (event_stream, _rx) = crate::ToolCallEventStream::test();
+
+        let task = cx.update(|cx| {
+            tool.run(
+                crate::ToolInput::resolved(TerminalToolInput {
+                    command: "a && b".to_string(),
+                    cd: "root".to_string(),
+                    timeout_ms: None,
+                    ..Default::default()
+                }),
+                event_stream,
+                cx,
+            )
+        });
+
+        task.await.expect("compound command should succeed");
+        assert_eq!(
+            captured_commands.borrow().as_slice(),
+            &["a && b"],
+            "compound command must be passed to wrapper verbatim without parsing or splitting"
+        );
+        assert_eq!(
+            environment.terminal_commands(),
+            vec!["rtk a && b".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_split_wrapper_command_unit() {
+        assert_eq!(
+            split_wrapper_command("rtk --profile x").unwrap(),
+            vec!["rtk", "--profile", "x"]
+        );
+        assert_eq!(
+            split_wrapper_command("\"C:\\Program Files\\rtk\\rtk.exe\" --profile x").unwrap(),
+            vec!["C:\\Program Files\\rtk\\rtk.exe", "--profile", "x"]
+        );
+        assert_eq!(
+            split_wrapper_command("'C:\\Program Files\\rtk\\rtk.exe' '--flag' 'arg with spaces'")
+                .unwrap(),
+            vec![
+                "C:\\Program Files\\rtk\\rtk.exe",
+                "--flag",
+                "arg with spaces"
+            ]
+        );
+        assert!(split_wrapper_command("rtk \"unbalanced").is_err());
+        assert!(split_wrapper_command("   ").is_err());
+        assert!(split_wrapper_command("\"\"").is_err());
+    }
+
+    #[gpui::test]
+    async fn test_terminal_wrapper_args_passed_to_runner(cx: &mut gpui::TestAppContext) {
+        crate::tests::init_test(cx);
+
+        let fs = fs::FakeFs::new(cx.executor());
+        fs.insert_tree("/root", serde_json::json!({})).await;
+        let project = project::Project::test(fs, ["/root".as_ref()], cx).await;
+
+        let environment = std::rc::Rc::new(cx.update(|cx| {
+            crate::tests::FakeThreadEnvironment::default().with_terminal(
+                crate::tests::FakeTerminalHandle::new_with_immediate_exit(cx, 0),
+            )
+        }));
+
+        let captured_wrapper = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let runner = {
+            let captured_wrapper = captured_wrapper.clone();
+            std::rc::Rc::new(
+                move |_cx: &mut gpui::AsyncApp,
+                      wrapper: &TerminalWrapperProgram,
+                      _cmd: &str,
+                      _cwd: Option<&Path>,
+                      _ctx: TerminalShellContext| {
+                    *captured_wrapper.borrow_mut() = Some(wrapper.clone());
+                    Task::ready(Ok("rewritten".to_string()))
+                },
+            )
+        };
+
+        cx.update(|cx| {
+            let mut settings = agent_settings::AgentSettings::get_global(cx).clone();
+            settings.tool_permissions.default = settings::ToolPermissionMode::Allow;
+            settings.terminal_wrapper_command = Some("rtk --profile x".to_string());
+            agent_settings::AgentSettings::override_global(settings, cx);
+        });
+
+        #[allow(clippy::arc_with_non_send_sync)]
+        let tool = std::sync::Arc::new(
+            TerminalTool::new(project, environment.clone()).with_wrapper_runner(runner),
+        );
+        let (event_stream, _rx) = crate::ToolCallEventStream::test();
+
+        let task = cx.update(|cx| {
+            tool.run(
+                crate::ToolInput::resolved(TerminalToolInput {
+                    command: "cargo test".to_string(),
+                    cd: "root".to_string(),
+                    timeout_ms: None,
+                    ..Default::default()
+                }),
+                event_stream,
+                cx,
+            )
+        });
+
+        task.await.expect("command should succeed");
+        assert_eq!(
+            captured_wrapper.borrow().as_ref(),
+            Some(&TerminalWrapperProgram {
+                program: "rtk".to_string(),
+                args: vec!["--profile".to_string(), "x".to_string()],
+            })
+        );
+    }
+
+    #[gpui::test]
+    async fn test_terminal_wrapper_invalid_spec_falls_back_and_warns(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        crate::tests::init_test(cx);
+
+        let fs = fs::FakeFs::new(cx.executor());
+        fs.insert_tree("/root", serde_json::json!({})).await;
+        let project = project::Project::test(fs, ["/root".as_ref()], cx).await;
+
+        let environment = std::rc::Rc::new(cx.update(|cx| {
+            crate::tests::FakeThreadEnvironment::default().with_terminal(
+                crate::tests::FakeTerminalHandle::new_with_immediate_exit(cx, 0),
+            )
+        }));
+
+        let runner_called = std::rc::Rc::new(std::cell::Cell::new(false));
+        let runner = {
+            let runner_called = runner_called.clone();
+            std::rc::Rc::new(
+                move |_cx: &mut gpui::AsyncApp,
+                      _wrapper: &TerminalWrapperProgram,
+                      _cmd: &str,
+                      _cwd: Option<&Path>,
+                      _ctx: TerminalShellContext| {
+                    runner_called.set(true);
+                    Task::ready(Ok("rewritten".to_string()))
+                },
+            )
+        };
+
+        cx.update(|cx| {
+            let mut settings = agent_settings::AgentSettings::get_global(cx).clone();
+            settings.tool_permissions.default = settings::ToolPermissionMode::Allow;
+            settings.terminal_wrapper_command = Some("rtk \"unclosed quote".to_string());
+            agent_settings::AgentSettings::override_global(settings, cx);
+        });
+
+        let wrapper_state = std::rc::Rc::new(TerminalWrapperState::new(runner));
+        #[allow(clippy::arc_with_non_send_sync)]
+        let tool = std::sync::Arc::new(
+            TerminalTool::new(project, environment.clone())
+                .with_wrapper_state(wrapper_state.clone()),
+        );
+        let (event_stream, mut rx) = crate::ToolCallEventStream::test();
+
+        let task = cx.update(|cx| {
+            tool.run(
+                crate::ToolInput::resolved(TerminalToolInput {
+                    command: "cargo test".to_string(),
+                    cd: "root".to_string(),
+                    timeout_ms: None,
+                    ..Default::default()
+                }),
+                event_stream,
+                cx,
+            )
+        });
+
+        task.await.expect("command should succeed via fallback");
+        assert!(
+            !runner_called.get(),
+            "runner should not be invoked on invalid spec"
+        );
+        assert_eq!(
+            environment.terminal_commands(),
+            vec!["cargo test".to_string()]
+        );
+        assert!(
+            wrapper_state.warned.lock().contains("rtk \"unclosed quote"),
+            "warning should be recorded in warned state"
+        );
+
+        // Assert warning was attached to tool call meta
+        let mut found_warning = false;
+        while let Ok(event) = rx.try_recv() {
+            if let Ok(crate::thread::ThreadEvent::ToolCallUpdate(
+                acp_thread::ToolCallUpdate::UpdateFields(update),
+            )) = event
+            {
+                if let Some(warning) = acp_thread::terminal_wrapper_warning_from_meta(&update.meta)
+                {
+                    assert!(warning.contains("Invalid `terminal_wrapper_command`"));
+                    found_warning = true;
+                    break;
+                }
+            }
+        }
+        assert!(
+            found_warning,
+            "warning should be attached to tool call meta"
+        );
+    }
+
+    #[test]
+    fn test_terminal_wrapper_ttl() {
+        let runner: TerminalWrapperRunner = Rc::new(
+            |_cx: &mut AsyncApp,
+             _wrapper: &TerminalWrapperProgram,
+             _cmd: &str,
+             _cwd: Option<&Path>,
+             _ctx: TerminalShellContext| { Task::ready(Ok("ok".to_string())) },
+        );
+        let state = TerminalWrapperState::new(runner);
+        let now = Instant::now();
+
+        state.mark_unavailable_at(TerminalShellContext::Host, "rtk", now);
+        assert!(state.is_unavailable_at(TerminalShellContext::Host, "rtk", now));
+        assert!(state.is_unavailable_at(
+            TerminalShellContext::Host,
+            "rtk",
+            now + Duration::from_secs(30)
+        ));
+        assert!(!state.is_unavailable_at(
+            TerminalShellContext::Host,
+            "rtk",
+            now + Duration::from_secs(61)
+        ));
+
+        // Success removes entry
+        state.mark_unavailable_at(TerminalShellContext::Host, "rtk", now);
+        assert!(state.is_unavailable_at(TerminalShellContext::Host, "rtk", now));
+        state.mark_available(TerminalShellContext::Host, "rtk");
+        assert!(!state.is_unavailable_at(TerminalShellContext::Host, "rtk", now));
+    }
+
+    #[gpui::test]
+    async fn test_terminal_wrapper_cache_reset_on_spec_change(cx: &mut gpui::TestAppContext) {
+        crate::tests::init_test(cx);
+
+        let fs = fs::FakeFs::new(cx.executor());
+        fs.insert_tree("/root", serde_json::json!({})).await;
+        let project = project::Project::test(fs, ["/root".as_ref()], cx).await;
+
+        let environment = std::rc::Rc::new(cx.update(|cx| {
+            crate::tests::FakeThreadEnvironment::default().with_terminal(
+                crate::tests::FakeTerminalHandle::new_with_immediate_exit(cx, 0),
+            )
+        }));
+
+        let runner_invocations = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let runner = {
+            let runner_invocations = runner_invocations.clone();
+            std::rc::Rc::new(
+                move |_cx: &mut gpui::AsyncApp,
+                      wrapper: &TerminalWrapperProgram,
+                      _cmd: &str,
+                      _cwd: Option<&Path>,
+                      _ctx: TerminalShellContext| {
+                    runner_invocations
+                        .borrow_mut()
+                        .push(wrapper.program.clone());
+                    Task::ready(Err(anyhow::anyhow!("fail")))
+                },
+            )
+        };
+
+        let wrapper_state = std::rc::Rc::new(TerminalWrapperState::new(runner));
+        #[allow(clippy::arc_with_non_send_sync)]
+        let tool = std::sync::Arc::new(
+            TerminalTool::new(project, environment.clone())
+                .with_wrapper_state(wrapper_state.clone()),
+        );
+
+        // Step 1: Run with spec A -> fails and is cached
+        cx.update(|cx| {
+            let mut settings = agent_settings::AgentSettings::get_global(cx).clone();
+            settings.tool_permissions.default = settings::ToolPermissionMode::Allow;
+            settings.terminal_wrapper_command = Some("spec_a".to_string());
+            agent_settings::AgentSettings::override_global(settings, cx);
+        });
+
+        let (event_stream, _rx) = crate::ToolCallEventStream::test();
+        let task = cx.update(|cx| {
+            tool.clone().run(
+                crate::ToolInput::resolved(TerminalToolInput {
+                    command: "cmd1".to_string(),
+                    cd: "root".to_string(),
+                    timeout_ms: None,
+                    ..Default::default()
+                }),
+                event_stream,
+                cx,
+            )
+        });
+        task.await.expect("run 1 succeeds via fallback");
+        assert_eq!(runner_invocations.borrow().as_slice(), &["spec_a"]);
+
+        // Step 2: Switch to spec B -> runner is invoked again for spec B
+        cx.update(|cx| {
+            let mut settings = agent_settings::AgentSettings::get_global(cx).clone();
+            settings.terminal_wrapper_command = Some("spec_b".to_string());
+            agent_settings::AgentSettings::override_global(settings, cx);
+        });
+
+        let (event_stream, _rx) = crate::ToolCallEventStream::test();
+        let task = cx.update(|cx| {
+            tool.clone().run(
+                crate::ToolInput::resolved(TerminalToolInput {
+                    command: "cmd2".to_string(),
+                    cd: "root".to_string(),
+                    timeout_ms: None,
+                    ..Default::default()
+                }),
+                event_stream,
+                cx,
+            )
+        });
+        task.await.expect("run 2 succeeds via fallback");
+        assert_eq!(
+            runner_invocations.borrow().as_slice(),
+            &["spec_a", "spec_b"]
+        );
+
+        // Step 3: Switch back to spec A within TTL -> spec A still cached, runner NOT invoked
+        cx.update(|cx| {
+            let mut settings = agent_settings::AgentSettings::get_global(cx).clone();
+            settings.terminal_wrapper_command = Some("spec_a".to_string());
+            agent_settings::AgentSettings::override_global(settings, cx);
+        });
+
+        let (event_stream, _rx) = crate::ToolCallEventStream::test();
+        let task = cx.update(|cx| {
+            tool.clone().run(
+                crate::ToolInput::resolved(TerminalToolInput {
+                    command: "cmd3".to_string(),
+                    cd: "root".to_string(),
+                    timeout_ms: None,
+                    ..Default::default()
+                }),
+                event_stream,
+                cx,
+            )
+        });
+        task.await.expect("run 3 succeeds via fallback");
+        assert_eq!(
+            runner_invocations.borrow().as_slice(),
+            &["spec_a", "spec_b"],
+            "spec_a should still be cached within TTL"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_terminal_wrapper_per_profile_tristate(cx: &mut gpui::TestAppContext) {
+        crate::tests::init_test(cx);
+
+        let fs = fs::FakeFs::new(cx.executor());
+        fs.insert_tree("/root", serde_json::json!({})).await;
+        let project = project::Project::test(fs, ["/root".as_ref()], cx).await;
+
+        let environment = std::rc::Rc::new(cx.update(|cx| {
+            crate::tests::FakeThreadEnvironment::default().with_terminal(
+                crate::tests::FakeTerminalHandle::new_with_immediate_exit(cx, 0),
+            )
+        }));
+
+        let captured_wrapper = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let runner = {
+            let captured_wrapper = captured_wrapper.clone();
+            std::rc::Rc::new(
+                move |_cx: &mut gpui::AsyncApp,
+                      wrapper: &TerminalWrapperProgram,
+                      _cmd: &str,
+                      _cwd: Option<&Path>,
+                      _ctx: TerminalShellContext| {
+                    captured_wrapper.borrow_mut().push(wrapper.program.clone());
+                    Task::ready(Ok("rewritten".to_string()))
+                },
+            )
+        };
+
+        // Global wrapper is "global_rtk"
+        cx.update(|cx| {
+            let mut settings = agent_settings::AgentSettings::get_global(cx).clone();
+            settings.tool_permissions.default = settings::ToolPermissionMode::Allow;
+            settings.terminal_wrapper_command = Some("global_rtk".to_string());
+            agent_settings::AgentSettings::override_global(settings, cx);
+        });
+
+        #[allow(clippy::arc_with_non_send_sync)]
+        let tool = std::sync::Arc::new(
+            TerminalTool::new(project, environment.clone()).with_wrapper_runner(runner),
+        );
+
+        // Case 1: Profile overrides with "profile_rtk" -> override wins
+        let override_profile_id = agent_settings::AgentProfileId("override_profile".into());
+        let override_profile = AgentProfileSettings {
+            name: "override_profile".into(),
+            origin: Default::default(),
+            tools: collections::IndexMap::default(),
+            enable_all_context_servers: false,
+            context_servers: collections::IndexMap::default(),
+            default_model: None,
+            custom_prompt_path: None,
+            system_prompt_template: None,
+            description: None,
+            skills: None,
+            delegation: None,
+            tool_permissions: None,
+            permission_mode: None,
+            terminal_wrapper_command: Some("profile_rtk".into()),
+        };
+        cx.update(|cx| {
+            let mut settings = agent_settings::AgentSettings::get_global(cx).clone();
+            settings
+                .profiles
+                .insert(override_profile_id.clone(), override_profile);
+            agent_settings::AgentSettings::override_global(settings, cx);
+        });
+
+        let (event_stream, _rx) =
+            crate::ToolCallEventStream::test_with_profile(override_profile_id);
+        let task = cx.update(|cx| {
+            tool.clone().run(
+                crate::ToolInput::resolved(TerminalToolInput {
+                    command: "cmd1".to_string(),
+                    cd: "root".to_string(),
+                    timeout_ms: None,
+                    ..Default::default()
+                }),
+                event_stream,
+                cx,
+            )
+        });
+        task.await.expect("command should succeed");
+        assert_eq!(captured_wrapper.borrow().as_slice(), &["profile_rtk"]);
+
+        // Case 2: Profile has Some("") -> explicitly disables wrapper despite global set
+        let disabled_profile_id = agent_settings::AgentProfileId("disabled_profile".into());
+        let disabled_profile = AgentProfileSettings {
+            name: "disabled_profile".into(),
+            origin: Default::default(),
+            tools: collections::IndexMap::default(),
+            enable_all_context_servers: false,
+            context_servers: collections::IndexMap::default(),
+            default_model: None,
+            custom_prompt_path: None,
+            system_prompt_template: None,
+            description: None,
+            skills: None,
+            delegation: None,
+            tool_permissions: None,
+            permission_mode: None,
+            terminal_wrapper_command: Some("".into()),
+        };
+        cx.update(|cx| {
+            let mut settings = agent_settings::AgentSettings::get_global(cx).clone();
+            settings
+                .profiles
+                .insert(disabled_profile_id.clone(), disabled_profile);
+            agent_settings::AgentSettings::override_global(settings, cx);
+        });
+
+        let (event_stream, _rx) =
+            crate::ToolCallEventStream::test_with_profile(disabled_profile_id);
+        let task = cx.update(|cx| {
+            tool.clone().run(
+                crate::ToolInput::resolved(TerminalToolInput {
+                    command: "cmd2".to_string(),
+                    cd: "root".to_string(),
+                    timeout_ms: None,
+                    ..Default::default()
+                }),
+                event_stream,
+                cx,
+            )
+        });
+        task.await.expect("command should succeed");
+        assert_eq!(
+            captured_wrapper.borrow().as_slice(),
+            &["profile_rtk"],
+            "disabled profile should not invoke wrapper"
+        );
+
+        // Case 3: Profile has None -> inherits global "global_rtk"
+        let inherit_profile_id = agent_settings::AgentProfileId("inherit_profile".into());
+        let inherit_profile = AgentProfileSettings {
+            name: "inherit_profile".into(),
+            origin: Default::default(),
+            tools: collections::IndexMap::default(),
+            enable_all_context_servers: false,
+            context_servers: collections::IndexMap::default(),
+            default_model: None,
+            custom_prompt_path: None,
+            system_prompt_template: None,
+            description: None,
+            skills: None,
+            delegation: None,
+            tool_permissions: None,
+            permission_mode: None,
+            terminal_wrapper_command: None,
+        };
+        cx.update(|cx| {
+            let mut settings = agent_settings::AgentSettings::get_global(cx).clone();
+            settings
+                .profiles
+                .insert(inherit_profile_id.clone(), inherit_profile);
+            agent_settings::AgentSettings::override_global(settings, cx);
+        });
+
+        let (event_stream, _rx) = crate::ToolCallEventStream::test_with_profile(inherit_profile_id);
+        let task = cx.update(|cx| {
+            tool.clone().run(
+                crate::ToolInput::resolved(TerminalToolInput {
+                    command: "cmd3".to_string(),
+                    cd: "root".to_string(),
+                    timeout_ms: None,
+                    ..Default::default()
+                }),
+                event_stream,
+                cx,
+            )
+        });
+        task.await.expect("command should succeed");
+        assert_eq!(
+            captured_wrapper.borrow().as_slice(),
+            &["profile_rtk", "global_rtk"]
+        );
+    }
+
+    #[gpui::test]
+    async fn test_terminal_wrapper_relative_path_resolved_from_project_root(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        crate::tests::init_test(cx);
+
+        let fs = fs::FakeFs::new(cx.executor());
+        fs.insert_tree("/root", serde_json::json!({})).await;
+        let project = project::Project::test(fs, ["/root".as_ref()], cx).await;
+
+        let environment = std::rc::Rc::new(cx.update(|cx| {
+            crate::tests::FakeThreadEnvironment::default().with_terminal(
+                crate::tests::FakeTerminalHandle::new_with_immediate_exit(cx, 0),
+            )
+        }));
+
+        let captured_program = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let runner = {
+            let captured_program = captured_program.clone();
+            std::rc::Rc::new(
+                move |_cx: &mut gpui::AsyncApp,
+                      wrapper: &TerminalWrapperProgram,
+                      _cmd: &str,
+                      _cwd: Option<&Path>,
+                      _ctx: TerminalShellContext| {
+                    *captured_program.borrow_mut() = Some(wrapper.program.clone());
+                    Task::ready(Ok("rewritten".to_string()))
+                },
+            )
+        };
+
+        cx.update(|cx| {
+            let mut settings = agent_settings::AgentSettings::get_global(cx).clone();
+            settings.tool_permissions.default = settings::ToolPermissionMode::Allow;
+            settings.terminal_wrapper_command = Some("./.zed/mcp/rtk.exe".to_string());
+            agent_settings::AgentSettings::override_global(settings, cx);
+        });
+
+        #[allow(clippy::arc_with_non_send_sync)]
+        let tool = std::sync::Arc::new(
+            TerminalTool::new(project, environment.clone()).with_wrapper_runner(runner),
+        );
+        let (event_stream, _rx) = crate::ToolCallEventStream::test();
+
+        let task = cx.update(|cx| {
+            tool.run(
+                crate::ToolInput::resolved(TerminalToolInput {
+                    command: "cargo test".to_string(),
+                    cd: "root".to_string(),
+                    timeout_ms: None,
+                    ..Default::default()
+                }),
+                event_stream,
+                cx,
+            )
+        });
+
+        task.await.expect("command should succeed");
+        let resolved = captured_program
+            .borrow()
+            .clone()
+            .expect("program was captured");
+        assert_eq!(
+            Path::new(&resolved),
+            Path::new("/root/.zed/mcp/rtk.exe"),
+            "relative wrapper program path should be resolved against project root"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_terminal_wrapper_warning_deduped(cx: &mut gpui::TestAppContext) {
+        crate::tests::init_test(cx);
+
+        let fs = fs::FakeFs::new(cx.executor());
+        fs.insert_tree("/root", serde_json::json!({})).await;
+        let project = project::Project::test(fs, ["/root".as_ref()], cx).await;
+
+        let environment = std::rc::Rc::new(cx.update(|cx| {
+            crate::tests::FakeThreadEnvironment::default().with_terminal(
+                crate::tests::FakeTerminalHandle::new_with_immediate_exit(cx, 0),
+            )
+        }));
+
+        let runner = std::rc::Rc::new(
+            |_cx: &mut gpui::AsyncApp,
+             _wrapper: &TerminalWrapperProgram,
+             _cmd: &str,
+             _cwd: Option<&Path>,
+             _ctx: TerminalShellContext| {
+                Task::ready(Err(anyhow::anyhow!("probe failure")))
+            },
+        );
+
+        let wrapper_state = std::rc::Rc::new(TerminalWrapperState::new(runner));
+
+        cx.update(|cx| {
+            let mut settings = agent_settings::AgentSettings::get_global(cx).clone();
+            settings.tool_permissions.default = settings::ToolPermissionMode::Allow;
+            settings.terminal_wrapper_command = Some("failing_rtk".to_string());
+            agent_settings::AgentSettings::override_global(settings, cx);
+        });
+
+        #[allow(clippy::arc_with_non_send_sync)]
+        let tool = std::sync::Arc::new(
+            TerminalTool::new(project, environment.clone())
+                .with_wrapper_state(wrapper_state.clone()),
+        );
+
+        // Run 1: probe fails -> attaches warning to meta and records in warned set
+        let (event_stream, mut rx) = crate::ToolCallEventStream::test();
+        let task = cx.update(|cx| {
+            tool.clone().run(
+                crate::ToolInput::resolved(TerminalToolInput {
+                    command: "cmd1".to_string(),
+                    cd: "root".to_string(),
+                    timeout_ms: None,
+                    ..Default::default()
+                }),
+                event_stream,
+                cx,
+            )
+        });
+        task.await.expect("run 1 should succeed via fallback");
+
+        let mut run1_warning = false;
+        while let Ok(event) = rx.try_recv() {
+            if let Ok(crate::thread::ThreadEvent::ToolCallUpdate(
+                acp_thread::ToolCallUpdate::UpdateFields(update),
+            )) = event
+            {
+                if acp_thread::terminal_wrapper_warning_from_meta(&update.meta).is_some() {
+                    run1_warning = true;
+                    break;
+                }
+            }
+        }
+        assert!(run1_warning, "run 1 should attach wrapper warning to meta");
+
+        // Run 2: same probe fails / hits cache -> does NOT attach warning again
+        let (event_stream, mut rx) = crate::ToolCallEventStream::test();
+        let task = cx.update(|cx| {
+            tool.clone().run(
+                crate::ToolInput::resolved(TerminalToolInput {
+                    command: "cmd2".to_string(),
+                    cd: "root".to_string(),
+                    timeout_ms: None,
+                    ..Default::default()
+                }),
+                event_stream,
+                cx,
+            )
+        });
+        task.await.expect("run 2 should succeed via fallback");
+
+        let mut run2_warning = false;
+        while let Ok(event) = rx.try_recv() {
+            if let Ok(crate::thread::ThreadEvent::ToolCallUpdate(
+                acp_thread::ToolCallUpdate::UpdateFields(update),
+            )) = event
+            {
+                if acp_thread::terminal_wrapper_warning_from_meta(&update.meta).is_some() {
+                    run2_warning = true;
+                    break;
+                }
+            }
+        }
+        assert!(
+            !run2_warning,
+            "run 2 should NOT attach duplicate wrapper warning"
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn test_to_wsl_path_conversion() {
+        assert_eq!(
+            to_wsl_path(Path::new("C:\\Program Files\\rtk\\rtk.exe")),
+            Some("/mnt/c/Program Files/rtk/rtk.exe".to_string())
+        );
+        assert_eq!(
+            to_wsl_path(Path::new("D:/tools/rtk")),
+            Some("/mnt/d/tools/rtk".to_string())
+        );
+        assert_eq!(to_wsl_path(Path::new("rtk")), None);
     }
 }

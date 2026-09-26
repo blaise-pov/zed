@@ -202,6 +202,7 @@ mod tests {
             delegation: None,
             tool_permissions: Some(ToolPermissions::default()),
             permission_mode: None,
+            terminal_wrapper_command: None,
         }
     }
 

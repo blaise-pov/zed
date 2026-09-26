@@ -101,7 +101,7 @@ impl EditFileTool {
         cx: &mut App,
     ) -> Task<Result<()>> {
         self.session_context
-            .authorize(Self::NAME, path, event_stream, cx)
+            .authorize(Self::NAME, path, None, event_stream, cx)
     }
 
     async fn process_streaming_edits(

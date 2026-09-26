@@ -1367,6 +1367,168 @@ mod tests {
         assert_eq!(on_disk, "on disk content plus user edit");
     }
 
+    #[gpui::test]
+    async fn test_write_file_relative_path_with_profile_write_scopes(cx: &mut TestAppContext) {
+        let (write_tool, _project, _action_log, _fs, _thread) = setup_test(
+            cx,
+            json!({
+                ".zed": {
+                    "prompts": {}
+                },
+                "dir": {}
+            }),
+        )
+        .await;
+
+        let profile_id = agent_settings::AgentProfileId("autonomous_dev".into());
+        let mut tools = collections::HashMap::default();
+        tools.insert(
+            Arc::from("write_file"),
+            agent_settings::ToolRules {
+                default: Some(settings::ToolPermissionMode::Allow),
+                always_allow: vec![],
+                always_deny: vec![],
+                always_confirm: vec![],
+                write_scopes: Some(
+                    agent_settings::WriteScopes::new(vec![
+                        Arc::from(".zed/prompts/**"),
+                        Arc::from("dir/**"),
+                    ])
+                    .unwrap(),
+                ),
+                invalid_patterns: vec![],
+            },
+        );
+        let profile = agent_settings::AgentProfileSettings {
+            name: "autonomous_dev".into(),
+            origin: Default::default(),
+            tools: collections::IndexMap::default(),
+            enable_all_context_servers: false,
+            context_servers: collections::IndexMap::default(),
+            default_model: None,
+            custom_prompt_path: None,
+            system_prompt_template: None,
+            description: None,
+            skills: None,
+            delegation: None,
+            tool_permissions: Some(agent_settings::ToolPermissions {
+                default: settings::ToolPermissionMode::Deny,
+                tools,
+            }),
+            permission_mode: Some(agent_settings::AgentPermissionMode::Autonomous),
+            terminal_wrapper_command: None,
+        };
+        cx.update(|cx| {
+            let mut settings = agent_settings::AgentSettings::get_global(cx).clone();
+            settings.profiles.insert(profile_id.clone(), profile);
+            agent_settings::AgentSettings::override_global(settings, cx);
+        });
+
+        let (event_stream, _rx) = ToolCallEventStream::test_with_profile(profile_id);
+
+        let result = cx
+            .update(|cx| {
+                write_tool.clone().run(
+                    ToolInput::resolved(WriteFileToolInput {
+                        path: ".zed/prompts/researcher.md".into(),
+                        content: "# Researcher Prompt".into(),
+                    }),
+                    event_stream,
+                    cx,
+                )
+            })
+            .await;
+
+        assert!(result.is_ok(), "Expected success, got: {:?}", result.err());
+    }
+
+    #[gpui::test]
+    async fn test_write_file_multi_worktree_relative_path_with_profile_write_scopes(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let fs = project::FakeFs::new(cx.executor());
+        fs.insert_tree(
+            "/root",
+            json!({
+                "backend": {
+                    "src": {}
+                },
+                "frontend": {
+                    "src": {}
+                }
+            }),
+        )
+        .await;
+
+        let (write_tool, _project, _action_log, _fs, _thread) = setup_test_with_fs(
+            cx,
+            fs,
+            &[
+                path!("/root/backend").as_ref(),
+                path!("/root/frontend").as_ref(),
+            ],
+        )
+        .await;
+
+        let profile_id = agent_settings::AgentProfileId("backend_dev".into());
+        let mut tools = collections::HashMap::default();
+        tools.insert(
+            Arc::from("write_file"),
+            agent_settings::ToolRules {
+                default: Some(settings::ToolPermissionMode::Allow),
+                always_allow: vec![],
+                always_deny: vec![],
+                always_confirm: vec![],
+                write_scopes: Some(
+                    agent_settings::WriteScopes::new(vec![Arc::from("backend/**")]).unwrap(),
+                ),
+                invalid_patterns: vec![],
+            },
+        );
+        let profile = agent_settings::AgentProfileSettings {
+            name: "backend_dev".into(),
+            origin: Default::default(),
+            tools: collections::IndexMap::default(),
+            enable_all_context_servers: false,
+            context_servers: collections::IndexMap::default(),
+            default_model: None,
+            custom_prompt_path: None,
+            system_prompt_template: None,
+            description: None,
+            skills: None,
+            delegation: None,
+            tool_permissions: Some(agent_settings::ToolPermissions {
+                default: settings::ToolPermissionMode::Deny,
+                tools,
+            }),
+            permission_mode: Some(agent_settings::AgentPermissionMode::Autonomous),
+            terminal_wrapper_command: None,
+        };
+        cx.update(|cx| {
+            let mut settings = agent_settings::AgentSettings::get_global(cx).clone();
+            settings.profiles.insert(profile_id.clone(), profile);
+            agent_settings::AgentSettings::override_global(settings, cx);
+        });
+
+        let (event_stream, _rx) = ToolCallEventStream::test_with_profile(profile_id);
+
+        let result = cx
+            .update(|cx| {
+                write_tool.clone().run(
+                    ToolInput::resolved(WriteFileToolInput {
+                        path: "backend/src/new_file.rs".into(),
+                        content: "fn main() {}".into(),
+                    }),
+                    event_stream,
+                    cx,
+                )
+            })
+            .await;
+
+        assert!(result.is_ok(), "Expected success, got: {:?}", result.err());
+    }
+
     async fn setup_test_with_fs(
         cx: &mut TestAppContext,
         fs: Arc<project::FakeFs>,

@@ -25,7 +25,7 @@ pub struct TerminalToolHeader {
     truncated_tooltip: Option<SharedString>,
     failed: bool,
     exit_code: Option<i32>,
-    sandbox_warning: Option<TerminalSandboxWarning>,
+    sandbox_warnings: Vec<TerminalSandboxWarning>,
     on_toggle_expand: Option<ClickHandler>,
     on_stop: Option<ClickHandler>,
     command_slot: Option<AnyElement>,
@@ -48,7 +48,7 @@ impl TerminalToolHeader {
             truncated_tooltip: None,
             failed: false,
             exit_code: None,
-            sandbox_warning: None,
+            sandbox_warnings: Vec::new(),
             on_toggle_expand: None,
             on_stop: None,
             command_slot: None,
@@ -77,7 +77,7 @@ impl TerminalToolHeader {
     }
 
     pub fn sandbox_warning(mut self, warning: TerminalSandboxWarning) -> Self {
-        self.sandbox_warning = Some(warning);
+        self.sandbox_warnings.push(warning);
         self
     }
 
@@ -119,7 +119,7 @@ impl RenderOnce for TerminalToolHeader {
             truncated_tooltip,
             failed,
             exit_code,
-            sandbox_warning,
+            sandbox_warnings,
             on_toggle_expand,
             on_stop,
             command_slot,
@@ -217,26 +217,44 @@ impl RenderOnce for TerminalToolHeader {
                         }),
                 )
             })
-            .when_some(sandbox_warning, |header, warning| {
-                let TerminalSandboxWarning {
-                    title,
-                    detail,
-                    docs_url,
-                } = warning;
-                header.child(
-                    IconButton::new(child_id("sandbox-not-applied"), IconName::LockOff)
+            .children(
+                sandbox_warnings
+                    .into_iter()
+                    .enumerate()
+                    .map(|(ix, warning)| {
+                        let TerminalSandboxWarning {
+                            title,
+                            detail,
+                            docs_url,
+                        } = warning;
+                        let has_docs = !docs_url.is_empty();
+                        IconButton::new(
+                            child_id(&format!("sandbox-warning-{ix}")),
+                            if has_docs {
+                                IconName::LockOff
+                            } else {
+                                IconName::Warning
+                            },
+                        )
                         .icon_size(IconSize::Small)
-                        .tooltip(move |_window, cx| {
-                            Tooltip::with_meta(
-                                title.clone(),
-                                None,
-                                format!("{detail} Click to learn more about sandboxing."),
-                                cx,
-                            )
+                        .when(!has_docs, |button| {
+                            button
+                                .cursor_style(CursorStyle::Arrow)
+                                .style(ButtonStyle::Transparent)
                         })
-                        .on_click(move |_, _, cx| cx.open_url(&docs_url)),
-                )
-            });
+                        .tooltip(move |_window, cx| {
+                            let meta = if has_docs {
+                                format!("{detail} Click to learn more about sandboxing.")
+                            } else {
+                                detail.to_string()
+                            };
+                            Tooltip::with_meta(title.clone(), None, meta, cx)
+                        })
+                        .when(has_docs, |button| {
+                            button.on_click(move |_, _, cx| cx.open_url(&docs_url))
+                        })
+                    }),
+            );
 
         v_flex()
             .group(hover_group)

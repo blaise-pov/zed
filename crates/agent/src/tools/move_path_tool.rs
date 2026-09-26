@@ -865,6 +865,7 @@ mod tests {
                 tools,
             }),
             permission_mode: Some(AgentPermissionMode::Autonomous),
+            terminal_wrapper_command: None,
         };
 
         cx.update(|cx| {
@@ -943,6 +944,7 @@ mod tests {
                 tools,
             }),
             permission_mode: Some(AgentPermissionMode::Interactive),
+            terminal_wrapper_command: None,
         };
 
         cx.update(|cx| {

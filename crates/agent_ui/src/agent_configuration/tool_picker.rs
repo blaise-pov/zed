@@ -430,6 +430,10 @@ impl PickerDelegate for ToolPickerDelegate {
                         .as_ref()
                         .map(|tool_permissions| tool_permissions.to_content()),
                     permission_mode: default_profile.permission_mode,
+                    terminal_wrapper_command: default_profile
+                        .terminal_wrapper_command
+                        .clone()
+                        .map(|s| s.to_string()),
                 });
 
             match item {

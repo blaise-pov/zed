@@ -7969,6 +7969,16 @@ impl ThreadView {
         .when_some(tool_call.sandbox_not_applied.as_ref(), |header, reason| {
             header.sandbox_warning(self.sandbox_not_applied_warning(reason, cx))
         })
+        .when_some(
+            tool_call.terminal_wrapper_warning.as_ref(),
+            |header, warning| {
+                header.sandbox_warning(TerminalSandboxWarning {
+                    title: "Terminal wrapper inactive".into(),
+                    detail: warning.clone(),
+                    docs_url: "".into(),
+                })
+            },
+        )
         .command_slot(command_element);
 
         let terminal_view = self

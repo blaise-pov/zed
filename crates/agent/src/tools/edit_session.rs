@@ -159,12 +159,14 @@ impl EditSessionContext {
         &self,
         tool_name: &str,
         path: &PathBuf,
+        resolved_path: Option<&PathBuf>,
         event_stream: &ToolCallEventStream,
         cx: &mut App,
     ) -> Task<Result<()>> {
-        super::tool_permissions::authorize_file_edit(
+        super::tool_permissions::authorize_file_edit_with_resolved(
             tool_name,
             path,
+            resolved_path.map(|p| p.as_path()),
             &self.thread,
             event_stream,
             cx,
@@ -718,7 +720,7 @@ impl EditSession {
             ToolCallUpdateFields::new().locations(vec![ToolCallLocation::new(abs_path.clone())]),
         );
 
-        cx.update(|cx| context.authorize(tool_name, &path, event_stream, cx))
+        cx.update(|cx| context.authorize(tool_name, &path, Some(&abs_path), event_stream, cx))
             .await
             .map_err(|e| e.to_string())?;
 

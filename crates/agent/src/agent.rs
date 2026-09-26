@@ -3238,12 +3238,13 @@ impl NativeThreadEnvironment {
             .read(cx)
             .agent_settings(cx)
             .nested_sub_agents;
-        let (current_depth, parent_session_id, slot_pool) = {
+        let (current_depth, parent_session_id, slot_pool, parent_budget) = {
             let parent_thread = parent_thread_entity.read(cx);
             (
                 parent_thread.depth(),
                 parent_thread.id().clone(),
                 parent_thread.subagent_slot_pool(),
+                parent_thread.delegation_budget(),
             )
         };
 
@@ -3286,7 +3287,7 @@ impl NativeThreadEnvironment {
             if let Some(error) = agent_settings::check_delegation(
                 &parent_profile_id,
                 parent_profile.as_ref(),
-                current_depth,
+                parent_budget,
                 profile.as_ref(),
             ) {
                 anyhow::bail!(error);
@@ -3403,28 +3404,38 @@ impl NativeThreadEnvironment {
         if let Some(profile) = profile {
             // Switching a resumed sub-agent to a different profile is itself a
             // delegation decision, so it must pass the parent's rules too.
-            if let Some(parent_thread_entity) = self.thread.upgrade() {
-                let (parent_profile_id, parent_depth) = {
-                    let parent_thread = parent_thread_entity.read(cx);
-                    (parent_thread.profile().clone(), parent_thread.depth())
-                };
-                let parent_profile = parent_thread_entity
-                    .read(cx)
-                    .agent_settings(cx)
-                    .profiles
-                    .get(&parent_profile_id)
-                    .cloned();
-                if let Some(error) = agent_settings::check_delegation(
-                    &parent_profile_id,
-                    parent_profile.as_ref(),
-                    parent_depth,
-                    Some(&profile),
-                ) {
-                    anyhow::bail!(error);
-                }
+            let parent_thread_entity = self
+                .thread
+                .upgrade()
+                .ok_or_else(|| anyhow!("Parent thread no longer exists"))?;
+            let (parent_profile_id, parent_budget) = {
+                let parent_thread = parent_thread_entity.read(cx);
+                (
+                    parent_thread.profile().clone(),
+                    parent_thread.delegation_budget(),
+                )
+            };
+            let parent_profile = parent_thread_entity
+                .read(cx)
+                .agent_settings(cx)
+                .profiles
+                .get(&parent_profile_id)
+                .cloned();
+            if let Some(error) = agent_settings::check_delegation(
+                &parent_profile_id,
+                parent_profile.as_ref(),
+                parent_budget,
+                Some(&profile),
+            ) {
+                anyhow::bail!(error);
             }
             subagent_thread.update(cx, |thread, cx| {
-                thread.apply_explicit_profile(profile, cx);
+                thread.apply_explicit_profile(profile.clone(), cx);
+                let child_profile = thread.agent_settings(cx).profiles.get(&profile);
+                thread.set_delegation_budget(agent_settings::child_remaining_budget(
+                    parent_budget,
+                    child_profile,
+                ));
             });
         }
 
