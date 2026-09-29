@@ -1,7 +1,9 @@
 use std::fmt::Write;
+use std::path::Path;
 use std::sync::Arc;
 
 use agent_client_protocol::schema::v1 as acp;
+use agent_settings::{AgentPermissionMode, AgentProfileSettings};
 use gpui::{App, Entity, SharedString, Task};
 use project::Project;
 use schemars::JsonSchema;
@@ -75,7 +77,7 @@ impl AgentTool for ApplyCodeActionTool {
     fn run(
         self: Arc<Self>,
         input: ToolInput<Self::Input>,
-        _event_stream: ToolCallEventStream,
+        event_stream: ToolCallEventStream,
         cx: &mut App,
     ) -> Task<Result<String, String>> {
         let project = self.project.clone();
@@ -85,6 +87,10 @@ impl AgentTool for ApplyCodeActionTool {
                 .recv()
                 .await
                 .map_err(|e| format!("Failed to receive tool input: {e}"))?;
+
+            let task_worktree = cx.update(|cx| event_stream.task_worktree(cx));
+            let profile = cx.update(|cx| event_stream.profile_settings(cx));
+            check_apply_code_action_permissions(profile.as_ref(), task_worktree.as_deref())?;
 
             let pending = store.update(cx, |store, _cx| store.take()).ok_or_else(|| {
                 "No code actions available. Call get_code_actions first.".to_string()
@@ -141,5 +147,78 @@ impl AgentTool for ApplyCodeActionTool {
 
             Ok(output)
         })
+    }
+}
+
+fn check_apply_code_action_permissions(
+    profile: Option<&AgentProfileSettings>,
+    task_worktree: Option<&Path>,
+) -> Result<(), String> {
+    if let Some(task_worktree) = task_worktree {
+        return Err(format!(
+            "PolicyDenied: apply_code_action performs language-server edits across an \
+             unbounded set of files, so it cannot be confined to isolated task worktree '{}'. \
+             Use edit_file instead.",
+            task_worktree.display()
+        ));
+    }
+
+    if let Some(profile) = profile
+        && profile.effective_permission_mode() == AgentPermissionMode::Autonomous
+    {
+        return Err(format!(
+            "PolicyDenied: apply_code_action performs language-server edits across an \
+             unbounded set of files, so it cannot be confined to write_scopes and is \
+             disallowed for autonomous profile '{}'. Use edit_file instead.",
+            profile.name
+        ));
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use agent_settings::ToolPermissions;
+
+    fn autonomous_profile() -> AgentProfileSettings {
+        AgentProfileSettings {
+            name: "backend_engineer".into(),
+            origin: Default::default(),
+            tools: collections::IndexMap::default(),
+            enable_all_context_servers: false,
+            context_servers: collections::IndexMap::default(),
+            default_model: None,
+            custom_prompt_path: None,
+            system_prompt_template: None,
+            description: None,
+            skills: None,
+            delegation: None,
+            tool_permissions: Some(ToolPermissions::default()),
+            permission_mode: None,
+            terminal_wrapper_command: None,
+        }
+    }
+
+    #[test]
+    fn test_apply_code_action_denied_for_worktree_bound() {
+        let worktree = Path::new("/worktrees/agent-task-TASK-1");
+        let error = check_apply_code_action_permissions(None, Some(worktree)).unwrap_err();
+        assert!(error.contains("PolicyDenied"));
+        assert!(error.contains("agent-task-TASK-1"));
+    }
+
+    #[test]
+    fn test_apply_code_action_denied_for_autonomous_profile() {
+        let profile = autonomous_profile();
+        let error = check_apply_code_action_permissions(Some(&profile), None).unwrap_err();
+        assert!(error.contains("PolicyDenied"));
+        assert!(error.contains("backend_engineer"));
+    }
+
+    #[test]
+    fn test_apply_code_action_allowed_without_profile_or_worktree() {
+        assert!(check_apply_code_action_permissions(None, None).is_ok());
     }
 }

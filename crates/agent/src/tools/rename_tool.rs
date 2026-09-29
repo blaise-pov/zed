@@ -1,4 +1,5 @@
 use std::fmt::Write;
+use std::path::Path;
 use std::sync::Arc;
 
 use agent_client_protocol::schema::v1 as acp;
@@ -102,7 +103,8 @@ impl AgentTool for RenameTool {
                     profile.as_ref(),
                 )
             });
-            check_rename_permissions(profile.as_ref(), decision)?;
+            let task_worktree = cx.update(|cx| event_stream.task_worktree(cx));
+            check_rename_permissions(profile.as_ref(), decision, task_worktree.as_deref())?;
 
             let rename_task = project.update(cx, |project, cx| {
                 project.perform_rename(
@@ -163,7 +165,17 @@ impl AgentTool for RenameTool {
 fn check_rename_permissions(
     profile: Option<&AgentProfileSettings>,
     decision: ToolPermissionDecision,
+    task_worktree: Option<&Path>,
 ) -> Result<(), String> {
+    if let Some(task_worktree) = task_worktree {
+        return Err(format!(
+            "PolicyDenied: rename_symbol performs language-server-wide edits across an \
+             unbounded set of files, so it cannot be confined to isolated task worktree '{}'. \
+             Use edit_file instead.",
+            task_worktree.display()
+        ));
+    }
+
     if let Some(profile) = profile
         && profile.effective_permission_mode() == AgentPermissionMode::Autonomous
     {
@@ -207,28 +219,42 @@ mod tests {
     }
 
     #[test]
+    fn test_rename_denied_for_worktree_bound() {
+        let worktree = Path::new("/worktrees/agent-task-TASK-1");
+        let error = check_rename_permissions(None, ToolPermissionDecision::Allow, Some(worktree))
+            .unwrap_err();
+        assert!(error.contains("PolicyDenied"));
+        assert!(error.contains("agent-task-TASK-1"));
+    }
+
+    #[test]
     fn test_rename_denied_for_autonomous_profile() {
         let profile = autonomous_profile();
-        let error =
-            check_rename_permissions(Some(&profile), ToolPermissionDecision::Allow).unwrap_err();
+        let error = check_rename_permissions(Some(&profile), ToolPermissionDecision::Allow, None)
+            .unwrap_err();
         assert!(error.contains("PolicyDenied"));
         assert!(error.contains("backend_engineer"));
     }
 
     #[test]
     fn test_rename_denied_by_deny_decision() {
-        let error =
-            check_rename_permissions(None, ToolPermissionDecision::Deny("blocked by rule".into()))
-                .unwrap_err();
+        let error = check_rename_permissions(
+            None,
+            ToolPermissionDecision::Deny("blocked by rule".into()),
+            None,
+        )
+        .unwrap_err();
         assert_eq!(error, "blocked by rule");
     }
 
     #[test]
     fn test_rename_allowed_without_profile_or_deny() {
-        assert!(check_rename_permissions(None, ToolPermissionDecision::Allow).is_ok());
+        assert!(check_rename_permissions(None, ToolPermissionDecision::Allow, None).is_ok());
         // A non-autonomous profile (no tool_permissions) still allows rename.
         let mut profile = autonomous_profile();
         profile.tool_permissions = None;
-        assert!(check_rename_permissions(Some(&profile), ToolPermissionDecision::Allow).is_ok());
+        assert!(
+            check_rename_permissions(Some(&profile), ToolPermissionDecision::Allow, None).is_ok()
+        );
     }
 }
