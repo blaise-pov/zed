@@ -7,6 +7,7 @@ mod native_agent_server;
 pub mod outline;
 mod pattern_extraction;
 mod sandboxing;
+pub mod task_worktree;
 mod templates;
 #[cfg(test)]
 mod tests;
@@ -3229,6 +3230,7 @@ impl NativeThreadEnvironment {
         &self,
         label: String,
         profile: Option<agent_settings::AgentProfileId>,
+        task_worktree: Option<PathBuf>,
         cx: &mut App,
     ) -> Result<Rc<dyn SubagentHandle>> {
         let Some(parent_thread_entity) = self.thread.upgrade() else {
@@ -3296,7 +3298,8 @@ impl NativeThreadEnvironment {
 
         let depth = current_depth + 1;
         let subagent_thread: Entity<Thread> = cx.new(|cx| {
-            let mut thread = Thread::new_subagent(&parent_thread_entity, profile, cx);
+            let mut thread =
+                Thread::new_subagent(&parent_thread_entity, profile, task_worktree, cx);
             let title = if depth > 1 {
                 format!("[d{depth}] {label}")
             } else {
@@ -3372,6 +3375,7 @@ impl NativeThreadEnvironment {
         &self,
         session_id: acp::SessionId,
         profile: Option<agent_settings::AgentProfileId>,
+        task_worktree: Option<PathBuf>,
         cx: &mut App,
     ) -> Result<Rc<dyn SubagentHandle>> {
         let (subagent_thread, acp_thread) = self.agent.update(cx, |agent, _cx| {
@@ -3436,6 +3440,12 @@ impl NativeThreadEnvironment {
                     parent_budget,
                     child_profile,
                 ));
+            });
+        }
+
+        if let Some(task_worktree) = task_worktree {
+            subagent_thread.update(cx, |thread, _cx| {
+                thread.set_task_worktree(Some(task_worktree));
             });
         }
 
@@ -3583,18 +3593,106 @@ impl ThreadEnvironment for NativeThreadEnvironment {
         &self,
         label: String,
         profile: Option<agent_settings::AgentProfileId>,
+        task_worktree: Option<PathBuf>,
         cx: &mut App,
     ) -> Result<Rc<dyn SubagentHandle>> {
-        self.create_subagent_thread(label, profile, cx)
+        self.create_subagent_thread(label, profile, task_worktree, cx)
     }
 
     fn resume_subagent(
         &self,
         session_id: acp::SessionId,
         profile: Option<agent_settings::AgentProfileId>,
+        task_worktree: Option<PathBuf>,
         cx: &mut App,
     ) -> Result<Rc<dyn SubagentHandle>> {
-        self.resume_subagent_thread(session_id, profile, cx)
+        self.resume_subagent_thread(session_id, profile, task_worktree, cx)
+    }
+
+    fn ensure_subagent_worktree(
+        &self,
+        task_id: &str,
+        goal_id: Option<String>,
+        base_branch: Option<String>,
+        on_branch: Option<String>,
+        cx: &mut AsyncApp,
+    ) -> Task<Result<PathBuf>> {
+        let Some(parent_thread_entity) = self.thread.upgrade() else {
+            return Task::ready(Err(anyhow!("Parent thread no longer exists")));
+        };
+        let project = cx.update(|cx| parent_thread_entity.read(cx).project().clone());
+        let task_summary = crate::AgentTaskSummary {
+            id: crate::AgentTaskId::from(task_id),
+            parent_id: None,
+            title: format!("agent-task/{task_id}"),
+            status: crate::AgentTaskStatus::Ready,
+            attempt: 1,
+            assignee: None,
+            write_scopes: Vec::new(),
+        };
+        cx.update(|cx| {
+            crate::task_worktree::ensure_task_worktree_with_policy(
+                project,
+                &task_summary,
+                goal_id,
+                base_branch,
+                on_branch,
+                cx,
+            )
+        })
+    }
+
+    fn subagent_task_id(&self, session_id: &acp::SessionId, cx: &App) -> Option<String> {
+        let agent_entity = self.agent.upgrade()?;
+        let agent = agent_entity.read(cx);
+        let session = agent.sessions.get(session_id)?;
+        session.thread.read(cx).task_id().map(|id| id.to_string())
+    }
+
+    fn commit_subagent_worktree(
+        &self,
+        task_id: &str,
+        _task_worktree: &Path,
+        is_error: bool,
+        cx: &mut AsyncApp,
+    ) -> Task<Result<crate::task_worktree::SubagentIsolationDetails>> {
+        let Some(parent_thread_entity) = self.thread.upgrade() else {
+            return Task::ready(Err(anyhow!("Parent thread no longer exists")));
+        };
+        let (project, task_id) = cx.update(|cx| {
+            let project = parent_thread_entity.read(cx).project().clone();
+            let task_id = crate::AgentTaskId::from(task_id.to_string());
+            (project, task_id)
+        });
+        cx.spawn(async move |cx| {
+            let task = cx.update(|cx| {
+                crate::task_worktree::commit_and_merge_task_worktree(
+                    project, &task_id, is_error, cx,
+                )
+            });
+            task.await
+        })
+    }
+
+    fn auto_cleanup_subagent_worktree(
+        &self,
+        task_id: &str,
+        cx: &mut AsyncApp,
+    ) -> Task<Result<bool>> {
+        let Some(parent_thread_entity) = self.thread.upgrade() else {
+            return Task::ready(Err(anyhow!("Parent thread no longer exists")));
+        };
+        let (project, task_id) = cx.update(|cx| {
+            let project = parent_thread_entity.read(cx).project().clone();
+            let task_id = crate::AgentTaskId::from(task_id.to_string());
+            (project, task_id)
+        });
+        cx.spawn(async move |cx| {
+            let task = cx.update(|cx| {
+                crate::task_worktree::auto_cleanup_task_worktree(project, &task_id, cx)
+            });
+            task.await
+        })
     }
 
     fn create_sibling_thread(
@@ -3787,6 +3885,12 @@ impl SubagentHandle for NativeSubagentHandle {
             result
         })
     }
+
+    fn set_task_id(&self, task_id: Option<String>, cx: &mut App) {
+        self.subagent_thread.update(cx, |thread, _cx| {
+            thread.set_task_id(task_id);
+        });
+    }
 }
 
 pub struct AcpTerminalHandle {
@@ -3824,6 +3928,18 @@ impl TerminalHandle for AcpTerminalHandle {
         Ok(self
             .terminal
             .read_with(cx, |term, _cx| term.was_stopped_by_user()))
+    }
+
+    fn output_activity_counter(&self, cx: &AsyncApp) -> Result<u64> {
+        Ok(self
+            .terminal
+            .read_with(cx, |term, cx| term.output_activity_counter(cx)))
+    }
+
+    fn process_tree_root_pid(&self, cx: &AsyncApp) -> Result<Option<u32>> {
+        Ok(self
+            .terminal
+            .read_with(cx, |term, cx| term.shell_process_id(cx)))
     }
 }
 
@@ -5544,7 +5660,7 @@ mod internal_tests {
         // Build the subagent thread the same way
         // `NativeThreadEnvironment::create_subagent_thread` does.
         let subagent_thread =
-            cx.update(|cx| cx.new(|cx| Thread::new_subagent(&parent_thread, None, cx)));
+            cx.update(|cx| cx.new(|cx| Thread::new_subagent(&parent_thread, None, None, cx)));
 
         // Run the subagent through the production registration path.
         // This is what installs the `SkillTool` on the thread.
@@ -7349,6 +7465,7 @@ mod internal_tests {
                 environment.create_subagent_thread(
                     "first".to_string(),
                     Some(agent_settings::AgentProfileId("write".into())),
+                    None,
                     cx,
                 )
             })
@@ -7358,6 +7475,7 @@ mod internal_tests {
                 environment.create_subagent_thread(
                     "second".to_string(),
                     Some(agent_settings::AgentProfileId("write".into())),
+                    None,
                     cx,
                 )
             })

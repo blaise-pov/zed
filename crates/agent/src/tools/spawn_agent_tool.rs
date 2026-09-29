@@ -8,6 +8,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use std::rc::Rc;
 use std::sync::Arc;
 
+use crate::task_worktree::SubagentIsolationDetails;
 use crate::{AgentTool, ThreadEnvironment, ToolCallEventStream, ToolInput};
 use settings::Settings as _;
 
@@ -35,7 +36,7 @@ use settings::Settings as _;
 /// - You will receive only the agent's final message as output.
 /// - Successful calls return a session_id that you can use for follow-up messages.
 /// - Error results may also include a session_id if a session was already created.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub struct SpawnAgentToolInput {
     /// Short label displayed in the UI while the agent runs (e.g., "Researching alternatives")
@@ -55,6 +56,24 @@ pub struct SpawnAgentToolInput {
     /// The profile controls which tools are available and can specify a default model.
     #[serde(default)]
     pub profile: Option<agent_settings::AgentProfileId>,
+    /// Goal identifier for goal-scoped task coordination (§8.2).
+    /// When specified, the task worktree forks from the goal's integration branch
+    /// `agent-goal/{goal_id}` (created lazily from HEAD of main if absent).
+    #[serde(default)]
+    pub goal_id: Option<String>,
+    /// Base branch or ref to fork the task worktree from (§8.2).
+    /// Overrides goal-tip as the fork base when both are specified. If the ref
+    /// matches `agent-goal/*`, it is auto-created lazily if absent; otherwise,
+    /// it must exist in the repository.
+    #[serde(default)]
+    pub base_branch: Option<String>,
+    /// Existing branch to check out into the subagent's task worktree (§8.2).
+    /// Used for review, CI, inspection, or conflict resolution without creating a new branch.
+    /// The subagent gets its own worktree on this existing branch, and writes are restricted
+    /// to this worktree. Mutually exclusive with `base_branch`. Accepts a branch name or the
+    /// special value "goal", which resolves to `agent-goal/{goal_id}`.
+    #[serde(default)]
+    pub on_branch: Option<String>,
 }
 
 fn deserialize_session_id<'de, D>(deserializer: D) -> Result<Option<acp::SessionId>, D::Error>
@@ -111,6 +130,10 @@ pub enum SpawnAgentToolOutput {
         session_id: acp::SessionId,
         output: String,
         session_info: SubagentSessionInfo,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        isolation: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        isolation_details: Option<SubagentIsolationDetails>,
     },
     Error {
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -118,6 +141,10 @@ pub enum SpawnAgentToolOutput {
         session_id: Option<acp::SessionId>,
         error: String,
         session_info: Option<SubagentSessionInfo>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        isolation: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        isolation_details: Option<SubagentIsolationDetails>,
     },
 }
 
@@ -128,20 +155,38 @@ impl From<SpawnAgentToolOutput> for LanguageModelToolResultContent {
                 session_id,
                 output,
                 session_info: _, // Don't show this to the model
-            } => serde_json::to_string(
-                &serde_json::json!({ "session_id": session_id, "output": output }),
-            )
-            .unwrap_or_else(|e| format!("Failed to serialize spawn_agent output: {e}"))
-            .into(),
+                isolation,
+                isolation_details,
+            } => {
+                let mut map = serde_json::json!({ "session_id": session_id, "output": output });
+                if let Some(isolation) = isolation {
+                    map["isolation"] = serde_json::Value::String(isolation);
+                }
+                if let Some(details) = isolation_details {
+                    map["isolation_details"] = serde_json::to_value(details).unwrap_or_default();
+                }
+                serde_json::to_string(&map)
+                    .unwrap_or_else(|e| format!("Failed to serialize spawn_agent output: {e}"))
+                    .into()
+            }
             SpawnAgentToolOutput::Error {
                 session_id,
                 error,
                 session_info: _, // Don't show this to the model
-            } => serde_json::to_string(
-                &serde_json::json!({ "session_id": session_id, "error": error }),
-            )
-            .unwrap_or_else(|e| format!("Failed to serialize spawn_agent output: {e}"))
-            .into(),
+                isolation,
+                isolation_details,
+            } => {
+                let mut map = serde_json::json!({ "session_id": session_id, "error": error });
+                if let Some(isolation) = isolation {
+                    map["isolation"] = serde_json::Value::String(isolation);
+                }
+                if let Some(details) = isolation_details {
+                    map["isolation_details"] = serde_json::to_value(details).unwrap_or_default();
+                }
+                serde_json::to_string(&map)
+                    .unwrap_or_else(|e| format!("Failed to serialize spawn_agent output: {e}"))
+                    .into()
+            }
         }
     }
 }
@@ -182,13 +227,14 @@ impl AgentTool for SpawnAgentTool {
         }
     }
 
+    #[allow(clippy::result_large_err)]
     fn run(
         self: Arc<Self>,
         input: ToolInput<Self::Input>,
         event_stream: ToolCallEventStream,
         cx: &mut App,
     ) -> Task<Result<Self::Output, Self::Output>> {
-        cx.spawn(async move |cx| {
+        cx.spawn(async move |mut cx| {
             let input = input
                 .recv()
                 .await
@@ -196,7 +242,98 @@ impl AgentTool for SpawnAgentTool {
                     session_id: None,
                     error: e.to_string(),
                     session_info: None,
+                    isolation: None,
+                    isolation_details: None,
                 })?;
+
+            if input.on_branch.is_some() && input.base_branch.is_some() {
+                return Err(SpawnAgentToolOutput::Error {
+                    session_id: input.session_id.clone(),
+                    error: "on_branch and base_branch are mutually exclusive: on_branch checks out an existing branch directly, while base_branch creates a new branch forked from a base ref".to_string(),
+                    session_info: None,
+                    isolation: None,
+                    isolation_details: None,
+                });
+            }
+
+            if input.on_branch.as_deref() == Some("goal") && input.goal_id.is_none() {
+                return Err(SpawnAgentToolOutput::Error {
+                    session_id: input.session_id.clone(),
+                    error: "on_branch 'goal' requires goal_id".to_string(),
+                    session_info: None,
+                    isolation: None,
+                    isolation_details: None,
+                });
+            }
+
+            let raw_task_id = input
+                .task_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
+            let task_id = if raw_task_id.is_some() {
+                raw_task_id
+            } else if let Some(session_id) = &input.session_id {
+                cx.update(|cx| self.environment.subagent_task_id(session_id, cx))
+            } else {
+                None
+            };
+
+            let (worktree_path, isolation) = if let Some(ref task_id) = task_id {
+                match self
+                    .environment
+                    .ensure_subagent_worktree(
+                        task_id,
+                        input.goal_id.clone(),
+                        input.base_branch.clone(),
+                        input.on_branch.clone(),
+                        &mut cx,
+                    )
+                    .await
+                {
+                    Ok(path) => {
+                        let task_id_typed = crate::AgentTaskId::from(task_id.clone());
+                        let isolation_str = if let Some(target) = crate::task_worktree::task_worktree_checkout_target(&task_id_typed) {
+                            format!("checkout:{target}")
+                        } else if let Some(ref on_b) = input.on_branch {
+                            let resolved = if on_b == "goal" {
+                                format!("agent-goal/{}", input.goal_id.as_deref().unwrap_or_default())
+                            } else {
+                                on_b.clone()
+                            };
+                            format!("checkout:{resolved}")
+                        } else {
+                            format!("worktree:agent-task/{task_id}")
+                        };
+                        (Some(path), Some(isolation_str))
+                    }
+                    Err(err) => {
+                        if err
+                            .downcast_ref::<crate::task_worktree::NoGitRepositoryError>()
+                            .is_some()
+                            || err
+                                .root_cause()
+                                .is::<crate::task_worktree::NoGitRepositoryError>()
+                        {
+                            (None, Some("shared:no-git-repository".to_string()))
+                        } else {
+                            let err_msg = err.to_string();
+                            return Err(SpawnAgentToolOutput::Error {
+                                session_id: input.session_id.clone(),
+                                error: format!(
+                                    "Failed to isolate subagent in git worktree: {err_msg}"
+                                ),
+                                session_info: None,
+                                isolation: None,
+                                isolation_details: None,
+                            });
+                        }
+                    }
+                }
+            } else {
+                (None, None)
+            };
 
             let (subagent, mut session_info) = cx.update(|cx| {
                 let location = event_stream.settings_location(cx);
@@ -205,20 +342,44 @@ impl AgentTool for SpawnAgentTool {
                         session_id: input.session_id.clone(),
                         error,
                         session_info: None,
+                        isolation: isolation.clone(),
+                        isolation_details: None,
                     });
                 }
                 let subagent = if let Some(session_id) = input.session_id {
-                    self.environment
-                        .resume_subagent(session_id, input.profile.clone(), cx)
+                    self.environment.resume_subagent(
+                        session_id,
+                        input.profile.clone(),
+                        worktree_path.clone(),
+                        cx,
+                    )
                 } else {
-                    self.environment
-                        .create_subagent(input.label, input.profile, cx)
+                    self.environment.create_subagent(
+                        input.label,
+                        input.profile,
+                        worktree_path.clone(),
+                        cx,
+                    )
                 };
                 let subagent = subagent.map_err(|err| SpawnAgentToolOutput::Error {
                     session_id: None,
                     error: err.to_string(),
                     session_info: None,
+                    isolation: isolation.clone(),
+                    isolation_details: None,
                 })?;
+                if let Some(ref task_id) = task_id {
+                    subagent.set_task_id(Some(task_id.clone()), cx);
+                    if let Some(ref worktree_path) = worktree_path {
+                        let task_id_typed = crate::AgentTaskId::from(task_id.clone());
+                        if crate::task_worktree::task_worktree_path_for_id(&task_id_typed).is_none() {
+                            crate::task_worktree::register_task_worktree(
+                                &task_id_typed,
+                                worktree_path.clone(),
+                            );
+                        }
+                    }
+                }
                 let session_info = SubagentSessionInfo {
                     session_id: subagent.id(),
                     message_start_index: subagent.num_entries(cx),
@@ -236,6 +397,12 @@ impl AgentTool for SpawnAgentTool {
 
                 Ok((subagent, session_info))
             })?;
+
+            let session_guard = task_id.as_ref().map(|id| {
+                crate::task_worktree::SubagentSessionGuard::new(crate::AgentTaskId::from(
+                    id.clone(),
+                ))
+            });
 
             let send_result = {
                 let message = match input.task_id.as_deref() {
@@ -263,6 +430,59 @@ impl AgentTool for SpawnAgentTool {
             session_info.message_end_index =
                 cx.update(|cx| Some(subagent.num_entries(cx).saturating_sub(1)));
 
+            let is_error = send_result.is_err();
+            let isolation_details =
+                if let (Some(worktree_path), Some(task_id)) = (&worktree_path, &task_id) {
+                    let details = match self
+                        .environment
+                        .commit_subagent_worktree(task_id, worktree_path, is_error, &mut cx)
+                        .await
+                    {
+                        Ok(details) => details,
+                        Err(e) => {
+                            let task_id_typed = crate::AgentTaskId::from(task_id.clone());
+                            crate::task_worktree::fallback_isolation_details(
+                                &task_id_typed,
+                                "worktree",
+                                Some(e.to_string()),
+                                None,
+                            )
+                        }
+                    };
+                    if let Some(ref err) = details.commit_error {
+                        crate::task_worktree::record_task_worktree_commit_error(
+                            &crate::AgentTaskId::from(task_id.clone()),
+                            err.clone(),
+                        );
+                    } else {
+                        crate::task_worktree::clear_task_worktree_commit_error(
+                            &crate::AgentTaskId::from(task_id.clone()),
+                        );
+                    }
+                    Some(details)
+                } else {
+                    None
+                };
+
+            // Release active session guard after commit is done to close race window
+            drop(session_guard);
+
+            if let Some(ref task_id) = task_id {
+                let task_id_typed = crate::AgentTaskId::from(task_id.clone());
+                if crate::task_worktree::is_task_terminal(&task_id_typed)
+                    && crate::task_worktree::task_worktree_commit_error(&task_id_typed).is_none()
+                    && crate::task_worktree::task_worktree_merge_conflict(&task_id_typed).is_none()
+                {
+                    if let Err(err) = self
+                        .environment
+                        .auto_cleanup_subagent_worktree(task_id, &mut cx)
+                        .await
+                    {
+                        log::error!("auto cleanup failed for subagent task {task_id}: {err:?}");
+                    }
+                }
+            }
+
             let meta = Some(acp::Meta::from_iter([(
                 SUBAGENT_SESSION_INFO_META_KEY.into(),
                 serde_json::json!(&session_info),
@@ -275,6 +495,8 @@ impl AgentTool for SpawnAgentTool {
                         session_id: session_info.session_id.clone(),
                         session_info,
                         output,
+                        isolation: isolation.clone(),
+                        isolation_details: isolation_details.clone(),
                     }),
                 ),
                 Err(e) => {
@@ -285,6 +507,8 @@ impl AgentTool for SpawnAgentTool {
                             session_id: Some(session_info.session_id.clone()),
                             error,
                             session_info: Some(session_info),
+                            isolation: isolation.clone(),
+                            isolation_details: isolation_details.clone(),
                         }),
                     )
                 }

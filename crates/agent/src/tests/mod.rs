@@ -48,7 +48,7 @@ use std::{
     rc::Rc,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -76,6 +76,8 @@ pub(crate) struct FakeTerminalHandle {
     wait_for_exit: Shared<Task<acp::TerminalExitStatus>>,
     output: acp::TerminalOutputResponse,
     id: acp::TerminalId,
+    output_activity_counter: Arc<AtomicU64>,
+    process_tree_root_pid: Option<u32>,
 }
 
 impl FakeTerminalHandle {
@@ -100,6 +102,8 @@ impl FakeTerminalHandle {
             wait_for_exit,
             output: acp::TerminalOutputResponse::new("partial output".to_string(), false),
             id: acp::TerminalId::new("fake_terminal".to_string()),
+            output_activity_counter: Arc::new(AtomicU64::new(0)),
+            process_tree_root_pid: None,
         }
     }
 
@@ -119,11 +123,23 @@ impl FakeTerminalHandle {
             wait_for_exit,
             output: acp::TerminalOutputResponse::new("command output".to_string(), false),
             id: acp::TerminalId::new("fake_terminal".to_string()),
+            output_activity_counter: Arc::new(AtomicU64::new(0)),
+            process_tree_root_pid: None,
         }
     }
 
     pub(crate) fn with_output(mut self, output: acp::TerminalOutputResponse) -> Self {
         self.output = output;
+        self
+    }
+
+    pub(crate) fn with_output_activity_counter(mut self, counter: Arc<AtomicU64>) -> Self {
+        self.output_activity_counter = counter;
+        self
+    }
+
+    pub(crate) fn with_process_tree_root_pid(mut self, pid: Option<u32>) -> Self {
+        self.process_tree_root_pid = pid;
         self
     }
 
@@ -163,6 +179,14 @@ impl crate::TerminalHandle for FakeTerminalHandle {
 
     fn was_stopped_by_user(&self, _cx: &AsyncApp) -> Result<bool> {
         Ok(self.stopped_by_user.load(Ordering::SeqCst))
+    }
+
+    fn output_activity_counter(&self, _cx: &AsyncApp) -> Result<u64> {
+        Ok(self.output_activity_counter.load(Ordering::Relaxed))
+    }
+
+    fn process_tree_root_pid(&self, _cx: &AsyncApp) -> Result<Option<u32>> {
+        Ok(self.process_tree_root_pid)
     }
 }
 
@@ -242,6 +266,7 @@ impl crate::ThreadEnvironment for FakeThreadEnvironment {
         &self,
         _label: String,
         _profile: Option<agent_settings::AgentProfileId>,
+        _task_worktree: Option<PathBuf>,
         _cx: &mut App,
     ) -> Result<Rc<dyn SubagentHandle>> {
         Ok(self
@@ -288,6 +313,7 @@ impl crate::ThreadEnvironment for MultiTerminalEnvironment {
         &self,
         _label: String,
         _profile: Option<agent_settings::AgentProfileId>,
+        _task_worktree: Option<PathBuf>,
         _cx: &mut App,
     ) -> Result<Rc<dyn SubagentHandle>> {
         unimplemented!()
@@ -556,6 +582,663 @@ async fn test_terminal_tool_without_timeout_does_not_kill_handle(cx: &mut TestAp
 }
 
 #[gpui::test]
+async fn test_terminal_tool_watchdog_idle_kills_handle(cx: &mut TestAppContext) {
+    init_test(cx);
+    always_allow_tools(cx);
+
+    cx.update(|cx| {
+        let mut settings = agent_settings::AgentSettings::get_global(cx).clone();
+        settings.terminal_watchdog.enabled = true;
+        settings.terminal_watchdog.idle_timeout_ms = Some(20);
+        settings.terminal_watchdog.idle_timeout_no_probe_ms = 20;
+        settings.terminal_watchdog.poll_interval_ms = 5;
+        settings.terminal_watchdog.hard_timeout_ms = Some(10_000);
+        agent_settings::AgentSettings::override_global(settings, cx);
+    });
+
+    let fs = FakeFs::new(cx.executor());
+    let project = Project::test(fs, [], cx).await;
+
+    let environment = Rc::new(cx.update(|cx| {
+        FakeThreadEnvironment::default().with_terminal(FakeTerminalHandle::new_never_exits(cx))
+    }));
+    let handle = environment
+        .terminal_handle
+        .clone()
+        .expect("terminal handle present");
+
+    #[allow(clippy::arc_with_non_send_sync)]
+    let tool = Arc::new(crate::TerminalTool::new(project, environment).with_now_fn({
+        let executor = cx.background_executor.clone();
+        move || executor.now()
+    }));
+    let (event_stream, mut rx) = crate::ToolCallEventStream::test();
+
+    let task = cx.update(|cx| {
+        tool.run(
+            ToolInput::resolved(crate::TerminalToolInput {
+                command: "sleep 1000".to_string(),
+                cd: ".".to_string(),
+                timeout_ms: None,
+                ..Default::default()
+            }),
+            event_stream,
+            cx,
+        )
+    });
+
+    let _update = rx.expect_update_fields().await;
+
+    let mut task_future: Pin<Box<Fuse<Task<Result<String, String>>>>> = Box::pin(task.fuse());
+
+    let deadline = std::time::Instant::now() + Duration::from_millis(1000);
+    loop {
+        if let Some(result) = task_future.as_mut().now_or_never() {
+            let result = result.expect("terminal tool task should complete");
+
+            assert!(
+                handle.was_killed(),
+                "expected terminal handle to be killed by watchdog idle"
+            );
+            assert!(
+                result.contains("partial output"),
+                "expected result to include terminal output, got: {result}"
+            );
+            return;
+        }
+
+        if std::time::Instant::now() >= deadline {
+            panic!("timed out waiting for terminal tool task to complete via watchdog");
+        }
+
+        cx.run_until_parked();
+        cx.background_executor.timer(Duration::from_millis(5)).await;
+    }
+}
+
+#[gpui::test]
+async fn test_terminal_tool_timeout_set_bypasses_watchdog(cx: &mut TestAppContext) {
+    init_test(cx);
+    always_allow_tools(cx);
+
+    // Watchdog has very short idle timeout (10ms), but timeout_ms is set to 500ms
+    cx.update(|cx| {
+        let mut settings = agent_settings::AgentSettings::get_global(cx).clone();
+        settings.terminal_watchdog.enabled = true;
+        settings.terminal_watchdog.idle_timeout_ms = Some(10);
+        settings.terminal_watchdog.idle_timeout_no_probe_ms = 10;
+        settings.terminal_watchdog.poll_interval_ms = 5;
+        settings.terminal_watchdog.hard_timeout_ms = Some(20);
+        agent_settings::AgentSettings::override_global(settings, cx);
+    });
+
+    let fs = FakeFs::new(cx.executor());
+    let project = Project::test(fs, [], cx).await;
+
+    let environment = Rc::new(cx.update(|cx| {
+        FakeThreadEnvironment::default().with_terminal(FakeTerminalHandle::new_never_exits(cx))
+    }));
+    let handle = environment
+        .terminal_handle
+        .clone()
+        .expect("terminal handle present");
+
+    #[allow(clippy::arc_with_non_send_sync)]
+    let tool = Arc::new(crate::TerminalTool::new(project, environment));
+    let (event_stream, mut rx) = crate::ToolCallEventStream::test();
+
+    let _task = cx.update(|cx| {
+        tool.run(
+            ToolInput::resolved(crate::TerminalToolInput {
+                command: "sleep 1000".to_string(),
+                cd: ".".to_string(),
+                // timeout_ms is explicitly set, which completely disables watchdog!
+                timeout_ms: Some(500),
+                ..Default::default()
+            }),
+            event_stream,
+            cx,
+        )
+    });
+
+    let _update = rx.expect_update_fields().await;
+
+    // Wait 50ms (well past the 10ms idle and 20ms cap)
+    cx.background_executor
+        .timer(Duration::from_millis(50))
+        .await;
+
+    assert!(
+        !handle.was_killed(),
+        "watchdog must not kill handle when timeout_ms is set"
+    );
+}
+
+#[gpui::test]
+async fn test_terminal_tool_watchdog_quiet_command_idle_kill(cx: &mut TestAppContext) {
+    init_test(cx);
+    always_allow_tools(cx);
+
+    cx.update(|cx| {
+        let mut settings = agent_settings::AgentSettings::get_global(cx).clone();
+        settings.terminal_watchdog.enabled = true;
+        settings.terminal_watchdog.idle_timeout_ms = Some(2000);
+        settings.terminal_watchdog.idle_timeout_no_probe_ms = 5000;
+        settings.terminal_watchdog.poll_interval_ms = 500;
+        settings.terminal_watchdog.hard_timeout_ms = Some(10_000);
+        agent_settings::AgentSettings::override_global(settings, cx);
+    });
+
+    let fs = FakeFs::new(cx.executor());
+    let project = Project::test(fs, [], cx).await;
+
+    let counter = Arc::new(AtomicU64::new(0));
+    let environment = Rc::new(cx.update(|cx| {
+        FakeThreadEnvironment::default().with_terminal(
+            FakeTerminalHandle::new_never_exits(cx)
+                .with_process_tree_root_pid(Some(1234))
+                .with_output_activity_counter(counter.clone()),
+        )
+    }));
+    let handle = environment
+        .terminal_handle
+        .clone()
+        .expect("terminal handle present");
+
+    let probe = crate::tools::terminal_watchdog::FakeActivityProbe {
+        sample: crate::tools::terminal_watchdog::ActivitySample {
+            cpu_percent: 0.0,
+            disk_bytes_delta: 0,
+            available: true,
+        },
+    };
+
+    #[allow(clippy::arc_with_non_send_sync)]
+    let tool = Arc::new(
+        crate::TerminalTool::new(project, environment)
+            .with_activity_probe(probe)
+            .with_now_fn({
+                let executor = cx.background_executor.clone();
+                move || executor.now()
+            }),
+    );
+    let (event_stream, mut rx) = crate::ToolCallEventStream::test();
+
+    let task = cx.update(|cx| {
+        tool.run(
+            ToolInput::resolved(crate::TerminalToolInput {
+                command: "sleep 1000".to_string(),
+                cd: ".".to_string(),
+                timeout_ms: None,
+                ..Default::default()
+            }),
+            event_stream,
+            cx,
+        )
+    });
+
+    let _update = rx.expect_update_fields().await;
+
+    let mut task_future = Box::pin(task.fuse());
+    let mut tool_result = None;
+    for _ in 0..10 {
+        if let Some(result) = task_future.as_mut().now_or_never() {
+            tool_result = Some(result);
+            break;
+        }
+        cx.run_until_parked();
+        cx.background_executor
+            .timer(Duration::from_millis(500))
+            .await;
+    }
+
+    let result = tool_result
+        .expect("task should complete via idle watchdog within deadline")
+        .expect("tool call should succeed with diagnostic result");
+
+    assert!(
+        handle.was_killed(),
+        "expected terminal handle to be killed by watchdog idle"
+    );
+    assert!(
+        result.contains("was stopped by the watchdog"),
+        "expected idle stop announcement, got: {result}"
+    );
+    assert!(
+        result.contains("no terminal output, no CPU usage, and no disk activity"),
+        "expected idle diagnostic reason, got: {result}"
+    );
+    assert!(
+        result.contains("for 2s"),
+        "expected 2s idle window in diagnostic, got: {result}"
+    );
+    assert!(
+        result.contains("Before retrying: check for -y/--yes/--no-pager/non-interactive flags and verify the command does not expect input"),
+        "expected guidance sentence, got: {result}"
+    );
+}
+
+#[gpui::test]
+async fn test_terminal_tool_watchdog_periodic_output_survives(cx: &mut TestAppContext) {
+    init_test(cx);
+    always_allow_tools(cx);
+
+    cx.update(|cx| {
+        let mut settings = agent_settings::AgentSettings::get_global(cx).clone();
+        settings.terminal_watchdog.enabled = true;
+        settings.terminal_watchdog.idle_timeout_ms = Some(2000);
+        settings.terminal_watchdog.idle_timeout_no_probe_ms = 5000;
+        settings.terminal_watchdog.poll_interval_ms = 500;
+        settings.terminal_watchdog.hard_timeout_ms = Some(10_000);
+        agent_settings::AgentSettings::override_global(settings, cx);
+    });
+
+    let fs = FakeFs::new(cx.executor());
+    let project = Project::test(fs, [], cx).await;
+
+    let counter = Arc::new(AtomicU64::new(0));
+    let environment = Rc::new(cx.update(|cx| {
+        FakeThreadEnvironment::default().with_terminal(
+            FakeTerminalHandle::new_never_exits(cx)
+                .with_process_tree_root_pid(Some(1234))
+                .with_output_activity_counter(counter.clone()),
+        )
+    }));
+    let handle = environment
+        .terminal_handle
+        .clone()
+        .expect("terminal handle present");
+
+    let probe = crate::tools::terminal_watchdog::FakeActivityProbe {
+        sample: crate::tools::terminal_watchdog::ActivitySample {
+            cpu_percent: 0.0,
+            disk_bytes_delta: 0,
+            available: true,
+        },
+    };
+
+    #[allow(clippy::arc_with_non_send_sync)]
+    let tool = Arc::new(
+        crate::TerminalTool::new(project, environment)
+            .with_activity_probe(probe)
+            .with_now_fn({
+                let executor = cx.background_executor.clone();
+                move || executor.now()
+            }),
+    );
+    let (event_stream, mut rx) = crate::ToolCallEventStream::test();
+
+    let task = cx.update(|cx| {
+        tool.run(
+            ToolInput::resolved(crate::TerminalToolInput {
+                command: "generating_logs".to_string(),
+                cd: ".".to_string(),
+                timeout_ms: None,
+                ..Default::default()
+            }),
+            event_stream,
+            cx,
+        )
+    });
+
+    let _update = rx.expect_update_fields().await;
+    let mut task_future = Box::pin(task.fuse());
+
+    for _ in 0..6 {
+        counter.fetch_add(10, Ordering::SeqCst);
+        cx.run_until_parked();
+        cx.background_executor
+            .timer(Duration::from_millis(500))
+            .await;
+
+        assert!(
+            !handle.was_killed(),
+            "handle should survive while producing periodic output"
+        );
+        assert!(
+            task_future.as_mut().now_or_never().is_none(),
+            "task should still be running while output is produced"
+        );
+    }
+
+    handle.signal_exit();
+    cx.run_until_parked();
+
+    let result = task_future
+        .await
+        .expect("task should complete successfully after exit signal");
+
+    assert!(
+        !handle.was_killed(),
+        "handle should not be killed by watchdog when exit was normal"
+    );
+    assert!(
+        !result.contains("was stopped by the watchdog"),
+        "result should not contain idle diagnostic"
+    );
+    assert!(
+        !result.contains("exceeded the default maximum runtime"),
+        "result should not contain hard cap diagnostic"
+    );
+}
+
+#[gpui::test]
+async fn test_terminal_tool_watchdog_busy_loop_killed_by_hard_cap(cx: &mut TestAppContext) {
+    init_test(cx);
+    always_allow_tools(cx);
+
+    cx.update(|cx| {
+        let mut settings = agent_settings::AgentSettings::get_global(cx).clone();
+        settings.terminal_watchdog.enabled = true;
+        settings.terminal_watchdog.idle_timeout_ms = Some(2000);
+        settings.terminal_watchdog.idle_timeout_no_probe_ms = 5000;
+        settings.terminal_watchdog.poll_interval_ms = 500;
+        settings.terminal_watchdog.hard_timeout_ms = Some(4000);
+        agent_settings::AgentSettings::override_global(settings, cx);
+    });
+
+    let fs = FakeFs::new(cx.executor());
+    let project = Project::test(fs, [], cx).await;
+
+    let counter = Arc::new(AtomicU64::new(0));
+    let environment = Rc::new(cx.update(|cx| {
+        FakeThreadEnvironment::default().with_terminal(
+            FakeTerminalHandle::new_never_exits(cx)
+                .with_process_tree_root_pid(Some(1234))
+                .with_output_activity_counter(counter.clone()),
+        )
+    }));
+    let handle = environment
+        .terminal_handle
+        .clone()
+        .expect("terminal handle present");
+
+    let probe = crate::tools::terminal_watchdog::FakeActivityProbe {
+        sample: crate::tools::terminal_watchdog::ActivitySample {
+            cpu_percent: 15.0,
+            disk_bytes_delta: 0,
+            available: true,
+        },
+    };
+
+    #[allow(clippy::arc_with_non_send_sync)]
+    let tool = Arc::new(
+        crate::TerminalTool::new(project, environment)
+            .with_activity_probe(probe)
+            .with_now_fn({
+                let executor = cx.background_executor.clone();
+                move || executor.now()
+            }),
+    );
+    let (event_stream, mut rx) = crate::ToolCallEventStream::test();
+
+    let task = cx.update(|cx| {
+        tool.run(
+            ToolInput::resolved(crate::TerminalToolInput {
+                command: "busy_loop".to_string(),
+                cd: ".".to_string(),
+                timeout_ms: None,
+                ..Default::default()
+            }),
+            event_stream,
+            cx,
+        )
+    });
+
+    let _update = rx.expect_update_fields().await;
+    let mut task_future = Box::pin(task.fuse());
+
+    // Advance 5 * 500ms = 2500ms (past the 2000ms idle window)
+    for _ in 0..5 {
+        cx.run_until_parked();
+        cx.background_executor
+            .timer(Duration::from_millis(500))
+            .await;
+    }
+
+    assert!(
+        !handle.was_killed(),
+        "busy loop should survive past the 2000ms idle window due to CPU activity"
+    );
+    assert!(
+        task_future.as_mut().now_or_never().is_none(),
+        "task should still be running at 2500ms"
+    );
+
+    // Continue advancing to reach the 4000ms hard cap
+    let mut tool_result = None;
+    for _ in 0..6 {
+        if let Some(result) = task_future.as_mut().now_or_never() {
+            tool_result = Some(result);
+            break;
+        }
+        cx.run_until_parked();
+        cx.background_executor
+            .timer(Duration::from_millis(500))
+            .await;
+    }
+
+    let result = tool_result
+        .expect("task should complete via hard cap")
+        .expect("tool call result should be Ok");
+
+    assert!(
+        handle.was_killed(),
+        "expected terminal handle to be killed by hard cap"
+    );
+    assert!(
+        result.contains("exceeded the default maximum runtime of 4s (timeout_ms was not set)"),
+        "expected hard cap diagnostic, got: {result}"
+    );
+    assert!(
+        result.contains("If this command legitimately needs longer, rerun it with timeout_ms set to the expected duration plus margin."),
+        "expected hard cap guidance sentence, got: {result}"
+    );
+    assert!(
+        !result.contains("no terminal output, no CPU usage"),
+        "must not contain idle diagnostic since CPU was active"
+    );
+}
+
+#[gpui::test]
+async fn test_terminal_tool_timeout_set_bypasses_watchdog_second_scale(cx: &mut TestAppContext) {
+    init_test(cx);
+    always_allow_tools(cx);
+
+    cx.update(|cx| {
+        let mut settings = agent_settings::AgentSettings::get_global(cx).clone();
+        settings.terminal_watchdog.enabled = true;
+        settings.terminal_watchdog.idle_timeout_ms = Some(2000);
+        settings.terminal_watchdog.idle_timeout_no_probe_ms = 4000;
+        settings.terminal_watchdog.poll_interval_ms = 500;
+        settings.terminal_watchdog.hard_timeout_ms = Some(3000);
+        agent_settings::AgentSettings::override_global(settings, cx);
+    });
+
+    let fs = FakeFs::new(cx.executor());
+    let project = Project::test(fs, [], cx).await;
+
+    let environment = Rc::new(cx.update(|cx| {
+        FakeThreadEnvironment::default().with_terminal(FakeTerminalHandle::new_never_exits(cx))
+    }));
+    let handle = environment
+        .terminal_handle
+        .clone()
+        .expect("terminal handle present");
+
+    #[allow(clippy::arc_with_non_send_sync)]
+    let tool = Arc::new(crate::TerminalTool::new(project, environment).with_now_fn({
+        let executor = cx.background_executor.clone();
+        move || executor.now()
+    }));
+    let (event_stream, mut rx) = crate::ToolCallEventStream::test();
+
+    let task = cx.update(|cx| {
+        tool.run(
+            ToolInput::resolved(crate::TerminalToolInput {
+                command: "long_running_job".to_string(),
+                cd: ".".to_string(),
+                timeout_ms: Some(10_000),
+                ..Default::default()
+            }),
+            event_stream,
+            cx,
+        )
+    });
+
+    let _update = rx.expect_update_fields().await;
+    let mut task_future = Box::pin(task.fuse());
+
+    // Advance 5000ms (well past the 2s idle and 3s hard cap windows)
+    cx.background_executor
+        .timer(Duration::from_millis(5000))
+        .await;
+    cx.run_until_parked();
+
+    assert!(
+        !handle.was_killed(),
+        "watchdog must not kill handle when timeout_ms is set"
+    );
+    assert!(
+        task_future.as_mut().now_or_never().is_none(),
+        "task should still be running before timeout_ms expires"
+    );
+
+    // Now advance past the 10s timeout_ms
+    cx.background_executor
+        .timer(Duration::from_millis(6000))
+        .await;
+    cx.run_until_parked();
+
+    let result = task_future
+        .await
+        .expect("task should complete on explicit timeout");
+
+    assert!(
+        handle.was_killed(),
+        "handle should be killed when timeout_ms expires"
+    );
+    assert!(
+        result.contains("timed out"),
+        "result should indicate standard timeout, got: {result}"
+    );
+    assert!(
+        !result.contains("was stopped by the watchdog"),
+        "watchdog should not have intervened"
+    );
+}
+
+#[gpui::test]
+async fn test_terminal_tool_watchdog_no_probe_mode_honors_widened_window(cx: &mut TestAppContext) {
+    init_test(cx);
+    always_allow_tools(cx);
+
+    cx.update(|cx| {
+        let mut settings = agent_settings::AgentSettings::get_global(cx).clone();
+        settings.terminal_watchdog.enabled = true;
+        settings.terminal_watchdog.idle_timeout_ms = Some(2000);
+        settings.terminal_watchdog.idle_timeout_no_probe_ms = 4000;
+        settings.terminal_watchdog.poll_interval_ms = 500;
+        settings.terminal_watchdog.hard_timeout_ms = Some(10_000);
+        agent_settings::AgentSettings::override_global(settings, cx);
+    });
+
+    let fs = FakeFs::new(cx.executor());
+    let project = Project::test(fs, [], cx).await;
+
+    let counter = Arc::new(AtomicU64::new(0));
+    let environment = Rc::new(cx.update(|cx| {
+        FakeThreadEnvironment::default().with_terminal(
+            FakeTerminalHandle::new_never_exits(cx)
+                .with_process_tree_root_pid(None)
+                .with_output_activity_counter(counter.clone()),
+        )
+    }));
+    let handle = environment
+        .terminal_handle
+        .clone()
+        .expect("terminal handle present");
+
+    #[allow(clippy::arc_with_non_send_sync)]
+    let tool = Arc::new(crate::TerminalTool::new(project, environment).with_now_fn({
+        let executor = cx.background_executor.clone();
+        move || executor.now()
+    }));
+    let (event_stream, mut rx) = crate::ToolCallEventStream::test();
+
+    let task = cx.update(|cx| {
+        tool.run(
+            ToolInput::resolved(crate::TerminalToolInput {
+                command: "no_probe_cmd".to_string(),
+                cd: ".".to_string(),
+                timeout_ms: None,
+                ..Default::default()
+            }),
+            event_stream,
+            cx,
+        )
+    });
+
+    let _update = rx.expect_update_fields().await;
+    let mut task_future = Box::pin(task.fuse());
+
+    // Advance 5 * 500ms = 2500ms (past the 2000ms idle_timeout_ms window)
+    for _ in 0..5 {
+        cx.run_until_parked();
+        cx.background_executor
+            .timer(Duration::from_millis(500))
+            .await;
+    }
+
+    assert!(
+        !handle.was_killed(),
+        "command without probe must survive past the normal 2000ms idle window"
+    );
+    assert!(
+        task_future.as_mut().now_or_never().is_none(),
+        "task should still be running at 2500ms"
+    );
+
+    // Advance remaining steps past the 4000ms idle_timeout_no_probe_ms window
+    let mut tool_result = None;
+    for _ in 0..6 {
+        if let Some(result) = task_future.as_mut().now_or_never() {
+            tool_result = Some(result);
+            break;
+        }
+        cx.run_until_parked();
+        cx.background_executor
+            .timer(Duration::from_millis(500))
+            .await;
+    }
+
+    let result = tool_result
+        .expect("task should complete via no-probe idle watchdog")
+        .expect("tool call result should be Ok");
+
+    assert!(
+        handle.was_killed(),
+        "handle should be killed when no-probe idle timeout is reached"
+    );
+    assert!(
+        result.contains("for 4s"),
+        "diagnostic must report the 4s widened no-probe window, got: {result}"
+    );
+    assert!(
+        result.contains("was stopped by the watchdog"),
+        "expected idle stop announcement, got: {result}"
+    );
+    assert!(
+        result.contains("no terminal output, no CPU usage, and no disk activity"),
+        "expected activity diagnostic, got: {result}"
+    );
+    assert!(
+        result.contains("Before retrying: check for -y/--yes/--no-pager/non-interactive flags and verify the command does not expect input"),
+        "expected guidance sentence, got: {result}"
+    );
+}
+
+#[gpui::test]
 async fn test_thinking(cx: &mut TestAppContext) {
     let ThreadTest { model, thread, .. } = setup(cx, TestModel::Fake).await;
     let fake_model = model.as_fake();
@@ -713,6 +1396,363 @@ async fn test_system_prompt_without_tools(cx: &mut TestAppContext) {
         "unexpected system message: {:?}",
         system_message
     );
+}
+
+#[gpui::test]
+async fn test_per_model_system_prompt_template_matched(cx: &mut TestAppContext) {
+    let ThreadTest {
+        model, thread, fs, ..
+    } = setup(cx, TestModel::Fake).await;
+    let fake_model = model.as_fake();
+
+    let template_path = std::env::temp_dir().join(format!(
+        "zed-test-per-model-matched-{}-{}.hbs",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::write(&template_path, "Custom per-model prompt for {{model_name}}").unwrap();
+
+    fs.insert_file(
+        paths::settings_file(),
+        json!({
+            "agent": {
+                "default_profile": "test-profile",
+                "profiles": {
+                    "test-profile": {
+                        "name": "Test Profile",
+                        "tools": {
+                            EchoTool::NAME: true,
+                        }
+                    }
+                },
+                "model_parameters": [
+                    {
+                        "provider": "fake",
+                        "model": "fake",
+                        "system_prompt_template": template_path.to_string_lossy(),
+                    }
+                ]
+            }
+        })
+        .to_string()
+        .into_bytes(),
+    )
+    .await;
+    cx.run_until_parked();
+
+    thread.update(cx, |thread, _| thread.add_tool(EchoTool));
+    thread
+        .update(cx, |thread, cx| {
+            thread.send(ClientUserMessageId::new(), ["test message"], cx)
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    let mut pending_completions = fake_model.pending_completions();
+    assert_eq!(pending_completions.len(), 1);
+    let pending_completion = pending_completions.pop().unwrap();
+    let MessageContent::Text(system_prompt) = &pending_completion.messages[0].content[0] else {
+        panic!("Expected text content");
+    };
+    assert_eq!(system_prompt, "Custom per-model prompt for Fake");
+
+    std::fs::remove_file(&template_path).log_err();
+}
+
+#[gpui::test]
+async fn test_per_model_system_prompt_template_beats_global(cx: &mut TestAppContext) {
+    let ThreadTest {
+        model, thread, fs, ..
+    } = setup(cx, TestModel::Fake).await;
+    let fake_model = model.as_fake();
+
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let global_template_path = std::env::temp_dir().join(format!(
+        "zed-test-global-template-{}-{}.hbs",
+        std::process::id(),
+        timestamp
+    ));
+    let per_model_template_path = std::env::temp_dir().join(format!(
+        "zed-test-per-model-beats-global-{}-{}.hbs",
+        std::process::id(),
+        timestamp
+    ));
+    std::fs::write(&global_template_path, "Global prompt").unwrap();
+    std::fs::write(
+        &per_model_template_path,
+        "Per-model prompt for {{model_name}}",
+    )
+    .unwrap();
+
+    fs.insert_file(
+        paths::settings_file(),
+        json!({
+            "agent": {
+                "default_profile": "test-profile",
+                "profiles": {
+                    "test-profile": {
+                        "name": "Test Profile",
+                        "tools": {
+                            EchoTool::NAME: true,
+                        }
+                    }
+                },
+                "system_prompt_template": global_template_path.to_string_lossy(),
+                "model_parameters": [
+                    {
+                        "provider": "fake",
+                        "model": "fake",
+                        "system_prompt_template": per_model_template_path.to_string_lossy(),
+                    }
+                ]
+            }
+        })
+        .to_string()
+        .into_bytes(),
+    )
+    .await;
+    cx.run_until_parked();
+
+    thread.update(cx, |thread, _| thread.add_tool(EchoTool));
+    thread
+        .update(cx, |thread, cx| {
+            thread.send(ClientUserMessageId::new(), ["test message"], cx)
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    let mut pending_completions = fake_model.pending_completions();
+    assert_eq!(pending_completions.len(), 1);
+    let pending_completion = pending_completions.pop().unwrap();
+    let MessageContent::Text(system_prompt) = &pending_completion.messages[0].content[0] else {
+        panic!("Expected text content");
+    };
+    assert_eq!(system_prompt, "Per-model prompt for Fake");
+
+    std::fs::remove_file(&global_template_path).log_err();
+    std::fs::remove_file(&per_model_template_path).log_err();
+}
+
+#[gpui::test]
+async fn test_per_model_system_prompt_template_global_fallback_when_unmatched(
+    cx: &mut TestAppContext,
+) {
+    let ThreadTest {
+        model, thread, fs, ..
+    } = setup(cx, TestModel::Fake).await;
+    let fake_model = model.as_fake();
+
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let global_template_path = std::env::temp_dir().join(format!(
+        "zed-test-global-unmatched-{}-{}.hbs",
+        std::process::id(),
+        timestamp
+    ));
+    let other_template_path = std::env::temp_dir().join(format!(
+        "zed-test-other-unmatched-{}-{}.hbs",
+        std::process::id(),
+        timestamp
+    ));
+    std::fs::write(&global_template_path, "Global prompt for {{model_name}}").unwrap();
+    std::fs::write(&other_template_path, "Other prompt").unwrap();
+
+    fs.insert_file(
+        paths::settings_file(),
+        json!({
+            "agent": {
+                "default_profile": "test-profile",
+                "profiles": {
+                    "test-profile": {
+                        "name": "Test Profile",
+                        "tools": {
+                            EchoTool::NAME: true,
+                        }
+                    }
+                },
+                "system_prompt_template": global_template_path.to_string_lossy(),
+                "model_parameters": [
+                    {
+                        "provider": "anthropic",
+                        "model": "claude-3-5-sonnet",
+                        "system_prompt_template": other_template_path.to_string_lossy(),
+                    }
+                ]
+            }
+        })
+        .to_string()
+        .into_bytes(),
+    )
+    .await;
+    cx.run_until_parked();
+
+    thread.update(cx, |thread, _| thread.add_tool(EchoTool));
+    thread
+        .update(cx, |thread, cx| {
+            thread.send(ClientUserMessageId::new(), ["test message"], cx)
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    let mut pending_completions = fake_model.pending_completions();
+    assert_eq!(pending_completions.len(), 1);
+    let pending_completion = pending_completions.pop().unwrap();
+    let MessageContent::Text(system_prompt) = &pending_completion.messages[0].content[0] else {
+        panic!("Expected text content");
+    };
+    assert_eq!(system_prompt, "Global prompt for Fake");
+
+    std::fs::remove_file(&global_template_path).log_err();
+    std::fs::remove_file(&other_template_path).log_err();
+}
+
+#[gpui::test]
+async fn test_per_model_custom_instructions(cx: &mut TestAppContext) {
+    let ThreadTest {
+        model,
+        thread,
+        fs,
+        project_context,
+        ..
+    } = setup(cx, TestModel::Fake).await;
+    let fake_model = model.as_fake();
+
+    project_context.update(cx, |project_context, _cx| {
+        project_context.shell = "test-shell".into()
+    });
+
+    fs.insert_file(
+        paths::settings_file(),
+        json!({
+            "agent": {
+                "default_profile": "test-profile",
+                "profiles": {
+                    "test-profile": {
+                        "name": "Test Profile",
+                        "tools": {
+                            EchoTool::NAME: true,
+                        }
+                    }
+                },
+                "model_parameters": [
+                    {
+                        "provider": "fake",
+                        "model": "fake",
+                        "custom_instructions": "Special per-model instructions for Fake model",
+                    }
+                ]
+            }
+        })
+        .to_string()
+        .into_bytes(),
+    )
+    .await;
+    cx.run_until_parked();
+
+    thread.update(cx, |thread, _| thread.add_tool(EchoTool));
+    thread
+        .update(cx, |thread, cx| {
+            thread.send(ClientUserMessageId::new(), ["test message"], cx)
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    let mut pending_completions = fake_model.pending_completions();
+    assert_eq!(pending_completions.len(), 1);
+    let pending_completion = pending_completions.pop().unwrap();
+    let MessageContent::Text(system_prompt) = &pending_completion.messages[0].content[0] else {
+        panic!("Expected text content");
+    };
+    // Per-model custom instructions should appear
+    assert!(
+        system_prompt.contains("Special per-model instructions for Fake model"),
+        "unexpected system prompt: {system_prompt}"
+    );
+    // Built-in system prompt should also be preserved
+    assert!(
+        system_prompt.contains("test-shell"),
+        "unexpected system prompt: {system_prompt}"
+    );
+    assert!(
+        system_prompt.contains("## Fixing Diagnostics"),
+        "unexpected system prompt: {system_prompt}"
+    );
+}
+
+#[gpui::test]
+async fn test_per_model_custom_instructions_appended_to_profile_prompt(cx: &mut TestAppContext) {
+    let ThreadTest {
+        model, thread, fs, ..
+    } = setup(cx, TestModel::Fake).await;
+    let fake_model = model.as_fake();
+
+    let profile_prompt_path = std::env::temp_dir().join(format!(
+        "zed-test-profile-prompt-{}-{}.md",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::write(&profile_prompt_path, "Instructions from profile").unwrap();
+
+    fs.insert_file(
+        paths::settings_file(),
+        json!({
+            "agent": {
+                "default_profile": "test-profile",
+                "profiles": {
+                    "test-profile": {
+                        "name": "Test Profile",
+                        "custom_prompt_path": profile_prompt_path.to_string_lossy(),
+                        "tools": {
+                            EchoTool::NAME: true,
+                        }
+                    }
+                },
+                "model_parameters": [
+                    {
+                        "provider": "fake",
+                        "model": "fake",
+                        "custom_instructions": "Instructions from model parameters",
+                    }
+                ]
+            }
+        })
+        .to_string()
+        .into_bytes(),
+    )
+    .await;
+    cx.run_until_parked();
+
+    thread.update(cx, |thread, _| thread.add_tool(EchoTool));
+    thread
+        .update(cx, |thread, cx| {
+            thread.send(ClientUserMessageId::new(), ["test message"], cx)
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    let mut pending_completions = fake_model.pending_completions();
+    assert_eq!(pending_completions.len(), 1);
+    let pending_completion = pending_completions.pop().unwrap();
+    let MessageContent::Text(system_prompt) = &pending_completion.messages[0].content[0] else {
+        panic!("Expected text content");
+    };
+    assert!(
+        system_prompt.contains("Instructions from profile\n\nInstructions from model parameters"),
+        "unexpected system prompt: {system_prompt}"
+    );
+
+    std::fs::remove_file(&profile_prompt_path).log_err();
 }
 
 #[gpui::test]
@@ -5676,6 +6716,9 @@ async fn test_subagent_tool_call_end_to_end(cx: &mut TestAppContext) {
         session_id: None,
         task_id: None,
         profile: Some(subagent_profile.clone()),
+        goal_id: None,
+        base_branch: None,
+        on_branch: None,
     };
     let subagent_tool_use = LanguageModelToolUse {
         id: "subagent_1".into(),
@@ -5816,6 +6859,9 @@ async fn test_subagent_tool_output_does_not_include_thinking(cx: &mut TestAppCon
         session_id: None,
         task_id: None,
         profile: Some(subagent_profile.clone()),
+        goal_id: None,
+        base_branch: None,
+        on_branch: None,
     };
     let subagent_tool_use = LanguageModelToolUse {
         id: "subagent_1".into(),
@@ -5969,6 +7015,9 @@ async fn test_subagent_tool_call_cancellation_during_task_prompt(cx: &mut TestAp
         session_id: None,
         task_id: None,
         profile: Some(subagent_profile.clone()),
+        goal_id: None,
+        base_branch: None,
+        on_branch: None,
     };
     let subagent_tool_use = LanguageModelToolUse {
         id: "subagent_1".into(),
@@ -6104,6 +7153,9 @@ async fn test_subagent_tool_resume_session(cx: &mut TestAppContext) {
         session_id: None,
         task_id: None,
         profile: Some(subagent_profile.clone()),
+        goal_id: None,
+        base_branch: None,
+        on_branch: None,
     };
     let subagent_tool_use = LanguageModelToolUse {
         id: "subagent_1".into(),
@@ -6170,6 +7222,9 @@ async fn test_subagent_tool_resume_session(cx: &mut TestAppContext) {
         session_id: Some(subagent_session_id.clone()),
         task_id: None,
         profile: Some(subagent_profile.clone()),
+        goal_id: None,
+        base_branch: None,
+        on_branch: None,
     };
     let resume_tool_use = LanguageModelToolUse {
         id: "subagent_2".into(),
@@ -6265,7 +7320,7 @@ async fn test_subagent_thread_inherits_parent_thread_properties(cx: &mut TestApp
         )
     });
 
-    let subagent_thread = cx.new(|cx| Thread::new_subagent(&parent_thread, None, cx));
+    let subagent_thread = cx.new(|cx| Thread::new_subagent(&parent_thread, None, None, cx));
     subagent_thread.read_with(cx, |subagent_thread, cx| {
         assert!(subagent_thread.is_subagent());
         assert_eq!(subagent_thread.depth(), 1);
@@ -6340,7 +7395,7 @@ async fn test_subagent_thread_uses_configured_subagent_model(cx: &mut TestAppCon
         )
     });
 
-    let subagent_thread = cx.new(|cx| Thread::new_subagent(&parent_thread, None, cx));
+    let subagent_thread = cx.new(|cx| Thread::new_subagent(&parent_thread, None, None, cx));
     subagent_thread.read_with(cx, |subagent_thread, _cx| {
         assert_eq!(
             subagent_thread.model().map(|model| model.id()),
@@ -6398,8 +7453,12 @@ async fn test_subagent_with_explicit_profile_uses_profile_tools(cx: &mut TestApp
         thread
     });
     let subagent_thread = cx.new(|cx| {
-        let mut thread =
-            Thread::new_subagent(&parent_thread, Some(AgentProfileId("research".into())), cx);
+        let mut thread = Thread::new_subagent(
+            &parent_thread,
+            Some(AgentProfileId("research".into())),
+            None,
+            cx,
+        );
         thread.add_default_tools(environment.clone(), cx);
         thread
     });
@@ -6461,9 +7520,14 @@ async fn test_subagent_with_explicit_profile_keeps_profile_when_parent_switches(
     });
 
     let pinned_thread = cx.new(|cx| {
-        Thread::new_subagent(&parent_thread, Some(AgentProfileId("research".into())), cx)
+        Thread::new_subagent(
+            &parent_thread,
+            Some(AgentProfileId("research".into())),
+            None,
+            cx,
+        )
     });
-    let unpinned_thread = cx.new(|cx| Thread::new_subagent(&parent_thread, None, cx));
+    let unpinned_thread = cx.new(|cx| Thread::new_subagent(&parent_thread, None, None, cx));
 
     assert_eq!(
         pinned_thread.read_with(cx, |thread, _| thread.profile().as_str().to_string()),
@@ -6553,7 +7617,12 @@ async fn test_subagent_with_explicit_profile_model_not_overridden_by_parent(
     });
 
     let subagent_thread = cx.new(|cx| {
-        Thread::new_subagent(&parent_thread, Some(AgentProfileId("research".into())), cx)
+        Thread::new_subagent(
+            &parent_thread,
+            Some(AgentProfileId("research".into())),
+            None,
+            cx,
+        )
     });
 
     // The profile's model wins over the parent's model.
@@ -6643,7 +7712,7 @@ async fn test_max_subagent_depth_prevents_tool_registration(cx: &mut TestAppCont
         thread
     });
     let deep_subagent_thread = cx.new(|cx| {
-        let mut thread = Thread::new_subagent(&deep_parent_thread, None, cx);
+        let mut thread = Thread::new_subagent(&deep_parent_thread, None, None, cx);
         thread.add_default_tools(environment, cx);
         thread
     });
@@ -6708,13 +7777,13 @@ async fn test_spawn_agent_gated_by_depth_across_boundaries(cx: &mut TestAppConte
     // Depth 0 (root) and every level below the limit keep the tool.
     assert_has_spawn_agent(&root, cx, true);
     let depth_one = cx.new(|cx| {
-        let mut thread = Thread::new_subagent(&root, None, cx);
+        let mut thread = Thread::new_subagent(&root, None, None, cx);
         thread.add_default_tools(environment.clone(), cx);
         thread
     });
     assert_has_spawn_agent(&depth_one, cx, true);
     let depth_two = cx.new(|cx| {
-        let mut thread = Thread::new_subagent(&depth_one, None, cx);
+        let mut thread = Thread::new_subagent(&depth_one, None, None, cx);
         thread.add_default_tools(environment.clone(), cx);
         thread
     });
@@ -6722,7 +7791,7 @@ async fn test_spawn_agent_gated_by_depth_across_boundaries(cx: &mut TestAppConte
 
     // At the limit the tool disappears and the system note appears.
     let depth_three = cx.new(|cx| {
-        let mut thread = Thread::new_subagent(&depth_two, None, cx);
+        let mut thread = Thread::new_subagent(&depth_two, None, None, cx);
         thread.add_default_tools(environment.clone(), cx);
         thread
     });
@@ -6733,7 +7802,7 @@ async fn test_spawn_agent_gated_by_depth_across_boundaries(cx: &mut TestAppConte
 
     // Beyond the limit (e.g. after the setting was lowered) stays without.
     let depth_four = cx.new(|cx| {
-        let mut thread = Thread::new_subagent(&depth_three, None, cx);
+        let mut thread = Thread::new_subagent(&depth_three, None, None, cx);
         thread.add_default_tools(environment, cx);
         thread
     });
@@ -6785,7 +7854,7 @@ async fn test_spawn_agent_absent_when_nesting_disabled_or_profile_lacks_it(
     // (the tool is absent because of the setting, not the depth limit).
     cx.update(|cx| set_nested_sub_agent_settings(cx, false, 3, 16));
     let subagent = cx.new(|cx| {
-        let mut thread = Thread::new_subagent(&root, None, cx);
+        let mut thread = Thread::new_subagent(&root, None, None, cx);
         thread.add_default_tools(environment.clone(), cx);
         thread
     });
@@ -6806,7 +7875,7 @@ async fn test_spawn_agent_absent_when_nesting_disabled_or_profile_lacks_it(
     });
     let limited = cx.new(|cx| {
         let mut thread =
-            Thread::new_subagent(&subagent, Some(AgentProfileId("no_spawn".into())), cx);
+            Thread::new_subagent(&subagent, Some(AgentProfileId("no_spawn".into())), None, cx);
         thread.add_default_tools(environment.clone(), cx);
         thread
     });
@@ -6823,7 +7892,7 @@ async fn test_spawn_agent_absent_when_nesting_disabled_or_profile_lacks_it(
     // still doesn't get it: depth wins over the profile.
     cx.update(|cx| set_nested_sub_agent_settings(cx, true, 1, 16));
     let spawned = cx.new(|cx| {
-        let mut thread = Thread::new_subagent(&root, None, cx);
+        let mut thread = Thread::new_subagent(&root, None, None, cx);
         thread.add_default_tools(environment, cx);
         thread
     });
@@ -6896,6 +7965,7 @@ async fn test_delegation_chain_budget_exhaustion_blocks_transitive_bypass(cx: &m
             root_env.create_subagent_thread(
                 "ci_runner".into(),
                 Some(AgentProfileId("ci_runner".into())),
+                None,
                 cx,
             )
         })
@@ -6925,6 +7995,7 @@ async fn test_delegation_chain_budget_exhaustion_blocks_transitive_bypass(cx: &m
         ci_runner_env.create_subagent_thread(
             "orchestrator".into(),
             Some(AgentProfileId("orchestrator".into())),
+            None,
             cx,
         )
     });
@@ -6943,6 +8014,7 @@ async fn test_delegation_chain_budget_exhaustion_blocks_transitive_bypass(cx: &m
         ci_runner_env.resume_subagent_thread(
             ci_runner_session_id.clone(),
             Some(AgentProfileId("orchestrator".into())),
+            None,
             cx,
         )
     });
@@ -7214,7 +8286,7 @@ async fn test_parent_cancel_stops_subagent(cx: &mut TestAppContext) {
         )
     });
 
-    let subagent = cx.new(|cx| Thread::new_subagent(&parent, None, cx));
+    let subagent = cx.new(|cx| Thread::new_subagent(&parent, None, None, cx));
 
     parent.update(cx, |thread, _cx| {
         thread.register_running_subagent(subagent.downgrade());
@@ -7299,6 +8371,9 @@ async fn test_subagent_context_window_warning(cx: &mut TestAppContext) {
         session_id: None,
         task_id: None,
         profile: Some(subagent_profile.clone()),
+        goal_id: None,
+        base_branch: None,
+        on_branch: None,
     };
     let subagent_tool_use = LanguageModelToolUse {
         id: "subagent_1".into(),
@@ -7429,6 +8504,9 @@ async fn test_subagent_no_context_window_warning_when_already_at_warning(cx: &mu
         session_id: None,
         task_id: None,
         profile: Some(subagent_profile.clone()),
+        goal_id: None,
+        base_branch: None,
+        on_branch: None,
     };
     let subagent_tool_use = LanguageModelToolUse {
         id: "subagent_1".into(),
@@ -7499,6 +8577,9 @@ async fn test_subagent_no_context_window_warning_when_already_at_warning(cx: &mu
         session_id: Some(subagent_session_id.clone()),
         task_id: None,
         profile: Some(subagent_profile.clone()),
+        goal_id: None,
+        base_branch: None,
+        on_branch: None,
     };
     let resume_tool_use = LanguageModelToolUse {
         id: "subagent_2".into(),
@@ -7611,6 +8692,9 @@ async fn test_subagent_error_propagation(cx: &mut TestAppContext) {
         session_id: None,
         task_id: None,
         profile: Some(subagent_profile.clone()),
+        goal_id: None,
+        base_branch: None,
+        on_branch: None,
     };
     let subagent_tool_use = LanguageModelToolUse {
         id: "subagent_1".into(),
@@ -9480,6 +10564,9 @@ async fn test_subagent_task_id_prompt_formatting(cx: &mut TestAppContext) {
         session_id: None,
         task_id: Some("TASK-42".into()),
         profile: Some(subagent_profile),
+        goal_id: None,
+        base_branch: None,
+        on_branch: None,
     };
 
     let tool_use = LanguageModelToolUse {
@@ -9756,6 +10843,7 @@ async fn test_profile_write_scopes_allowed_and_denied(cx: &mut TestAppContext) {
             &project,
             &canonical_roots,
             Some(&profile),
+            None,
             cx,
         )
     });
@@ -9773,6 +10861,7 @@ async fn test_profile_write_scopes_allowed_and_denied(cx: &mut TestAppContext) {
             &project,
             &canonical_roots,
             Some(&profile),
+            None,
             cx,
         )
     });
@@ -9799,6 +10888,7 @@ async fn test_profile_write_scopes_allowed_and_denied(cx: &mut TestAppContext) {
             &project,
             &canonical_roots,
             Some(&profile),
+            None,
             cx,
         )
     });
@@ -9816,6 +10906,7 @@ async fn test_profile_write_scopes_allowed_and_denied(cx: &mut TestAppContext) {
             &project,
             &canonical_roots,
             Some(&profile),
+            None,
             cx,
         )
     });
@@ -9823,4 +10914,1547 @@ async fn test_profile_write_scopes_allowed_and_denied(cx: &mut TestAppContext) {
         denied.is_err(),
         "frontend/src/new_file.rs should be outside write_scopes"
     );
+}
+
+#[gpui::test]
+async fn test_spawn_agent_two_tasks_isolated_worktrees(cx: &mut TestAppContext) {
+    init_test(cx);
+    always_allow_tools(cx);
+    cx.update(|cx| {
+        LanguageModelRegistry::test(cx);
+        enable_default_profile_delegation(cx);
+    });
+
+    cx.update(|cx| {
+        cx.update_flags(true, vec!["subagents".to_string()]);
+    });
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(
+        "/root",
+        json!({
+            ".git": {},
+            "file.txt": "original content"
+        }),
+    )
+    .await;
+    let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
+    let thread_store = cx.new(|cx| ThreadStore::new(cx));
+    let agent =
+        cx.update(|cx| NativeAgent::new(thread_store.clone(), Templates::new(), fs.clone(), cx));
+    let connection = Rc::new(NativeAgentConnection(agent.clone()));
+
+    let acp_thread = cx
+        .update(|cx| {
+            connection
+                .clone()
+                .new_session(project.clone(), PathList::new(&[Path::new("")]), cx)
+        })
+        .await
+        .unwrap();
+    let session_id = acp_thread.read_with(cx, |thread, _| thread.session_id().clone());
+    let thread = agent.read_with(cx, |agent, _| {
+        agent.sessions.get(&session_id).unwrap().thread.clone()
+    });
+    let model = Arc::new(FakeLanguageModel::default());
+
+    thread.update(cx, |thread, cx| {
+        thread.set_model(model.clone(), cx);
+    });
+    cx.run_until_parked();
+
+    // === First subagent with TASK-1 ===
+    let send1 = acp_thread.update(cx, |thread, cx| thread.send_raw("Start task 1", cx));
+    cx.run_until_parked();
+    model.send_last_completion_stream_text_chunk("spawning subagent 1");
+    let subagent1_input = SpawnAgentToolInput {
+        label: "task 1".to_string(),
+        message: "do task 1".to_string(),
+        session_id: None,
+        task_id: Some("TASK-1".to_string()),
+        profile: None,
+        goal_id: None,
+        base_branch: None,
+        on_branch: None,
+    };
+    let tool_use_1 = LanguageModelToolUse {
+        id: "subagent_1".into(),
+        name: SpawnAgentTool::NAME.into(),
+        raw_input: serde_json::to_string(&subagent1_input).unwrap(),
+        input: language_model::LanguageModelToolUseInput::Json(
+            serde_json::to_value(&subagent1_input).unwrap(),
+        ),
+        is_input_complete: true,
+        thought_signature: None,
+    };
+    model.send_last_completion_stream_event(LanguageModelCompletionEvent::ToolUse(tool_use_1));
+    model.end_last_completion_stream();
+    cx.run_until_parked();
+
+    let subagent1_session_id = thread.read_with(cx, |thread, cx| {
+        thread.running_subagent_ids(cx).get(0).cloned().unwrap()
+    });
+    let subagent1_thread = agent.read_with(cx, |agent, _| {
+        agent
+            .sessions
+            .get(&subagent1_session_id)
+            .unwrap()
+            .thread
+            .clone()
+    });
+    let worktree1_path = subagent1_thread.read_with(cx, |t, _| {
+        t.task_worktree()
+            .map(|p| p.to_path_buf())
+            .expect("subagent 1 should have task worktree")
+    });
+    assert!(
+        worktree1_path
+            .to_string_lossy()
+            .contains("agent-task-TASK-1")
+    );
+
+    // Subagent 1 writes to file.txt
+    let write_input_1 = crate::tools::WriteFileToolInput {
+        path: PathBuf::from("file.txt"),
+        content: "task 1 content".to_string(),
+    };
+    let write_tool_use_1 = LanguageModelToolUse {
+        id: "write_1".into(),
+        name: crate::tools::WriteFileTool::NAME.into(),
+        raw_input: serde_json::to_string(&write_input_1).unwrap(),
+        input: language_model::LanguageModelToolUseInput::Json(
+            serde_json::to_value(&write_input_1).unwrap(),
+        ),
+        is_input_complete: true,
+        thought_signature: None,
+    };
+    model
+        .send_last_completion_stream_event(LanguageModelCompletionEvent::ToolUse(write_tool_use_1));
+    model.end_last_completion_stream();
+    cx.run_until_parked();
+
+    // Subagent 1 finishes
+    model.send_last_completion_stream_text_chunk("done with task 1");
+    model.end_last_completion_stream();
+    cx.run_until_parked();
+
+    // Verify parent received isolation_details with branch, sha, changed_files
+    let completion1 = model
+        .pending_completions()
+        .pop()
+        .expect("expected parent completion after subagent 1 finish");
+    let tool_result_1 = completion1
+        .messages
+        .iter()
+        .flat_map(|m| &m.content)
+        .find_map(|content| match content {
+            language_model::MessageContent::ToolResult(result) => Some(result),
+            _ => None,
+        })
+        .expect("expected a tool result for subagent 1");
+
+    let text1 = match &tool_result_1.content[0] {
+        language_model::LanguageModelToolResultContent::Text(t) => t.as_ref(),
+        _ => panic!("expected text"),
+    };
+    let parsed1: serde_json::Value = serde_json::from_str(text1).unwrap();
+    assert_eq!(parsed1["isolation"], "worktree:agent-task/TASK-1");
+    assert_eq!(parsed1["isolation_details"]["branch"], "agent-task/TASK-1");
+    assert_eq!(parsed1["isolation_details"]["changed_files"], 1);
+    let head_sha_1 = parsed1["isolation_details"]["head_sha"]
+        .as_str()
+        .expect("head_sha should be present");
+    assert!(!head_sha_1.is_empty());
+
+    // Parent completes turn 1
+    model.send_last_completion_stream_text_chunk("Parent response 1");
+    model.end_last_completion_stream();
+    send1.await.unwrap();
+
+    // === Second subagent with TASK-2 ===
+    let send2 = acp_thread.update(cx, |thread, cx| thread.send_raw("Start task 2", cx));
+    cx.run_until_parked();
+    model.send_last_completion_stream_text_chunk("spawning subagent 2");
+    let subagent2_input = SpawnAgentToolInput {
+        label: "task 2".to_string(),
+        message: "do task 2".to_string(),
+        session_id: None,
+        task_id: Some("TASK-2".to_string()),
+        profile: None,
+        goal_id: None,
+        base_branch: None,
+        on_branch: None,
+    };
+    let tool_use_2 = LanguageModelToolUse {
+        id: "subagent_2".into(),
+        name: SpawnAgentTool::NAME.into(),
+        raw_input: serde_json::to_string(&subagent2_input).unwrap(),
+        input: language_model::LanguageModelToolUseInput::Json(
+            serde_json::to_value(&subagent2_input).unwrap(),
+        ),
+        is_input_complete: true,
+        thought_signature: None,
+    };
+    model.send_last_completion_stream_event(LanguageModelCompletionEvent::ToolUse(tool_use_2));
+    model.end_last_completion_stream();
+    cx.run_until_parked();
+
+    let subagent2_session_id = thread.read_with(cx, |thread, cx| {
+        thread.running_subagent_ids(cx).get(0).cloned().unwrap()
+    });
+    let subagent2_thread = agent.read_with(cx, |agent, _| {
+        agent
+            .sessions
+            .get(&subagent2_session_id)
+            .unwrap()
+            .thread
+            .clone()
+    });
+    let worktree2_path = subagent2_thread.read_with(cx, |t, _| {
+        t.task_worktree()
+            .map(|p| p.to_path_buf())
+            .expect("subagent 2 should have task worktree")
+    });
+    assert!(
+        worktree2_path
+            .to_string_lossy()
+            .contains("agent-task-TASK-2")
+    );
+
+    // Subagent 2 writes to file.txt
+    let write_input_2 = crate::tools::WriteFileToolInput {
+        path: PathBuf::from("file.txt"),
+        content: "task 2 content".to_string(),
+    };
+    let write_tool_use_2 = LanguageModelToolUse {
+        id: "write_2".into(),
+        name: crate::tools::WriteFileTool::NAME.into(),
+        raw_input: serde_json::to_string(&write_input_2).unwrap(),
+        input: language_model::LanguageModelToolUseInput::Json(
+            serde_json::to_value(&write_input_2).unwrap(),
+        ),
+        is_input_complete: true,
+        thought_signature: None,
+    };
+    model
+        .send_last_completion_stream_event(LanguageModelCompletionEvent::ToolUse(write_tool_use_2));
+    model.end_last_completion_stream();
+    cx.run_until_parked();
+
+    // Subagent 2 finishes
+    model.send_last_completion_stream_text_chunk("done with task 2");
+    model.end_last_completion_stream();
+    cx.run_until_parked();
+
+    // Verify parent received isolation_details with branch, sha, changed_files for task 2
+    let completion2 = model
+        .pending_completions()
+        .pop()
+        .expect("expected parent completion after subagent 2 finish");
+    let tool_result_2 = completion2
+        .messages
+        .iter()
+        .flat_map(|m| &m.content)
+        .find_map(|content| match content {
+            language_model::MessageContent::ToolResult(result)
+                if result.tool_use_id == "subagent_2".into() =>
+            {
+                Some(result)
+            }
+            _ => None,
+        })
+        .expect("expected a tool result for subagent 2");
+
+    let text2 = match &tool_result_2.content[0] {
+        language_model::LanguageModelToolResultContent::Text(t) => t.as_ref(),
+        _ => panic!("expected text"),
+    };
+    let parsed2: serde_json::Value = serde_json::from_str(text2).unwrap();
+    assert_eq!(parsed2["isolation"], "worktree:agent-task/TASK-2");
+    assert_eq!(parsed2["isolation_details"]["branch"], "agent-task/TASK-2");
+    assert_eq!(parsed2["isolation_details"]["changed_files"], 1);
+    let head_sha_2 = parsed2["isolation_details"]["head_sha"]
+        .as_str()
+        .expect("head_sha should be present");
+    assert!(!head_sha_2.is_empty());
+
+    // Parent completes turn 2
+    model.send_last_completion_stream_text_chunk("Parent response 2");
+    model.end_last_completion_stream();
+    send2.await.unwrap();
+
+    // Verify isolation assertions:
+    assert_ne!(worktree1_path, worktree2_path);
+    // Main project tree is untouched!
+    assert_eq!(
+        fs.load(path!("/root/file.txt").as_ref())
+            .await
+            .unwrap()
+            .trim(),
+        "original content"
+    );
+    // Worktree 1 has task 1 content
+    assert_eq!(
+        fs.load(&worktree1_path.join("file.txt"))
+            .await
+            .unwrap()
+            .trim(),
+        "task 1 content"
+    );
+    // Worktree 2 has task 2 content
+    assert_eq!(
+        fs.load(&worktree2_path.join("file.txt"))
+            .await
+            .unwrap()
+            .trim(),
+        "task 2 content"
+    );
+
+    // Verify worktree statuses are clean after commit!
+    let empty_path = git::repository::RepoPath::from_rel_path(&util::rel_path::RelPath::empty());
+    let repo1 = fs.open_repo(&worktree1_path.join(".git"), None).unwrap();
+    let status1 = repo1
+        .status(std::slice::from_ref(&empty_path))
+        .await
+        .unwrap();
+    assert!(
+        status1.entries.is_empty(),
+        "worktree 1 should have clean status after commit"
+    );
+
+    let repo2 = fs.open_repo(&worktree2_path.join(".git"), None).unwrap();
+    let status2 = repo2
+        .status(std::slice::from_ref(&empty_path))
+        .await
+        .unwrap();
+    assert!(
+        status2.entries.is_empty(),
+        "worktree 2 should have clean status after commit"
+    );
+}
+
+#[gpui::test]
+async fn test_spawn_agent_non_git_degrades_isolation(cx: &mut TestAppContext) {
+    init_test(cx);
+    cx.update(|cx| {
+        LanguageModelRegistry::test(cx);
+        enable_default_profile_delegation(cx);
+    });
+
+    cx.update(|cx| {
+        cx.update_flags(true, vec!["subagents".to_string()]);
+    });
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(
+        "/root",
+        json!({
+            "file.txt": "hello"
+        }),
+    )
+    .await;
+    let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
+    let thread_store = cx.new(|cx| ThreadStore::new(cx));
+    let agent =
+        cx.update(|cx| NativeAgent::new(thread_store.clone(), Templates::new(), fs.clone(), cx));
+    let connection = Rc::new(NativeAgentConnection(agent.clone()));
+
+    let acp_thread = cx
+        .update(|cx| {
+            connection
+                .clone()
+                .new_session(project.clone(), PathList::new(&[Path::new("")]), cx)
+        })
+        .await
+        .unwrap();
+    let session_id = acp_thread.read_with(cx, |thread, _| thread.session_id().clone());
+    let thread = agent.read_with(cx, |agent, _| {
+        agent.sessions.get(&session_id).unwrap().thread.clone()
+    });
+    let model = Arc::new(FakeLanguageModel::default());
+
+    thread.update(cx, |thread, cx| {
+        thread.set_model(model.clone(), cx);
+    });
+    cx.run_until_parked();
+
+    let send = acp_thread.update(cx, |thread, cx| thread.send_raw("Start task", cx));
+    cx.run_until_parked();
+    model.send_last_completion_stream_text_chunk("spawning subagent");
+    let subagent_input = SpawnAgentToolInput {
+        label: "non-git task".to_string(),
+        message: "do something".to_string(),
+        session_id: None,
+        task_id: Some("TASK-404".to_string()),
+        profile: None,
+        goal_id: None,
+        base_branch: None,
+        on_branch: None,
+    };
+    let tool_use = LanguageModelToolUse {
+        id: "subagent_1".into(),
+        name: SpawnAgentTool::NAME.into(),
+        raw_input: serde_json::to_string(&subagent_input).unwrap(),
+        input: language_model::LanguageModelToolUseInput::Json(
+            serde_json::to_value(&subagent_input).unwrap(),
+        ),
+        is_input_complete: true,
+        thought_signature: None,
+    };
+    model.send_last_completion_stream_event(LanguageModelCompletionEvent::ToolUse(tool_use));
+    model.end_last_completion_stream();
+    cx.run_until_parked();
+
+    // Subagent should be spawned successfully despite non-git (graceful degradation)
+    let subagent_session_id = thread.read_with(cx, |thread, cx| {
+        thread
+            .running_subagent_ids(cx)
+            .get(0)
+            .cloned()
+            .expect("subagent should be running")
+    });
+    let subagent_thread = agent.read_with(cx, |agent, _| {
+        agent
+            .sessions
+            .get(&subagent_session_id)
+            .unwrap()
+            .thread
+            .clone()
+    });
+    assert_eq!(
+        subagent_thread.read_with(cx, |t, _| t.task_worktree().map(|p| p.to_path_buf())),
+        None
+    );
+
+    // Subagent responds
+    model.send_last_completion_stream_text_chunk("subagent finished work");
+    model.end_last_completion_stream();
+    cx.run_until_parked();
+
+    // Verify parent model received the tool result containing the degradation marker
+    let completion = model
+        .pending_completions()
+        .pop()
+        .expect("expected parent completion after subagent finish");
+    let tool_result = completion
+        .messages
+        .iter()
+        .flat_map(|m| &m.content)
+        .find_map(|content| match content {
+            language_model::MessageContent::ToolResult(result) => Some(result),
+            _ => None,
+        })
+        .expect("expected a tool result");
+
+    let text = match &tool_result.content[0] {
+        language_model::LanguageModelToolResultContent::Text(t) => t.as_ref(),
+        _ => panic!("expected text"),
+    };
+    let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
+    assert_eq!(parsed["isolation"], "shared:no-git-repository");
+
+    // Parent completes turn
+    model.send_last_completion_stream_text_chunk("Parent response");
+    model.end_last_completion_stream();
+    send.await.unwrap();
+}
+
+#[gpui::test]
+async fn test_spawn_agent_error_creates_wip_commit(cx: &mut TestAppContext) {
+    init_test(cx);
+    always_allow_tools(cx);
+    cx.update(|cx| {
+        LanguageModelRegistry::test(cx);
+        enable_default_profile_delegation(cx);
+        cx.update_flags(true, vec!["subagents".to_string()]);
+    });
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(
+        "/root",
+        json!({
+            ".git": {},
+            "file.txt": "original"
+        }),
+    )
+    .await;
+    let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
+    let thread_store = cx.new(|cx| ThreadStore::new(cx));
+    let agent =
+        cx.update(|cx| NativeAgent::new(thread_store.clone(), Templates::new(), fs.clone(), cx));
+    let connection = Rc::new(NativeAgentConnection(agent.clone()));
+
+    let acp_thread = cx
+        .update(|cx| {
+            connection
+                .clone()
+                .new_session(project.clone(), PathList::new(&[Path::new("")]), cx)
+        })
+        .await
+        .unwrap();
+    let session_id = acp_thread.read_with(cx, |thread, _| thread.session_id().clone());
+    let thread = agent.read_with(cx, |agent, _| {
+        agent.sessions.get(&session_id).unwrap().thread.clone()
+    });
+    let model = Arc::new(FakeLanguageModel::default());
+
+    thread.update(cx, |thread, cx| {
+        thread.set_model(model.clone(), cx);
+    });
+    cx.run_until_parked();
+
+    let send = acp_thread.update(cx, |thread, cx| thread.send_raw("Start failing task", cx));
+    cx.run_until_parked();
+    model.send_last_completion_stream_text_chunk("spawning subagent");
+    let subagent_input = SpawnAgentToolInput {
+        label: "error task".to_string(),
+        message: "do error task".to_string(),
+        session_id: None,
+        task_id: Some("TASK-FAIL".to_string()),
+        profile: None,
+        goal_id: None,
+        base_branch: None,
+        on_branch: None,
+    };
+    let tool_use = LanguageModelToolUse {
+        id: "subagent_1".into(),
+        name: SpawnAgentTool::NAME.into(),
+        raw_input: serde_json::to_string(&subagent_input).unwrap(),
+        input: language_model::LanguageModelToolUseInput::Json(
+            serde_json::to_value(&subagent_input).unwrap(),
+        ),
+        is_input_complete: true,
+        thought_signature: None,
+    };
+    model.send_last_completion_stream_event(LanguageModelCompletionEvent::ToolUse(tool_use));
+    model.end_last_completion_stream();
+    cx.run_until_parked();
+
+    let subagent_session_id = thread.read_with(cx, |thread, cx| {
+        thread.running_subagent_ids(cx).get(0).cloned().unwrap()
+    });
+    let subagent_thread = agent.read_with(cx, |agent, _| {
+        agent
+            .sessions
+            .get(&subagent_session_id)
+            .unwrap()
+            .thread
+            .clone()
+    });
+    let worktree_path = subagent_thread.read_with(cx, |t, _| {
+        t.task_worktree()
+            .map(|p| p.to_path_buf())
+            .expect("subagent should have task worktree")
+    });
+
+    // Subagent writes file before failing
+    let write_input = crate::tools::WriteFileToolInput {
+        path: PathBuf::from("file.txt"),
+        content: "wip content before error".to_string(),
+    };
+    let write_tool_use = LanguageModelToolUse {
+        id: "write_1".into(),
+        name: crate::tools::WriteFileTool::NAME.into(),
+        raw_input: serde_json::to_string(&write_input).unwrap(),
+        input: language_model::LanguageModelToolUseInput::Json(
+            serde_json::to_value(&write_input).unwrap(),
+        ),
+        is_input_complete: true,
+        thought_signature: None,
+    };
+    model.send_last_completion_stream_event(LanguageModelCompletionEvent::ToolUse(write_tool_use));
+    model.end_last_completion_stream();
+    cx.run_until_parked();
+
+    // Now subagent model produces an error / cancelled
+    model.send_last_completion_stream_event(LanguageModelCompletionEvent::Stop(
+        language_model::StopReason::Refusal,
+    ));
+    model.end_last_completion_stream();
+    cx.run_until_parked();
+
+    // Verify WIP-commit exists in the worktree
+    let repo = fs.open_repo(&worktree_path.join(".git"), None).unwrap();
+    let head_sha = repo
+        .head_sha()
+        .await
+        .expect("head sha should exist after WIP commit");
+    assert!(!head_sha.is_empty());
+
+    // Worktree status should be clean because WIP-commit staged and committed the changes
+    let empty_path = git::repository::RepoPath::from_rel_path(&util::rel_path::RelPath::empty());
+    let status = repo.status(&[empty_path]).await.unwrap();
+    assert!(
+        status.entries.is_empty(),
+        "worktree should be clean after WIP commit"
+    );
+
+    // File on disk has the WIP content
+    assert_eq!(
+        fs.load(&worktree_path.join("file.txt"))
+            .await
+            .unwrap()
+            .trim(),
+        "wip content before error"
+    );
+
+    // Parent completes turn
+    model.send_last_completion_stream_text_chunk("Parent response");
+    model.end_last_completion_stream();
+    send.await.unwrap();
+}
+
+#[gpui::test]
+async fn test_auto_cleanup_terminal_task_removes_worktree_preserves_branch(
+    cx: &mut TestAppContext,
+) {
+    init_test(cx);
+    always_allow_tools(cx);
+    cx.update(|cx| {
+        LanguageModelRegistry::test(cx);
+        enable_default_profile_delegation(cx);
+        cx.update_flags(true, vec!["subagents".to_string()]);
+    });
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(
+        "/root",
+        json!({
+            ".git": {},
+            "file.txt": "original"
+        }),
+    )
+    .await;
+    let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
+    let task_id = AgentTaskId::from("TASK-CLEAN");
+    let summary = AgentTaskSummary {
+        id: task_id.clone(),
+        parent_id: None,
+        title: "Clean task".to_string(),
+        status: AgentTaskStatus::Completed,
+        attempt: 1,
+        assignee: None,
+        write_scopes: vec![],
+    };
+
+    let worktree_path = cx
+        .update(|cx| crate::task_worktree::ensure_task_worktree(project.clone(), &summary, cx))
+        .await
+        .unwrap();
+
+    assert!(fs.is_dir(&worktree_path).await);
+
+    // Commit changes to worktree
+    fs.save(
+        &worktree_path.join("file.txt"),
+        &"new work".into(),
+        text::LineEnding::Unix,
+    )
+    .await
+    .unwrap();
+    let commit_res = crate::task_worktree::commit_task_worktree(
+        fs.clone(),
+        worktree_path.clone(),
+        task_id.to_string(),
+        false,
+        &mut cx.to_async(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(commit_res.changed_files, 1);
+    assert!(commit_res.commit_error.is_none());
+
+    // Auto-cleanup on terminal status
+    let cleaned = cx
+        .update(|cx| {
+            crate::task_worktree::auto_cleanup_task_worktree(project.clone(), &task_id, cx)
+        })
+        .await
+        .unwrap();
+    assert!(cleaned, "auto_cleanup should succeed");
+
+    // Checkout directory is removed
+    assert!(
+        !fs.is_dir(&worktree_path).await,
+        "worktree directory should be deleted"
+    );
+
+    // Branch and commits are preserved in git!
+    let dot_git = path!("/root/.git");
+    let has_branch = fs
+        .with_git_state(dot_git.as_ref(), false, |state| {
+            state.branches.contains("agent-task/TASK-CLEAN")
+        })
+        .unwrap();
+    assert!(
+        has_branch,
+        "branch agent-task/TASK-CLEAN must be preserved in git"
+    );
+}
+
+#[gpui::test]
+async fn test_auto_cleanup_retains_worktree_on_commit_error(cx: &mut TestAppContext) {
+    init_test(cx);
+    always_allow_tools(cx);
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(
+        "/root",
+        json!({
+            ".git": {},
+            "file.txt": "original"
+        }),
+    )
+    .await;
+    let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
+    let task_id = AgentTaskId::from("TASK-ERR-RETAIN");
+    let summary = AgentTaskSummary {
+        id: task_id.clone(),
+        parent_id: None,
+        title: "Failing commit task".to_string(),
+        status: AgentTaskStatus::Completed,
+        attempt: 1,
+        assignee: None,
+        write_scopes: vec![],
+    };
+
+    let worktree_path = cx
+        .update(|cx| crate::task_worktree::ensure_task_worktree(project.clone(), &summary, cx))
+        .await
+        .unwrap();
+    assert!(fs.is_dir(&worktree_path).await);
+
+    // Record commit error
+    crate::task_worktree::record_task_worktree_commit_error(
+        &task_id,
+        "simulated commit failure".to_string(),
+    );
+    assert_eq!(
+        crate::task_worktree::task_worktree_commit_error(&task_id),
+        Some("simulated commit failure".to_string())
+    );
+
+    // Auto-cleanup attempted
+    let cleaned = cx
+        .update(|cx| {
+            crate::task_worktree::auto_cleanup_task_worktree(project.clone(), &task_id, cx)
+        })
+        .await
+        .unwrap();
+    assert!(
+        !cleaned,
+        "auto_cleanup must NOT delete worktree when commit_error is present (fail-open)"
+    );
+
+    // Worktree is retained on disk!
+    assert!(
+        fs.is_dir(&worktree_path).await,
+        "worktree must be retained on disk"
+    );
+
+    // Manual override button removes worktree and clears error
+    cx.update(|cx| crate::task_worktree::remove_task_worktree(project.clone(), &task_id, cx))
+        .await
+        .unwrap();
+    assert!(
+        !fs.is_dir(&worktree_path).await,
+        "manual remove must remove worktree"
+    );
+    assert_eq!(
+        crate::task_worktree::task_worktree_commit_error(&task_id),
+        None,
+        "manual remove must clear commit error"
+    );
+}
+
+#[gpui::test]
+async fn test_startup_sweep_cleans_only_terminal_tasks(cx: &mut TestAppContext) {
+    init_test(cx);
+    always_allow_tools(cx);
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(
+        "/root",
+        json!({
+            ".git": {},
+            "file.txt": "original"
+        }),
+    )
+    .await;
+    let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
+
+    let task1 = AgentTaskSummary {
+        id: AgentTaskId::from("TASK-SWEEP-1"),
+        parent_id: None,
+        title: "Task 1".to_string(),
+        status: AgentTaskStatus::Completed,
+        attempt: 1,
+        assignee: None,
+        write_scopes: vec![],
+    };
+    let task2 = AgentTaskSummary {
+        id: AgentTaskId::from("TASK-SWEEP-2"),
+        parent_id: None,
+        title: "Task 2".to_string(),
+        status: AgentTaskStatus::Running,
+        attempt: 1,
+        assignee: None,
+        write_scopes: vec![],
+    };
+    let task3 = AgentTaskSummary {
+        id: AgentTaskId::from("TASK-SWEEP-3"),
+        parent_id: None,
+        title: "Task 3".to_string(),
+        status: AgentTaskStatus::Completed,
+        attempt: 1,
+        assignee: None,
+        write_scopes: vec![],
+    };
+
+    let path1 = cx
+        .update(|cx| crate::task_worktree::ensure_task_worktree(project.clone(), &task1, cx))
+        .await
+        .unwrap();
+    let path2 = cx
+        .update(|cx| crate::task_worktree::ensure_task_worktree(project.clone(), &task2, cx))
+        .await
+        .unwrap();
+    let path3 = cx
+        .update(|cx| crate::task_worktree::ensure_task_worktree(project.clone(), &task3, cx))
+        .await
+        .unwrap();
+
+    assert!(fs.is_dir(&path1).await);
+    assert!(fs.is_dir(&path2).await);
+    assert!(fs.is_dir(&path3).await);
+
+    // Fail-open: when TGS task list is None, sweep skips everything
+    let empty_swept = cx
+        .update(|cx| crate::task_worktree::startup_sweep(project.clone(), None, cx))
+        .await
+        .unwrap();
+    assert!(empty_swept.is_empty());
+    assert!(fs.is_dir(&path1).await);
+    assert!(fs.is_dir(&path2).await);
+    assert!(fs.is_dir(&path3).await);
+
+    // Sweep with known tasks: only task1 (Completed) and task2 (Running) in provider list.
+    // task3 is not in the list (unknown status -> fail-open skip).
+    let swept = cx
+        .update(|cx| {
+            crate::task_worktree::startup_sweep(
+                project.clone(),
+                Some(&[task1.clone(), task2.clone()]),
+                cx,
+            )
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(swept, vec![task1.id.clone()]);
+    // Task 1 was swept (terminal)
+    assert!(!fs.is_dir(&path1).await, "task 1 worktree should be swept");
+    // Task 2 was preserved (running)
+    assert!(
+        fs.is_dir(&path2).await,
+        "task 2 worktree should be preserved"
+    );
+    // Task 3 was preserved (unknown to TGS)
+    assert!(
+        fs.is_dir(&path3).await,
+        "task 3 worktree should be preserved"
+    );
+
+    // Manual button works for task 2
+    cx.update(|cx| crate::task_worktree::remove_task_worktree(project.clone(), &task2.id, cx))
+        .await
+        .unwrap();
+    assert!(
+        !fs.is_dir(&path2).await,
+        "manual button removes task 2 worktree"
+    );
+}
+
+#[gpui::test]
+async fn test_subagent_lsp_rename_denied_outside_task_worktree(cx: &mut TestAppContext) {
+    init_test(cx);
+    always_allow_tools(cx);
+    cx.update(|cx| {
+        LanguageModelRegistry::test(cx);
+        enable_default_profile_delegation(cx);
+        cx.update_flags(true, vec!["subagents".to_string()]);
+    });
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(
+        "/root",
+        json!({
+            ".git": {},
+            "outside.txt": "outside content"
+        }),
+    )
+    .await;
+    let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
+    let thread_store = cx.new(|cx| ThreadStore::new(cx));
+    let agent =
+        cx.update(|cx| NativeAgent::new(thread_store.clone(), Templates::new(), fs.clone(), cx));
+    let connection = Rc::new(NativeAgentConnection(agent.clone()));
+
+    let acp_thread = cx
+        .update(|cx| {
+            connection
+                .clone()
+                .new_session(project.clone(), PathList::new(&[Path::new("")]), cx)
+        })
+        .await
+        .unwrap();
+    let session_id = acp_thread.read_with(cx, |thread, _| thread.session_id().clone());
+    let thread = agent.read_with(cx, |agent, _| {
+        agent.sessions.get(&session_id).unwrap().thread.clone()
+    });
+    let model = Arc::new(FakeLanguageModel::default());
+
+    thread.update(cx, |thread, cx| {
+        thread.set_model(model.clone(), cx);
+    });
+    cx.run_until_parked();
+
+    // Spawn subagent with TASK-LSP
+    let _send = acp_thread.update(cx, |thread, cx| thread.send_raw("Start subagent", cx));
+    cx.run_until_parked();
+    model.send_last_completion_stream_text_chunk("spawning subagent");
+    let subagent_input = SpawnAgentToolInput {
+        label: "lsp test".to_string(),
+        message: "do lsp test".to_string(),
+        session_id: None,
+        task_id: Some("TASK-LSP".to_string()),
+        profile: None,
+        goal_id: None,
+        base_branch: None,
+        on_branch: None,
+    };
+    let tool_use = LanguageModelToolUse {
+        id: "subagent_1".into(),
+        name: SpawnAgentTool::NAME.into(),
+        raw_input: serde_json::to_string(&subagent_input).unwrap(),
+        input: language_model::LanguageModelToolUseInput::Json(
+            serde_json::to_value(&subagent_input).unwrap(),
+        ),
+        is_input_complete: true,
+        thought_signature: None,
+    };
+    model.send_last_completion_stream_event(LanguageModelCompletionEvent::ToolUse(tool_use));
+    model.end_last_completion_stream();
+    cx.run_until_parked();
+
+    // Subagent attempts to rename outside.txt
+    let rename_input = crate::tools::RenameToolInput {
+        symbol: crate::tools::SymbolLocator {
+            file_path: "outside.txt".to_string(),
+            line: 1,
+            symbol_name: "outside".to_string(),
+        },
+        new_name: "tampered".to_string(),
+    };
+    let rename_tool_use = LanguageModelToolUse {
+        id: "rename_1".into(),
+        name: crate::tools::RenameTool::NAME.into(),
+        raw_input: serde_json::to_string(&rename_input).unwrap(),
+        input: language_model::LanguageModelToolUseInput::Json(
+            serde_json::to_value(&rename_input).unwrap(),
+        ),
+        is_input_complete: true,
+        thought_signature: None,
+    };
+    model.send_last_completion_stream_event(LanguageModelCompletionEvent::ToolUse(rename_tool_use));
+    model.end_last_completion_stream();
+    cx.run_until_parked();
+
+    // Verify subagent tool result is PolicyDenied
+    let completion = model
+        .pending_completions()
+        .pop()
+        .expect("expected subagent completion after rename");
+    let tool_result = completion
+        .messages
+        .iter()
+        .flat_map(|m| &m.content)
+        .find_map(|content| match content {
+            language_model::MessageContent::ToolResult(result) => Some(result),
+            _ => None,
+        })
+        .expect("expected tool result");
+    assert!(
+        tool_result.is_error,
+        "rename tool must be rejected with error"
+    );
+    let error_text = match &tool_result.content[0] {
+        language_model::LanguageModelToolResultContent::Text(t) => t.as_ref(),
+        _ => panic!("expected text error"),
+    };
+    assert!(
+        error_text.contains("PolicyDenied"),
+        "expected PolicyDenied error, got: {error_text}"
+    );
+    assert!(
+        error_text.contains("isolated task worktree"),
+        "expected error to mention isolated task worktree, got: {error_text}"
+    );
+
+    // Verify outside file was NOT modified!
+    let outside_content = fs.load(path!("/root/outside.txt").as_ref()).await.unwrap();
+    assert_eq!(outside_content, "outside content");
+}
+
+#[gpui::test]
+async fn test_spawn_agent_with_goal_id_and_base_branch(cx: &mut TestAppContext) {
+    init_test(cx);
+    always_allow_tools(cx);
+    cx.update(|cx| {
+        LanguageModelRegistry::test(cx);
+        enable_default_profile_delegation(cx);
+        cx.update_flags(true, vec!["subagents".to_string()]);
+    });
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(
+        "/root",
+        json!({
+            ".git": {
+                "HEAD": "ref: refs/heads/main\n"
+            },
+            "file.txt": "main content"
+        }),
+    )
+    .await;
+    let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
+    let thread_store = cx.new(|cx| ThreadStore::new(cx));
+    let agent =
+        cx.update(|cx| NativeAgent::new(thread_store.clone(), Templates::new(), fs.clone(), cx));
+    let connection = Rc::new(NativeAgentConnection(agent.clone()));
+
+    let acp_thread = cx
+        .update(|cx| {
+            connection
+                .clone()
+                .new_session(project.clone(), PathList::new(&[Path::new("")]), cx)
+        })
+        .await
+        .unwrap();
+    let session_id = acp_thread.read_with(cx, |thread, _| thread.session_id().clone());
+    let thread = agent.read_with(cx, |agent, _| {
+        agent.sessions.get(&session_id).unwrap().thread.clone()
+    });
+    let model = Arc::new(FakeLanguageModel::default());
+
+    thread.update(cx, |thread, cx| {
+        thread.set_model(model.clone(), cx);
+    });
+    cx.run_until_parked();
+
+    // 1. Unknown base_branch -> model-readable error before subagent starts
+    let send1 = acp_thread.update(cx, |thread, cx| thread.send_raw("Start invalid branch", cx));
+    cx.run_until_parked();
+    model.send_last_completion_stream_text_chunk("spawning subagent invalid");
+    let invalid_input = SpawnAgentToolInput {
+        label: "invalid branch test".to_string(),
+        message: "do work".to_string(),
+        session_id: None,
+        task_id: Some("TASK-INVALID".to_string()),
+        profile: None,
+        goal_id: None,
+        base_branch: Some("nonexistent-branch".to_string()),
+        on_branch: None,
+    };
+    let tool_use_invalid = LanguageModelToolUse {
+        id: "subagent_invalid".into(),
+        name: SpawnAgentTool::NAME.into(),
+        raw_input: serde_json::to_string(&invalid_input).unwrap(),
+        input: language_model::LanguageModelToolUseInput::Json(
+            serde_json::to_value(&invalid_input).unwrap(),
+        ),
+        is_input_complete: true,
+        thought_signature: None,
+    };
+    model
+        .send_last_completion_stream_event(LanguageModelCompletionEvent::ToolUse(tool_use_invalid));
+    model.end_last_completion_stream();
+    cx.run_until_parked();
+
+    let completion = model
+        .pending_completions()
+        .pop()
+        .expect("expected parent completion");
+    let tool_result = completion
+        .messages
+        .iter()
+        .flat_map(|m| &m.content)
+        .find_map(|c| match c {
+            language_model::MessageContent::ToolResult(r) => Some(r),
+            _ => None,
+        })
+        .expect("expected tool result");
+    assert!(tool_result.is_error);
+    let err_str = match &tool_result.content[0] {
+        language_model::LanguageModelToolResultContent::Text(t) => t.as_ref(),
+        _ => panic!("expected text"),
+    };
+    assert!(err_str.contains("branch not found: nonexistent-branch"));
+    model.send_last_completion_stream_text_chunk("recovered");
+    model.end_last_completion_stream();
+    send1.await.unwrap();
+
+    // 2. Goal branch lazy creation and task fork from goal-tip
+    let send2 = acp_thread.update(cx, |thread, cx| thread.send_raw("Start goal task", cx));
+    cx.run_until_parked();
+    model.send_last_completion_stream_text_chunk("spawning goal subagent");
+    let goal_input = SpawnAgentToolInput {
+        label: "goal task".to_string(),
+        message: "do goal work".to_string(),
+        session_id: None,
+        task_id: Some("TASK-GOAL-1".to_string()),
+        profile: None,
+        goal_id: Some("GOAL-ALPHA".to_string()),
+        base_branch: None,
+        on_branch: None,
+    };
+    let tool_use_goal = LanguageModelToolUse {
+        id: "subagent_goal".into(),
+        name: SpawnAgentTool::NAME.into(),
+        raw_input: serde_json::to_string(&goal_input).unwrap(),
+        input: language_model::LanguageModelToolUseInput::Json(
+            serde_json::to_value(&goal_input).unwrap(),
+        ),
+        is_input_complete: true,
+        thought_signature: None,
+    };
+    model.send_last_completion_stream_event(LanguageModelCompletionEvent::ToolUse(tool_use_goal));
+    model.end_last_completion_stream();
+    cx.run_until_parked();
+
+    // Subagent finishes work
+    model.send_last_completion_stream_text_chunk("done with goal task");
+    model.end_last_completion_stream();
+    cx.run_until_parked();
+
+    let completion2 = model
+        .pending_completions()
+        .pop()
+        .expect("expected parent completion");
+    let tool_result2 = completion2
+        .messages
+        .iter()
+        .rev()
+        .flat_map(|m| &m.content)
+        .find_map(|c| match c {
+            language_model::MessageContent::ToolResult(r) => Some(r),
+            _ => None,
+        })
+        .expect("expected tool result");
+    assert!(
+        !tool_result2.is_error,
+        "tool_result2 failed with: {:?}",
+        tool_result2.content
+    );
+    let text2 = match &tool_result2.content[0] {
+        language_model::LanguageModelToolResultContent::Text(t) => t.as_ref(),
+        _ => panic!("expected text"),
+    };
+    let parsed2: serde_json::Value = serde_json::from_str(text2).unwrap();
+    assert_eq!(
+        parsed2["isolation_details"]["branch"],
+        "agent-task/TASK-GOAL-1"
+    );
+    assert_eq!(
+        parsed2["isolation_details"]["base_branch"],
+        "agent-goal/GOAL-ALPHA"
+    );
+
+    // 3. Task without goal_id/base_branch has None for base_branch in isolation_details
+    model.send_last_completion_stream_text_chunk("Parent response 2");
+    model.end_last_completion_stream();
+    send2.await.unwrap();
+
+    let _send3 = acp_thread.update(cx, |thread, cx| thread.send_raw("Start standard task", cx));
+    cx.run_until_parked();
+    model.send_last_completion_stream_text_chunk("spawning standard subagent");
+    let standard_input = SpawnAgentToolInput {
+        label: "standard task".to_string(),
+        message: "do standard work".to_string(),
+        session_id: None,
+        task_id: Some("TASK-STANDARD".to_string()),
+        profile: None,
+        goal_id: None,
+        base_branch: None,
+        on_branch: None,
+    };
+    let tool_use_standard = LanguageModelToolUse {
+        id: "subagent_standard".into(),
+        name: SpawnAgentTool::NAME.into(),
+        raw_input: serde_json::to_string(&standard_input).unwrap(),
+        input: language_model::LanguageModelToolUseInput::Json(
+            serde_json::to_value(&standard_input).unwrap(),
+        ),
+        is_input_complete: true,
+        thought_signature: None,
+    };
+    model.send_last_completion_stream_event(LanguageModelCompletionEvent::ToolUse(
+        tool_use_standard,
+    ));
+    model.end_last_completion_stream();
+    cx.run_until_parked();
+
+    model.send_last_completion_stream_text_chunk("done with standard task");
+    model.end_last_completion_stream();
+    cx.run_until_parked();
+
+    let completion3 = model
+        .pending_completions()
+        .pop()
+        .expect("expected parent completion");
+    let tool_result3 = completion3
+        .messages
+        .iter()
+        .rev()
+        .flat_map(|m| &m.content)
+        .find_map(|c| match c {
+            language_model::MessageContent::ToolResult(r) => Some(r),
+            _ => None,
+        })
+        .expect("expected tool result");
+    assert!(!tool_result3.is_error);
+    let text3 = match &tool_result3.content[0] {
+        language_model::LanguageModelToolResultContent::Text(t) => t.as_ref(),
+        _ => panic!("expected text"),
+    };
+    let parsed3: serde_json::Value = serde_json::from_str(text3).unwrap();
+    assert_eq!(
+        parsed3["isolation_details"]["branch"],
+        "agent-task/TASK-STANDARD"
+    );
+    assert!(parsed3["isolation_details"]["base_branch"].is_null());
+}
+
+#[gpui::test]
+async fn test_spawn_agent_with_on_branch_goal_and_exclusivity(cx: &mut TestAppContext) {
+    init_test(cx);
+    always_allow_tools(cx);
+    cx.update(|cx| {
+        LanguageModelRegistry::test(cx);
+        enable_default_profile_delegation(cx);
+        cx.update_flags(true, vec!["subagents".to_string()]);
+    });
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(
+        "/root",
+        json!({
+            ".git": {
+                "HEAD": "ref: refs/heads/main\n"
+            },
+            "file.txt": "main content"
+        }),
+    )
+    .await;
+    let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
+    let thread_store = cx.new(|cx| ThreadStore::new(cx));
+    let agent =
+        cx.update(|cx| NativeAgent::new(thread_store.clone(), Templates::new(), fs.clone(), cx));
+    let connection = Rc::new(NativeAgentConnection(agent.clone()));
+
+    let acp_thread = cx
+        .update(|cx| {
+            connection
+                .clone()
+                .new_session(project.clone(), PathList::new(&[Path::new("")]), cx)
+        })
+        .await
+        .unwrap();
+    let session_id = acp_thread.read_with(cx, |thread, _| thread.session_id().clone());
+    let thread = agent.read_with(cx, |agent, _| {
+        agent.sessions.get(&session_id).unwrap().thread.clone()
+    });
+    let model = Arc::new(FakeLanguageModel::default());
+
+    thread.update(cx, |thread, cx| {
+        thread.set_model(model.clone(), cx);
+    });
+    cx.run_until_parked();
+
+    // 1. Validation error: on_branch and base_branch mutually exclusive
+    let send1 = acp_thread.update(cx, |thread, cx| {
+        thread.send_raw("Start mutual exclusivity", cx)
+    });
+    cx.run_until_parked();
+    model.send_last_completion_stream_text_chunk("spawning subagent mutual exclusivity");
+    let invalid_input1 = SpawnAgentToolInput {
+        label: "mutually exclusive test".to_string(),
+        message: "do work".to_string(),
+        session_id: None,
+        task_id: Some("TASK-MUTEX".to_string()),
+        profile: None,
+        goal_id: Some("GOAL-EXC".to_string()),
+        base_branch: Some("main".to_string()),
+        on_branch: Some("goal".to_string()),
+    };
+    let tool_use1 = LanguageModelToolUse {
+        id: "subagent_invalid_1".into(),
+        name: SpawnAgentTool::NAME.into(),
+        raw_input: serde_json::to_string(&invalid_input1).unwrap(),
+        input: language_model::LanguageModelToolUseInput::Json(
+            serde_json::to_value(&invalid_input1).unwrap(),
+        ),
+        is_input_complete: true,
+        thought_signature: None,
+    };
+    model.send_last_completion_stream_event(LanguageModelCompletionEvent::ToolUse(tool_use1));
+    model.end_last_completion_stream();
+    cx.run_until_parked();
+
+    let completion1 = model
+        .pending_completions()
+        .pop()
+        .expect("expected parent completion");
+    let tool_result1 = completion1
+        .messages
+        .iter()
+        .flat_map(|m| &m.content)
+        .find_map(|c| match c {
+            language_model::MessageContent::ToolResult(r) => Some(r),
+            _ => None,
+        })
+        .expect("expected tool result");
+    assert!(tool_result1.is_error);
+    let err_str1 = match &tool_result1.content[0] {
+        language_model::LanguageModelToolResultContent::Text(t) => t.as_ref(),
+        _ => panic!("expected text"),
+    };
+    assert!(err_str1.contains("on_branch and base_branch are mutually exclusive"));
+    model.send_last_completion_stream_text_chunk("recovered from mutex error");
+    model.end_last_completion_stream();
+    send1.await.unwrap();
+
+    // 2. Validation error: on_branch: "goal" requires goal_id
+    let send2 = acp_thread.update(cx, |thread, cx| {
+        thread.send_raw("Start goal without id", cx)
+    });
+    cx.run_until_parked();
+    model.send_last_completion_stream_text_chunk("spawning subagent goal without id");
+    let invalid_input2 = SpawnAgentToolInput {
+        label: "goal without id test".to_string(),
+        message: "do work".to_string(),
+        session_id: None,
+        task_id: Some("TASK-NO-ID".to_string()),
+        profile: None,
+        goal_id: None,
+        base_branch: None,
+        on_branch: Some("goal".to_string()),
+    };
+    let tool_use2 = LanguageModelToolUse {
+        id: "subagent_invalid_2".into(),
+        name: SpawnAgentTool::NAME.into(),
+        raw_input: serde_json::to_string(&invalid_input2).unwrap(),
+        input: language_model::LanguageModelToolUseInput::Json(
+            serde_json::to_value(&invalid_input2).unwrap(),
+        ),
+        is_input_complete: true,
+        thought_signature: None,
+    };
+    model.send_last_completion_stream_event(LanguageModelCompletionEvent::ToolUse(tool_use2));
+    model.end_last_completion_stream();
+    cx.run_until_parked();
+
+    let completion2 = model
+        .pending_completions()
+        .pop()
+        .expect("expected parent completion");
+    let tool_result2 = completion2
+        .messages
+        .iter()
+        .rev()
+        .flat_map(|m| &m.content)
+        .find_map(|c| match c {
+            language_model::MessageContent::ToolResult(r) => Some(r),
+            _ => None,
+        })
+        .expect("expected tool result");
+    assert!(tool_result2.is_error);
+    let err_str2 = match &tool_result2.content[0] {
+        language_model::LanguageModelToolResultContent::Text(t) => t.as_ref(),
+        _ => panic!("expected text"),
+    };
+    assert!(err_str2.contains("on_branch 'goal' requires goal_id"));
+    model.send_last_completion_stream_text_chunk("recovered from missing goal_id error");
+    model.end_last_completion_stream();
+    send2.await.unwrap();
+
+    // 3. Subagent 1 spawns on on_branch: "goal"
+    let send3 = acp_thread.update(cx, |thread, cx| thread.send_raw("Start subagent 1", cx));
+    cx.run_until_parked();
+    model.send_last_completion_stream_text_chunk("spawning subagent 1");
+    let subagent1_input = SpawnAgentToolInput {
+        label: "subagent 1 on goal".to_string(),
+        message: "do subagent 1 work".to_string(),
+        session_id: None,
+        task_id: Some("TASK-ON-GOAL-1".to_string()),
+        profile: None,
+        goal_id: Some("GOAL-EXC".to_string()),
+        base_branch: None,
+        on_branch: Some("goal".to_string()),
+    };
+    let tool_use3 = LanguageModelToolUse {
+        id: "subagent_1".into(),
+        name: SpawnAgentTool::NAME.into(),
+        raw_input: serde_json::to_string(&subagent1_input).unwrap(),
+        input: language_model::LanguageModelToolUseInput::Json(
+            serde_json::to_value(&subagent1_input).unwrap(),
+        ),
+        is_input_complete: true,
+        thought_signature: None,
+    };
+    model.send_last_completion_stream_event(LanguageModelCompletionEvent::ToolUse(tool_use3));
+    model.end_last_completion_stream();
+    cx.run_until_parked();
+
+    let subagent1_session_id = thread.read_with(cx, |thread, cx| {
+        thread
+            .running_subagent_ids(cx)
+            .get(0)
+            .cloned()
+            .expect("subagent 1 should be running")
+    });
+    let subagent1_thread = agent.read_with(cx, |agent, _| {
+        agent
+            .sessions
+            .get(&subagent1_session_id)
+            .unwrap()
+            .thread
+            .clone()
+    });
+    let worktree1_path = subagent1_thread.read_with(cx, |t, _| {
+        t.task_worktree()
+            .map(|p| p.to_path_buf())
+            .expect("subagent 1 should have task worktree")
+    });
+    assert!(
+        worktree1_path
+            .to_string_lossy()
+            .contains("agent-task-TASK-ON-GOAL-1")
+    );
+
+    // 4. Session 2 attempts concurrent spawn on same goal branch -> exclusivity error
+    let acp_thread2 = cx
+        .update(|cx| {
+            connection
+                .clone()
+                .new_session(project.clone(), PathList::new(&[Path::new("")]), cx)
+        })
+        .await
+        .unwrap();
+    let session_id2 = acp_thread2.read_with(cx, |thread, _| thread.session_id().clone());
+    let thread2 = agent.read_with(cx, |agent, _| {
+        agent.sessions.get(&session_id2).unwrap().thread.clone()
+    });
+    thread2.update(cx, |thread, cx| {
+        thread.set_model(model.clone(), cx);
+    });
+    cx.run_until_parked();
+
+    let send4 = acp_thread2.update(cx, |thread, cx| {
+        thread.send_raw("Start concurrent subagent 2", cx)
+    });
+    cx.run_until_parked();
+    model.send_last_completion_stream_text_chunk("spawning subagent 2 on same goal");
+    let subagent2_input = SpawnAgentToolInput {
+        label: "subagent 2 on same goal".to_string(),
+        message: "do subagent 2 work".to_string(),
+        session_id: None,
+        task_id: Some("TASK-ON-GOAL-2".to_string()),
+        profile: None,
+        goal_id: Some("GOAL-EXC".to_string()),
+        base_branch: None,
+        on_branch: Some("goal".to_string()),
+    };
+    let tool_use4 = LanguageModelToolUse {
+        id: "subagent_2".into(),
+        name: SpawnAgentTool::NAME.into(),
+        raw_input: serde_json::to_string(&subagent2_input).unwrap(),
+        input: language_model::LanguageModelToolUseInput::Json(
+            serde_json::to_value(&subagent2_input).unwrap(),
+        ),
+        is_input_complete: true,
+        thought_signature: None,
+    };
+    model.send_last_completion_stream_event(LanguageModelCompletionEvent::ToolUse(tool_use4));
+    model.end_last_completion_stream();
+    cx.run_until_parked();
+
+    let completion_exc = model
+        .pending_completions()
+        .pop()
+        .expect("expected completion for exclusivity error");
+    let tool_result_exc = completion_exc
+        .messages
+        .iter()
+        .rev()
+        .flat_map(|m| &m.content)
+        .find_map(|c| match c {
+            language_model::MessageContent::ToolResult(r) => Some(r),
+            _ => None,
+        })
+        .expect("expected tool result for subagent 2");
+    assert!(tool_result_exc.is_error);
+    let err_str_exc = match &tool_result_exc.content[0] {
+        language_model::LanguageModelToolResultContent::Text(t) => t.as_ref(),
+        _ => panic!("expected text"),
+    };
+    assert!(
+        err_str_exc.contains(
+            "is checked out by task TASK-ON-GOAL-1; serialize or use on_branch after it completes"
+        ),
+        "expected exclusivity error, got: {err_str_exc}"
+    );
+    model.send_last_completion_stream_text_chunk("recovered from exclusivity error");
+    model.end_last_completion_stream();
+    send4.await.unwrap();
+
+    // 5. Subagent 1 finishes work
+    model.send_last_completion_stream_text_chunk("subagent 1 finished work");
+    model.end_last_completion_stream();
+    cx.run_until_parked();
+
+    // 6. Verify subagent 1 tool result: isolation == checkout:agent-goal/GOAL-EXC
+    let completion_sub1 = model
+        .pending_completions()
+        .pop()
+        .expect("expected parent completion after subagent 1 finish");
+    let tool_result_sub1 = completion_sub1
+        .messages
+        .iter()
+        .rev()
+        .flat_map(|m| &m.content)
+        .find_map(|c| match c {
+            language_model::MessageContent::ToolResult(r) => Some(r),
+            _ => None,
+        })
+        .expect("expected tool result for subagent 1 finish");
+    assert!(!tool_result_sub1.is_error);
+    let text_sub1 = match &tool_result_sub1.content[0] {
+        language_model::LanguageModelToolResultContent::Text(t) => t.as_ref(),
+        _ => panic!("expected text"),
+    };
+    let parsed_sub1: serde_json::Value = serde_json::from_str(text_sub1).unwrap();
+    assert_eq!(parsed_sub1["isolation"], "checkout:agent-goal/GOAL-EXC");
+    assert_eq!(parsed_sub1["isolation_details"]["mode"], "checkout");
+    assert_eq!(
+        parsed_sub1["isolation_details"]["branch"],
+        "agent-goal/GOAL-EXC"
+    );
+    assert!(parsed_sub1["isolation_details"]["base_branch"].is_null());
+    assert!(parsed_sub1["isolation_details"]["merged_into"].is_null());
+    assert_eq!(parsed_sub1["isolation_details"]["changed_files"], 0);
+
+    model.send_last_completion_stream_text_chunk("Parent finished");
+    model.end_last_completion_stream();
+    send3.await.unwrap();
 }
