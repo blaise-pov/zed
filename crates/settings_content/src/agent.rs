@@ -211,6 +211,80 @@ pub struct NestedSubAgentsSettingsContent {
     pub max_concurrent: Option<u32>,
 }
 
+fn deserialize_optional_timeout<'de, D>(deserializer: D) -> Result<Option<Option<u64>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    serde::Deserialize::deserialize(deserializer).map(Some)
+}
+
+#[derive(Clone, PartialEq, Serialize, Deserialize, JsonSchema, Debug, Default)]
+pub struct TerminalWatchdogSettingsContent {
+    /// Whether the terminal watchdog is enabled.
+    ///
+    /// Default: true
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    /// Idle timeout window in milliseconds. Process is killed if idle across this window.
+    /// An explicit `null` disables idle detection.
+    ///
+    /// Default: 300000 (5 minutes)
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_optional_timeout"
+    )]
+    pub idle_timeout_ms: Option<Option<u64>>,
+    /// Process tree CPU percentage below which the process counts as idle.
+    ///
+    /// Default: 5.0
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_cpu_threshold_percent: Option<f32>,
+    /// Hard cap runtime in milliseconds when timeout_ms is absent.
+    /// An explicit `null` disables the cap.
+    ///
+    /// Default: 3600000 (1 hour)
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_optional_timeout"
+    )]
+    pub hard_timeout_ms: Option<Option<u64>>,
+    /// Sampling period in milliseconds for activity signals.
+    ///
+    /// Default: 5000 (5 seconds)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub poll_interval_ms: Option<u64>,
+    /// Idle timeout window in milliseconds where CPU/IO sampling is unavailable.
+    ///
+    /// Default: 600000 (10 minutes)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_timeout_no_probe_ms: Option<u64>,
+}
+
+impl crate::merge_from::MergeFrom for TerminalWatchdogSettingsContent {
+    fn merge_from(&mut self, other: &Self) {
+        if let Some(enabled) = other.enabled {
+            self.enabled = Some(enabled);
+        }
+        if other.idle_timeout_ms.is_some() {
+            self.idle_timeout_ms = other.idle_timeout_ms;
+        }
+        if let Some(idle_cpu_threshold_percent) = other.idle_cpu_threshold_percent {
+            self.idle_cpu_threshold_percent = Some(idle_cpu_threshold_percent);
+        }
+        if other.hard_timeout_ms.is_some() {
+            self.hard_timeout_ms = other.hard_timeout_ms;
+        }
+        if let Some(poll_interval_ms) = other.poll_interval_ms {
+            self.poll_interval_ms = Some(poll_interval_ms);
+        }
+        if let Some(idle_timeout_no_probe_ms) = other.idle_timeout_no_probe_ms {
+            self.idle_timeout_no_probe_ms = Some(idle_timeout_no_probe_ms);
+        }
+    }
+}
+
 #[with_fallible_options]
 #[derive(Clone, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom, Debug, Default)]
 pub struct AgentSettingsContent {
@@ -365,6 +439,8 @@ pub struct AgentSettingsContent {
     ///
     /// Default: null (disabled)
     pub terminal_wrapper_command: Option<String>,
+    /// Configuration for the terminal watchdog that monitors commands for hangs and runaway execution.
+    pub terminal_watchdog: Option<TerminalWatchdogSettingsContent>,
     /// How thinking blocks should be displayed by default in the agent panel.
     ///
     /// Default: automatic
@@ -762,6 +838,10 @@ pub struct LanguageModelParameters {
     pub model: Option<String>,
     #[serde(serialize_with = "crate::serialize_optional_f32_with_two_decimal_places")]
     pub temperature: Option<f32>,
+    /// Path to a custom Handlebars template file that fully replaces the agent system prompt.
+    pub system_prompt_template: Option<String>,
+    /// Inline custom instructions appended to the system prompt.
+    pub custom_instructions: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, MergeFrom)]
@@ -1570,5 +1650,62 @@ mod tests {
             serde_json::to_value(&resolved).unwrap(),
             serde_json::json!({ "requested": "/tmp/x", "resolved": "/tmp/real" })
         );
+    }
+
+    #[test]
+    fn test_terminal_watchdog_content_deserialization_and_merge() -> anyhow::Result<()> {
+        use crate::merge_from::MergeFrom as _;
+
+        // Absent fields deserialize to None
+        let absent: TerminalWatchdogSettingsContent = serde_json::from_str("{}")?;
+        assert_eq!(absent.enabled, None);
+        assert_eq!(absent.idle_timeout_ms, None);
+        assert_eq!(absent.idle_cpu_threshold_percent, None);
+        assert_eq!(absent.hard_timeout_ms, None);
+        assert_eq!(absent.poll_interval_ms, None);
+        assert_eq!(absent.idle_timeout_no_probe_ms, None);
+
+        // Explicit values deserialize properly
+        let configured: TerminalWatchdogSettingsContent = serde_json::from_str(
+            r#"{
+                "enabled": false,
+                "idle_timeout_ms": 120000,
+                "idle_cpu_threshold_percent": 10.0,
+                "hard_timeout_ms": 7200000,
+                "poll_interval_ms": 2000,
+                "idle_timeout_no_probe_ms": 300000
+            }"#,
+        )?;
+        assert_eq!(configured.enabled, Some(false));
+        assert_eq!(configured.idle_timeout_ms, Some(Some(120000)));
+        assert_eq!(configured.idle_cpu_threshold_percent, Some(10.0));
+        assert_eq!(configured.hard_timeout_ms, Some(Some(7200000)));
+        assert_eq!(configured.poll_interval_ms, Some(2000));
+        assert_eq!(configured.idle_timeout_no_probe_ms, Some(300000));
+
+        // Explicit nulls deserialize to Some(None)
+        let nulls: TerminalWatchdogSettingsContent = serde_json::from_str(
+            r#"{
+                "idle_timeout_ms": null,
+                "hard_timeout_ms": null
+            }"#,
+        )?;
+        assert_eq!(nulls.idle_timeout_ms, Some(None));
+        assert_eq!(nulls.hard_timeout_ms, Some(None));
+
+        // MergeFrom: explicit null overrides existing value
+        let mut base = configured.clone();
+        base.merge_from(&nulls);
+        assert_eq!(base.enabled, Some(false));
+        assert_eq!(base.idle_timeout_ms, Some(None));
+        assert_eq!(base.hard_timeout_ms, Some(None));
+        assert_eq!(base.idle_cpu_threshold_percent, Some(10.0));
+
+        // MergeFrom: absent field does not override existing value
+        let mut base2 = configured.clone();
+        base2.merge_from(&absent);
+        assert_eq!(base2, configured);
+
+        Ok(())
     }
 }

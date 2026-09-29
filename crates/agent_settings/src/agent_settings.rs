@@ -23,8 +23,8 @@ use settings::{
     DockPosition, DockSide, IntoGpui, LanguageModelParameters, LanguageModelSelection,
     NestedSubAgentsSettingsContent, NotifyWhenAgentWaiting, PlaySoundWhenAgentDone,
     RegisterSetting, Settings, SettingsContent, SettingsLocation, SettingsStore,
-    SidebarDockPosition, SidebarSide, ThinkingBlockDisplay, ToolPermissionMode, WorktreeId,
-    update_settings_file, update_settings_file_with_completion,
+    SidebarDockPosition, SidebarSide, TerminalWatchdogSettingsContent, ThinkingBlockDisplay,
+    ToolPermissionMode, WorktreeId, update_settings_file, update_settings_file_with_completion,
 };
 use util::ResultExt as _;
 
@@ -287,6 +287,68 @@ fn parse_auto_compact_threshold(raw: &str) -> anyhow::Result<AutoCompactThreshol
 /// the agent task panel uses to find the task graph MCP server.
 pub const DEFAULT_TASK_GRAPH_SERVER_ID: &str = "tgs";
 
+pub const DEFAULT_TERMINAL_WATCHDOG_ENABLED: bool = true;
+pub const DEFAULT_TERMINAL_WATCHDOG_IDLE_TIMEOUT_MS: u64 = 300_000;
+pub const DEFAULT_TERMINAL_WATCHDOG_IDLE_CPU_THRESHOLD_PERCENT: f32 = 5.0;
+pub const DEFAULT_TERMINAL_WATCHDOG_HARD_TIMEOUT_MS: u64 = 3_600_000;
+pub const DEFAULT_TERMINAL_WATCHDOG_POLL_INTERVAL_MS: u64 = 5000;
+pub const MIN_TERMINAL_WATCHDOG_POLL_INTERVAL_MS: u64 = 250;
+pub const DEFAULT_TERMINAL_WATCHDOG_IDLE_TIMEOUT_NO_PROBE_MS: u64 = 600_000;
+
+/// Settings for the agent terminal tool watchdog.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TerminalWatchdogSettings {
+    pub enabled: bool,
+    pub idle_timeout_ms: Option<u64>,
+    pub idle_cpu_threshold_percent: f32,
+    pub hard_timeout_ms: Option<u64>,
+    pub poll_interval_ms: u64,
+    pub idle_timeout_no_probe_ms: u64,
+}
+
+impl Default for TerminalWatchdogSettings {
+    fn default() -> Self {
+        Self {
+            enabled: DEFAULT_TERMINAL_WATCHDOG_ENABLED,
+            idle_timeout_ms: Some(DEFAULT_TERMINAL_WATCHDOG_IDLE_TIMEOUT_MS),
+            idle_cpu_threshold_percent: DEFAULT_TERMINAL_WATCHDOG_IDLE_CPU_THRESHOLD_PERCENT,
+            hard_timeout_ms: Some(DEFAULT_TERMINAL_WATCHDOG_HARD_TIMEOUT_MS),
+            poll_interval_ms: DEFAULT_TERMINAL_WATCHDOG_POLL_INTERVAL_MS,
+            idle_timeout_no_probe_ms: DEFAULT_TERMINAL_WATCHDOG_IDLE_TIMEOUT_NO_PROBE_MS,
+        }
+    }
+}
+
+impl TerminalWatchdogSettings {
+    pub fn from_content(content: Option<&TerminalWatchdogSettingsContent>) -> Self {
+        let Some(content) = content else {
+            return Self::default();
+        };
+
+        Self {
+            enabled: content.enabled.unwrap_or(DEFAULT_TERMINAL_WATCHDOG_ENABLED),
+            idle_timeout_ms: match content.idle_timeout_ms {
+                None => Some(DEFAULT_TERMINAL_WATCHDOG_IDLE_TIMEOUT_MS),
+                Some(inner) => inner,
+            },
+            idle_cpu_threshold_percent: content
+                .idle_cpu_threshold_percent
+                .unwrap_or(DEFAULT_TERMINAL_WATCHDOG_IDLE_CPU_THRESHOLD_PERCENT),
+            hard_timeout_ms: match content.hard_timeout_ms {
+                None => Some(DEFAULT_TERMINAL_WATCHDOG_HARD_TIMEOUT_MS),
+                Some(inner) => inner,
+            },
+            poll_interval_ms: content
+                .poll_interval_ms
+                .map(|interval| interval.max(MIN_TERMINAL_WATCHDOG_POLL_INTERVAL_MS))
+                .unwrap_or(DEFAULT_TERMINAL_WATCHDOG_POLL_INTERVAL_MS),
+            idle_timeout_no_probe_ms: content
+                .idle_timeout_no_probe_ms
+                .unwrap_or(DEFAULT_TERMINAL_WATCHDOG_IDLE_TIMEOUT_NO_PROBE_MS),
+        }
+    }
+}
+
 #[derive(Clone, Debug, RegisterSetting)]
 pub struct AgentSettings {
     pub enabled: bool,
@@ -326,6 +388,7 @@ pub struct AgentSettings {
     pub expand_terminal_card: bool,
     pub terminal_init_command: Option<String>,
     pub terminal_wrapper_command: Option<String>,
+    pub terminal_watchdog: TerminalWatchdogSettings,
     pub thinking_display: ThinkingBlockDisplay,
     pub cancel_generation_on_terminal_stop: bool,
     pub use_modifier_to_send: bool,
@@ -357,6 +420,54 @@ impl AgentSettings {
             return setting.temperature;
         }
         return None;
+    }
+
+    pub fn system_prompt_template_for_model(
+        model: &Arc<dyn LanguageModel>,
+        cx: &App,
+    ) -> Option<String> {
+        let settings = Self::get_global(cx);
+        for setting in settings.model_parameters.iter().rev() {
+            let Some(template) = &setting.system_prompt_template else {
+                continue;
+            };
+            if let Some(provider) = &setting.provider
+                && provider.0 != model.provider_id().0
+            {
+                continue;
+            }
+            if let Some(setting_model) = &setting.model
+                && *setting_model != model.id().0
+            {
+                continue;
+            }
+            return Some(template.clone());
+        }
+        None
+    }
+
+    pub fn custom_instructions_for_model(
+        model: &Arc<dyn LanguageModel>,
+        cx: &App,
+    ) -> Option<String> {
+        let settings = Self::get_global(cx);
+        for setting in settings.model_parameters.iter().rev() {
+            let Some(custom_instructions) = &setting.custom_instructions else {
+                continue;
+            };
+            if let Some(provider) = &setting.provider
+                && provider.0 != model.provider_id().0
+            {
+                continue;
+            }
+            if let Some(setting_model) = &setting.model
+                && *setting_model != model.id().0
+            {
+                continue;
+            }
+            return Some(custom_instructions.clone());
+        }
+        None
     }
 
     /// Returns the fully resolved prompt used for thread title generation.
@@ -1082,6 +1193,9 @@ impl Settings for AgentSettings {
             terminal_wrapper_command: agent
                 .terminal_wrapper_command
                 .filter(|command| !command.trim().is_empty()),
+            terminal_watchdog: TerminalWatchdogSettings::from_content(
+                agent.terminal_watchdog.as_ref(),
+            ),
             thinking_display: agent.thinking_display.unwrap(),
             cancel_generation_on_terminal_stop: agent.cancel_generation_on_terminal_stop.unwrap(),
             use_modifier_to_send: agent.use_modifier_to_send.unwrap(),
@@ -1299,6 +1413,125 @@ mod tests {
     fn nested_from_json(value: serde_json::Value) -> NestedSubAgentsSettings {
         let content: NestedSubAgentsSettingsContent = serde_json::from_value(value).unwrap();
         NestedSubAgentsSettings::from_content(Some(&content))
+    }
+
+    fn watchdog_from_json(value: serde_json::Value) -> anyhow::Result<TerminalWatchdogSettings> {
+        let content: TerminalWatchdogSettingsContent = serde_json::from_value(value)?;
+        Ok(TerminalWatchdogSettings::from_content(Some(&content)))
+    }
+
+    #[test]
+    fn test_terminal_watchdog_defaults() -> anyhow::Result<()> {
+        let default = TerminalWatchdogSettings::default();
+        assert!(default.enabled);
+        assert_eq!(default.idle_timeout_ms, Some(300_000));
+        assert_eq!(default.idle_cpu_threshold_percent, 5.0);
+        assert_eq!(default.hard_timeout_ms, Some(3_600_000));
+        assert_eq!(default.poll_interval_ms, 5000);
+        assert_eq!(default.idle_timeout_no_probe_ms, 600_000);
+
+        // Absent section -> defaults
+        assert_eq!(TerminalWatchdogSettings::from_content(None), default);
+
+        // Empty object -> defaults
+        assert_eq!(watchdog_from_json(json!({}))?, default);
+        Ok(())
+    }
+
+    #[test]
+    fn test_terminal_watchdog_null_semantics() -> anyhow::Result<()> {
+        // Explicit null disables idle detection
+        let idle_disabled = watchdog_from_json(json!({ "idle_timeout_ms": null }))?;
+        assert_eq!(idle_disabled.idle_timeout_ms, None);
+        assert_eq!(idle_disabled.hard_timeout_ms, Some(3_600_000));
+        assert!(idle_disabled.enabled);
+
+        // Explicit null disables hard cap
+        let cap_disabled = watchdog_from_json(json!({ "hard_timeout_ms": null }))?;
+        assert_eq!(cap_disabled.idle_timeout_ms, Some(300_000));
+        assert_eq!(cap_disabled.hard_timeout_ms, None);
+        assert!(cap_disabled.enabled);
+
+        // Both disabled
+        let both_disabled = watchdog_from_json(json!({
+            "idle_timeout_ms": null,
+            "hard_timeout_ms": null
+        }))?;
+        assert_eq!(both_disabled.idle_timeout_ms, None);
+        assert_eq!(both_disabled.hard_timeout_ms, None);
+
+        // Explicit values override defaults
+        let custom = watchdog_from_json(json!({
+            "idle_timeout_ms": 120_000,
+            "hard_timeout_ms": 7_200_000,
+            "idle_cpu_threshold_percent": 10.0,
+            "poll_interval_ms": 2000,
+            "idle_timeout_no_probe_ms": 300_000
+        }))?;
+        assert_eq!(custom.idle_timeout_ms, Some(120_000));
+        assert_eq!(custom.hard_timeout_ms, Some(7_200_000));
+        assert_eq!(custom.idle_cpu_threshold_percent, 10.0);
+        assert_eq!(custom.poll_interval_ms, 2000);
+        assert_eq!(custom.idle_timeout_no_probe_ms, 300_000);
+
+        let clamped = watchdog_from_json(json!({ "poll_interval_ms": 0 }))?;
+        assert_eq!(
+            clamped.poll_interval_ms,
+            MIN_TERMINAL_WATCHDOG_POLL_INTERVAL_MS
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_terminal_watchdog_enabled_master_switch() -> anyhow::Result<()> {
+        let disabled = watchdog_from_json(json!({ "enabled": false }))?;
+        assert!(!disabled.enabled);
+        assert_eq!(disabled.idle_timeout_ms, Some(300_000));
+
+        let enabled = watchdog_from_json(json!({ "enabled": true }))?;
+        assert!(enabled.enabled);
+
+        Ok(())
+    }
+
+    #[gpui::test]
+    fn test_terminal_watchdog_settings_store_resolution(cx: &mut gpui::App) {
+        let store = SettingsStore::test(cx);
+        cx.set_global(store);
+        project::DisableAiSettings::register(cx);
+        AgentSettings::register(cx);
+
+        // Default when absent
+        let settings = AgentSettings::get_global(cx);
+        assert_eq!(
+            settings.terminal_watchdog,
+            TerminalWatchdogSettings::default()
+        );
+
+        // User settings with explicit nulls and enabled=false
+        let parse_result = SettingsStore::update_global(cx, |store, cx| {
+            store.set_user_settings(
+                r#"{
+                    "agent": {
+                        "terminal_watchdog": {
+                            "enabled": false,
+                            "idle_timeout_ms": null
+                        }
+                    }
+                }"#,
+                cx,
+            )
+        });
+        assert!(matches!(
+            parse_result.parse_status,
+            settings::ParseStatus::Success
+        ));
+
+        let settings = AgentSettings::get_global(cx);
+        assert!(!settings.terminal_watchdog.enabled);
+        assert_eq!(settings.terminal_watchdog.idle_timeout_ms, None);
+        assert_eq!(settings.terminal_watchdog.hard_timeout_ms, Some(3_600_000));
     }
 
     #[test]
@@ -2504,5 +2737,244 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&worktree_dir).log_err();
+    }
+
+    #[gpui::test]
+    fn test_model_parameters_per_model_system_prompt_and_instructions(cx: &mut gpui::App) {
+        use language_model::fake_provider::FakeLanguageModel;
+
+        let store = SettingsStore::test(cx);
+        cx.set_global(store);
+        project::DisableAiSettings::register(cx);
+        AgentSettings::register(cx);
+
+        let sonnet: Arc<dyn LanguageModel> = Arc::new(FakeLanguageModel::with_id_and_thinking(
+            "anthropic",
+            "claude-3-5-sonnet",
+            "Sonnet",
+            false,
+        ));
+        let opus: Arc<dyn LanguageModel> = Arc::new(FakeLanguageModel::with_id_and_thinking(
+            "anthropic",
+            "claude-3-opus",
+            "Opus",
+            false,
+        ));
+        let gpt4: Arc<dyn LanguageModel> = Arc::new(FakeLanguageModel::with_id_and_thinking(
+            "openai", "gpt-4", "GPT-4", false,
+        ));
+
+        // 1. Provider-only match: matches all models from that provider, but not other providers.
+        SettingsStore::update_global(cx, |store, cx| {
+            store
+                .set_user_settings(
+                    r#"{
+                        "agent": {
+                            "model_parameters": [
+                                {
+                                    "provider": "anthropic",
+                                    "system_prompt_template": "anthropic_default.hbs",
+                                    "custom_instructions": "anthropic instructions"
+                                }
+                            ]
+                        }
+                    }"#,
+                    cx,
+                )
+                .unwrap();
+        });
+        assert_eq!(
+            AgentSettings::system_prompt_template_for_model(&sonnet, cx),
+            Some("anthropic_default.hbs".to_string())
+        );
+        assert_eq!(
+            AgentSettings::custom_instructions_for_model(&sonnet, cx),
+            Some("anthropic instructions".to_string())
+        );
+        assert_eq!(
+            AgentSettings::system_prompt_template_for_model(&opus, cx),
+            Some("anthropic_default.hbs".to_string())
+        );
+        assert_eq!(
+            AgentSettings::custom_instructions_for_model(&opus, cx),
+            Some("anthropic instructions".to_string())
+        );
+        assert_eq!(
+            AgentSettings::system_prompt_template_for_model(&gpt4, cx),
+            None
+        );
+        assert_eq!(
+            AgentSettings::custom_instructions_for_model(&gpt4, cx),
+            None
+        );
+
+        // 2. Exact provider+model match: only matches the specific model.
+        SettingsStore::update_global(cx, |store, cx| {
+            store
+                .set_user_settings(
+                    r#"{
+                        "agent": {
+                            "model_parameters": [
+                                {
+                                    "provider": "anthropic",
+                                    "model": "claude-3-5-sonnet",
+                                    "system_prompt_template": "sonnet_exact.hbs",
+                                    "custom_instructions": "sonnet instructions"
+                                }
+                            ]
+                        }
+                    }"#,
+                    cx,
+                )
+                .unwrap();
+        });
+        assert_eq!(
+            AgentSettings::system_prompt_template_for_model(&sonnet, cx),
+            Some("sonnet_exact.hbs".to_string())
+        );
+        assert_eq!(
+            AgentSettings::custom_instructions_for_model(&sonnet, cx),
+            Some("sonnet instructions".to_string())
+        );
+        assert_eq!(
+            AgentSettings::system_prompt_template_for_model(&opus, cx),
+            None
+        );
+        assert_eq!(
+            AgentSettings::custom_instructions_for_model(&opus, cx),
+            None
+        );
+
+        // 3. Exact beats provider-only when later in the list.
+        SettingsStore::update_global(cx, |store, cx| {
+            store
+                .set_user_settings(
+                    r#"{
+                        "agent": {
+                            "model_parameters": [
+                                {
+                                    "provider": "anthropic",
+                                    "system_prompt_template": "anthropic_generic.hbs",
+                                    "custom_instructions": "anthropic generic"
+                                },
+                                {
+                                    "provider": "anthropic",
+                                    "model": "claude-3-5-sonnet",
+                                    "system_prompt_template": "sonnet_specific.hbs",
+                                    "custom_instructions": "sonnet specific"
+                                }
+                            ]
+                        }
+                    }"#,
+                    cx,
+                )
+                .unwrap();
+        });
+        assert_eq!(
+            AgentSettings::system_prompt_template_for_model(&sonnet, cx),
+            Some("sonnet_specific.hbs".to_string())
+        );
+        assert_eq!(
+            AgentSettings::custom_instructions_for_model(&sonnet, cx),
+            Some("sonnet specific".to_string())
+        );
+        assert_eq!(
+            AgentSettings::system_prompt_template_for_model(&opus, cx),
+            Some("anthropic_generic.hbs".to_string())
+        );
+        assert_eq!(
+            AgentSettings::custom_instructions_for_model(&opus, cx),
+            Some("anthropic generic".to_string())
+        );
+
+        // 4. Last matching entry wins.
+        SettingsStore::update_global(cx, |store, cx| {
+            store
+                .set_user_settings(
+                    r#"{
+                        "agent": {
+                            "model_parameters": [
+                                {
+                                    "provider": "anthropic",
+                                    "model": "claude-3-5-sonnet",
+                                    "system_prompt_template": "first.hbs",
+                                    "custom_instructions": "first instructions"
+                                },
+                                {
+                                    "provider": "anthropic",
+                                    "model": "claude-3-5-sonnet",
+                                    "system_prompt_template": "second.hbs",
+                                    "custom_instructions": "second instructions"
+                                }
+                            ]
+                        }
+                    }"#,
+                    cx,
+                )
+                .unwrap();
+        });
+        assert_eq!(
+            AgentSettings::system_prompt_template_for_model(&sonnet, cx),
+            Some("second.hbs".to_string())
+        );
+        assert_eq!(
+            AgentSettings::custom_instructions_for_model(&sonnet, cx),
+            Some("second instructions".to_string())
+        );
+
+        // 5. Entry without the field is skipped (falls through to earlier matching entry).
+        SettingsStore::update_global(cx, |store, cx| {
+            store
+                .set_user_settings(
+                    r#"{
+                        "agent": {
+                            "model_parameters": [
+                                {
+                                    "provider": "anthropic",
+                                    "system_prompt_template": "anthropic_fallback.hbs",
+                                    "custom_instructions": "anthropic fallback"
+                                },
+                                {
+                                    "provider": "anthropic",
+                                    "model": "claude-3-5-sonnet",
+                                    "temperature": 0.5
+                                }
+                            ]
+                        }
+                    }"#,
+                    cx,
+                )
+                .unwrap();
+        });
+        assert_eq!(
+            AgentSettings::system_prompt_template_for_model(&sonnet, cx),
+            Some("anthropic_fallback.hbs".to_string())
+        );
+        assert_eq!(
+            AgentSettings::custom_instructions_for_model(&sonnet, cx),
+            Some("anthropic fallback".to_string())
+        );
+
+        // 6. No match -> None.
+        SettingsStore::update_global(cx, |store, cx| {
+            store
+                .set_user_settings(
+                    r#"{
+                        "agent": {
+                            "model_parameters": []
+                        }
+                    }"#,
+                    cx,
+                )
+                .unwrap();
+        });
+        assert_eq!(
+            AgentSettings::system_prompt_template_for_model(&sonnet, cx),
+            None
+        );
+        assert_eq!(
+            AgentSettings::custom_instructions_for_model(&sonnet, cx),
+            None
+        );
     }
 }

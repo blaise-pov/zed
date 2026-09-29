@@ -31,6 +31,7 @@ util.workspace = true
 [dev-dependencies]
 fs.workspace = true
 gpui = { workspace = true, features = ["test-support"] }
+language_model = { workspace = true, features = ["test-support"] }
 
 serde_json_lenient.workspace = true
 serde_json.workspace = true
