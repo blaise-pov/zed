@@ -9,6 +9,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use crate::task_worktree::SubagentIsolationDetails;
+use acp_thread::AgentModelId;
 use crate::{AgentTool, ThreadEnvironment, ToolCallEventStream, ToolInput};
 use settings::Settings as _;
 
@@ -31,6 +32,12 @@ use settings::Settings as _;
 /// - Split implementation into disjoint codebase slices and spawn multiple agents for them in parallel when the write scopes do not overlap.
 /// - When a plan has multiple independent steps, prefer delegating those steps in parallel rather than serializing them unnecessarily.
 /// - Reuse the returned session_id when you want to follow up on the same delegated subproblem instead of creating a duplicate session.
+///
+/// ### Model selection
+/// - When the user requests a particular model or asks you to choose based on cost or capability, call `list_agents_and_models` first, then pass the exact `models[].id` from the native Zed agent entry (`is_native: true`) in `model`.
+/// - Omit `model` to use the user's configured subagent model, or the parent model when no subagent model is configured.
+/// - Do not silently choose a different model when an explicit model is unavailable unless the user allowed fallback.
+/// - A resumed session keeps its existing model, so `model` cannot be combined with `session_id`.
 ///
 /// ### Output
 /// - You will receive only the agent's final message as output.
@@ -74,6 +81,11 @@ pub struct SpawnAgentToolInput {
     /// special value "goal", which resolves to `agent-goal/{goal_id}`.
     #[serde(default)]
     pub on_branch: Option<String>,
+    /// Optional model override. Pass the exact `models[].id` returned for the
+    /// native Zed agent (`is_native: true`) by `list_agents_and_models`.
+    /// Omit to preserve default behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 fn deserialize_session_id<'de, D>(deserializer: D) -> Result<Option<acp::SessionId>, D::Error>
@@ -246,6 +258,16 @@ impl AgentTool for SpawnAgentTool {
                     isolation_details: None,
                 })?;
 
+            if input.session_id.is_some() && input.model.is_some() {
+                return Err(SpawnAgentToolOutput::Error {
+                    session_id: input.session_id.clone(),
+                    error: "model cannot be changed when resuming a subagent session".to_string(),
+                    session_info: None,
+                    isolation: None,
+                    isolation_details: None,
+                });
+            }
+
             if input.on_branch.is_some() && input.base_branch.is_some() {
                 return Err(SpawnAgentToolOutput::Error {
                     session_id: input.session_id.clone(),
@@ -357,6 +379,7 @@ impl AgentTool for SpawnAgentTool {
                     self.environment.create_subagent(
                         input.label,
                         input.profile,
+                        input.model.map(AgentModelId::from),
                         worktree_path.clone(),
                         cx,
                     )
