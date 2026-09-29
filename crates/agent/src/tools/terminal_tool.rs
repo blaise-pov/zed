@@ -14,6 +14,7 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
+use util::ResultExt;
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 use crate::SandboxFallbackDecision;
@@ -21,6 +22,7 @@ use crate::sandboxing::{
     NetworkRequest, sandbox_protected_paths, sandbox_worktree_writable_paths,
     sandboxing_enabled_for_project,
 };
+use crate::tools::terminal_watchdog;
 use crate::{AgentTool, ThreadEnvironment, ToolCallEventStream, ToolInput};
 
 const COMMAND_OUTPUT_LIMIT: u64 = 16 * 1024;
@@ -37,7 +39,7 @@ const COMMAND_OUTPUT_LIMIT: u64 = 16 * 1024;
 ///
 /// Do not pipe output to `head`, `tail`, or similar output-filtering commands just to reduce what you receive. Instead, use `head_lines` and/or `tail_lines`; this keeps the terminal output visible to the user in real time while limiting only the final output sent back to you. When both are specified, the first `head_lines` lines are returned, then a blank line, then the last `tail_lines` lines. Avoid requesting too many lines, or the response may waste tokens or exceed the context window.
 ///
-/// Do not use this tool for commands that run indefinitely, such as servers (like `npm run start`, `npm run dev`, `python -m http.server`, etc) or file watchers that don't terminate on their own.
+/// Do not use this tool for commands that run indefinitely, such as servers (like `npm run start`, `npm run dev`, `python -m http.server`, etc) or file watchers that don't terminate on their own. Commands that wait for a finite external event (`gh run watch`, `kubectl wait`, `docker wait`, waiting for a lock) must be run with `timeout_ms` set to the expected duration plus margin.
 ///
 /// For potentially long-running commands, prefer specifying `timeout_ms` to bound runtime and prevent indefinite hangs.
 ///
@@ -79,7 +81,7 @@ pub struct TerminalToolInput {
 ///
 /// Do not pipe output to `head`, `tail`, or similar output-filtering commands just to reduce what you receive. Instead, use `head_lines` and/or `tail_lines`; this keeps the terminal output visible to the user in real time while limiting only the final output sent back to you. When both are specified, the first `head_lines` lines are returned, then a blank line, then the last `tail_lines` lines. Avoid requesting too many lines, or the response may waste tokens or exceed the context window.
 ///
-/// Do not use this tool for commands that run indefinitely, such as servers (like `npm run start`, `npm run dev`, `python -m http.server`, etc) or file watchers that don't terminate on their own.
+/// Do not use this tool for commands that run indefinitely, such as servers (like `npm run start`, `npm run dev`, `python -m http.server`, etc) or file watchers that don't terminate on their own. Commands that wait for a finite external event (`gh run watch`, `kubectl wait`, `docker wait`, waiting for a lock) must be run with `timeout_ms` set to the expected duration plus margin.
 ///
 /// For potentially long-running commands, prefer specifying `timeout_ms` to bound runtime and prevent indefinite hangs.
 ///
@@ -556,6 +558,10 @@ pub struct TerminalTool {
     project: Entity<Project>,
     environment: Rc<dyn ThreadEnvironment>,
     wrapper_state: Rc<TerminalWrapperState>,
+    #[cfg(any(test, feature = "test-support"))]
+    probe_builder: Option<Arc<dyn Fn() -> Box<dyn terminal_watchdog::ActivityProbe> + Send + Sync>>,
+    #[cfg(any(test, feature = "test-support"))]
+    now_fn: Option<Arc<dyn Fn() -> Instant + Send + Sync>>,
 }
 
 impl TerminalTool {
@@ -564,6 +570,10 @@ impl TerminalTool {
             project,
             environment,
             wrapper_state: Rc::new(TerminalWrapperState::default()),
+            #[cfg(any(test, feature = "test-support"))]
+            probe_builder: None,
+            #[cfg(any(test, feature = "test-support"))]
+            now_fn: None,
         }
     }
 
@@ -578,6 +588,24 @@ impl TerminalTool {
     #[allow(dead_code)]
     pub(crate) fn with_wrapper_state(mut self, state: Rc<TerminalWrapperState>) -> Self {
         self.wrapper_state = state;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_activity_probe<P: terminal_watchdog::ActivityProbe + Clone + Sync>(
+        mut self,
+        probe: P,
+    ) -> Self {
+        self.probe_builder = Some(Arc::new(move || Box::new(probe.clone())));
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_now_fn<F>(mut self, now_fn: F) -> Self
+    where
+        F: Fn() -> Instant + Send + Sync + 'static,
+    {
+        self.now_fn = Some(Arc::new(now_fn));
         self
     }
 }
@@ -640,6 +668,11 @@ impl AgentTool for TerminalTool {
         event_stream: ToolCallEventStream,
         cx: &mut App,
     ) -> Task<Result<Self::Output, Self::Output>> {
+        #[cfg(any(test, feature = "test-support"))]
+        let probe_builder = self.probe_builder.clone();
+        #[cfg(any(test, feature = "test-support"))]
+        let now_fn = self.now_fn.clone();
+
         cx.spawn(async move |cx| {
             let input = input.recv().await.map_err(|e| e.to_string())?;
             run_terminal_tool(
@@ -648,6 +681,10 @@ impl AgentTool for TerminalTool {
                 self.wrapper_state.clone(),
                 input.into(),
                 event_stream,
+                #[cfg(any(test, feature = "test-support"))]
+                probe_builder,
+                #[cfg(any(test, feature = "test-support"))]
+                now_fn,
                 cx,
             )
             .await
@@ -691,6 +728,10 @@ impl AgentTool for SandboxedTerminalTool {
                 self.wrapper_state.clone(),
                 input.into(),
                 event_stream,
+                #[cfg(any(test, feature = "test-support"))]
+                None,
+                #[cfg(any(test, feature = "test-support"))]
+                None,
                 cx,
             )
             .await
@@ -845,6 +886,12 @@ async fn run_terminal_tool(
     wrapper_state: Rc<TerminalWrapperState>,
     input: TerminalToolRequest,
     event_stream: ToolCallEventStream,
+    #[cfg(any(test, feature = "test-support"))] probe_builder: Option<
+        Arc<dyn Fn() -> Box<dyn terminal_watchdog::ActivityProbe> + Send + Sync>,
+    >,
+    #[cfg(any(test, feature = "test-support"))] now_fn: Option<
+        Arc<dyn Fn() -> Instant + Send + Sync>,
+    >,
     cx: &mut AsyncApp,
 ) -> Result<String, String> {
     let selection = input.selection;
@@ -1471,6 +1518,7 @@ async fn run_terminal_tool(
 
     let mut timed_out = false;
     let mut user_stopped_via_signal = false;
+    let mut watchdog_stop = None;
     let wait_for_exit = terminal.wait_for_exit(cx).map_err(|e| e.to_string())?;
 
     match timeout {
@@ -1492,12 +1540,74 @@ async fn run_terminal_tool(
             }
         }
         None => {
-            futures::select! {
-                _ = wait_for_exit.clone().fuse() => {},
-                _ = event_stream.cancelled_by_user().fuse() => {
-                    user_stopped_via_signal = true;
-                    terminal.kill(cx).map_err(|e| e.to_string())?;
-                    wait_for_exit.await;
+            let watchdog_settings = cx.update(|cx| {
+                let location = event_stream.settings_location(cx);
+                agent_settings::AgentSettings::get(location, cx).terminal_watchdog
+            });
+
+            if watchdog_settings.enabled
+                && (watchdog_settings.hard_timeout_ms.is_some()
+                    || watchdog_settings.idle_timeout_ms.is_some())
+            {
+                let initial_output = terminal.output_activity_counter(cx).log_err().unwrap_or(0);
+                let probe: Box<dyn terminal_watchdog::ActivityProbe> = {
+                    #[cfg(any(test, feature = "test-support"))]
+                    {
+                        if let Some(builder) = probe_builder {
+                            builder()
+                        } else {
+                            Box::new(terminal_watchdog::SysinfoActivityProbe::new())
+                        }
+                    }
+                    #[cfg(not(any(test, feature = "test-support")))]
+                    {
+                        Box::new(terminal_watchdog::SysinfoActivityProbe::new())
+                    }
+                };
+                let mut watchdog =
+                    terminal_watchdog::TerminalWatchdog::new(watchdog_settings, probe)
+                        .with_initial_output_counter(initial_output);
+
+                #[cfg(any(test, feature = "test-support"))]
+                if let Some(now_fn) = now_fn {
+                    watchdog = watchdog.with_now_fn(now_fn);
+                }
+
+                let cap_task = terminal_watchdog::cap_timer(
+                    watchdog_settings.hard_timeout_ms,
+                    cx.background_executor(),
+                );
+                let cx_clone = cx.clone();
+                let idle_task = watchdog.run_idle_loop(terminal.as_ref(), &cx_clone);
+
+                futures::select_biased! {
+                    _ = wait_for_exit.clone().fuse() => {},
+                    _ = event_stream.cancelled_by_user().fuse() => {
+                        user_stopped_via_signal = true;
+                        terminal.kill(cx).map_err(|e| e.to_string())?;
+                        wait_for_exit.await;
+                    }
+                    stop = cap_task.fuse() => {
+                        log::debug!("terminal command stopped by watchdog cap: {stop:?}");
+                        watchdog_stop = Some(stop);
+                        terminal.kill(cx).map_err(|e| e.to_string())?;
+                        wait_for_exit.await;
+                    }
+                    stop = idle_task.fuse() => {
+                        log::debug!("terminal command stopped by watchdog idle: {stop:?}");
+                        watchdog_stop = Some(stop);
+                        terminal.kill(cx).map_err(|e| e.to_string())?;
+                        wait_for_exit.await;
+                    }
+                }
+            } else {
+                futures::select_biased! {
+                    _ = wait_for_exit.clone().fuse() => {},
+                    _ = event_stream.cancelled_by_user().fuse() => {
+                        user_stopped_via_signal = true;
+                        terminal.kill(cx).map_err(|e| e.to_string())?;
+                        wait_for_exit.await;
+                    }
                 }
             }
         }
@@ -1509,7 +1619,14 @@ async fn run_terminal_tool(
 
     let output = terminal.current_output(cx).map_err(|e| e.to_string())?;
 
-    let result = process_content(output, &input.command, timed_out, user_stopped, selection);
+    let result = process_content(
+        output,
+        &input.command,
+        timed_out,
+        user_stopped,
+        watchdog_stop.as_ref(),
+        selection,
+    );
     let notes = sandbox_note.into_iter().collect::<Vec<_>>();
     Ok(if notes.is_empty() {
         result
@@ -1720,11 +1837,29 @@ fn wsl_interop_blocked(content: &str) -> bool {
     content.contains("UtilGetPpid") || content.contains("Failed to parse: /proc/1/stat")
 }
 
+fn format_watchdog_cap_duration(cap_milliseconds: u64) -> String {
+    let total_seconds = (cap_milliseconds + 500) / 1000;
+    if total_seconds >= 3600 && total_seconds.is_multiple_of(3600) {
+        format!("{}h", total_seconds / 3600)
+    } else if total_seconds >= 60 {
+        let minutes = total_seconds / 60;
+        let seconds = total_seconds % 60;
+        if seconds == 0 {
+            format!("{}m", minutes)
+        } else {
+            format!("{}m {}s", minutes, seconds)
+        }
+    } else {
+        format!("{}s", total_seconds)
+    }
+}
+
 fn process_content(
     output: acp::TerminalOutputResponse,
     command: &str,
     timed_out: bool,
     user_stopped: bool,
+    watchdog_stop: Option<&terminal_watchdog::WatchdogStop>,
     selection: TerminalOutputSelection,
 ) -> String {
     let content = output.output.trim();
@@ -1771,6 +1906,54 @@ fn process_content(
                 "Command \"{command}\" timed out. Output captured before timeout:\n\n{}",
                 content
             )
+        }
+    } else if let Some(watchdog_stop) = watchdog_stop {
+        match watchdog_stop {
+            terminal_watchdog::WatchdogStop::Idle { window_ms } => {
+                let seconds = *window_ms / 1000;
+                if is_empty {
+                    format!(
+                        "Command \"{command}\" was stopped by the watchdog: no terminal output, no CPU usage, and no disk \
+                        activity from the process tree for {seconds}s. This usually means the command is blocked waiting \
+                        for interactive input (confirmation prompt, pager, editor), stalled on a network/resource, \
+                        or legitimately waiting for an external event (CI run, container, lock). No output was captured before stopping.\n\n\
+                        Before retrying: check for -y/--yes/--no-pager/non-interactive flags and verify the command \
+                        does not expect input; if it legitimately waits for an external event, rerun with timeout_ms \
+                        set to the expected duration plus margin, or switch to periodic polling of the event source. \
+                        Do not retry the exact same command unchanged."
+                    )
+                } else {
+                    format!(
+                        "Command \"{command}\" was stopped by the watchdog: no terminal output, no CPU usage, and no disk \
+                        activity from the process tree for {seconds}s. This usually means the command is blocked waiting \
+                        for interactive input (confirmation prompt, pager, editor), stalled on a network/resource, \
+                        or legitimately waiting for an external event (CI run, container, lock). Output captured \
+                        before stopping:\n\n{content}\n\n\
+                        Before retrying: check for -y/--yes/--no-pager/non-interactive flags and verify the command \
+                        does not expect input; if it legitimately waits for an external event, rerun with timeout_ms \
+                        set to the expected duration plus margin, or switch to periodic polling of the event source. \
+                        Do not retry the exact same command unchanged."
+                    )
+                }
+            }
+            terminal_watchdog::WatchdogStop::HardCap { cap_ms } => {
+                let duration = format_watchdog_cap_duration(*cap_ms);
+                if is_empty {
+                    format!(
+                        "Command \"{command}\" exceeded the default maximum runtime of {duration} (timeout_ms was not set). \
+                        No output was captured before stopping.\n\n\
+                        If this command legitimately needs longer, rerun it with timeout_ms set to the expected \
+                        duration plus margin."
+                    )
+                } else {
+                    format!(
+                        "Command \"{command}\" exceeded the default maximum runtime of {duration} (timeout_ms was not set). \
+                        Output captured before stopping:\n\n{content}\n\n\
+                        If this command legitimately needs longer, rerun it with timeout_ms set to the expected \
+                        duration plus margin."
+                    )
+                }
+            }
         }
     } else {
         let exit_code = output.exit_status.as_ref().and_then(|s| s.exit_code);
@@ -2085,6 +2268,7 @@ mod tests {
             "cargo build",
             false,
             true,
+            None,
             TerminalOutputSelection::default(),
         );
 
@@ -2322,6 +2506,7 @@ mod tests {
             "printf lines",
             false,
             false,
+            None,
             TerminalOutputSelection {
                 head_lines: Some(1),
                 tail_lines: Some(1),
@@ -2341,6 +2526,7 @@ mod tests {
             "failing command",
             false,
             false,
+            None,
             TerminalOutputSelection {
                 head_lines: None,
                 tail_lines: Some(1),
@@ -2362,6 +2548,7 @@ mod tests {
             "slow command",
             true,
             false,
+            None,
             TerminalOutputSelection {
                 head_lines: Some(1),
                 tail_lines: None,
@@ -2375,6 +2562,34 @@ mod tests {
     }
 
     #[test]
+    fn test_process_content_filters_watchdog_output_for_model() {
+        let output = acp::TerminalOutputResponse::new(
+            "alpha
+beta
+gamma"
+                .to_string(),
+            false,
+        );
+
+        let result = process_content(
+            output,
+            "slow command",
+            false,
+            false,
+            Some(&terminal_watchdog::WatchdogStop::Idle { window_ms: 300_000 }),
+            TerminalOutputSelection {
+                head_lines: Some(1),
+                tail_lines: None,
+            },
+        );
+
+        assert!(result.contains("was stopped by the watchdog"));
+        assert!(result.contains("alpha"));
+        assert!(!result.contains("beta"));
+        assert!(!result.contains("gamma"));
+    }
+
+    #[test]
     fn test_process_content_filters_user_stopped_output_for_model() {
         let output = acp::TerminalOutputResponse::new("one\ntwo\nthree".to_string(), false);
 
@@ -2383,6 +2598,7 @@ mod tests {
             "stopped command",
             false,
             true,
+            None,
             TerminalOutputSelection {
                 head_lines: None,
                 tail_lines: Some(1),
@@ -2406,6 +2622,7 @@ mod tests {
             "printf lines",
             false,
             false,
+            None,
             TerminalOutputSelection {
                 head_lines: Some(1),
                 tail_lines: Some(1),
@@ -2426,6 +2643,7 @@ mod tests {
             "cargo build",
             false,
             true,
+            None,
             TerminalOutputSelection::default(),
         );
 
@@ -2450,6 +2668,7 @@ mod tests {
             "cargo build",
             true,
             false,
+            None,
             TerminalOutputSelection::default(),
         );
 
@@ -2474,6 +2693,7 @@ mod tests {
             "sleep 1000",
             true,
             false,
+            None,
             TerminalOutputSelection::default(),
         );
 
@@ -2490,6 +2710,185 @@ mod tests {
     }
 
     #[test]
+    fn test_process_content_watchdog_idle() {
+        let output = acp::TerminalOutputResponse::new("hanging output here".to_string(), false);
+
+        let result = process_content(
+            output,
+            "cargo test",
+            false,
+            false,
+            Some(&terminal_watchdog::WatchdogStop::Idle { window_ms: 300_000 }),
+            TerminalOutputSelection::default(),
+        );
+
+        assert!(
+            result.contains("was stopped by the watchdog: no terminal output, no CPU usage, and no disk activity from the process tree for 300s."),
+            "Expected watchdog idle message, got: {}",
+            result
+        );
+        assert!(
+            result.contains("Output captured before stopping:"),
+            "Expected 'Output captured before stopping:', got: {}",
+            result
+        );
+        assert!(
+            result.contains("hanging output here"),
+            "Expected partial output to be included, got: {}",
+            result
+        );
+        assert!(
+            result.contains("Before retrying: check for -y/--yes/--no-pager/non-interactive flags"),
+            "Expected retry guidance, got: {}",
+            result
+        );
+        assert!(
+            result.contains("Do not retry the exact same command unchanged."),
+            "Expected non-retry warning, got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_process_content_watchdog_idle_with_empty_output() {
+        let output = acp::TerminalOutputResponse::new("".to_string(), false);
+
+        let result = process_content(
+            output,
+            "sleep 1000",
+            false,
+            false,
+            Some(&terminal_watchdog::WatchdogStop::Idle { window_ms: 300_000 }),
+            TerminalOutputSelection::default(),
+        );
+
+        assert!(
+            result.contains("was stopped by the watchdog: no terminal output, no CPU usage, and no disk activity from the process tree for 300s."),
+            "Expected watchdog idle message, got: {}",
+            result
+        );
+        assert!(
+            result.contains("No output was captured before stopping."),
+            "Expected 'No output was captured before stopping.', got: {}",
+            result
+        );
+        assert!(
+            !result.contains("Output captured before stopping:"),
+            "Should not contain 'Output captured before stopping:', got: {}",
+            result
+        );
+        assert!(
+            result.contains("Before retrying: check for -y/--yes/--no-pager/non-interactive flags"),
+            "Expected retry guidance, got: {}",
+            result
+        );
+        assert!(
+            result.contains("Do not retry the exact same command unchanged."),
+            "Expected non-retry warning, got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_process_content_watchdog_hard_cap() {
+        let output = acp::TerminalOutputResponse::new("busy loop output".to_string(), false);
+
+        let result = process_content(
+            output,
+            "while true; do echo loop; done",
+            false,
+            false,
+            Some(&terminal_watchdog::WatchdogStop::HardCap { cap_ms: 3_600_000 }),
+            TerminalOutputSelection::default(),
+        );
+
+        assert!(
+            result.contains("exceeded the default maximum runtime of 1h (timeout_ms was not set)."),
+            "Expected hard cap message with 1h, got: {}",
+            result
+        );
+        assert!(
+            result.contains("Output captured before stopping:"),
+            "Expected 'Output captured before stopping:', got: {}",
+            result
+        );
+        assert!(
+            result.contains("busy loop output"),
+            "Expected partial output to be included, got: {}",
+            result
+        );
+        assert!(
+            result.contains("If this command legitimately needs longer, rerun it with timeout_ms set to the expected duration plus margin."),
+            "Expected cap guidance, got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_process_content_watchdog_hard_cap_with_empty_output() {
+        let output = acp::TerminalOutputResponse::new("".to_string(), false);
+
+        let result = process_content(
+            output,
+            "while true; do :; done",
+            false,
+            false,
+            Some(&terminal_watchdog::WatchdogStop::HardCap { cap_ms: 3_600_000 }),
+            TerminalOutputSelection::default(),
+        );
+
+        assert!(
+            result.contains("exceeded the default maximum runtime of 1h (timeout_ms was not set)."),
+            "Expected hard cap message with 1h, got: {}",
+            result
+        );
+        assert!(
+            result.contains("No output was captured before stopping."),
+            "Expected 'No output was captured before stopping.', got: {}",
+            result
+        );
+        assert!(
+            !result.contains("Output captured before stopping:"),
+            "Should not contain 'Output captured before stopping:', got: {}",
+            result
+        );
+        assert!(
+            result.contains("If this command legitimately needs longer, rerun it with timeout_ms set to the expected duration plus margin."),
+            "Expected cap guidance, got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_format_watchdog_cap_duration() {
+        assert_eq!(format_watchdog_cap_duration(3_600_000), "1h");
+        assert_eq!(format_watchdog_cap_duration(7_200_000), "2h");
+        assert_eq!(format_watchdog_cap_duration(5_400_000), "90m");
+        assert_eq!(format_watchdog_cap_duration(60_000), "1m");
+        assert_eq!(format_watchdog_cap_duration(90_000), "1m 30s");
+        assert_eq!(format_watchdog_cap_duration(90_500), "1m 31s");
+        assert_eq!(format_watchdog_cap_duration(30_000), "30s");
+        assert_eq!(format_watchdog_cap_duration(0), "0s");
+    }
+
+    #[test]
+    fn test_process_content_user_stopped_takes_precedence_over_watchdog() {
+        let output = acp::TerminalOutputResponse::new("output".to_string(), false);
+
+        let result = process_content(
+            output,
+            "cargo test",
+            false,
+            true,
+            Some(&terminal_watchdog::WatchdogStop::Idle { window_ms: 300_000 }),
+            TerminalOutputSelection::default(),
+        );
+
+        assert!(result.contains("user stopped"));
+        assert!(!result.contains("watchdog"));
+    }
+
+    #[test]
     fn test_process_content_with_success() {
         let output = acp::TerminalOutputResponse::new("success output".to_string(), false)
             .exit_status(acp::TerminalExitStatus::new().exit_code(0));
@@ -2499,6 +2898,7 @@ mod tests {
             "echo hello",
             false,
             false,
+            None,
             TerminalOutputSelection::default(),
         );
 
@@ -2524,6 +2924,7 @@ mod tests {
             "true",
             false,
             false,
+            None,
             TerminalOutputSelection::default(),
         );
 
@@ -2544,6 +2945,7 @@ mod tests {
             "false",
             false,
             false,
+            None,
             TerminalOutputSelection::default(),
         );
 
@@ -2569,6 +2971,7 @@ mod tests {
             "false",
             false,
             false,
+            None,
             TerminalOutputSelection::default(),
         );
 
@@ -2588,6 +2991,7 @@ mod tests {
             "some_command",
             false,
             false,
+            None,
             TerminalOutputSelection::default(),
         );
 
@@ -2612,6 +3016,7 @@ mod tests {
             "some_command",
             false,
             false,
+            None,
             TerminalOutputSelection::default(),
         );
 

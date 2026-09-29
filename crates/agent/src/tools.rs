@@ -25,6 +25,7 @@ mod skill_tool;
 mod spawn_agent_tool;
 mod symbol_locator;
 mod terminal_tool;
+pub(crate) mod terminal_watchdog;
 mod tool_permissions;
 mod web_search_tool;
 mod write_file_tool;
