@@ -1020,6 +1020,7 @@ impl TerminalBuilder {
             term,
             term_config: config,
             output_processor: Processor::<StdSyncHandler>::new(),
+            output_activity_counter: Arc::new(AtomicU64::new(0)),
             title_override: None,
             events: VecDeque::with_capacity(10),
             last_content: Content {
@@ -1216,6 +1217,8 @@ impl TerminalBuilder {
                 alternate_scroll,
             );
 
+            let output_activity_counter = Arc::new(AtomicU64::new(0));
+
             // When `no_pty` is set (headless hosts), run the task as a plain
             // subprocess and pump its piped output into the same emulator the
             // PTY path would feed.
@@ -1234,6 +1237,7 @@ impl TerminalBuilder {
                     working_directory.clone(),
                     term.clone(),
                     events_tx,
+                    output_activity_counter.clone(),
                     &background_executor,
                 ) {
                     Ok(subprocess) => subprocess,
@@ -1307,6 +1311,7 @@ impl TerminalBuilder {
                 term,
                 term_config: config,
                 output_processor: Processor::<StdSyncHandler>::new(),
+                output_activity_counter,
                 title_override: terminal_title_override,
                 events: VecDeque::with_capacity(10), //Should never get this high.
                 last_content: Default::default(),
@@ -1507,6 +1512,7 @@ pub struct Terminal {
     term: Arc<AlacrittyTermLock>,
     term_config: AlacrittyTermConfig,
     output_processor: Processor<StdSyncHandler>,
+    output_activity_counter: Arc<AtomicU64>,
     events: VecDeque<InternalEvent>,
     /// This is only used for mouse mode cell change detection
     last_mouse: Option<(Point, SelectionSide)>,
@@ -1672,6 +1678,13 @@ impl Terminal {
                 //NOOP, Handled in render
             }
             TerminalBackendEvent::Wakeup => {
+                if matches!(self.terminal_type, TerminalType::Pty { .. }) {
+                    // Byte-accurate PTY wrapping is impractical because Zed's
+                    // AlacrittyPty wraps private fork internals. A wakeup indicates
+                    // newly parsed input from the PTY; spinner CR-rewrites tick, and
+                    // scrollback trimming cannot reset this counter.
+                    self.output_activity_counter.fetch_add(1, Ordering::Relaxed);
+                }
                 self.detect_init_command_startup_marker();
                 cx.emit(Event::Wakeup);
 
@@ -1961,6 +1974,8 @@ impl Terminal {
     pub fn write_output(&mut self, bytes: &[u8], cx: &mut Context<Self>) {
         // Inject bytes directly into the terminal emulator and refresh the UI.
         // This bypasses the PTY/event loop for display-only terminals.
+        self.output_activity_counter
+            .fetch_add(bytes.len() as u64, Ordering::Relaxed);
         let mut previous_byte_was_cr = false;
         let converted = convert_lf_to_crlf(bytes, &mut previous_byte_was_cr);
 
@@ -2204,6 +2219,33 @@ impl Terminal {
 
     pub fn is_pty(&self) -> bool {
         matches!(self.terminal_type, TerminalType::Pty { .. })
+    }
+
+    /// Returns the process ID of the spawned shell or root subprocess.
+    ///
+    /// For PTY terminals, this is the spawned shell child PID (tree root),
+    /// not the foreground process group PID (`tcgetpgrp`).
+    /// For headless subprocess terminals, this is the child subprocess PID.
+    /// For display-only terminals without a subprocess, returns `None`.
+    pub fn shell_process_id(&self) -> Option<u32> {
+        match &self.terminal_type {
+            TerminalType::Pty { info, .. } => Some(info.pid_getter().fallback_pid().as_u32()),
+            TerminalType::DisplayOnly => self
+                .subprocess
+                .as_ref()
+                .and_then(|subprocess| subprocess.pid()),
+        }
+    }
+
+    /// Returns a monotonic counter tracking output activity on this terminal.
+    ///
+    /// The counter never resets. Units differ by backend:
+    /// - PTY terminals advance by 1 tick per wakeup event when new parsed input arrives.
+    /// - Headless subprocess and display-only terminals advance by the number of bytes written.
+    ///
+    /// Callers should only compare per-terminal counter deltas to detect activity.
+    pub fn output_activity_counter(&self) -> u64 {
+        self.output_activity_counter.load(Ordering::Relaxed)
     }
 
     pub fn write_init_command_after_startup(
@@ -3277,6 +3319,10 @@ impl SubprocessHandle {
             child.kill().log_err();
         }
     }
+
+    fn pid(&self) -> Option<u32> {
+        self.child.lock().as_ref().map(|child| child.id())
+    }
 }
 
 /// Spawns `program`/`args` as a plain subprocess with piped stdout/stderr and
@@ -3289,6 +3335,7 @@ fn spawn_task_subprocess(
     working_directory: Option<PathBuf>,
     term: Arc<AlacrittyTermLock>,
     events_tx: futures::channel::mpsc::UnboundedSender<PtyEvent>,
+    output_activity_counter: Arc<AtomicU64>,
     executor: &BackgroundExecutor,
 ) -> Result<SubprocessHandle> {
     use futures::io::AsyncReadExt as _;
@@ -3317,6 +3364,7 @@ fn spawn_task_subprocess(
             let pump = |reader: Option<BoxedReader>| {
                 let term = term.clone();
                 let events_tx = events_tx.clone();
+                let output_activity_counter = output_activity_counter.clone();
                 async move {
                     let Some(mut reader) = reader else { return };
                     let mut processor = Processor::<StdSyncHandler>::new();
@@ -3330,6 +3378,7 @@ fn spawn_task_subprocess(
                                 return;
                             }
                             Ok(count) => {
+                                output_activity_counter.fetch_add(count as u64, Ordering::Relaxed);
                                 let converted =
                                     convert_lf_to_crlf(&buffer[..count], &mut previous_byte_was_cr);
                                 {
@@ -3749,7 +3798,6 @@ mod tests {
     /// headless hosts (e.g. the eval CLI) where PTY allocation fails with
     /// `ENOTTY`. The command runs as a plain subprocess whose piped output is
     /// pumped into the emulator.
-    #[cfg(not(target_os = "windows"))]
     async fn build_test_subprocess_terminal(
         cx: &mut TestAppContext,
         program: String,
@@ -3785,8 +3833,78 @@ mod tests {
                 )
             })
             .await
-            .unwrap();
+            .expect("failed to build test subprocess terminal");
         cx.new(|cx| builder.subscribe(cx))
+    }
+
+    #[gpui::test]
+    async fn test_output_activity_counter_strictly_increases(cx: &mut TestAppContext) {
+        let terminal = init_terminal_test(cx, b"");
+
+        let initial_count =
+            terminal.read_with(cx, |terminal, _| terminal.output_activity_counter());
+        assert_eq!(initial_count, 0);
+
+        terminal.update(cx, |terminal, cx| {
+            terminal.write_output(b"hello", cx);
+        });
+        let count_after_first =
+            terminal.read_with(cx, |terminal, _| terminal.output_activity_counter());
+        assert!(count_after_first > initial_count);
+        assert_eq!(count_after_first, 5);
+
+        terminal.update(cx, |terminal, cx| {
+            terminal.write_output(b" world", cx);
+        });
+        let count_after_second =
+            terminal.read_with(cx, |terminal, _| terminal.output_activity_counter());
+        assert!(count_after_second > count_after_first);
+        assert_eq!(count_after_second, 11);
+
+        terminal.update(cx, |terminal, cx| {
+            terminal.write_output(b"", cx);
+        });
+        let count_after_empty =
+            terminal.read_with(cx, |terminal, _| terminal.output_activity_counter());
+        assert_eq!(count_after_empty, count_after_second);
+        assert!(count_after_empty >= count_after_second);
+    }
+
+    #[gpui::test]
+    async fn test_shell_process_id_reporting(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+
+        // 1. Display-only terminal has no subprocess or shell PID.
+        let display_only = init_terminal_test(cx, b"");
+        assert_eq!(
+            display_only.read_with(cx, |terminal, _| terminal.shell_process_id()),
+            None
+        );
+
+        // 2. Headless subprocess terminal exposes its child PID.
+        let (program, args) = if cfg!(target_os = "windows") {
+            (
+                "cmd.exe".to_string(),
+                vec!["/c".to_string(), "echo".to_string(), "headless".to_string()],
+            )
+        } else {
+            ("echo".to_string(), vec!["headless".to_string()])
+        };
+        let subprocess_terminal = build_test_subprocess_terminal(cx, program, args).await;
+        let subprocess_pid =
+            subprocess_terminal.read_with(cx, |terminal, _| terminal.shell_process_id());
+        assert!(
+            subprocess_pid.is_some_and(|pid| pid > 0),
+            "expected Some(pid > 0), got {subprocess_pid:?}"
+        );
+
+        // 3. PTY terminal exposes its spawned shell PID.
+        let pty_terminal = build_test_terminal(cx, "echo", &["pty"]).await;
+        let pty_pid = pty_terminal.read_with(cx, |terminal, _| terminal.shell_process_id());
+        assert!(
+            pty_pid.is_some_and(|pid| pid > 0),
+            "expected Some(pid > 0), got {pty_pid:?}"
+        );
     }
 
     #[test]

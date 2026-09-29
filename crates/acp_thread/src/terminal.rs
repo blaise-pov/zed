@@ -537,6 +537,14 @@ impl Terminal {
         self.user_stopped.load(Ordering::SeqCst)
     }
 
+    pub fn output_activity_counter(&self, cx: &App) -> u64 {
+        self.terminal.read(cx).output_activity_counter()
+    }
+
+    pub fn shell_process_id(&self, cx: &App) -> Option<u32> {
+        self.terminal.read(cx).shell_process_id()
+    }
+
     pub fn current_output(&self, cx: &App) -> acp::TerminalOutputResponse {
         if let Some(output) = self.output.as_ref() {
             let exit_status = output.exit_status.map(portable_pty::ExitStatus::from);
