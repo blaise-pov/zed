@@ -388,6 +388,7 @@
             "collab_engineer",
             "reviewer",
             "git_committer",
+            "fork_merger",
             "ci_runner",
             "researcher"
           ],
@@ -819,12 +820,7 @@
               "default": "allow"
             },
             "terminal": {
-              "default": "deny",
-              "always_allow": [
-                {
-                  "pattern": "^git\\s+(-C\\s+\\S+\\s+)?(--no-pager\\s+|--no-optional-locks\\s+)*(status|log|diff|show|branch|rev-parse|ls-files|blame|describe|cat-file|tag|remote|version|--version|config\\s+--get|shortlog).*"
-                }
-              ]
+              "default": "allow"
             },
             "mcp:agent-bus:send_feedback": {
               "default": "allow"
@@ -1581,6 +1577,129 @@
               "default": "allow"
             },
             "terminal": {
+              "default": "allow"
+            },
+            "mcp:agent-bus:send_feedback": {
+              "default": "allow"
+            },
+            "mcp:taskgraph:task_get": {
+              "default": "allow"
+            },
+            "mcp:taskgraph:task_start": {
+              "default": "allow"
+            },
+            "mcp:taskgraph:task_complete": {
+              "default": "allow"
+            },
+            "mcp:taskgraph:task_fail": {
+              "default": "allow"
+            }
+          }
+        }
+      },
+      "fork_merger": {
+        "name": "Fork Merger",
+        "description": "Detects the latest zed-industries/zed release (including -pre) and merges it into this fork, resolving conflicts and pushing fork tags",
+        "default_model": {
+          "provider": "${FRONTIER_MODEL_PROVIDER}",
+          "model": "${FRONTIER_MODEL}",
+          "enable_thinking": true
+        },
+        "tools": {
+          "read_file": true,
+          "grep": true,
+          "find_path": true,
+          "list_directory": true,
+          "edit_file": true,
+          "write_file": true,
+          "terminal": true,
+          "diagnostics": true,
+          "fetch": true
+        },
+        "skills": [],
+        "context_servers": {
+          "agent-bus": {
+            "tools": {
+              "send_feedback": true
+            }
+          },
+          "taskgraph": {
+            "tools": {
+              "task_get": true,
+              "task_start": true,
+              "task_complete": true,
+              "task_fail": true
+            }
+          }
+        },
+        "tool_permissions": {
+          "default": "deny",
+          "tools": {
+            "read_file": {
+              "default": "allow"
+            },
+            "grep": {
+              "default": "allow"
+            },
+            "find_path": {
+              "default": "allow"
+            },
+            "list_directory": {
+              "default": "allow"
+            },
+            "edit_file": {
+              "default": "allow",
+              "write_scopes": [
+                "crates/**",
+                "docs/**",
+                "extensions/**",
+                "script/**",
+                "tooling/**",
+                "nix/**",
+                ".github/**",
+                ".cargo/**",
+                ".config/**",
+                ".factory/**",
+                "corgi-patches/**",
+                "corgi.toml",
+                "clippy.toml",
+                "Cargo.toml",
+                "Cargo.lock",
+                "AGENTS.md",
+                "README.md",
+                ".zed/**"
+              ]
+            },
+            "write_file": {
+              "default": "allow",
+              "write_scopes": [
+                "crates/**",
+                "docs/**",
+                "extensions/**",
+                "script/**",
+                "tooling/**",
+                "nix/**",
+                ".github/**",
+                ".cargo/**",
+                ".config/**",
+                ".factory/**",
+                "corgi-patches/**",
+                "corgi.toml",
+                "clippy.toml",
+                "Cargo.toml",
+                "Cargo.lock",
+                "AGENTS.md",
+                "README.md",
+                ".zed/**"
+              ]
+            },
+            "terminal": {
+              "default": "allow"
+            },
+            "diagnostics": {
+              "default": "allow"
+            },
+            "fetch": {
               "default": "allow"
             },
             "mcp:agent-bus:send_feedback": {
