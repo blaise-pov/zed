@@ -107,6 +107,42 @@ By default, context compaction (both `/compact` and auto-compaction) uses the th
 
 - The configured model should have a context window at least as large as the thread's primary model for predictable behavior.
 
+## Terminal Watchdog {#terminal-watchdog}
+
+The terminal watchdog monitors commands executed by the agent terminal tool for hangs (such as waiting for interactive input, a pager, or a stalled network/resource) and runaway execution.
+
+The watchdog applies two independent mechanisms:
+- **Idle detection**: Stops a command when there is simultaneously no terminal output, no process tree CPU activity, and no disk IO across the idle window.
+- **Hard cap**: Stops runaway execution when `timeout_ms` was not set by the model.
+
+If a command is stopped, the agent receives captured output and remediation guidance to self-correct.
+
+The watchdog is configurable globally in `settings.json` or per-project in `.zed/settings.json` (project settings override user settings for free via Zed's layering):
+
+```json [settings]
+{
+  "agent": {
+    "terminal_watchdog": {
+      "enabled": true,
+      "idle_timeout_ms": 300000,
+      "idle_cpu_threshold_percent": 5.0,
+      "hard_timeout_ms": 3600000,
+      "poll_interval_ms": 5000,
+      "idle_timeout_no_probe_ms": 600000
+    }
+  }
+}
+```
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `enabled` | `true` | Master switch enabling or disabling the terminal watchdog. |
+| `idle_timeout_ms` | `300000` (5m) | Idle duration before stopping an inactive command. Set to `null` to disable idle detection. |
+| `idle_cpu_threshold_percent` | `5.0` | Process tree CPU percentage below which execution is considered idle. |
+| `hard_timeout_ms` | `3600000` (1h) | Maximum runtime cap when `timeout_ms` was not specified in the tool call. Set to `null` to disable the cap. |
+| `poll_interval_ms` | `5000` (5s) | Sampling interval for checking activity signals (PTY output, CPU, disk IO). |
+| `idle_timeout_no_probe_ms` | `600000` (10m) | Fallback idle duration based on output alone when CPU/IO probing is unavailable (e.g., WSL or remote projects). |
+
 ## External Agents {#external-agents}
 
 The External Agents section configures ACP-integrated agents.
@@ -180,6 +216,44 @@ Zed checks matching entries from last to first. An entry can omit `provider` or
 `model` to apply more broadly. For provider-specific model configuration such as
 custom model entries, context windows, or gateway routing, see
 [LLM Providers](./llm-providers.md) and the provider setup pages.
+
+## Per-model System Prompts {#per-model-system-prompts}
+
+You can customize the agent system prompt per provider, per model, or for a specific provider/model pair by adding `system_prompt_template` or `custom_instructions` to `agent.model_parameters`:
+
+- `system_prompt_template`: path to a custom Handlebars template file (`.hbs`) that fully replaces the built-in agent system prompt for matching models.
+- `custom_instructions`: inline text appended to the custom instructions section of the system prompt (preserving the built-in prompt and tool definitions).
+
+When resolving system prompt templates, Zed follows this precedence chain:
+
+1. Active profile template (`agent.profiles.<id>.system_prompt_template`)
+2. Per-model template in `agent.model_parameters` (exact provider and model match)
+3. Per-provider template in `agent.model_parameters` (provider-only match)
+4. Global template (`agent.system_prompt_template`)
+5. Built-in system prompt (`system_prompt.hbs`)
+
+For `model_parameters`, entries are evaluated from last to first (the last matching entry wins), so a later provider-only entry takes precedence over an earlier exact-match one. If a matching entry omits a field, Zed skips it and continues searching for an earlier matching entry that sets that field. If a custom template file is missing or fails to render, Zed logs a warning and falls back to the built-in system prompt.
+
+When `custom_instructions` is set in `model_parameters`, it is appended to any profile custom instructions (separated by two newlines) and made available to both the built-in prompt and custom templates via the `custom_instructions` template variable.
+
+```json [settings]
+{
+  "agent": {
+    "model_parameters": [
+      {
+        "provider": "anthropic",
+        "system_prompt_template": "~/prompts/anthropic.hbs"
+      },
+      {
+        "provider": "anthropic",
+        "model": "claude-sonnet-4-5",
+        "system_prompt_template": "~/prompts/sonnet.hbs",
+        "custom_instructions": "Prefer concise explanations and prioritize correctness over speed."
+      }
+    ]
+  }
+}
+```
 
 ## Rules, Skills, and Instructions {#rules-skills-instructions}
 
