@@ -687,6 +687,7 @@ impl EditSession {
         event_stream: &ToolCallEventStream,
         cx: &mut AsyncApp,
     ) -> Result<Self, String> {
+        let mut path = path;
         let target = if let Some(abs_path) =
             resolve_global_skill_path_for_edit_session(mode, &path, &context, cx).await?
         {
@@ -695,6 +696,24 @@ impl EditSession {
                 project_path: None,
             }
         } else {
+            let task_worktree = cx.update(|cx| {
+                context
+                    .thread
+                    .upgrade()
+                    .and_then(|t| t.read(cx).task_worktree().map(std::path::Path::to_path_buf))
+            });
+            if let Some(ref task_worktree) = task_worktree {
+                if path.is_relative() {
+                    let worktree_name = task_worktree
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("");
+                    if !path.starts_with(worktree_name) {
+                        path = task_worktree.join(&path);
+                    }
+                }
+            }
+
             let project_path = cx.update(|cx| resolve_path(mode, &path, &context.project, cx))?;
 
             let Some(abs_path) =
@@ -1236,6 +1255,13 @@ fn resolve_path(
         EditSessionMode::Edit => {
             let path = project
                 .find_project_path(&path, cx)
+                .or_else(|| {
+                    if path.is_absolute() {
+                        project.project_path_for_absolute_path(path, cx)
+                    } else {
+                        None
+                    }
+                })
                 .ok_or_else(|| "Can't edit file: path not found".to_string())?;
 
             let entry = project
@@ -1249,8 +1275,13 @@ fn resolve_path(
             }
         }
         EditSessionMode::Write => {
-            if let Some(path) = project.find_project_path(&path, cx)
-                && let Some(entry) = project.entry_for_path(&path, cx)
+            if let Some(path) = project.find_project_path(&path, cx).or_else(|| {
+                if path.is_absolute() {
+                    project.project_path_for_absolute_path(path, cx)
+                } else {
+                    None
+                }
+            }) && let Some(entry) = project.entry_for_path(&path, cx)
             {
                 if entry.is_file() {
                     return Ok(path);
@@ -1263,7 +1294,13 @@ fn resolve_path(
                 .parent()
                 .ok_or_else(|| "Can't create file: incorrect path".to_string())?;
 
-            let parent_project_path = project.find_project_path(&parent_path, cx);
+            let parent_project_path = project.find_project_path(&parent_path, cx).or_else(|| {
+                if parent_path.is_absolute() {
+                    project.project_path_for_absolute_path(parent_path, cx)
+                } else {
+                    None
+                }
+            });
 
             let parent_entry = parent_project_path
                 .as_ref()

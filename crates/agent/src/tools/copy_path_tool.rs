@@ -116,6 +116,7 @@ impl AgentTool for CopyPathTool {
 
             let fs = project.read_with(cx, |project, _cx| project.fs().clone());
             let canonical_roots = canonicalize_worktree_roots(&project, &fs, cx).await;
+            let task_worktree = cx.update(|cx| event_stream.task_worktree(cx));
 
             cx.update(|cx| {
                 check_profile_write_scope(
@@ -124,6 +125,7 @@ impl AgentTool for CopyPathTool {
                     &project,
                     &canonical_roots,
                     profile.as_ref(),
+                    task_worktree.as_deref(),
                     cx,
                 )
             })

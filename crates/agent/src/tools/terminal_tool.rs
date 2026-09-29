@@ -852,8 +852,9 @@ async fn run_terminal_tool(
 
     let (working_dir, authorize, sandboxing, is_local_project, wsl_zed_release) =
         cx.update(|cx| {
-            let working_dir =
-                working_dir(&input.cd, &project, cx).map_err(|err| err.to_string())?;
+            let task_worktree = event_stream.task_worktree(cx);
+            let working_dir = working_dir(&input.cd, &project, task_worktree.as_deref(), cx)
+                .map_err(|err| err.to_string())?;
             let context =
                 crate::ToolPermissionContext::new(TerminalTool::NAME, vec![input.command.clone()]);
             let authorize =
@@ -1811,7 +1812,41 @@ fn process_content(
     content
 }
 
-fn working_dir(cd: &str, project: &Entity<Project>, cx: &mut App) -> Result<Option<PathBuf>> {
+fn working_dir(
+    cd: &str,
+    project: &Entity<Project>,
+    task_worktree: Option<&Path>,
+    cx: &mut App,
+) -> Result<Option<PathBuf>> {
+    if let Some(task_worktree) = task_worktree {
+        if cd == "." || cd.is_empty() {
+            return Ok(Some(task_worktree.to_path_buf()));
+        }
+        let cd_path = Path::new(cd);
+        let resolved = if cd_path.is_absolute() {
+            cd_path.to_path_buf()
+        } else {
+            let worktree_name = task_worktree
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("");
+            if let Ok(rel) = cd_path.strip_prefix(worktree_name) {
+                task_worktree.join(rel)
+            } else {
+                task_worktree.join(cd_path)
+            }
+        };
+        let normalized = util::paths::normalize_lexically(&resolved)?;
+        let normalized_task_worktree = util::paths::normalize_lexically(task_worktree)?;
+        if !normalized.starts_with(&normalized_task_worktree) {
+            anyhow::bail!(
+                "`cd` directory {cd:?} is outside the isolated task worktree {}.",
+                task_worktree.display()
+            );
+        }
+        return Ok(Some(normalized));
+    }
+
     let project = project.read(cx);
 
     if cd == "." || cd.is_empty() {

@@ -468,6 +468,13 @@ pub fn resolve_project_path(
                 path: parent_project_path.path.join(file_rel).into(),
             })
         })
+        .or_else(|| {
+            if path.is_absolute() {
+                project.project_path_for_absolute_path(path, cx)
+            } else {
+                None
+            }
+        })
         .ok_or_else(|| anyhow!("Path {} is not in the project", path.display()))?;
 
     let worktree = project
@@ -736,8 +743,59 @@ pub fn check_profile_write_scope(
     project: &Entity<Project>,
     canonical_worktree_roots: &[PathBuf],
     profile: Option<&AgentProfileSettings>,
+    task_worktree: Option<&Path>,
     cx: &App,
 ) -> Result<()> {
+    if let Some(task_worktree) = task_worktree {
+        let project_ref = project.read(cx);
+        let resolved = resolve_project_path(project_ref, path, canonical_worktree_roots, cx);
+        let in_task_worktree = match resolved {
+            Ok(ResolvedProjectPath::Safe(project_path)) => project_ref
+                .worktree_for_id(project_path.worktree_id, cx)
+                .map(|w| {
+                    let w_abs = w.read(cx).abs_path();
+                    let norm_w = util::paths::normalize_lexically(w_abs.as_ref())
+                        .unwrap_or_else(|_| normalize_path(w_abs.as_ref()));
+                    let norm_task = util::paths::normalize_lexically(task_worktree)
+                        .unwrap_or_else(|_| normalize_path(task_worktree));
+                    #[cfg(windows)]
+                    {
+                        norm_w == norm_task
+                            || norm_w
+                                .to_string_lossy()
+                                .eq_ignore_ascii_case(&norm_task.to_string_lossy())
+                    }
+                    #[cfg(not(windows))]
+                    {
+                        norm_w == norm_task
+                    }
+                })
+                .unwrap_or(false),
+            Ok(ResolvedProjectPath::SymlinkEscape { .. }) => false,
+            Err(_) => {
+                if let Ok(normalized_path) = util::paths::normalize_lexically(path) {
+                    if let Ok(normalized_worktree) = util::paths::normalize_lexically(task_worktree)
+                    {
+                        normalized_path.starts_with(&normalized_worktree)
+                    } else {
+                        normalized_path.starts_with(task_worktree)
+                    }
+                } else {
+                    false
+                }
+            }
+        };
+
+        if !in_task_worktree {
+            bail!(
+                "PolicyDenied: Cannot {} '{}': path is outside isolated task worktree '{}'",
+                tool_name,
+                path.display(),
+                task_worktree.display()
+            );
+        }
+    }
+
     let Some(profile) = profile else {
         return Ok(());
     };
@@ -884,10 +942,7 @@ pub fn authorize_file_edit_with_resolved(
                 p.effective_permission_mode()
             });
 
-        if mode == AgentPermissionMode::Unrestricted {
-            return Ok(());
-        }
-
+        let task_worktree = cx.update(|cx| event_stream.task_worktree(cx));
         cx.update(|cx| {
             check_profile_write_scope(
                 &tool_name,
@@ -895,9 +950,14 @@ pub fn authorize_file_edit_with_resolved(
                 &project_entity,
                 &canonical_roots,
                 profile.as_ref(),
+                task_worktree.as_deref(),
                 cx,
             )
         })?;
+
+        if mode == AgentPermissionMode::Unrestricted && task_worktree.is_none() {
+            return Ok(());
+        }
 
         let resolved = project_entity.read_with(cx, |project, cx| {
             resolve_project_path(project, &check_path_owned, &canonical_roots, cx)
