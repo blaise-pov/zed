@@ -10,7 +10,7 @@ pub use crate::hosting_provider::*;
 pub use crate::remote::*;
 use anyhow::Result;
 use gpui::{Action, actions};
-pub use repository::RemoteCommandOutput;
+pub use repository::{MergeTreeResult, RemoteCommandOutput};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::fmt::{self, Write as _};

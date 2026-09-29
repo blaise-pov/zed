@@ -81,6 +81,7 @@ pub struct FakeGitRepositoryState {
     pub commit_data: HashMap<Oid, FakeCommitDataEntry>,
     pub stash_entries: GitStash,
     pub commit_template: Option<GitCommitTemplate>,
+    pub simulated_merge_conflicts: HashMap<(String, String), Vec<String>>,
 }
 
 impl FakeGitRepositoryState {
@@ -108,7 +109,27 @@ impl FakeGitRepositoryState {
             commit_history: Vec::new(),
             stash_entries: Default::default(),
             commit_template: None,
+            simulated_merge_conflicts: Default::default(),
         }
+    }
+}
+
+fn string_to_oid(s: &str) -> git::Oid {
+    if let Ok(oid) = <git::Oid as std::str::FromStr>::from_str(s) {
+        oid
+    } else {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut hasher = DefaultHasher::new();
+        s.hash(&mut hasher);
+        let h1 = hasher.finish();
+        "oid".hash(&mut hasher);
+        let h2 = hasher.finish();
+        let mut bytes = [0u8; 20];
+        bytes[0..8].copy_from_slice(&h1.to_be_bytes());
+        bytes[8..16].copy_from_slice(&h2.to_be_bytes());
+        bytes[16..20].copy_from_slice(&(h1 ^ h2).to_be_bytes()[0..4]);
+        git::Oid::from_bytes(&bytes).expect("20 bytes is valid Oid")
     }
 }
 
@@ -1653,6 +1674,76 @@ impl GitRepository for FakeGitRepository {
 
     fn delete_ref(&self, ref_name: String) -> BoxFuture<'_, Result<()>> {
         self.edit_ref(RefEdit::Delete { ref_name })
+    }
+
+    fn merge_tree(
+        &self,
+        base_commit: String,
+        target_commit: String,
+    ) -> BoxFuture<'_, Result<git::repository::MergeTreeResult>> {
+        self.with_state_async(false, move |state| {
+            if let Some(conflicts) = state
+                .simulated_merge_conflicts
+                .get(&(base_commit.clone(), target_commit.clone()))
+                .or_else(|| {
+                    state
+                        .simulated_merge_conflicts
+                        .get(&(target_commit.clone(), base_commit.clone()))
+                })
+            {
+                return Ok(git::repository::MergeTreeResult::Conflict {
+                    conflicts: conflicts.clone(),
+                });
+            }
+
+            let tree_sha = format!("tree-{base_commit}-{target_commit}");
+            Ok(git::repository::MergeTreeResult::Clean { tree_sha })
+        })
+        .boxed()
+    }
+
+    fn commit_tree(
+        &self,
+        _tree_sha: String,
+        parents: Vec<String>,
+        message: String,
+    ) -> BoxFuture<'_, Result<String>> {
+        let executor = self.executor.clone();
+        self.with_state_async(true, move |state| {
+            let commit_oid = git::Oid::random(&mut *executor.rng().lock());
+            let parent_oids: smallvec::SmallVec<[Oid; 1]> = parents
+                .iter()
+                .map(|p| string_to_oid(p))
+                .collect();
+
+            state.commit_history.push(FakeCommitSnapshot {
+                head_contents: state.head_contents.clone(),
+                index_contents: state.index_contents.clone(),
+                sha: commit_oid.to_string(),
+            });
+
+            state.graph_commits.push(Arc::new(git::repository::InitialGraphCommitData {
+                sha: commit_oid,
+                parents: parent_oids.clone(),
+                ref_names: Vec::new(),
+            }));
+
+            state.commit_data.insert(
+                commit_oid,
+                FakeCommitDataEntry::Success(git::repository::CommitData {
+                    sha: commit_oid,
+                    parents: parent_oids,
+                    author_name: "Zed Agent".into(),
+                    author_email: "agent@zed.dev".into(),
+                    commit_timestamp: 0,
+                    subject: message.lines().next().unwrap_or("").to_string().into(),
+                    message: message.into(),
+                }),
+            );
+
+            Ok(commit_oid.to_string())
+        })
+        .boxed()
     }
 
     fn repair_worktrees(&self) -> BoxFuture<'_, Result<()>> {

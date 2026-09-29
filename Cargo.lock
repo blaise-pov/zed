@@ -6696,6 +6696,7 @@ dependencies = [
  "serde",
  "serde_json",
  "slotmap",
+ "smallvec",
  "smol",
  "telemetry",
  "tempfile",

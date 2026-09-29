@@ -1138,8 +1138,27 @@ pub trait GitRepository: Send + Sync {
 
     fn repair_worktrees(&self) -> BoxFuture<'_, Result<()>>;
 
+    fn merge_tree(
+        &self,
+        base_commit: String,
+        target_commit: String,
+    ) -> BoxFuture<'_, Result<MergeTreeResult>>;
+
+    fn commit_tree(
+        &self,
+        tree_sha: String,
+        parents: Vec<String>,
+        message: String,
+    ) -> BoxFuture<'_, Result<String>>;
+
     fn set_trusted(&self, trusted: bool);
     fn is_trusted(&self) -> bool;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MergeTreeResult {
+    Clean { tree_sha: String },
+    Conflict { conflicts: Vec<String> },
 }
 
 pub enum DiffType {
@@ -2800,6 +2819,106 @@ impl GitRepository for RealGitRepository {
 
     fn delete_ref(&self, ref_name: String) -> BoxFuture<'_, Result<()>> {
         self.edit_ref(RefEdit::Delete { ref_name })
+    }
+
+    fn merge_tree(
+        &self,
+        base_commit: String,
+        target_commit: String,
+    ) -> BoxFuture<'_, Result<MergeTreeResult>> {
+        let git = self.git_binary();
+        self.executor
+            .spawn(async move {
+                let mut command = git.build_command(&[
+                    "merge-tree",
+                    "--write-tree",
+                    "--name-only",
+                    &base_commit,
+                    &target_commit,
+                ]);
+                let output = command.output().await?;
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                if output.status.success() {
+                    let tree_sha = stdout
+                        .lines()
+                        .next()
+                        .map(str::trim)
+                        .unwrap_or("")
+                        .to_string();
+                    anyhow::ensure!(!tree_sha.is_empty(), "git merge-tree returned empty tree sha");
+                    Ok(MergeTreeResult::Clean { tree_sha })
+                } else if output.status.code() == Some(1) {
+                    let mut conflicts = Vec::new();
+                    for line in stdout.lines().skip(1) {
+                        let trimmed = line.trim();
+                        if trimmed.is_empty()
+                            || trimmed.starts_with("Auto-merging")
+                            || trimmed.starts_with("CONFLICT")
+                        {
+                            break;
+                        }
+                        conflicts.push(trimmed.to_string());
+                    }
+                    if conflicts.is_empty() {
+                        for line in stdout.lines() {
+                            if let Some(rest) = line.strip_prefix("CONFLICT") {
+                                if let Some(file) = rest.rsplit(" in ").next() {
+                                    let file = file.trim().to_string();
+                                    if !file.is_empty() && !conflicts.contains(&file) {
+                                        conflicts.push(file);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Ok(MergeTreeResult::Conflict { conflicts })
+                } else {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    anyhow::bail!(
+                        "git merge-tree failed unexpectedly with status {}: {stderr}",
+                        output.status
+                    );
+                }
+            })
+            .boxed()
+    }
+
+    fn commit_tree(
+        &self,
+        tree_sha: String,
+        parents: Vec<String>,
+        message: String,
+    ) -> BoxFuture<'_, Result<String>> {
+        let git = self.git_binary();
+        self.executor
+            .spawn(async move {
+                let mut args = vec!["commit-tree".to_string(), tree_sha];
+                for parent in parents {
+                    args.push("-p".to_string());
+                    args.push(parent);
+                }
+                args.push("-m".to_string());
+                args.push(message);
+
+                let mut command = git.build_command(&args);
+                command.env("GIT_AUTHOR_NAME", "Zed Agent");
+                command.env("GIT_AUTHOR_EMAIL", "agent@zed.dev");
+                command.env("GIT_COMMITTER_NAME", "Zed Agent");
+                command.env("GIT_COMMITTER_EMAIL", "agent@zed.dev");
+
+                let output = command.output().await?;
+                anyhow::ensure!(
+                    output.status.success(),
+                    GitBinaryCommandError {
+                        stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+                        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+                        status: output.status,
+                    }
+                );
+                let commit_sha = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                Ok(commit_sha)
+            })
+            .boxed()
     }
 
     fn repair_worktrees(&self) -> BoxFuture<'_, Result<()>> {
@@ -6974,4 +7093,99 @@ mod tests {
             "/Users/user/My Projects/upstream.git"
         );
     }
+    #[gpui::test]
+    async fn test_merge_tree_and_commit_tree(cx: &mut TestAppContext) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+
+        let repo_dir = tempfile::tempdir().unwrap();
+        git_init_repo(repo_dir.path());
+
+        let repo = RealGitRepository::new(
+            &repo_dir.path().join(".git"),
+            None,
+            Some("git".into()),
+            cx.executor(),
+        )
+        .unwrap();
+
+        // 1. Initial commit
+        smol::fs::write(repo_dir.path().join("base.txt"), "base content
+")
+            .await
+            .unwrap();
+        let base_sha = repo.checkpoint().await.unwrap().commit_sha.to_string();
+        repo.update_ref("refs/heads/main".into(), base_sha.clone())
+            .await
+            .unwrap();
+
+        // 2. Commit on branch 1 (edits base.txt and adds file_1.txt)
+        smol::fs::write(repo_dir.path().join("base.txt"), "branch 1 edits base
+")
+            .await
+            .unwrap();
+        smol::fs::write(repo_dir.path().join("file_1.txt"), "branch 1 content
+")
+            .await
+            .unwrap();
+        let sha_1 = repo.checkpoint().await.unwrap().commit_sha.to_string();
+        repo.update_ref("refs/heads/branch-1".into(), sha_1.clone())
+            .await
+            .unwrap();
+
+        // 3. Commit on branch 2 (non-conflicting)
+        smol::fs::write(repo_dir.path().join("file_2.txt"), "branch 2 content
+")
+            .await
+            .unwrap();
+        let sha_2 = repo.checkpoint().await.unwrap().commit_sha.to_string();
+        repo.update_ref("refs/heads/branch-2".into(), sha_2.clone())
+            .await
+            .unwrap();
+
+        // Clean merge test
+        let merge_res = repo.merge_tree(sha_1.clone(), sha_2.clone()).await.unwrap();
+        let tree_sha = match merge_res {
+            MergeTreeResult::Clean { tree_sha } => tree_sha,
+            MergeTreeResult::Conflict { conflicts } => {
+                panic!("expected clean merge, got conflicts: {:?}", conflicts)
+            }
+        };
+
+        let commit_msg = "Merge branch-2 into branch-1".to_string();
+        let merge_sha = repo
+            .commit_tree(tree_sha, vec![sha_1.clone(), sha_2.clone()], commit_msg)
+            .await
+            .unwrap();
+
+        assert!(!merge_sha.is_empty());
+        assert_ne!(merge_sha, sha_1);
+        assert_ne!(merge_sha, sha_2);
+
+        // Update branch-1 ref to merge commit
+        repo.update_ref("refs/heads/branch-1".into(), merge_sha.clone())
+            .await
+            .unwrap();
+
+        // 4. Conflicting commit on branch 3 (edits base.txt differently)
+        smol::fs::write(repo_dir.path().join("base.txt"), "conflicting content
+")
+            .await
+            .unwrap();
+        let sha_3 = repo.checkpoint().await.unwrap().commit_sha.to_string();
+        repo.update_ref("refs/heads/branch-3".into(), sha_3.clone())
+            .await
+            .unwrap();
+
+        let conflict_res = repo.merge_tree(sha_1.clone(), sha_3.clone()).await.unwrap();
+        match conflict_res {
+            MergeTreeResult::Conflict { conflicts } => {
+                assert!(conflicts.contains(&"base.txt".to_string()));
+            }
+            MergeTreeResult::Clean { .. } => {
+                panic!("expected conflict on base.txt, got clean merge");
+            }
+        }
+    }
 }
+
