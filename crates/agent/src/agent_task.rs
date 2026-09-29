@@ -5,7 +5,7 @@ use context_server::ContextServerId;
 use gpui::{App, SharedString, Task};
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct AgentTaskId(pub Arc<str>);
 
 impl std::fmt::Display for AgentTaskId {
