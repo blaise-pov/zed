@@ -7,7 +7,12 @@ if [[ ! " $* " == *" -p "* && ! " $* " == *" --package "* ]]; then
 fi
 
 set -x
-"${CARGO:-cargo}" clippy "$@" --release --all-targets --all-features -- --deny warnings
+# Route through rtk (compact output proxy) when it's on PATH; an explicit $CARGO bypasses it.
+if command -v rtk >/dev/null 2>&1 && [[ "${CARGO:-cargo}" == "cargo" ]]; then
+    rtk cargo clippy "$@" --release --all-targets --all-features -- --deny warnings
+else
+    "${CARGO:-cargo}" clippy "$@" --release --all-targets --all-features -- --deny warnings
+fi
 
 # If local, run other checks if we have the tools installed.
 if [[ -z "${GITHUB_ACTIONS+x}" ]]; then

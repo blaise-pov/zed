@@ -1,3 +1,10 @@
 #!/usr/bin/env bash
 
-cargo build -p zed && cargo run -p cli -- --foreground --zed=${CARGO_TARGET_DIR:-target}/debug/zed "$@"
+# Route the build through rtk (compact output proxy) when it's on PATH.
+if command -v rtk >/dev/null 2>&1; then
+    cargo_build=(rtk cargo build)
+else
+    cargo_build=(cargo)
+fi
+
+"${cargo_build[@]}" -p zed && cargo run -p cli -- --foreground --zed=${CARGO_TARGET_DIR:-target}/debug/zed "$@"
