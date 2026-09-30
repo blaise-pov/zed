@@ -133,6 +133,8 @@ fn string_to_oid(s: &str) -> git::Oid {
         bytes[8..16].copy_from_slice(&h2.to_be_bytes());
         bytes[16..20].copy_from_slice(&(h1 ^ h2).to_be_bytes()[0..4]);
         git::Oid::from_bytes(&bytes).expect("20 bytes is valid Oid")
+    }
+}
 
 #[derive(Clone, Default, Debug)]
 pub struct FakeBlobReadGate(Arc<Mutex<BlobReadGateState>>);
@@ -1809,10 +1811,8 @@ impl GitRepository for FakeGitRepository {
         let executor = self.executor.clone();
         self.with_state_async(true, move |state| {
             let commit_oid = git::Oid::random(&mut *executor.rng().lock());
-            let parent_oids: smallvec::SmallVec<[Oid; 1]> = parents
-                .iter()
-                .map(|p| string_to_oid(p))
-                .collect();
+            let parent_oids: smallvec::SmallVec<[Oid; 1]> =
+                parents.iter().map(|p| string_to_oid(p)).collect();
 
             state.commit_history.push(FakeCommitSnapshot {
                 head_contents: state.head_contents.clone(),
@@ -1820,11 +1820,13 @@ impl GitRepository for FakeGitRepository {
                 sha: commit_oid.to_string(),
             });
 
-            state.graph_commits.push(Arc::new(git::repository::InitialGraphCommitData {
-                sha: commit_oid,
-                parents: parent_oids.clone(),
-                ref_names: Vec::new(),
-            }));
+            state
+                .graph_commits
+                .push(Arc::new(git::repository::InitialGraphCommitData {
+                    sha: commit_oid,
+                    parents: parent_oids.clone(),
+                    ref_names: Vec::new(),
+                }));
 
             state.commit_data.insert(
                 commit_oid,
