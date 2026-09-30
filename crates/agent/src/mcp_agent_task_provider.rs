@@ -133,6 +133,45 @@ impl AgentTaskProvider for McpAgentTaskProvider {
         })
     }
 
+    fn archive_task(&self, id: &AgentTaskId, cx: &mut App) -> Task<Result<()>> {
+        let mut args = serde_json::Map::new();
+        args.insert(
+            "task_id".to_string(),
+            serde_json::Value::String(id.to_string()),
+        );
+        let task = self.call_tool("task_archive", Some(args), cx);
+        cx.spawn(async move |_cx| {
+            task.await?;
+            Ok(())
+        })
+    }
+
+    fn unarchive_task(&self, id: &AgentTaskId, cx: &mut App) -> Task<Result<()>> {
+        let mut args = serde_json::Map::new();
+        args.insert(
+            "task_id".to_string(),
+            serde_json::Value::String(id.to_string()),
+        );
+        let task = self.call_tool("task_unarchive", Some(args), cx);
+        cx.spawn(async move |_cx| {
+            task.await?;
+            Ok(())
+        })
+    }
+
+    fn delete_task(&self, id: &AgentTaskId, cx: &mut App) -> Task<Result<()>> {
+        let mut args = serde_json::Map::new();
+        args.insert(
+            "task_id".to_string(),
+            serde_json::Value::String(id.to_string()),
+        );
+        let task = self.call_tool("task_delete", Some(args), cx);
+        cx.spawn(async move |_cx| {
+            task.await?;
+            Ok(())
+        })
+    }
+
     fn list_events(&self, limit: u32, cx: &mut App) -> Task<Result<Vec<AgentTaskEvent>>> {
         let mut args = serde_json::Map::new();
         args.insert("limit".to_string(), serde_json::Value::Number(limit.into()));

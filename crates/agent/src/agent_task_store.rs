@@ -147,6 +147,39 @@ impl AgentTaskStore {
         })
     }
 
+    pub fn archive_task(&mut self, id: &AgentTaskId, cx: &mut Context<Self>) -> Task<Result<()>> {
+        let provider = self.provider.clone();
+        let task = provider.archive_task(id, cx);
+        cx.spawn(async move |this, cx| {
+            task.await?;
+            let refresh_task = this.update(cx, |store, cx| store.refresh(cx))?;
+            refresh_task.await?;
+            Ok(())
+        })
+    }
+
+    pub fn unarchive_task(&mut self, id: &AgentTaskId, cx: &mut Context<Self>) -> Task<Result<()>> {
+        let provider = self.provider.clone();
+        let task = provider.unarchive_task(id, cx);
+        cx.spawn(async move |this, cx| {
+            task.await?;
+            let refresh_task = this.update(cx, |store, cx| store.refresh(cx))?;
+            refresh_task.await?;
+            Ok(())
+        })
+    }
+
+    pub fn delete_task(&mut self, id: &AgentTaskId, cx: &mut Context<Self>) -> Task<Result<()>> {
+        let provider = self.provider.clone();
+        let task = provider.delete_task(id, cx);
+        cx.spawn(async move |this, cx| {
+            task.await?;
+            let refresh_task = this.update(cx, |store, cx| store.refresh(cx))?;
+            refresh_task.await?;
+            Ok(())
+        })
+    }
+
     pub fn get_task_detail(&self, id: &AgentTaskId, cx: &mut App) -> Task<Result<AgentTaskDetail>> {
         self.provider.get_task(id, cx)
     }
@@ -166,14 +199,26 @@ impl AgentTaskStore {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
     use super::*;
     use crate::agent_task::AgentTaskStatus;
     use crate::agent_task::AgentTaskSummary;
     use context_server::ContextServerId;
     use gpui::{App, AppContext, TestAppContext};
 
+    #[derive(Default)]
+    struct CallCounts {
+        archive_calls: Vec<AgentTaskId>,
+        unarchive_calls: Vec<AgentTaskId>,
+        delete_calls: Vec<AgentTaskId>,
+        fetch_graph_count: usize,
+    }
+
+    #[derive(Default)]
     struct TestProvider {
         should_fail: bool,
+        calls: Arc<Mutex<CallCounts>>,
     }
 
     impl AgentTaskProvider for TestProvider {
@@ -182,6 +227,7 @@ mod tests {
         }
 
         fn fetch_graph(&self, _cx: &mut App) -> Task<Result<AgentTaskGraph>> {
+            self.calls.lock().unwrap().fetch_graph_count += 1;
             if self.should_fail {
                 Task::ready(Err(anyhow::anyhow!("offline")))
             } else {
@@ -211,6 +257,21 @@ mod tests {
             Task::ready(Ok(()))
         }
 
+        fn archive_task(&self, id: &AgentTaskId, _cx: &mut App) -> Task<Result<()>> {
+            self.calls.lock().unwrap().archive_calls.push(id.clone());
+            Task::ready(Ok(()))
+        }
+
+        fn unarchive_task(&self, id: &AgentTaskId, _cx: &mut App) -> Task<Result<()>> {
+            self.calls.lock().unwrap().unarchive_calls.push(id.clone());
+            Task::ready(Ok(()))
+        }
+
+        fn delete_task(&self, id: &AgentTaskId, _cx: &mut App) -> Task<Result<()>> {
+            self.calls.lock().unwrap().delete_calls.push(id.clone());
+            Task::ready(Ok(()))
+        }
+
         fn list_events(&self, _limit: u32, _cx: &mut App) -> Task<Result<Vec<AgentTaskEvent>>> {
             Task::ready(Ok(vec![]))
         }
@@ -234,7 +295,10 @@ mod tests {
 
     #[gpui::test]
     async fn test_agent_task_store_success(cx: &mut TestAppContext) {
-        let provider = Arc::new(TestProvider { should_fail: false });
+        let provider = Arc::new(TestProvider {
+            should_fail: false,
+            ..Default::default()
+        });
         let store = cx.update(|cx| cx.new(|cx| AgentTaskStore::new(provider, cx)));
 
         cx.run_until_parked();
@@ -248,7 +312,10 @@ mod tests {
 
     #[gpui::test]
     async fn test_agent_task_store_offline(cx: &mut TestAppContext) {
-        let provider = Arc::new(TestProvider { should_fail: true });
+        let provider = Arc::new(TestProvider {
+            should_fail: true,
+            ..Default::default()
+        });
         let store = cx.update(|cx| cx.new(|cx| AgentTaskStore::new(provider, cx)));
 
         cx.run_until_parked();
@@ -257,5 +324,85 @@ mod tests {
             assert!(store.is_offline());
             assert_eq!(store.last_error(), Some("offline"));
         });
+    }
+
+    #[gpui::test]
+    async fn test_agent_task_store_archive_task(cx: &mut TestAppContext) {
+        let calls = Arc::new(Mutex::new(CallCounts::default()));
+        let provider = Arc::new(TestProvider {
+            should_fail: false,
+            calls: calls.clone(),
+        });
+        let store = cx.update(|cx| cx.new(|cx| AgentTaskStore::new(provider, cx)));
+        cx.run_until_parked();
+
+        let initial_refreshes = calls.lock().unwrap().fetch_graph_count;
+        let task_id = AgentTaskId::from("TASK-1");
+        let result = store
+            .update(cx, |store, cx| store.archive_task(&task_id, cx))
+            .await;
+        assert!(result.is_ok());
+
+        let counts = calls.lock().unwrap();
+        assert_eq!(counts.archive_calls, vec![task_id]);
+        assert_eq!(counts.fetch_graph_count, initial_refreshes + 1);
+    }
+
+    #[gpui::test]
+    async fn test_agent_task_store_unarchive_task(cx: &mut TestAppContext) {
+        let calls = Arc::new(Mutex::new(CallCounts::default()));
+        let provider = Arc::new(TestProvider {
+            should_fail: false,
+            calls: calls.clone(),
+        });
+        let store = cx.update(|cx| cx.new(|cx| AgentTaskStore::new(provider, cx)));
+        cx.run_until_parked();
+
+        let initial_refreshes = calls.lock().unwrap().fetch_graph_count;
+        let task_id = AgentTaskId::from("TASK-1");
+        let result = store
+            .update(cx, |store, cx| store.unarchive_task(&task_id, cx))
+            .await;
+        assert!(result.is_ok());
+
+        let counts = calls.lock().unwrap();
+        assert_eq!(counts.unarchive_calls, vec![task_id]);
+        assert_eq!(counts.fetch_graph_count, initial_refreshes + 1);
+    }
+
+    #[gpui::test]
+    async fn test_agent_task_store_delete_task(cx: &mut TestAppContext) {
+        let calls = Arc::new(Mutex::new(CallCounts::default()));
+        let provider = Arc::new(TestProvider {
+            should_fail: false,
+            calls: calls.clone(),
+        });
+        let store = cx.update(|cx| cx.new(|cx| AgentTaskStore::new(provider, cx)));
+        cx.run_until_parked();
+
+        let initial_refreshes = calls.lock().unwrap().fetch_graph_count;
+        let task_id = AgentTaskId::from("TASK-1");
+        let result = store
+            .update(cx, |store, cx| store.delete_task(&task_id, cx))
+            .await;
+        assert!(result.is_ok());
+
+        let counts = calls.lock().unwrap();
+        assert_eq!(counts.delete_calls, vec![task_id]);
+        assert_eq!(counts.fetch_graph_count, initial_refreshes + 1);
+    }
+
+    #[test]
+    fn test_agent_task_status_archived() {
+        assert!(AgentTaskStatus::Archived.is_terminal());
+        assert!(AgentTaskStatus::Completed.is_terminal());
+        assert!(AgentTaskStatus::Failed.is_terminal());
+        assert!(!AgentTaskStatus::Ready.is_terminal());
+        assert!(!AgentTaskStatus::Running.is_terminal());
+
+        let serialized = serde_json::to_string(&AgentTaskStatus::Archived).unwrap();
+        assert_eq!(serialized, "\"archived\"");
+        let deserialized: AgentTaskStatus = serde_json::from_str("\"archived\"").unwrap();
+        assert_eq!(deserialized, AgentTaskStatus::Archived);
     }
 }

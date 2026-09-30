@@ -26,7 +26,7 @@ impl From<String> for AgentTaskId {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentTaskStatus {
     Ready,
@@ -36,11 +36,12 @@ pub enum AgentTaskStatus {
     Review,
     Completed,
     Failed,
+    Archived,
 }
 
 impl AgentTaskStatus {
     pub fn is_terminal(&self) -> bool {
-        matches!(self, Self::Completed | Self::Failed)
+        matches!(self, Self::Completed | Self::Failed | Self::Archived)
     }
 }
 
@@ -101,6 +102,9 @@ pub trait AgentTaskProvider: 'static + Send + Sync {
     fn get_task(&self, id: &AgentTaskId, cx: &mut App) -> Task<Result<AgentTaskDetail>>;
     fn complete_task(&self, id: &AgentTaskId, cx: &mut App) -> Task<Result<()>>;
     fn fail_task(&self, id: &AgentTaskId, reason: &str, cx: &mut App) -> Task<Result<()>>;
+    fn archive_task(&self, id: &AgentTaskId, cx: &mut App) -> Task<Result<()>>;
+    fn unarchive_task(&self, id: &AgentTaskId, cx: &mut App) -> Task<Result<()>>;
+    fn delete_task(&self, id: &AgentTaskId, cx: &mut App) -> Task<Result<()>>;
     fn list_events(&self, limit: u32, cx: &mut App) -> Task<Result<Vec<AgentTaskEvent>>>;
     fn list_artifacts(
         &self,
