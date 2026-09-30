@@ -248,6 +248,8 @@ impl FakeThreadEnvironment {
 
     pub(crate) fn terminal_commands(&self) -> Vec<String> {
         self.terminal_commands.borrow().clone()
+    }
+
     fn subagent_models(&self) -> Vec<Option<AgentModelId>> {
         self.subagent_models.borrow().clone()
     }
@@ -328,11 +330,8 @@ impl crate::ThreadEnvironment for MultiTerminalEnvironment {
         &self,
         _label: String,
         _profile: Option<agent_settings::AgentProfileId>,
-        model: Option<AgentModelId>,
+        _model: Option<AgentModelId>,
         _task_worktree: Option<PathBuf>,
-        _cx: &mut App,
-    ) -> Result<Rc<dyn SubagentHandle>> {
-        self.subagent_models.borrow_mut().push(model);
         _cx: &mut App,
     ) -> Result<Rc<dyn SubagentHandle>> {
         unimplemented!()
@@ -6701,6 +6700,7 @@ async fn test_spawn_agent_tool_forwards_explicit_model(cx: &mut TestAppContext) 
                     message: "prompt".to_string(),
                     session_id: None,
                     model: Some("fake-corp/cheap-model".to_string()),
+                    ..Default::default()
                 }),
                 event_stream,
                 cx,
@@ -6734,6 +6734,7 @@ async fn test_spawn_agent_tool_rejects_model_when_resuming(cx: &mut TestAppConte
                     message: "prompt".to_string(),
                     session_id: Some(acp::SessionId::new("subagent-id")),
                     model: Some("fake-corp/other-model".to_string()),
+                    ..Default::default()
                 }),
                 event_stream,
                 cx,
@@ -7500,11 +7501,12 @@ async fn test_subagent_thread_model_selection(cx: &mut TestAppContext) {
     let explicit_selection = LanguageModelSelection {
         provider: LanguageModelProviderSetting("fake-corp".to_string()),
         model: "explicit-model".to_string(),
+        enable_thinking: false,
         effort: None,
         speed: None,
     };
-    let explicit_subagent_thread =
-        cx.new(|cx| Thread::new_subagent(&parent_thread, None, Some(&explicit_selection), None, cx));
+    let explicit_subagent_thread = cx
+        .new(|cx| Thread::new_subagent(&parent_thread, None, Some(&explicit_selection), None, cx));
     subagent_thread.read_with(cx, |subagent_thread, _cx| {
         assert_eq!(
             subagent_thread.model().map(|model| model.id()),
@@ -8004,8 +8006,13 @@ async fn test_spawn_agent_absent_when_nesting_disabled_or_profile_lacks_it(
         insert_profile(cx, "no_spawn", &["read_file"], None);
     });
     let limited = cx.new(|cx| {
-        let mut thread =
-            Thread::new_subagent(&subagent, Some(AgentProfileId("no_spawn".into())), None, None, cx);
+        let mut thread = Thread::new_subagent(
+            &subagent,
+            Some(AgentProfileId("no_spawn".into())),
+            None,
+            None,
+            cx,
+        );
         thread.add_default_tools(environment.clone(), cx);
         thread
     });
@@ -8507,7 +8514,7 @@ async fn test_subagent_auto_compaction(cx: &mut TestAppContext) {
     let handle = cx
         .update(|cx| {
             test.environment
-                .resume_subagent_thread(test.handle.id(), cx)
+                .resume_subagent_thread(test.handle.id(), None, None, cx)
         })
         .unwrap();
     assert_eq!(handle.id(), test.handle.id());
@@ -8747,7 +8754,6 @@ async fn test_subagent_compaction_exhausts_transient_retries(cx: &mut TestAppCon
     cx.run_until_parked();
     assert_eq!(test.model.pending_completions(), Vec::new());
 }
-
 
 #[gpui::test]
 async fn test_subagent_compaction_parent_cancellation(cx: &mut TestAppContext) {
@@ -10751,6 +10757,7 @@ async fn test_subagent_task_id_prompt_formatting(cx: &mut TestAppContext) {
         goal_id: None,
         base_branch: None,
         on_branch: None,
+        model: None,
     };
 
     let tool_use = LanguageModelToolUse {
@@ -11160,6 +11167,7 @@ async fn test_spawn_agent_two_tasks_isolated_worktrees(cx: &mut TestAppContext) 
         goal_id: None,
         base_branch: None,
         on_branch: None,
+        model: None,
     };
     let tool_use_1 = LanguageModelToolUse {
         id: "subagent_1".into(),
@@ -11268,6 +11276,7 @@ async fn test_spawn_agent_two_tasks_isolated_worktrees(cx: &mut TestAppContext) 
         goal_id: None,
         base_branch: None,
         on_branch: None,
+        model: None,
     };
     let tool_use_2 = LanguageModelToolUse {
         id: "subagent_2".into(),
@@ -11474,6 +11483,7 @@ async fn test_spawn_agent_non_git_degrades_isolation(cx: &mut TestAppContext) {
         goal_id: None,
         base_branch: None,
         on_branch: None,
+        model: None,
     };
     let tool_use = LanguageModelToolUse {
         id: "subagent_1".into(),
@@ -11599,6 +11609,7 @@ async fn test_spawn_agent_error_creates_wip_commit(cx: &mut TestAppContext) {
         goal_id: None,
         base_branch: None,
         on_branch: None,
+        model: None,
     };
     let tool_use = LanguageModelToolUse {
         id: "subagent_1".into(),
@@ -12016,6 +12027,7 @@ async fn test_subagent_lsp_rename_denied_outside_task_worktree(cx: &mut TestAppC
         goal_id: None,
         base_branch: None,
         on_branch: None,
+        model: None,
     };
     let tool_use = LanguageModelToolUse {
         id: "subagent_1".into(),
@@ -12149,6 +12161,7 @@ async fn test_spawn_agent_with_goal_id_and_base_branch(cx: &mut TestAppContext) 
         goal_id: None,
         base_branch: Some("nonexistent-branch".to_string()),
         on_branch: None,
+        model: None,
     };
     let tool_use_invalid = LanguageModelToolUse {
         id: "subagent_invalid".into(),
@@ -12201,6 +12214,7 @@ async fn test_spawn_agent_with_goal_id_and_base_branch(cx: &mut TestAppContext) 
         goal_id: Some("GOAL-ALPHA".to_string()),
         base_branch: None,
         on_branch: None,
+        model: None,
     };
     let tool_use_goal = LanguageModelToolUse {
         id: "subagent_goal".into(),
@@ -12271,6 +12285,7 @@ async fn test_spawn_agent_with_goal_id_and_base_branch(cx: &mut TestAppContext) 
         goal_id: None,
         base_branch: None,
         on_branch: None,
+        model: None,
     };
     let tool_use_standard = LanguageModelToolUse {
         id: "subagent_standard".into(),
@@ -12380,6 +12395,7 @@ async fn test_spawn_agent_with_on_branch_goal_and_exclusivity(cx: &mut TestAppCo
         goal_id: Some("GOAL-EXC".to_string()),
         base_branch: Some("main".to_string()),
         on_branch: Some("goal".to_string()),
+        model: None,
     };
     let tool_use1 = LanguageModelToolUse {
         id: "subagent_invalid_1".into(),
@@ -12433,6 +12449,7 @@ async fn test_spawn_agent_with_on_branch_goal_and_exclusivity(cx: &mut TestAppCo
         goal_id: None,
         base_branch: None,
         on_branch: Some("goal".to_string()),
+        model: None,
     };
     let tool_use2 = LanguageModelToolUse {
         id: "subagent_invalid_2".into(),
@@ -12485,6 +12502,7 @@ async fn test_spawn_agent_with_on_branch_goal_and_exclusivity(cx: &mut TestAppCo
         goal_id: Some("GOAL-EXC".to_string()),
         base_branch: None,
         on_branch: Some("goal".to_string()),
+        model: None,
     };
     let tool_use3 = LanguageModelToolUse {
         id: "subagent_1".into(),
@@ -12558,6 +12576,7 @@ async fn test_spawn_agent_with_on_branch_goal_and_exclusivity(cx: &mut TestAppCo
         goal_id: Some("GOAL-EXC".to_string()),
         base_branch: None,
         on_branch: Some("goal".to_string()),
+        model: None,
     };
     let tool_use4 = LanguageModelToolUse {
         id: "subagent_2".into(),
@@ -12641,6 +12660,7 @@ async fn test_spawn_agent_with_on_branch_goal_and_exclusivity(cx: &mut TestAppCo
     model.send_last_completion_stream_text_chunk("Parent finished");
     model.end_last_completion_stream();
     send3.await.unwrap();
+}
 
 const SUBAGENT_CONTEXT_LIMIT_WARNING: &str = "The agent is nearing the end of its context window and has been stopped. You can prompt the thread again to have the agent wrap up or hand off its work.";
 
@@ -12695,7 +12715,9 @@ impl SubagentCompactionTest {
             acp_thread: acp_thread.downgrade(),
         };
         let handle = cx
-            .update(|cx| environment.create_subagent_thread("subagent".to_string(), None, None, None, cx))
+            .update(|cx| {
+                environment.create_subagent_thread("subagent".to_string(), None, None, None, cx)
+            })
             .unwrap();
         let thread = agent.read_with(cx, |agent, _| {
             agent.sessions.get(&handle.id()).unwrap().thread.clone()

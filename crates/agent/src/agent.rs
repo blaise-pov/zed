@@ -3356,8 +3356,13 @@ impl NativeThreadEnvironment {
 
         let depth = current_depth + 1;
         let subagent_thread: Entity<Thread> = cx.new(|cx| {
-            let mut thread =
-                Thread::new_subagent(&parent_thread_entity, profile, model.as_ref(), task_worktree, cx);
+            let mut thread = Thread::new_subagent(
+                &parent_thread_entity,
+                profile,
+                model.as_ref(),
+                task_worktree,
+                cx,
+            );
             let title = if depth > 1 {
                 format!("[d{depth}] {label}")
             } else {
@@ -4384,7 +4389,9 @@ mod internal_tests {
             .update(|cx| {
                 environment.create_subagent_thread(
                     "subagent".to_string(),
+                    None,
                     Some(AgentModelId::from("fake-corp/subagent-model".to_string())),
+                    None,
                     cx,
                 )
             })
