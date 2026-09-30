@@ -39,10 +39,36 @@ use gpui::{
 };
 use project::Project;
 use settings::{Settings, SettingsStore};
-use ui::{Color, Icon, IconButton, IconName, IconSize, Label, LabelSize, Tooltip, prelude::*};
+use ui::{
+    Color, ContextMenu, Icon, IconButton, IconName, IconPosition, IconSize, Label, LabelSize,
+    PopoverMenu, Tooltip, prelude::*,
+};
 use util::ResultExt;
 use workspace::Workspace;
 use workspace::dock::{DockPosition, Panel, PanelEvent};
+
+pub const ALL_TASK_STATUSES: [AgentTaskStatus; 8] = [
+    AgentTaskStatus::Ready,
+    AgentTaskStatus::Blocked,
+    AgentTaskStatus::Running,
+    AgentTaskStatus::Stale,
+    AgentTaskStatus::Review,
+    AgentTaskStatus::Completed,
+    AgentTaskStatus::Failed,
+    AgentTaskStatus::Archived,
+];
+
+pub fn default_status_filters() -> HashSet<AgentTaskStatus> {
+    HashSet::from([
+        AgentTaskStatus::Ready,
+        AgentTaskStatus::Blocked,
+        AgentTaskStatus::Running,
+        AgentTaskStatus::Stale,
+        AgentTaskStatus::Review,
+        AgentTaskStatus::Completed,
+        AgentTaskStatus::Failed,
+    ])
+}
 
 actions!(agent_tasks, [ToggleAgentTaskPanel]);
 
@@ -89,7 +115,7 @@ pub struct AgentTaskPanel {
     pub store: Entity<AgentTaskStore>,
     pub selected_task_id: Option<AgentTaskId>,
     pub selected_detail: Option<AgentTaskDetail>,
-    pub hide_completed_tasks: bool,
+    pub status_filters: HashSet<AgentTaskStatus>,
     pub goal_cleanup_result: Option<agent::task_worktree::GoalCleanupResult>,
     focus_handle: FocusHandle,
     workspace: WeakEntity<Workspace>,
@@ -128,7 +154,7 @@ impl AgentTaskPanel {
             store,
             selected_task_id: None,
             selected_detail: None,
-            hide_completed_tasks: true,
+            status_filters: default_status_filters(),
             goal_cleanup_result: None,
             focus_handle: cx.focus_handle(),
             workspace,
@@ -214,7 +240,7 @@ impl AgentTaskPanel {
         let store = self.store.read(cx);
         let graph = store.graph().clone();
         let events = store.events();
-        let rows = build_task_rows(&graph.tasks, events, self.hide_completed_tasks);
+        let rows = build_task_rows(&graph.tasks, events, &self.status_filters);
 
         if rows.is_empty() {
             return v_flex().p_4().items_center().child(
@@ -248,6 +274,10 @@ impl AgentTaskPanel {
 
         let task_element = h_flex()
             .id(SharedString::from(format!("task-node-{}", task.id)))
+            .debug_selector({
+                let task_id = task.id.clone();
+                move || format!("task-node-{}", task_id)
+            })
             .w_full()
             .items_center()
             .justify_between()
@@ -303,6 +333,65 @@ impl AgentTaskPanel {
                                 .icon_size(IconSize::Small)
                                 .icon_color(Color::Warning)
                                 .tooltip(Tooltip::text(denied_message)),
+                        )
+                    })
+                    .when(task.status != AgentTaskStatus::Archived, |this| {
+                        let task_id = task.id.clone();
+                        this.child(
+                            IconButton::new(
+                                SharedString::from(format!("archive-task-{}", task.id)),
+                                IconName::Archive,
+                            )
+                            .icon_size(IconSize::Small)
+                            .tooltip(Tooltip::text("Archive Task"))
+                            .on_click(cx.listener(
+                                move |this, _event, _window, cx| {
+                                    this.store
+                                        .update(cx, |store, cx| store.archive_task(&task_id, cx))
+                                        .detach_and_log_err(cx);
+                                    cx.stop_propagation();
+                                },
+                            )),
+                        )
+                    })
+                    .when(task.status == AgentTaskStatus::Archived, |this| {
+                        let unarchive_task_id = task.id.clone();
+                        let delete_task_id = task.id.clone();
+                        this.child(
+                            IconButton::new(
+                                SharedString::from(format!("unarchive-task-{}", task.id)),
+                                IconName::Archive,
+                            )
+                            .icon_size(IconSize::Small)
+                            .tooltip(Tooltip::text("Unarchive Task"))
+                            .on_click(cx.listener(
+                                move |this, _event, _window, cx| {
+                                    this.store
+                                        .update(cx, |store, cx| {
+                                            store.unarchive_task(&unarchive_task_id, cx)
+                                        })
+                                        .detach_and_log_err(cx);
+                                    cx.stop_propagation();
+                                },
+                            )),
+                        )
+                        .child(
+                            IconButton::new(
+                                SharedString::from(format!("delete-task-{}", task.id)),
+                                IconName::Trash,
+                            )
+                            .icon_size(IconSize::Small)
+                            .tooltip(Tooltip::text("Delete Task"))
+                            .on_click(cx.listener(
+                                move |this, _event, _window, cx| {
+                                    this.store
+                                        .update(cx, |store, cx| {
+                                            store.delete_task(&delete_task_id, cx)
+                                        })
+                                        .detach_and_log_err(cx);
+                                    cx.stop_propagation();
+                                },
+                            )),
                         )
                     }),
             )
@@ -584,7 +673,7 @@ impl Panel for AgentTaskPanel {
     }
 
     fn activation_priority(&self) -> u32 {
-        10
+        0
     }
 }
 
@@ -597,11 +686,7 @@ impl Render for AgentTaskPanel {
         let mut key_context = KeyContext::new_with_defaults();
         key_context.add("AgentTaskPanel");
 
-        let (filter_icon, filter_tooltip) = if self.hide_completed_tasks {
-            (IconName::EyeOff, "Show Completed Tasks")
-        } else {
-            (IconName::Eye, "Hide Completed Tasks")
-        };
+        let view = cx.entity().downgrade();
 
         v_flex()
             .key_context(key_context)
@@ -628,13 +713,57 @@ impl Render for AgentTaskPanel {
                             .gap_1()
                             .items_center()
                             .child(
-                                IconButton::new("toggle_hide_completed", filter_icon)
-                                    .icon_size(IconSize::Small)
-                                    .tooltip(Tooltip::text(filter_tooltip))
-                                    .on_click(cx.listener(|this, _event, _window, cx| {
-                                        this.hide_completed_tasks = !this.hide_completed_tasks;
-                                        cx.notify();
-                                    })),
+                                PopoverMenu::new("task-status-filter-menu")
+                                    .trigger(
+                                        IconButton::new("status_filter_menu", IconName::Filter)
+                                            .icon_size(IconSize::Small)
+                                            .tooltip(Tooltip::text("Filter Tasks by Status")),
+                                    )
+                                    .anchor(gpui::Anchor::TopRight)
+                                    .menu(move |window, cx| {
+                                        let view = view.clone();
+                                        Some(ContextMenu::build_persistent(
+                                            window,
+                                            cx,
+                                            move |menu, _window, cx| {
+                                                let mut menu = menu;
+                                                let current_filters = view
+                                                    .upgrade()
+                                                    .map(|v| v.read(cx).status_filters.clone())
+                                                    .unwrap_or_default();
+
+                                                for status in ALL_TASK_STATUSES {
+                                                    let is_selected =
+                                                        current_filters.contains(&status);
+                                                    let view = view.clone();
+                                                    menu = menu.toggleable_entry(
+                                                        status_label(status),
+                                                        is_selected,
+                                                        IconPosition::Start,
+                                                        None,
+                                                        move |_window, cx| {
+                                                            view.update(cx, |this, cx| {
+                                                                if this
+                                                                    .status_filters
+                                                                    .contains(&status)
+                                                                {
+                                                                    this.status_filters
+                                                                        .remove(&status);
+                                                                } else {
+                                                                    this.status_filters
+                                                                        .insert(status);
+                                                                }
+                                                                cx.notify();
+                                                            })
+                                                            .log_err();
+                                                        },
+                                                    );
+                                                }
+
+                                                menu
+                                            },
+                                        ))
+                                    }),
                             )
                             .child(
                                 IconButton::new("refresh_tasks", IconName::RotateCw)
@@ -690,6 +819,7 @@ pub fn status_color(status: AgentTaskStatus) -> Color {
         AgentTaskStatus::Review => Color::Accent,
         AgentTaskStatus::Completed => Color::Success,
         AgentTaskStatus::Failed => Color::Error,
+        AgentTaskStatus::Archived => Color::Muted,
     }
 }
 
@@ -702,6 +832,7 @@ pub fn status_icon(status: AgentTaskStatus) -> IconName {
         AgentTaskStatus::Review => IconName::Eye,
         AgentTaskStatus::Completed => IconName::Check,
         AgentTaskStatus::Failed => IconName::Close,
+        AgentTaskStatus::Archived => IconName::Archive,
     }
 }
 
@@ -720,6 +851,7 @@ pub fn status_label(status: AgentTaskStatus) -> &'static str {
         AgentTaskStatus::Review => "Review",
         AgentTaskStatus::Completed => "Completed",
         AgentTaskStatus::Failed => "Failed",
+        AgentTaskStatus::Archived => "Archived",
     }
 }
 
@@ -893,17 +1025,13 @@ pub fn compute_task_creation_timestamps<'a>(
 
 pub fn filter_visible_tasks(
     tasks: &[AgentTaskSummary],
-    hide_completed: bool,
+    status_filters: &HashSet<AgentTaskStatus>,
 ) -> Vec<AgentTaskSummary> {
-    if hide_completed {
-        tasks
-            .iter()
-            .filter(|task| task.status != AgentTaskStatus::Completed)
-            .cloned()
-            .collect()
-    } else {
-        tasks.to_vec()
-    }
+    tasks
+        .iter()
+        .filter(|task| status_filters.contains(&task.status))
+        .cloned()
+        .collect()
 }
 
 pub fn sort_tasks_newest_first(
@@ -965,10 +1093,10 @@ pub struct TaskRow {
 pub fn build_task_rows<'a>(
     tasks: &[AgentTaskSummary],
     events: impl IntoIterator<Item = &'a AgentTaskEvent>,
-    hide_completed: bool,
+    status_filters: &HashSet<AgentTaskStatus>,
 ) -> Vec<TaskRow> {
     let timestamps = compute_task_creation_timestamps(events);
-    let visible = filter_visible_tasks(tasks, hide_completed);
+    let visible = filter_visible_tasks(tasks, status_filters);
     let roots = visible_roots(&visible, &timestamps);
     let mut rows = Vec::new();
     let mut visited = HashSet::new();
@@ -1048,10 +1176,18 @@ mod tests {
     use project::Project;
     use settings::SettingsStore;
 
+    #[derive(Default)]
+    struct CallCounts {
+        archive_calls: Vec<AgentTaskId>,
+        unarchive_calls: Vec<AgentTaskId>,
+        delete_calls: Vec<AgentTaskId>,
+    }
+
     struct TestProvider {
         offline: bool,
         tasks: Vec<AgentTaskSummary>,
         events: Vec<AgentTaskEvent>,
+        calls: Arc<std::sync::Mutex<CallCounts>>,
     }
 
     impl Default for TestProvider {
@@ -1068,6 +1204,7 @@ mod tests {
                     write_scopes: vec![],
                 }],
                 events: vec![],
+                calls: Arc::new(std::sync::Mutex::new(CallCounts::default())),
             }
         }
     }
@@ -1124,6 +1261,21 @@ mod tests {
             _reason: &str,
             _cx: &mut App,
         ) -> Task<anyhow::Result<()>> {
+            Task::ready(Ok(()))
+        }
+
+        fn archive_task(&self, id: &AgentTaskId, _cx: &mut App) -> Task<anyhow::Result<()>> {
+            self.calls.lock().unwrap().archive_calls.push(id.clone());
+            Task::ready(Ok(()))
+        }
+
+        fn unarchive_task(&self, id: &AgentTaskId, _cx: &mut App) -> Task<anyhow::Result<()>> {
+            self.calls.lock().unwrap().unarchive_calls.push(id.clone());
+            Task::ready(Ok(()))
+        }
+
+        fn delete_task(&self, id: &AgentTaskId, _cx: &mut App) -> Task<anyhow::Result<()>> {
+            self.calls.lock().unwrap().delete_calls.push(id.clone());
             Task::ready(Ok(()))
         }
 
@@ -1297,6 +1449,7 @@ mod tests {
             offline: false,
             tasks,
             events: vec![],
+            ..Default::default()
         });
         let store = cx.update(|cx| cx.new(|cx| AgentTaskStore::new(provider, cx)));
 
@@ -1305,49 +1458,12 @@ mod tests {
         });
         cx.run_until_parked();
 
-        // Default: hide_completed_tasks is true.
-        // Completed root is filtered out; child is promoted to root.
+        // Default: status_filters has all non-archived statuses (including Completed).
+        // All 3 tasks are visible; child_failed is under root_completed.
         panel.read_with(cx, |panel, cx| {
-            assert!(panel.hide_completed_tasks);
+            assert!(panel.status_filters.contains(&AgentTaskStatus::Completed));
             let store = panel.store.read(cx);
-            let visible = filter_visible_tasks(&store.graph().tasks, panel.hide_completed_tasks);
-            assert_eq!(visible.len(), 2);
-            assert!(
-                visible
-                    .iter()
-                    .all(|t| t.status != AgentTaskStatus::Completed)
-            );
-
-            let timestamps = HashMap::new();
-            let roots = visible_roots(&visible, &timestamps);
-            assert_eq!(roots.len(), 2);
-            let root_ids: Vec<&str> = roots.iter().map(|t| t.id.0.as_ref()).collect();
-            assert!(root_ids.contains(&"TASK-FAILED-CHILD"));
-            assert!(root_ids.contains(&"TASK-READY"));
-
-            let rows = build_task_rows(
-                &store.graph().tasks,
-                store.events(),
-                panel.hide_completed_tasks,
-            );
-            assert_eq!(rows.len(), 2);
-            assert_eq!(rows[0].prefix, "");
-            assert_eq!(rows[0].depth, 0);
-            assert_eq!(rows[1].prefix, "");
-            assert_eq!(rows[1].depth, 0);
-        });
-
-        // Toggle filter off: all tasks visible, Completed root is present and Failed child is under it.
-        panel.update(cx, |panel, cx| {
-            panel.hide_completed_tasks = false;
-            cx.notify();
-        });
-        cx.run_until_parked();
-
-        panel.read_with(cx, |panel, cx| {
-            assert!(!panel.hide_completed_tasks);
-            let store = panel.store.read(cx);
-            let visible = filter_visible_tasks(&store.graph().tasks, panel.hide_completed_tasks);
+            let visible = filter_visible_tasks(&store.graph().tasks, &panel.status_filters);
             assert_eq!(visible.len(), 3);
 
             let timestamps = HashMap::new();
@@ -1362,11 +1478,7 @@ mod tests {
             assert_eq!(children.len(), 1);
             assert_eq!(children[0].id.0.as_ref(), "TASK-FAILED-CHILD");
 
-            let rows = build_task_rows(
-                &store.graph().tasks,
-                store.events(),
-                panel.hide_completed_tasks,
-            );
+            let rows = build_task_rows(&store.graph().tasks, store.events(), &panel.status_filters);
             assert_eq!(rows.len(), 3);
             let row_info: Vec<(&str, &str, usize)> = rows
                 .iter()
@@ -1380,6 +1492,39 @@ mod tests {
                     ("TASK-READY", "", 0),
                 ]
             );
+        });
+
+        // Filter out Completed: Completed root is filtered out; child is promoted to root.
+        panel.update(cx, |panel, cx| {
+            panel.status_filters.remove(&AgentTaskStatus::Completed);
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        panel.read_with(cx, |panel, cx| {
+            assert!(!panel.status_filters.contains(&AgentTaskStatus::Completed));
+            let store = panel.store.read(cx);
+            let visible = filter_visible_tasks(&store.graph().tasks, &panel.status_filters);
+            assert_eq!(visible.len(), 2);
+            assert!(
+                visible
+                    .iter()
+                    .all(|t| t.status != AgentTaskStatus::Completed)
+            );
+
+            let timestamps = HashMap::new();
+            let roots = visible_roots(&visible, &timestamps);
+            assert_eq!(roots.len(), 2);
+            let root_ids: Vec<&str> = roots.iter().map(|t| t.id.0.as_ref()).collect();
+            assert!(root_ids.contains(&"TASK-FAILED-CHILD"));
+            assert!(root_ids.contains(&"TASK-READY"));
+
+            let rows = build_task_rows(&store.graph().tasks, store.events(), &panel.status_filters);
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows[0].prefix, "");
+            assert_eq!(rows[0].depth, 0);
+            assert_eq!(rows[1].prefix, "");
+            assert_eq!(rows[1].depth, 0);
         });
     }
 
@@ -1508,7 +1653,7 @@ mod tests {
                 message: "created C".to_string(),
             },
         ];
-        let rows = build_task_rows(&tasks, &events, false);
+        let rows = build_task_rows(&tasks, &events, &default_status_filters());
         let extracted: Vec<(&str, &str, usize)> = rows
             .iter()
             .map(|r| (r.task.id.0.as_ref(), r.prefix.as_str(), r.depth))
@@ -1720,6 +1865,194 @@ LGTM approved"
             assert_eq!(summary.branch, "agent-goal/GOAL-TEST");
             assert_eq!(summary.tip_sha, Some("deadbeef012345".to_string()));
             assert!(!panel.store.read(cx).is_offline());
+        });
+    }
+
+    #[gpui::test]
+    async fn test_agent_task_panel_archive_unarchive_delete_actions(cx: &mut TestAppContext) {
+        init_test(cx);
+        let file_system = FakeFs::new(cx.executor());
+        let project = Project::test(file_system.clone(), [], cx).await;
+
+        let task_active = AgentTaskSummary {
+            id: AgentTaskId::from("TASK-ACTIVE"),
+            parent_id: None,
+            title: "Active Task".to_string(),
+            status: AgentTaskStatus::Ready,
+            attempt: 1,
+            assignee: None,
+            write_scopes: vec![],
+        };
+        let task_archived = AgentTaskSummary {
+            id: AgentTaskId::from("TASK-ARCHIVED"),
+            parent_id: None,
+            title: "Archived Task".to_string(),
+            status: AgentTaskStatus::Archived,
+            attempt: 1,
+            assignee: None,
+            write_scopes: vec![],
+        };
+
+        let calls = Arc::new(std::sync::Mutex::new(CallCounts::default()));
+        let provider = Arc::new(TestProvider {
+            offline: false,
+            tasks: vec![task_active, task_archived],
+            events: vec![],
+            calls: calls.clone(),
+        });
+        let store = cx.update(|cx| cx.new(|cx| AgentTaskStore::new(provider, cx)));
+
+        let (panel, cx) = cx.add_window_view(|_window, cx| {
+            AgentTaskPanel::new(store, WeakEntity::new_invalid(), project, file_system, cx)
+        });
+        cx.run_until_parked();
+
+        // Active task archive button is present
+        let archive_btn_bounds = cx
+            .debug_bounds("ICON-Archive")
+            .expect("archive button should be rendered for active task");
+        cx.simulate_click(archive_btn_bounds.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+
+        // Check archive was called and task selection did NOT trigger
+        assert_eq!(
+            calls.lock().unwrap().archive_calls,
+            vec![AgentTaskId::from("TASK-ACTIVE")]
+        );
+        panel.read_with(cx, |panel, _| {
+            assert!(panel.selected_task_id.is_none());
+        });
+
+        // Filter to only Archived status to show archived task
+        panel.update(cx, |panel, cx| {
+            panel.status_filters.clear();
+            panel.status_filters.insert(AgentTaskStatus::Archived);
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        // Archived task unarchive and delete buttons are present
+        let unarchive_btn_bounds = cx
+            .debug_bounds("ICON-Archive")
+            .expect("unarchive button should be rendered for archived task");
+        let delete_btn_bounds = cx
+            .debug_bounds("ICON-Trash")
+            .expect("delete button should be rendered for archived task");
+
+        // Clicking unarchive
+        cx.simulate_click(unarchive_btn_bounds.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        assert_eq!(
+            calls.lock().unwrap().unarchive_calls,
+            vec![AgentTaskId::from("TASK-ARCHIVED")]
+        );
+        panel.read_with(cx, |panel, _| {
+            assert!(panel.selected_task_id.is_none());
+        });
+
+        // Clicking delete
+        cx.simulate_click(delete_btn_bounds.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        assert_eq!(
+            calls.lock().unwrap().delete_calls,
+            vec![AgentTaskId::from("TASK-ARCHIVED")]
+        );
+        panel.read_with(cx, |panel, _| {
+            assert!(panel.selected_task_id.is_none());
+        });
+
+        // Restore default filters and test task selection
+        panel.update(cx, |panel, cx| {
+            panel.status_filters = default_status_filters();
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        // Clicking the task node (left side, avoiding action buttons) triggers task selection
+        let task_node_bounds = cx
+            .debug_bounds("task-node-TASK-ACTIVE")
+            .expect("task node should be rendered");
+        cx.simulate_click(
+            gpui::Point::new(
+                task_node_bounds.left() + gpui::px(10.0),
+                task_node_bounds.center().y,
+            ),
+            gpui::Modifiers::default(),
+        );
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                panel.selected_task_id,
+                Some(AgentTaskId::from("TASK-ACTIVE"))
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_agent_task_panel_status_filter_dropdown(cx: &mut TestAppContext) {
+        init_test(cx);
+        let file_system = FakeFs::new(cx.executor());
+        let project = Project::test(file_system.clone(), [], cx).await;
+        let provider = Arc::new(TestProvider::default());
+        let store = cx.update(|cx| cx.new(|cx| AgentTaskStore::new(provider, cx)));
+
+        let (panel, cx) = cx.add_window_view(|_window, cx| {
+            AgentTaskPanel::new(store, WeakEntity::new_invalid(), project, file_system, cx)
+        });
+        cx.run_until_parked();
+
+        // Default filters contain all non-archived statuses
+        panel.read_with(cx, |panel, _| {
+            assert!(panel.status_filters.contains(&AgentTaskStatus::Ready));
+            assert!(panel.status_filters.contains(&AgentTaskStatus::Completed));
+            assert!(!panel.status_filters.contains(&AgentTaskStatus::Archived));
+        });
+
+        // Click status filter menu button to open dropdown
+        let filter_menu_btn = cx
+            .debug_bounds("ICON-Filter")
+            .expect("status filter menu button should be rendered");
+        cx.simulate_click(filter_menu_btn.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+
+        // Click "Archived" entry to toggle it on
+        let archived_entry = cx
+            .debug_bounds("MENU_ITEM-Archived")
+            .expect("Archived entry should be present in status filter menu");
+        cx.simulate_click(archived_entry.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+
+        panel.read_with(cx, |panel, _| {
+            assert!(panel.status_filters.contains(&AgentTaskStatus::Archived));
+        });
+
+        // Click "Archived" entry again to toggle it off (persistent menu stays open)
+        let archived_entry_again = cx
+            .debug_bounds("MENU_ITEM-Archived")
+            .expect("Archived entry should still be present in persistent menu");
+        cx.simulate_click(archived_entry_again.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+
+        panel.read_with(cx, |panel, _| {
+            assert!(!panel.status_filters.contains(&AgentTaskStatus::Archived));
+        });
+    }
+
+    #[gpui::test]
+    async fn test_agent_task_panel_activation_priority(cx: &mut TestAppContext) {
+        init_test(cx);
+        let file_system = FakeFs::new(cx.executor());
+        let project = Project::test(file_system.clone(), [], cx).await;
+        let provider = Arc::new(TestProvider::default());
+        let store = cx.update(|cx| cx.new(|cx| AgentTaskStore::new(provider, cx)));
+
+        let (panel, cx) = cx.add_window_view(|_window, cx| {
+            AgentTaskPanel::new(store, WeakEntity::new_invalid(), project, file_system, cx)
+        });
+        cx.run_until_parked();
+
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(panel.activation_priority(), 0);
         });
     }
 }
