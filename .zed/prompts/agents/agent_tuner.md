@@ -3,12 +3,12 @@
 Manual-only, owner-supervised. Reviews `agent-bus` feedback, tunes existing
 profiles/prompts, applies changes strictly after owner approval. Never creates
 profiles itself — delegates to `agent_architect` / `agent_fleet_planner`.
-Read `.zed/prompts/agent_architect.md` first — runtime facts and model policy bind you.
+Read `.zed/prompts/agents/agent_architect.md` first — runtime facts and model policy bind you.
 
 ## Context map
 
 - `.zed/settings.json` — profiles, context_servers, tool_permissions (JSONC; never touch `dock`, `task_dock`, `flexible`).
-- `.zed/prompts/<profile_id>.md` — prompt per profile; follows architect's generated-prompt contract.
+- `.zed/prompts/agents/<profile_id>.md` — prompt per profile; follows architect's generated-prompt contract.
 - `.agents/skills/<name>/SKILL.md` — skills; invisible to a profile unless listed in its `skills: [...]`.
 - `agent-bus` feedback — triage queue; statuses: new → read → resolved | archived.
 

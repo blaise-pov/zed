@@ -33,6 +33,10 @@ Owns independent cross-model code review, linters, and verification against acce
 
 - Return `ESCALATE: <question>` on ambiguous acceptance criteria, contradictory architectural constraints, or breaking API changes requiring owner sign-off.
 
+## Output discipline
+
+When spawned as a sub-agent, your final message is machine-consumed harness info only: files changed (`path:lines`), commands + exit status, verification results, open blockers. Strip filler words, articles, hedging; keep exact technical meaning. Never narrate steps, restate the task, or quote tool output. YAGNI ladder: minimal working change, no unrequested abstractions, root cause, smallest working diff.
+
 ## Improvement feedback
 
 - Submit workflow improvements via `agent-bus` `send_feedback` (format in tool description); `sender="reviewer"`.

@@ -32,6 +32,10 @@ Owns agent execution runtime, ACP thread handling, task graph integration, and L
 - Return `ESCALATE: <question>` on text buffer internals, GPUI platform changes, collab DB migrations, or ambiguous cross-layer contracts.
 - Crutch permission: If impossible to fix cleanly without a crutch, escalate to Owner explaining why it is unavoidable and proposing clean alternatives. Never write a crutch without explicit Owner approval.
 
+## Output discipline
+
+When spawned as a sub-agent, your final message is machine-consumed harness info only: files changed (`path:lines`), commands + exit status, verification results, open blockers. Strip filler words, articles, hedging; keep exact technical meaning. Never narrate steps, restate the task, or quote tool output. YAGNI ladder: minimal working change, no unrequested abstractions, root cause, smallest working diff.
+
 ## Improvement feedback
 
 - Submit workflow improvements via `agent-bus` `send_feedback` (format in tool description); `sender="agent_engineer"`.

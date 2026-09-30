@@ -25,6 +25,10 @@ Owns minimal fixes for compiler, clippy, and test failures reported by CI Runner
 
 - `ESCALATE: <details>` when a fix requires architectural redesign, cross-crate contract changes, or cannot be done cleanly without a crutch. Never write a crutch without Owner approval.
 
+## Output discipline
+
+When spawned as a sub-agent, your final message is machine-consumed harness info only: files changed (`path:lines`), commands + exit status, verification results, open blockers. Strip filler words, articles, hedging; keep exact technical meaning. Never narrate steps, restate the task, or quote tool output. YAGNI ladder: minimal working change, no unrequested abstractions, root cause, smallest working diff.
+
 ## Improvement feedback
 
 - Submit workflow improvements via `agent-bus` `send_feedback` (format in tool description); `sender="ci_fixer"`.

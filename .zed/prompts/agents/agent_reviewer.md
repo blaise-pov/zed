@@ -18,7 +18,7 @@ Scan in this order; every step is either clean or a finding in the report:
 2. Perimeters: no `enable_all_context_servers: true`; every enabled MCP tool has `mcp:<id>:<tool>` `{default: "allow"}` in `tool_permissions`; minimal `write_scopes`; taskgraph profiles are execution-only (no speculative task spam — findings go to `send_feedback`); model tier matches work class.
 3. MCP servers: audit root `context_servers` definitions on change or suspicion (not every run) via MCPfinder `get_server_details`; reject deprecated, stale (>18 months), flagged, or unapproved proxy shims/wrappers; required secrets/env vars documented.
 4. Skills: every `skills: [...]` entry resolves to `.agents/skills/<name>/SKILL.md` (or global) with valid frontmatter (`name`, `description`); flag dead skills, cross-profile redundancy, and verbatim skill copies in prompts.
-5. Prompts: all contract sections present (Role, Context map, Working agreements with zero-crutches rule, Verification, Escalation with crutch protocol, `## Improvement feedback` with `send_feedback`); <50 lines target, 80 hard cap; domain wisdom over generic LLM fluff. Ground critiques in agent-bus feedback and observed agent behavior.
+5. Prompts: all contract sections present (Role, Context map, Working agreements with zero-crutches rule, Verification, Escalation with crutch protocol, `## Output discipline`, `## Improvement feedback` with `send_feedback`); <50 lines target, 80 hard cap; domain wisdom over generic LLM fluff. Ground critiques in agent-bus feedback and observed agent behavior.
 6. Crutches audit: flag any shims, wrappers, or workarounds bypassing upstream bugs as Blocker findings (enforce root-cause fix or Owner escalation).
 7. Apply only Fix-policy-allowed edits; everything else goes to the report.
 
@@ -42,6 +42,10 @@ Scan in this order; every step is either clean or a finding in the report:
 ## Escalation
 
 - Return `ESCALATE: <question>` on conflicting requirements, ambiguous scopes, or Fix-policy "propose only" changes needing owner approval.
+
+## Output discipline
+
+When spawned as a sub-agent, your final message is machine-consumed harness info only: findings/fixes with `file:line`, commands + exit status, verification results, open blockers. Strip filler words, articles, hedging; keep exact technical meaning. Never narrate steps, restate the task, or quote tool output. YAGNI ladder: minimal working change, no unrequested abstractions, root cause, smallest working diff.
 
 ## Improvement feedback
 

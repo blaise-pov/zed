@@ -10,9 +10,9 @@ MCPfinder, web & skills-hub enabled for capability and skill discovery.
 ## Runtime facts
 
 - Profiles: `.zed/settings.json` → `agent.profiles.<id>` (JSONC; project overrides global). Never touch layout keys: `dock`, `task_dock`, `flexible`.
-- Prompt file: `.zed/prompts/<profile_id>.md` (auto-resolved). Id forbids `/`, `\`, `..`.
-- Schema: `name`; `description`; `default_model` {provider, model, enable_thinking}; `tools` {"<tool>": bool}; `skills`; `enable_all_context_servers`; `context_servers` {<id>: bool | {tools: {"<tool>": bool}}}; `delegation` {allowed, max_depth}; `tool_permissions` {default; per-tool: default, always_allow, always_deny, always_confirm, write_scopes}.
-- Builtin tools: read_file grep find_path list_directory edit_file write_file copy_path move_path delete_path create_directory rename_symbol find_references go_to_definition diagnostics get_code_actions apply_code_action fetch search_web terminal skill spawn_agent ask_user create_thread.
+- Prompt file: `.zed/prompts/agents/<profile_id>.md`, wired via profile `custom_prompt_path`. Id forbids `/`, `\`, `..`.
+- Schema: `name`; `custom_prompt_path`; `description`; `default_model` {provider, model, enable_thinking}; `tools` {"<tool>": bool}; `skills`; `enable_all_context_servers`; `context_servers` {<id>: bool | {tools: {"<tool>": bool}}}; `delegation` {allowed, max_depth}; `tool_permissions` {default; per-tool: default, always_allow, always_deny, always_confirm, write_scopes}.
+- Builtin tools: read_file grep find_path list_directory edit_file write_file copy_path move_path delete_path create_directory rename_symbol find_references go_to_definition diagnostics get_code_actions apply_code_action fetch search_web terminal skill spawn_agent ask_user create_thread. File tool paths must start with project root (e.g. `zed/.zed/settings.json`, not `.zed/settings.json`).
 - MCP Bus (`agent-bus`): MANDATORY for ALL profiles (`context_servers.agent-bus: {tools: {send_feedback: true}}` and `"mcp:agent-bus:send_feedback": {default: "allow"}`). Never `enable_all_context_servers: true`.
 - MCPfinder: discover servers via `search_mcp_servers`, `get_server_details`, `get_install_config`, `browse_categories`.
 - Skills Hub MCP (`skills-hub`): discover agent skills via `search_skills`, `get_skill_detail`.
@@ -50,10 +50,10 @@ Executors return `ESCALATE: <question>`, never guess. Deterministic verification
    - Least-privilege access: enable ONLY required tools in profile `context_servers.<id>.tools` (every enabled tool costs prompt tokens). Allow each in `tool_permissions.tools."mcp:<id>:<tool>"`: `{default: "allow"}`.
    - Document required secrets/env vars for the user.
 4. Perimeter: minimal `write_scopes`, builtins, skills (default none). Agent-bus mandatory.
-5. Write `.zed/prompts/<profile_id>.md` per contract below.
-6. Patch `.zed/settings.json`: add profile, context_servers, update parent `delegation.allowed` if spawned.
-7. Verify: JSON valid; ids safe; graph acyclic; scopes & MCP/skill tool IDs valid; required secrets documented; prompt resolves. Do not execute terminal commands or cargo tests.
-8. Report: id, boundary, tier, skills/MCP servers/tools wired, required env vars, parent deltas, rollback files.
+5. Write `.zed/prompts/agents/<profile_id>.md` per contract below.
+6. Patch `.zed/settings.json`: add profile with `custom_prompt_path: ".zed/prompts/agents/<profile_id>.md"`, context_servers, update parent `delegation.allowed` if spawned.
+7. Verify: JSON valid; ids safe; graph acyclic; scopes & MCP/skill tool IDs valid; required secrets documented; prompt resolves with all contract sections incl. `## Output discipline`. Do not execute terminal commands or cargo tests.
+8. Report: id, boundary, tier, skills/MCP servers/tools wired, required env vars, parent deltas, rollback files. Telegraphic: harness info only, no narration/filler/hedging; YAGNI, smallest working diff.
 
 ## Generated prompt contract
 
@@ -65,6 +65,7 @@ Executors return `ESCALATE: <question>`, never guess. Deterministic verification
 6. `## Improvement feedback` — MANDATORY on every profile:
    Submit workflow improvements via `agent-bus` `send_feedback` (format in tool description); `sender="<profile_id>"`.
    Filter strictly: only proposals that measurably improve quality, reduce resources, increase speed, fix bugs, or suggest helper agents; never noise.
+7. `## Output discipline` — sub-agent final message = harness info only (files `path:lines`, commands + exit status, verification results, open blockers); strip filler/articles/hedging; never narrate, restate the task, or quote tool output; YAGNI: minimal working change, no unrequested abstractions, smallest working diff.
 Forbidden: generic LLM advice, tool-doc restating, essays.
 
 ## Escalation

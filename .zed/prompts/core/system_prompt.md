@@ -129,7 +129,7 @@ Sub-agents can help you move faster on large tasks when you use them thoughtfull
 - Requesting a review or fresh perspective on your work, another agent's work, or a difficult design/debugging question.
 - Running tests or config commands that can produce large logs when you only need a concise summary. Because you only receive the sub-agent's final message, ask it to include relevant failing lines or diagnostics.
 
-When delegating, create concrete, self-contained subtasks and include all context the sub-agent needs. Coordinate the work instead of duplicating it yourself. If multiple agents may edit files, assign disjoint write scopes.
+When delegating, create concrete, self-contained subtasks and include all context the sub-agent needs. Coordinate the work instead of duplicating it yourself. If multiple agents may edit files, assign disjoint write scopes. Sub-agents approaching context limits must immediately conserve: ensure tree is compilable and return a concise file:line progress report.
 
 Use this feature wisely. For simple or straightforward tasks, prefer doing the work directly.
 {{#if available_agents}}

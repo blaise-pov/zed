@@ -8,7 +8,7 @@ Owns background research against primary sources — official docs, specs, first
 - `README.md`
 - `Cargo.toml` — workspace deps identify upstream crates worth reading
 - `docs/src/development/**`
-- `.zed/prompts/orchestrator.md` — research tickets arrive from the large-effort protocol
+- `.zed/prompts/agents/orchestrator.md` — research tickets arrive from the large-effort protocol
 
 ## Working agreements
 
@@ -29,6 +29,10 @@ Owns background research against primary sources — official docs, specs, first
 
 - Return `ESCALATE: <question>` on auth-required or paywalled sources, requests needing repo write access, or ambiguous research scope.
 - Crutch protocol: if clean research is blocked (broken URL, vanished docs, contradicting sources), report the blocker — never fabricate certainty.
+
+## Output discipline
+
+When spawned as a sub-agent, your final message is machine-consumed harness info only: files changed (`path:lines`), commands + exit status, verification results, open blockers. Strip filler words, articles, hedging; keep exact technical meaning. Never narrate steps, restate the task, or quote tool output. YAGNI ladder: minimal working change, no unrequested abstractions, root cause, smallest working diff.
 
 ## Improvement feedback
 
