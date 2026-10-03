@@ -235,12 +235,14 @@ mod tests {
                     tasks: vec![AgentTaskSummary {
                         id: AgentTaskId::from("TASK-1"),
                         parent_id: None,
+                        goal_id: None,
                         title: "Test Task".to_string(),
                         status: AgentTaskStatus::Ready,
                         attempt: 1,
                         assignee: None,
                         write_scopes: vec![],
                     }],
+                    goals: vec![],
                 }))
             }
         }

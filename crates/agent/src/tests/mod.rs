@@ -11725,6 +11725,7 @@ async fn test_auto_cleanup_terminal_task_removes_worktree_preserves_branch(
     let summary = AgentTaskSummary {
         id: task_id.clone(),
         parent_id: None,
+        goal_id: None,
         title: "Clean task".to_string(),
         status: AgentTaskStatus::Completed,
         attempt: 1,
@@ -11806,6 +11807,7 @@ async fn test_auto_cleanup_retains_worktree_on_commit_error(cx: &mut TestAppCont
     let summary = AgentTaskSummary {
         id: task_id.clone(),
         parent_id: None,
+        goal_id: None,
         title: "Failing commit task".to_string(),
         status: AgentTaskStatus::Completed,
         attempt: 1,
@@ -11881,6 +11883,7 @@ async fn test_startup_sweep_cleans_only_terminal_tasks(cx: &mut TestAppContext) 
     let task1 = AgentTaskSummary {
         id: AgentTaskId::from("TASK-SWEEP-1"),
         parent_id: None,
+        goal_id: None,
         title: "Task 1".to_string(),
         status: AgentTaskStatus::Completed,
         attempt: 1,
@@ -11890,6 +11893,7 @@ async fn test_startup_sweep_cleans_only_terminal_tasks(cx: &mut TestAppContext) 
     let task2 = AgentTaskSummary {
         id: AgentTaskId::from("TASK-SWEEP-2"),
         parent_id: None,
+        goal_id: None,
         title: "Task 2".to_string(),
         status: AgentTaskStatus::Running,
         attempt: 1,
@@ -11899,6 +11903,7 @@ async fn test_startup_sweep_cleans_only_terminal_tasks(cx: &mut TestAppContext) 
     let task3 = AgentTaskSummary {
         id: AgentTaskId::from("TASK-SWEEP-3"),
         parent_id: None,
+        goal_id: None,
         title: "Task 3".to_string(),
         status: AgentTaskStatus::Completed,
         attempt: 1,

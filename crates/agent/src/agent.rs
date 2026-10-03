@@ -8,6 +8,7 @@ pub mod outline;
 mod pattern_extraction;
 mod sandboxing;
 pub mod task_worktree;
+pub mod task_worktree_status;
 mod templates;
 #[cfg(test)]
 mod tests;
@@ -30,6 +31,7 @@ pub use sandboxing::{
     settings_thread_sandbox,
 };
 pub use shell_command_parser::extract_commands;
+pub use task_worktree_status::*;
 pub use templates::*;
 pub use thread::*;
 pub use thread_store::*;
@@ -3688,6 +3690,7 @@ impl ThreadEnvironment for NativeThreadEnvironment {
         let task_summary = crate::AgentTaskSummary {
             id: crate::AgentTaskId::from(task_id),
             parent_id: None,
+            goal_id: goal_id.clone(),
             title: format!("agent-task/{task_id}"),
             status: crate::AgentTaskStatus::Ready,
             attempt: 1,

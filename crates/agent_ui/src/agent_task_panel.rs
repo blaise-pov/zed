@@ -28,8 +28,9 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use agent::{
-    AgentTaskArtifact, AgentTaskDetail, AgentTaskEvent, AgentTaskEventKind, AgentTaskId,
-    AgentTaskStatus, AgentTaskStore, AgentTaskSummary,
+    AgentGoalSummary, AgentTaskArtifact, AgentTaskDetail, AgentTaskEvent, AgentTaskEventKind,
+    AgentTaskId, AgentTaskStatus, AgentTaskStore, AgentTaskSummary, GoalGitState, OrphanWorktree,
+    TaskGitSnapshot, TaskWorktreeStatus,
 };
 use agent_settings::AgentSettings;
 use fs::Fs;
@@ -37,7 +38,7 @@ use gpui::{
     Action, App, Context, Div, Entity, EventEmitter, FocusHandle, Focusable, KeyContext, Pixels,
     Task, WeakEntity, Window, actions, prelude::*,
 };
-use project::Project;
+use project::{Project, git_store::Repository};
 use settings::{Settings, SettingsStore};
 use ui::{
     Color, ContextMenu, Icon, IconButton, IconName, IconPosition, IconSize, Label, LabelSize,
@@ -46,6 +47,7 @@ use ui::{
 use util::ResultExt;
 use workspace::Workspace;
 use workspace::dock::{DockPosition, Panel, PanelEvent};
+use zed_actions::{OpenWorktreeInNewWindow, SwitchWorktree};
 
 pub const ALL_TASK_STATUSES: [AgentTaskStatus; 8] = [
     AgentTaskStatus::Ready,
@@ -57,6 +59,30 @@ pub const ALL_TASK_STATUSES: [AgentTaskStatus; 8] = [
     AgentTaskStatus::Failed,
     AgentTaskStatus::Archived,
 ];
+
+pub const NO_GOAL_KEY: &str = "__no_goal__";
+
+fn paths_match(a: &std::path::Path, b: &std::path::Path) -> bool {
+    a == b
+        || util::paths::normalize_lexically(a).ok().as_deref()
+            == util::paths::normalize_lexically(b).ok().as_deref()
+}
+
+pub(crate) fn find_repository_for_worktree_path(
+    project: &Entity<Project>,
+    worktree_path: &std::path::Path,
+    cx: &App,
+) -> Option<Entity<Repository>> {
+    project
+        .read(cx)
+        .repositories(cx)
+        .values()
+        .find(|repo| {
+            let work_dir = repo.read(cx).snapshot().work_directory_abs_path;
+            paths_match(work_dir.as_ref(), worktree_path)
+        })
+        .cloned()
+}
 
 pub fn default_status_filters() -> HashSet<AgentTaskStatus> {
     HashSet::from([
@@ -113,9 +139,12 @@ pub fn init(file_system: Arc<dyn Fs>, cx: &mut App) {
 
 pub struct AgentTaskPanel {
     pub store: Entity<AgentTaskStore>,
+    pub worktree_status: Entity<TaskWorktreeStatus>,
     pub selected_task_id: Option<AgentTaskId>,
     pub selected_detail: Option<AgentTaskDetail>,
     pub status_filters: HashSet<AgentTaskStatus>,
+    pub seen_other_statuses: HashSet<AgentTaskStatus>,
+    pub collapsed_goals: HashMap<String, bool>,
     pub goal_cleanup_result: Option<agent::task_worktree::GoalCleanupResult>,
     focus_handle: FocusHandle,
     workspace: WeakEntity<Workspace>,
@@ -132,14 +161,33 @@ impl AgentTaskPanel {
         file_system: Arc<dyn Fs>,
         cx: &mut Context<Self>,
     ) -> Self {
+        let worktree_status = cx.new(|cx| TaskWorktreeStatus::new(project.clone(), cx));
+        cx.observe(&worktree_status, |_, _, cx| {
+            cx.notify();
+        })
+        .detach();
+
         let mut swept = false;
         cx.observe(&store, move |this, store, cx| {
-            if !swept && !store.read(cx).is_offline() && !store.read(cx).graph().tasks.is_empty() {
-                swept = true;
-                let project = this.project.clone();
-                let tasks = store.read(cx).graph().tasks.clone();
-                agent::task_worktree::startup_sweep(project, Some(&tasks), cx)
-                    .detach_and_log_err(cx);
+            let (is_offline, tasks) = {
+                let store_read = store.read(cx);
+                (store_read.is_offline(), store_read.graph().tasks.clone())
+            };
+            if !is_offline {
+                if !swept && !tasks.is_empty() {
+                    swept = true;
+                    let project = this.project.clone();
+                    agent::task_worktree::startup_sweep(project, Some(&tasks), cx)
+                        .detach_and_log_err(cx);
+                }
+                this.refresh_worktree_status(cx);
+            }
+            for task in &tasks {
+                if let AgentTaskStatus::Other(_) = &task.status {
+                    if this.seen_other_statuses.insert(task.status.clone()) {
+                        this.status_filters.insert(task.status.clone());
+                    }
+                }
             }
             cx.notify();
         })
@@ -150,18 +198,51 @@ impl AgentTaskPanel {
         })
         .detach();
 
-        Self {
+        let mut seen_other_statuses = HashSet::new();
+        let mut status_filters = default_status_filters();
+        {
+            let store_read = store.read(cx);
+            for task in &store_read.graph().tasks {
+                if let AgentTaskStatus::Other(_) = &task.status {
+                    if seen_other_statuses.insert(task.status.clone()) {
+                        status_filters.insert(task.status.clone());
+                    }
+                }
+            }
+        }
+
+        let mut panel = Self {
             store,
+            worktree_status,
             selected_task_id: None,
             selected_detail: None,
-            status_filters: default_status_filters(),
+            status_filters,
+            seen_other_statuses,
+            collapsed_goals: HashMap::new(),
             goal_cleanup_result: None,
             focus_handle: cx.focus_handle(),
             workspace,
             project,
             file_system,
             _fetch_detail_task: None,
+        };
+
+        if !panel.store.read(cx).is_offline() {
+            panel.refresh_worktree_status(cx);
         }
+
+        panel
+    }
+
+    pub fn refresh_worktree_status(&mut self, cx: &mut Context<Self>) {
+        let (tasks, goals) = {
+            let store = self.store.read(cx);
+            let graph = store.graph();
+            (graph.tasks.clone(), graph.goals.clone())
+        };
+        self.worktree_status.update(cx, |status, cx| {
+            status.refresh(tasks, goals, cx).detach_and_log_err(cx);
+        });
     }
 
     fn sync_task_server(&mut self, cx: &mut Context<Self>) {
@@ -219,8 +300,34 @@ impl AgentTaskPanel {
 
             if let Some(detail) = detail {
                 if let Some(workspace) = workspace.upgrade() {
+                    let (goal, goal_git) = this
+                        .update(cx, |panel, cx| {
+                            let goal_id = detail.summary.goal_id.as_ref();
+                            let goal = goal_id.and_then(|gid| {
+                                panel
+                                    .store
+                                    .read(cx)
+                                    .graph()
+                                    .goals
+                                    .iter()
+                                    .find(|g| &g.goal_id == gid)
+                                    .cloned()
+                            });
+                            let goal_git = goal_id.and_then(|gid| {
+                                panel
+                                    .worktree_status
+                                    .read(cx)
+                                    .snapshot()
+                                    .and_then(|s| s.goals.get(gid))
+                                    .cloned()
+                            });
+                            (goal, goal_git)
+                        })
+                        .unwrap_or((None, None));
+
                     let title = format_task_editor_title(&id, &detail.summary.title);
-                    let markdown = render_task_markdown(&detail, &artifacts);
+                    let markdown =
+                        render_task_markdown(&detail, &artifacts, goal.as_ref(), goal_git.as_ref());
                     let open_task = cx
                         .update(|window, cx| {
                             crate::open_markdown_in_workspace(
@@ -240,9 +347,14 @@ impl AgentTaskPanel {
         let store = self.store.read(cx);
         let graph = store.graph().clone();
         let events = store.events();
-        let rows = build_task_rows(&graph.tasks, events, &self.status_filters);
+        let groups = build_goal_groups(&graph.tasks, &graph.goals, events, &self.status_filters);
 
-        if rows.is_empty() {
+        let snapshot = self.worktree_status.read(cx).snapshot().cloned();
+        let has_orphans = snapshot
+            .as_ref()
+            .map_or(false, |s| !s.orphan_worktrees.is_empty());
+
+        if groups.is_empty() && !has_orphans {
             return v_flex().p_4().items_center().child(
                 Label::new("No tasks")
                     .size(LabelSize::Small)
@@ -250,15 +362,437 @@ impl AgentTaskPanel {
             );
         }
 
-        let mut row_elements = Vec::with_capacity(rows.len());
-        for row in rows {
-            row_elements.push(self.render_task_row(row, cx));
+        let mut group_elements = Vec::with_capacity(groups.len() + 1);
+        for group in groups {
+            group_elements.push(self.render_goal_group(group, snapshot.as_ref(), cx));
         }
 
-        v_flex().gap_1().children(row_elements)
+        if let Some(snapshot) = snapshot.as_ref() {
+            if !snapshot.orphan_worktrees.is_empty() {
+                group_elements.push(self.render_orphan_worktrees(&snapshot.orphan_worktrees, cx));
+            }
+        }
+
+        v_flex().gap_2().children(group_elements)
     }
 
-    fn render_task_row(&self, row: TaskRow, cx: &mut Context<Self>) -> Div {
+    fn render_orphan_worktrees(&self, orphans: &[OrphanWorktree], cx: &mut Context<Self>) -> Div {
+        let mut rows = Vec::with_capacity(orphans.len());
+        for orphan in orphans {
+            let task_id_hint = orphan.task_id_hint.clone();
+            let path = orphan.path.clone();
+            let path_str = path.to_string_lossy().to_string();
+
+            let delete_button = IconButton::new(
+                SharedString::from(format!("delete-orphan-{}", task_id_hint)),
+                IconName::Trash,
+            )
+            .icon_size(IconSize::Small)
+            .tooltip(Tooltip::text("Delete Orphaned Worktree"))
+            .on_click(cx.listener({
+                let path = path.clone();
+                let task_id_hint = task_id_hint.clone();
+                move |this, _event, _window, cx| {
+                    cx.stop_propagation();
+                    let project = this.project.clone();
+                    let path = path.clone();
+                    let task_id_hint_for_async = task_id_hint.clone();
+                    let remove_task =
+                        agent::task_worktree::remove_orphan_worktree(project, path, cx);
+                    cx.spawn(async move |this, cx| {
+                        if let Err(e) = remove_task.await {
+                            log::warn!(
+                                "Failed to remove orphan worktree for {task_id_hint_for_async}: {e}"
+                            );
+                        }
+                        this.update(cx, |this, cx| {
+                            this.refresh_worktree_status(cx);
+                        })
+                        .ok();
+                    })
+                    .detach();
+                }
+            }));
+
+            rows.push(
+                h_flex()
+                    .id(SharedString::from(format!(
+                        "orphan-worktree-{}",
+                        task_id_hint
+                    )))
+                    .debug_selector({
+                        let task_id_hint = task_id_hint.clone();
+                        move || format!("orphan-worktree-{}", task_id_hint)
+                    })
+                    .w_full()
+                    .items_center()
+                    .justify_between()
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .items_center()
+                            .flex_1()
+                            .overflow_hidden()
+                            .child(
+                                Icon::new(IconName::Warning)
+                                    .size(IconSize::Small)
+                                    .color(Color::Warning),
+                            )
+                            .child(
+                                Label::new(format!("agent-task-{}", task_id_hint))
+                                    .size(LabelSize::Small),
+                            )
+                            .child(
+                                Label::new(path_str)
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted)
+                                    .truncate(),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id(SharedString::from(format!(
+                                "delete-orphan-{}",
+                                task_id_hint
+                            )))
+                            .debug_selector({
+                                let task_id_hint = task_id_hint.clone();
+                                move || format!("delete-orphan-{}", task_id_hint)
+                            })
+                            .child(delete_button),
+                    ),
+            );
+        }
+
+        div().child(
+            v_flex()
+                .id("orphan-worktrees-section")
+                .debug_selector(|| "orphan-worktrees-section".to_string())
+                .gap_1()
+                .pt_2()
+                .border_t_1()
+                .border_color(cx.theme().colors().border_variant)
+                .child(
+                    h_flex()
+                        .px_2()
+                        .py_0p5()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            Label::new("Orphaned Worktrees")
+                                .size(LabelSize::Small)
+                                .color(Color::Muted),
+                        )
+                        .child(
+                            Label::new(format!("({})", orphans.len()))
+                                .size(LabelSize::Small)
+                                .color(Color::Muted),
+                        ),
+                )
+                .children(rows),
+        )
+    }
+
+    fn render_goal_group(
+        &self,
+        group: GoalGroup,
+        snapshot: Option<&TaskGitSnapshot>,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        if let Some(goal_id) = group.goal_id {
+            let is_collapsed = self.collapsed_goals.get(&goal_id).copied().unwrap_or(false);
+
+            let title = group
+                .goal_summary
+                .as_ref()
+                .map(|g| g.title.clone())
+                .unwrap_or_else(|| goal_id.clone());
+
+            let goal_git = snapshot.and_then(|s| s.goals.get(&goal_id));
+            let branch_exists = goal_git.map_or(false, |g| g.branch_exists);
+            let tip_sha = goal_git.and_then(|g| g.tip_sha.as_deref());
+
+            let (tasks_done, tasks_total) = if let Some(summary) = &group.goal_summary {
+                (summary.tasks_done, summary.tasks_total)
+            } else {
+                let store = self.store.read(cx);
+                let total = store
+                    .graph()
+                    .tasks
+                    .iter()
+                    .filter(|t| t.goal_id.as_deref() == Some(&goal_id))
+                    .count() as u64;
+                let done = store
+                    .graph()
+                    .tasks
+                    .iter()
+                    .filter(|t| {
+                        t.goal_id.as_deref() == Some(&goal_id)
+                            && t.status == AgentTaskStatus::Completed
+                    })
+                    .count() as u64;
+                (done, total)
+            };
+
+            let has_active_tasks = self
+                .store
+                .read(cx)
+                .graph()
+                .tasks
+                .iter()
+                .any(|t| t.goal_id.as_deref() == Some(&goal_id) && !t.status.is_terminal());
+            let can_cleanup = !has_active_tasks && branch_exists;
+
+            let cleanup_button = Button::new(
+                SharedString::from(format!("cleanup-goal-{}", goal_id)),
+                "Cleanup Goal Branches",
+            )
+            .style(ButtonStyle::Subtle)
+            .label_size(LabelSize::Small)
+            .disabled(!can_cleanup)
+            .tooltip(if has_active_tasks {
+                Tooltip::text("Cannot clean up goal: tasks are still active")
+            } else if !branch_exists {
+                Tooltip::text("Cannot clean up goal: branch does not exist")
+            } else {
+                Tooltip::text("Clean up goal branch and all associated task branches")
+            })
+            .on_click(cx.listener({
+                let goal_id = goal_id.clone();
+                move |this, _event, _window, cx| {
+                    cx.stop_propagation();
+                    if !can_cleanup {
+                        return;
+                    }
+                    let goal_id_for_async = goal_id.clone();
+                    let cleanup_task = agent::task_worktree::cleanup_graduated_goal(
+                        this.project.clone(),
+                        &goal_id,
+                        cx,
+                    );
+                    cx.spawn(async move |this, cx| match cleanup_task.await {
+                        Ok(result) => {
+                            log::info!(
+                                "Cleaned up goal {}: {} branches deleted, {} failed",
+                                result.goal_id,
+                                result.deleted_branches.len(),
+                                result.failed_branches.len()
+                            );
+                            this.update(cx, |this, cx| {
+                                this.goal_cleanup_result = Some(result);
+                                this.refresh_worktree_status(cx);
+                                cx.notify();
+                            })
+                            .ok();
+                        }
+                        Err(e) => {
+                            log::warn!("Failed to clean up goal {goal_id_for_async}: {e}");
+                        }
+                    })
+                    .detach();
+                }
+            }));
+
+            let header = h_flex()
+                .id(SharedString::from(format!("goal-group-header-{}", goal_id)))
+                .debug_selector({
+                    let goal_id = goal_id.clone();
+                    move || format!("goal-group-header-{}", goal_id)
+                })
+                .w_full()
+                .items_center()
+                .justify_between()
+                .px_2()
+                .py_1()
+                .rounded_md()
+                .cursor_pointer()
+                .bg(cx.theme().colors().element_background)
+                .on_click(cx.listener({
+                    let goal_id = goal_id.clone();
+                    move |this, _event, _window, cx| {
+                        let entry = this.collapsed_goals.entry(goal_id.clone()).or_insert(false);
+                        *entry = !*entry;
+                        cx.notify();
+                    }
+                }))
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .items_center()
+                        .flex_1()
+                        .overflow_hidden()
+                        .child(
+                            Icon::new(if is_collapsed {
+                                IconName::ChevronRight
+                            } else {
+                                IconName::ChevronDown
+                            })
+                            .size(IconSize::Small)
+                            .color(Color::Muted),
+                        )
+                        .child(Label::new(title).size(LabelSize::Small).truncate())
+                        .child(
+                            Label::new(format!("agent-goal/{goal_id}"))
+                                .size(LabelSize::Small)
+                                .color(Color::Muted),
+                        )
+                        .when(!branch_exists, |this| {
+                            this.child(
+                                h_flex()
+                                    .id(SharedString::from(format!(
+                                        "goal-branch-missing-{}",
+                                        goal_id
+                                    )))
+                                    .child(
+                                        Icon::new(IconName::Warning)
+                                            .size(IconSize::Small)
+                                            .color(Color::Warning),
+                                    )
+                                    .tooltip(Tooltip::text("Goal branch does not exist")),
+                            )
+                        })
+                        .when_some(tip_sha, |this, sha| {
+                            let short_sha = &sha[..7.min(sha.len())];
+                            this.child(
+                                Label::new(format!("[{short_sha}]"))
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted),
+                            )
+                        })
+                        .child(
+                            Label::new(format!("{tasks_done}/{tasks_total}"))
+                                .size(LabelSize::Small)
+                                .color(Color::Muted),
+                        )
+                        .when_some(group.goal_summary.as_ref(), |this, summary| {
+                            this.child(
+                                Label::new(format!("P{} · {}", summary.priority, summary.status))
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted),
+                            )
+                        })
+                        .when_some(
+                            self.goal_cleanup_result
+                                .as_ref()
+                                .filter(|res| res.goal_id == goal_id),
+                            |this, res| {
+                                let summary_text = if res.failed_branches.is_empty() {
+                                    format!("Cleaned ({} deleted)", res.deleted_branches.len())
+                                } else {
+                                    format!(
+                                        "Cleaned ({} deleted, {} failed)",
+                                        res.deleted_branches.len(),
+                                        res.failed_branches.len()
+                                    )
+                                };
+                                let color = if res.failed_branches.is_empty() {
+                                    Color::Success
+                                } else {
+                                    Color::Warning
+                                };
+                                this.child(
+                                    Label::new(summary_text).size(LabelSize::Small).color(color),
+                                )
+                            },
+                        ),
+                )
+                .child(
+                    h_flex().gap_1().items_center().child(
+                        div()
+                            .id(SharedString::from(format!("cleanup-goal-{}", goal_id)))
+                            .debug_selector({
+                                let goal_id = goal_id.clone();
+                                move || format!("cleanup-goal-{}", goal_id)
+                            })
+                            .child(cleanup_button),
+                    ),
+                );
+
+            let mut group_div = v_flex().w_full().gap_1().child(header);
+
+            if !is_collapsed {
+                let mut row_elements = Vec::with_capacity(group.rows.len());
+                for row in group.rows {
+                    row_elements.push(self.render_task_row(row, snapshot, cx));
+                }
+                group_div = group_div.children(row_elements);
+            }
+
+            group_div
+        } else {
+            let is_collapsed = self
+                .collapsed_goals
+                .get(NO_GOAL_KEY)
+                .copied()
+                .unwrap_or(false);
+
+            let header = h_flex()
+                .id("goal-group-header-no-goal")
+                .debug_selector(|| "goal-group-header-no-goal".to_string())
+                .w_full()
+                .items_center()
+                .justify_between()
+                .px_2()
+                .py_1()
+                .rounded_md()
+                .cursor_pointer()
+                .bg(cx.theme().colors().element_background)
+                .on_click(cx.listener(|this, _event, _window, cx| {
+                    let entry = this
+                        .collapsed_goals
+                        .entry(NO_GOAL_KEY.to_string())
+                        .or_insert(false);
+                    *entry = !*entry;
+                    cx.notify();
+                }))
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .items_center()
+                        .child(
+                            Icon::new(if is_collapsed {
+                                IconName::ChevronRight
+                            } else {
+                                IconName::ChevronDown
+                            })
+                            .size(IconSize::Small)
+                            .color(Color::Muted),
+                        )
+                        .child(
+                            Label::new("No goal")
+                                .size(LabelSize::Small)
+                                .color(Color::Muted),
+                        )
+                        .child(
+                            Label::new(format!("({} tasks)", group.rows.len()))
+                                .size(LabelSize::Small)
+                                .color(Color::Muted),
+                        ),
+                );
+
+            let mut group_div = v_flex().w_full().gap_1().child(header);
+
+            if !is_collapsed {
+                let mut row_elements = Vec::with_capacity(group.rows.len());
+                for row in group.rows {
+                    row_elements.push(self.render_task_row(row, snapshot, cx));
+                }
+                group_div = group_div.children(row_elements);
+            }
+
+            group_div
+        }
+    }
+
+    fn render_task_row(
+        &self,
+        row: TaskRow,
+        snapshot: Option<&TaskGitSnapshot>,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
         let task = row.task;
         let prefix = row.prefix;
         let is_selected = self
@@ -272,7 +806,190 @@ impl AgentTaskPanel {
             .policy_denied_event_for_task(&task.id)
             .cloned();
 
-        let task_element = h_flex()
+        let task_git = snapshot.and_then(|s| s.tasks.get(&task.id));
+        let has_worktree = task_git.map_or(false, |g| g.exists_on_disk);
+        let worktree_path = task_git.map(|g| g.worktree_path.clone());
+        let goal_git = task
+            .goal_id
+            .as_ref()
+            .and_then(|gid| snapshot.and_then(|s| s.goals.get(gid)));
+        let goal_branch_exists = goal_git.map_or(false, |g| g.branch_exists);
+        let can_diff = task.goal_id.is_some() && goal_branch_exists && has_worktree;
+
+        let open_worktree_btn = IconButton::new(
+            SharedString::from(format!("open-worktree-{}", task.id)),
+            IconName::FolderOpen,
+        )
+        .icon_size(IconSize::Small)
+        .disabled(!has_worktree)
+        .tooltip(if has_worktree {
+            Tooltip::text("Switch Worktree (Right-click: Open in New Window)")
+        } else {
+            Tooltip::text("Worktree does not exist on disk")
+        })
+        .on_click(cx.listener({
+            let path = worktree_path.clone();
+            let task_id = task.id.clone();
+            move |_this, _event, window, cx| {
+                cx.stop_propagation();
+                if let Some(path) = path.clone() {
+                    let display_name = format!("agent-task-{}", task_id);
+                    window.dispatch_action(Box::new(SwitchWorktree { path, display_name }), cx);
+                }
+            }
+        }))
+        .on_right_click(cx.listener({
+            let path = worktree_path.clone();
+            move |_this, _event: &gpui::ClickEvent, window, cx| {
+                cx.stop_propagation();
+                if let Some(path) = path.clone() {
+                    window.dispatch_action(Box::new(OpenWorktreeInNewWindow { path }), cx);
+                }
+            }
+        }));
+
+        let diff_btn = IconButton::new(
+            SharedString::from(format!("diff-task-{}", task.id)),
+            IconName::Diff,
+        )
+        .icon_size(IconSize::Small)
+        .disabled(!can_diff)
+        .tooltip(if can_diff {
+            Tooltip::text("Diff with Goal Branch")
+        } else if task.goal_id.is_none() {
+            Tooltip::text("Task has no goal")
+        } else if !goal_branch_exists {
+            Tooltip::text("Goal branch does not exist")
+        } else {
+            Tooltip::text("Worktree does not exist on disk")
+        })
+        .on_click(cx.listener({
+            let goal_id = task.goal_id.clone();
+            move |this, _event, window, cx| {
+                cx.stop_propagation();
+                if !can_diff {
+                    return;
+                }
+                let Some(goal_id) = goal_id.clone() else {
+                    return;
+                };
+                let Some(worktree_path) = worktree_path.clone() else {
+                    return;
+                };
+                let base_ref: SharedString = format!("agent-goal/{goal_id}").into();
+                let project = this.project.clone();
+                let workspace = this.workspace.clone();
+                let file_system = this.file_system.clone();
+
+                if let Some(task_repo) =
+                    find_repository_for_worktree_path(&project, &worktree_path, cx)
+                {
+                    if let Some(workspace) = workspace.upgrade() {
+                        workspace.update(cx, |workspace, cx| {
+                            git_ui::branch_diff::BranchDiff::deploy_branch_diff_with_base_ref(
+                                workspace, project, task_repo, base_ref, None, window, cx,
+                            );
+                        });
+                    }
+                    return;
+                }
+
+                cx.spawn_in(window, async move |_this, cx| {
+                    if !file_system.is_dir(&worktree_path).await {
+                        log::warn!(
+                            "failed to find worktree at {}: not a directory",
+                            worktree_path.display()
+                        );
+                        return;
+                    }
+
+                    let find_task = project.update(cx, |project, cx| {
+                        project.find_or_create_worktree(&worktree_path, true, cx)
+                    });
+                    let (worktree, _) = match find_task.await {
+                        Ok(res) => res,
+                        Err(err) => {
+                            log::warn!(
+                                "failed to find worktree at {}: {err:?}",
+                                worktree_path.display()
+                            );
+                            return;
+                        }
+                    };
+                    let scan_complete = cx
+                        .update(|_window, cx| {
+                            worktree
+                                .read(cx)
+                                .as_local()
+                                .map(|local| local.scan_complete())
+                        })
+                        .ok()
+                        .flatten();
+                    if let Some(scan) = scan_complete {
+                        scan.await;
+                    }
+                    let task_repo = cx
+                        .update(|_window, cx| {
+                            find_repository_for_worktree_path(&project, &worktree_path, cx)
+                        })
+                        .ok()
+                        .flatten();
+                    let Some(task_repo) = task_repo else {
+                        log::warn!(
+                            "could not resolve repository for worktree at {}",
+                            worktree_path.display()
+                        );
+                        return;
+                    };
+                    if let Some(workspace) = workspace.upgrade() {
+                        if let Err(err) = workspace.update_in(cx, |workspace, window, cx| {
+                            git_ui::branch_diff::BranchDiff::deploy_branch_diff_with_base_ref(
+                                workspace, project, task_repo, base_ref, None, window, cx,
+                            );
+                        }) {
+                            log::warn!("failed to deploy branch diff in workspace: {err:?}");
+                        }
+                    }
+                })
+                .detach();
+            }
+        }));
+
+        let remove_worktree_btn = IconButton::new(
+            SharedString::from(format!("remove-worktree-{}", task.id)),
+            IconName::Eraser,
+        )
+        .icon_size(IconSize::Small)
+        .disabled(!has_worktree)
+        .tooltip(if has_worktree {
+            Tooltip::text("Remove Task Worktree from Disk")
+        } else {
+            Tooltip::text("Worktree does not exist on disk")
+        })
+        .on_click(cx.listener({
+            let task_id = task.id.clone();
+            move |this, _event, _window, cx| {
+                cx.stop_propagation();
+                if !has_worktree {
+                    return;
+                }
+                let project = this.project.clone();
+                let task_id_for_async = task_id.clone();
+                let remove_task = agent::task_worktree::remove_task_worktree(project, &task_id, cx);
+                cx.spawn(async move |this, cx| {
+                    if let Err(e) = remove_task.await {
+                        log::warn!("Failed to remove worktree for {task_id_for_async}: {e}");
+                    }
+                    this.update(cx, |this, cx| {
+                        this.refresh_worktree_status(cx);
+                    })
+                    .ok();
+                })
+                .detach();
+            }
+        }));
+
+        h_flex()
             .id(SharedString::from(format!("task-node-{}", task.id)))
             .debug_selector({
                 let task_id = task.id.clone();
@@ -301,7 +1018,7 @@ impl AgentTaskPanel {
                                 .color(Color::Muted),
                         )
                     })
-                    .child(render_status_icon(task.status))
+                    .child(render_status_icon(&task.status))
                     .when_some(task.assignee.as_ref(), |this, assignee| {
                         this.child(
                             Label::new(format!("[{assignee}]"))
@@ -335,6 +1052,33 @@ impl AgentTaskPanel {
                                 .tooltip(Tooltip::text(denied_message)),
                         )
                     })
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("open-worktree-{}", task.id)))
+                            .debug_selector({
+                                let task_id = task.id.clone();
+                                move || format!("open-worktree-{}", task_id)
+                            })
+                            .child(open_worktree_btn),
+                    )
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("diff-task-{}", task.id)))
+                            .debug_selector({
+                                let task_id = task.id.clone();
+                                move || format!("diff-task-{}", task_id)
+                            })
+                            .child(diff_btn),
+                    )
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("remove-worktree-{}", task.id)))
+                            .debug_selector({
+                                let task_id = task.id.clone();
+                                move || format!("remove-worktree-{}", task_id)
+                            })
+                            .child(remove_worktree_btn),
+                    )
                     .when(task.status != AgentTaskStatus::Archived, |this| {
                         let task_id = task.id.clone();
                         this.child(
@@ -400,206 +1144,8 @@ impl AgentTaskPanel {
                 move |this, _event, window, cx| {
                     this.select_task(task_id.clone(), window, cx);
                 }
-            }));
-
-        let goal_summary = agent::task_worktree::goal_branch_summary_for_task(&task.id);
-        let has_worktree = agent::task_worktree::task_worktree_path_for_id(&task.id).is_some();
-
-        let goal_row = if let Some(summary) = goal_summary.as_ref() {
-            let short_sha = summary
-                .tip_sha
-                .as_deref()
-                .map(|sha| &sha[..7.min(sha.len())])
-                .unwrap_or("none");
-            let goal_id = summary.goal_id.clone();
-            let has_active_sibling_tasks = agent::task_worktree::goal_has_active_tasks(&goal_id);
-            let is_terminal = task.status.is_terminal()
-                || agent::task_worktree::get_goal_graduation_summary(&goal_id).is_some();
-            let project = self.project.clone();
-            let task_id_clone = task.id.clone();
-
-            Some(
-                h_flex()
-                    .w_full()
-                    .pl_6()
-                    .pr_2()
-                    .py_0p5()
-                    .gap_2()
-                    .items_center()
-                    .justify_between()
-                    .child(
-                        h_flex()
-                            .gap_1p5()
-                            .items_center()
-                            .child(
-                                Label::new(format!("goal: {}", summary.branch))
-                                    .size(LabelSize::Small)
-                                    .color(Color::Accent),
-                            )
-                            .child(
-                                Label::new(format!("[{short_sha}]"))
-                                    .size(LabelSize::Small)
-                                    .color(Color::Muted),
-                            )
-                            .child(
-                                Label::new(format!("{} merged", summary.merged_tasks_count))
-                                    .size(LabelSize::Small)
-                                    .color(Color::Muted),
-                            )
-                            .when(summary.has_conflict, |this| {
-                                this.child(
-                                    Label::new("conflict")
-                                        .size(LabelSize::Small)
-                                        .color(Color::Error),
-                                )
-                            })
-                            .when_some(
-                                self.goal_cleanup_result
-                                    .as_ref()
-                                    .filter(|res| res.goal_id == goal_id),
-                                |this, res| {
-                                    let summary_text = if res.failed_branches.is_empty() {
-                                        format!("Cleaned ({} deleted)", res.deleted_branches.len())
-                                    } else {
-                                        format!(
-                                            "Cleaned ({} deleted, {} failed)",
-                                            res.deleted_branches.len(),
-                                            res.failed_branches.len()
-                                        )
-                                    };
-                                    let color = if res.failed_branches.is_empty() {
-                                        Color::Success
-                                    } else {
-                                        Color::Warning
-                                    };
-                                    this.child(
-                                        Label::new(summary_text)
-                                            .size(LabelSize::Small)
-                                            .color(color),
-                                    )
-                                },
-                            ),
-                    )
-                    .child(
-                        h_flex()
-                            .gap_1()
-                            .items_center()
-                            .when(has_worktree, |this| {
-                                let project = project.clone();
-                                let task_id = task_id_clone.clone();
-                                this.child(
-                                    Button::new(
-                                        SharedString::from(format!("remove-worktree-{}", task_id)),
-                                        "Remove Worktree",
-                                    )
-                                    .style(ButtonStyle::Subtle)
-                                    .label_size(LabelSize::Small)
-                                    .on_click(cx.listener(
-                                        move |_this, _event, _window, cx| {
-                                            agent::task_worktree::remove_task_worktree(
-                                                project.clone(),
-                                                &task_id,
-                                                cx,
-                                            )
-                                            .detach_and_log_err(cx);
-                                        },
-                                    )),
-                                )
-                            })
-                            .when(is_terminal, |this| {
-                                let project = project.clone();
-                                let goal_id = goal_id.clone();
-                                this.child(
-                                    Button::new(
-                                        SharedString::from(format!("cleanup-goal-{}", task.id)),
-                                        "Cleanup Goal Branches",
-                                    )
-                                    .style(ButtonStyle::Subtle)
-                                    .label_size(LabelSize::Small)
-                                    .disabled(has_active_sibling_tasks)
-                                    .tooltip(if has_active_sibling_tasks {
-                                        Tooltip::text("Cannot clean up goal: sibling tasks are still active")
-                                    } else {
-                                        Tooltip::text("Clean up goal branch and all associated task branches")
-                                    })
-                                    .on_click(cx.listener(
-                                        move |_this, _event, _window, cx| {
-                                            if agent::task_worktree::goal_has_active_tasks(&goal_id) {
-                                                log::warn!(
-                                                    "Cannot clean up goal {goal_id}: sibling tasks still running"
-                                                );
-                                                return;
-                                            }
-                                            let goal_id_for_async = goal_id.clone();
-                                            let cleanup_task =
-                                                agent::task_worktree::cleanup_graduated_goal(
-                                                    project.clone(),
-                                                    &goal_id,
-                                                    cx,
-                                                );
-                                            cx.spawn(async move |this, cx| {
-                                                match cleanup_task.await {
-                                                    Ok(result) => {
-                                                        log::info!(
-                                                            "Cleaned up goal {}: {} branches deleted, {} failed",
-                                                            result.goal_id,
-                                                            result.deleted_branches.len(),
-                                                            result.failed_branches.len()
-                                                        );
-                                                        this.update(cx, |this, cx| {
-                                                            this.goal_cleanup_result = Some(result);
-                                                            cx.notify();
-                                                        })
-                                                        .ok();
-                                                    }
-                                                    Err(e) => {
-                                                        log::warn!(
-                                                            "Failed to clean up goal {goal_id_for_async}: {e}"
-                                                        );
-                                                    }
-                                                }
-                                            })
-                                            .detach();
-                                        },
-                                    )),
-                                )
-                            }),
-                    ),
-            )
-        } else if has_worktree {
-            let project = self.project.clone();
-            let task_id = task.id.clone();
-            Some(
-                h_flex()
-                    .w_full()
-                    .pl_6()
-                    .pr_2()
-                    .py_0p5()
-                    .justify_end()
-                    .child(
-                        Button::new(
-                            SharedString::from(format!("remove-worktree-{}", task.id)),
-                            "Remove Worktree",
-                        )
-                        .style(ButtonStyle::Subtle)
-                        .label_size(LabelSize::Small)
-                        .on_click(cx.listener(
-                            move |_this, _event, _window, cx| {
-                                agent::task_worktree::remove_task_worktree(
-                                    project.clone(),
-                                    &task_id,
-                                    cx,
-                                )
-                                .detach_and_log_err(cx);
-                            },
-                        )),
-                    ),
-            )
-        } else {
-            None
-        };
-
-        v_flex().w_full().child(task_element).children(goal_row)
+            }))
+            .into_any_element()
     }
 }
 
@@ -682,6 +1228,11 @@ impl Render for AgentTaskPanel {
         let store = self.store.read(cx);
         let is_offline = store.is_offline();
         let last_error = store.last_error().map(|error| error.to_string());
+        let worktree_last_error = self
+            .worktree_status
+            .read(cx)
+            .last_error()
+            .map(|error| error.to_string());
 
         let mut key_context = KeyContext::new_with_defaults();
         key_context.add("AgentTaskPanel");
@@ -727,17 +1278,41 @@ impl Render for AgentTaskPanel {
                                             cx,
                                             move |menu, _window, cx| {
                                                 let mut menu = menu;
-                                                let current_filters = view
+                                                let (current_filters, other_statuses) = view
                                                     .upgrade()
-                                                    .map(|v| v.read(cx).status_filters.clone())
+                                                    .map(|v| {
+                                                        let panel = v.read(cx);
+                                                        let mut others = Vec::new();
+                                                        for task in
+                                                            &panel.store.read(cx).graph().tasks
+                                                        {
+                                                            if let AgentTaskStatus::Other(_) =
+                                                                &task.status
+                                                            {
+                                                                if !others.contains(&task.status) {
+                                                                    others
+                                                                        .push(task.status.clone());
+                                                                }
+                                                            }
+                                                        }
+                                                        others.sort_by(|a, b| {
+                                                            a.as_str().cmp(b.as_str())
+                                                        });
+                                                        (panel.status_filters.clone(), others)
+                                                    })
                                                     .unwrap_or_default();
 
-                                                for status in ALL_TASK_STATUSES {
+                                                let mut all_statuses: Vec<AgentTaskStatus> =
+                                                    ALL_TASK_STATUSES.to_vec();
+                                                all_statuses.extend(other_statuses);
+
+                                                for status in all_statuses {
                                                     let is_selected =
                                                         current_filters.contains(&status);
                                                     let view = view.clone();
+                                                    let filter_status = status.clone();
                                                     menu = menu.toggleable_entry(
-                                                        status_label(status),
+                                                        status_label(&status),
                                                         is_selected,
                                                         IconPosition::Start,
                                                         None,
@@ -745,13 +1320,14 @@ impl Render for AgentTaskPanel {
                                                             view.update(cx, |this, cx| {
                                                                 if this
                                                                     .status_filters
-                                                                    .contains(&status)
+                                                                    .contains(&filter_status)
                                                                 {
                                                                     this.status_filters
-                                                                        .remove(&status);
+                                                                        .remove(&filter_status);
                                                                 } else {
-                                                                    this.status_filters
-                                                                        .insert(status);
+                                                                    this.status_filters.insert(
+                                                                        filter_status.clone(),
+                                                                    );
                                                                 }
                                                                 cx.notify();
                                                             })
@@ -774,6 +1350,7 @@ impl Render for AgentTaskPanel {
                                         store
                                             .update(cx, |store, cx| store.refresh(cx))
                                             .detach_and_log_err(cx);
+                                        this.refresh_worktree_status(cx);
                                     })),
                             ),
                     ),
@@ -800,6 +1377,28 @@ impl Render for AgentTaskPanel {
                         ),
                 )
             })
+            .when_some(worktree_last_error, |this, error_msg| {
+                this.child(
+                    h_flex()
+                        .id("worktree_status_error_banner")
+                        .debug_selector(|| "worktree_status_error_banner".to_string())
+                        .px_3()
+                        .py_2()
+                        .bg(cx.theme().status().warning_background)
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            Icon::new(IconName::Warning)
+                                .size(IconSize::Small)
+                                .color(Color::Warning),
+                        )
+                        .child(
+                            Label::new(error_msg)
+                                .size(LabelSize::Small)
+                                .color(Color::Warning),
+                        ),
+                )
+            })
             .child(
                 v_flex()
                     .id("agent_tasks_scroll_container")
@@ -810,7 +1409,7 @@ impl Render for AgentTaskPanel {
     }
 }
 
-pub fn status_color(status: AgentTaskStatus) -> Color {
+pub fn status_color(status: &AgentTaskStatus) -> Color {
     match status {
         AgentTaskStatus::Ready => Color::Muted,
         AgentTaskStatus::Blocked => Color::Warning,
@@ -819,11 +1418,11 @@ pub fn status_color(status: AgentTaskStatus) -> Color {
         AgentTaskStatus::Review => Color::Accent,
         AgentTaskStatus::Completed => Color::Success,
         AgentTaskStatus::Failed => Color::Error,
-        AgentTaskStatus::Archived => Color::Muted,
+        AgentTaskStatus::Archived | AgentTaskStatus::Other(_) => Color::Muted,
     }
 }
 
-pub fn status_icon(status: AgentTaskStatus) -> IconName {
+pub fn status_icon(status: &AgentTaskStatus) -> IconName {
     match status {
         AgentTaskStatus::Ready => IconName::Circle,
         AgentTaskStatus::Blocked => IconName::Stop,
@@ -833,16 +1432,17 @@ pub fn status_icon(status: AgentTaskStatus) -> IconName {
         AgentTaskStatus::Completed => IconName::Check,
         AgentTaskStatus::Failed => IconName::Close,
         AgentTaskStatus::Archived => IconName::Archive,
+        AgentTaskStatus::Other(_) => IconName::Circle,
     }
 }
 
-pub fn render_status_icon(status: AgentTaskStatus) -> impl IntoElement {
+pub fn render_status_icon(status: &AgentTaskStatus) -> impl IntoElement {
     Icon::new(status_icon(status))
         .size(IconSize::Small)
         .color(status_color(status))
 }
 
-pub fn status_label(status: AgentTaskStatus) -> &'static str {
+pub fn status_label(status: &AgentTaskStatus) -> &str {
     match status {
         AgentTaskStatus::Ready => "Ready",
         AgentTaskStatus::Blocked => "Blocked",
@@ -852,16 +1452,18 @@ pub fn status_label(status: AgentTaskStatus) -> &'static str {
         AgentTaskStatus::Completed => "Completed",
         AgentTaskStatus::Failed => "Failed",
         AgentTaskStatus::Archived => "Archived",
+        AgentTaskStatus::Other(name) => name.as_ref(),
     }
 }
 
-pub fn event_kind_name(kind: AgentTaskEventKind) -> &'static str {
+pub fn event_kind_name(kind: &AgentTaskEventKind) -> &str {
     match kind {
         AgentTaskEventKind::Info => "INFO",
         AgentTaskEventKind::ToolCall => "TOOL",
         AgentTaskEventKind::PolicyDenied => "DENIED",
         AgentTaskEventKind::StatusChanged => "STATUS",
         AgentTaskEventKind::ReviewVerdict => "REVIEW",
+        AgentTaskEventKind::Other(name) => name.as_ref(),
     }
 }
 
@@ -875,113 +1477,89 @@ pub fn format_task_editor_title(id: &AgentTaskId, title: &str) -> String {
     }
 }
 
-pub fn render_task_markdown(detail: &AgentTaskDetail, artifacts: &[AgentTaskArtifact]) -> String {
+pub fn render_task_markdown(
+    detail: &AgentTaskDetail,
+    artifacts: &[AgentTaskArtifact],
+    goal: Option<&AgentGoalSummary>,
+    goal_git: Option<&GoalGitState>,
+) -> String {
     let mut doc = String::new();
+    doc.push_str(&format!("# {}\n\n", detail.summary.title));
     doc.push_str(&format!(
-        "# {}
-
-",
-        detail.summary.title
+        "- **Status:** {}\n",
+        status_label(&detail.summary.status)
     ));
-    doc.push_str(&format!(
-        "- **Status:** {}
-",
-        status_label(detail.summary.status)
-    ));
-    doc.push_str(&format!(
-        "- **Task ID:** {}
-",
-        detail.summary.id
-    ));
+    doc.push_str(&format!("- **Task ID:** {}\n", detail.summary.id));
     if let Some(assignee) = &detail.summary.assignee {
-        doc.push_str(&format!(
-            "- **Assignee:** {}
-",
-            assignee
-        ));
+        doc.push_str(&format!("- **Assignee:** {}\n", assignee));
     }
     if detail.summary.attempt > 1 {
-        doc.push_str(&format!(
-            "- **Attempt:** {}
-",
-            detail.summary.attempt
-        ));
+        doc.push_str(&format!("- **Attempt:** {}\n", detail.summary.attempt));
     }
 
-    doc.push_str(
-        "
-## Description
-
-",
-    );
+    doc.push_str("\n## Description\n\n");
     doc.push_str(detail.description.trim_end());
-    doc.push_str(
-        "
-",
-    );
+    doc.push_str("\n\n");
 
     if !detail.acceptance_criteria.is_empty() {
-        doc.push_str(
-            "
-## Acceptance Criteria
-
-",
-        );
+        doc.push_str("\n## Acceptance Criteria\n\n");
         for criterion in &detail.acceptance_criteria {
-            doc.push_str(&format!(
-                "- [ ] {}
-",
-                criterion
-            ));
+            doc.push_str(&format!("- [ ] {}\n", criterion));
         }
     }
 
     if !artifacts.is_empty() {
-        doc.push_str(
-            "
-## Artifacts
-
-",
-        );
+        doc.push_str("\n## Artifacts\n\n");
         for (index, artifact) in artifacts.iter().enumerate() {
             if index > 0 {
-                doc.push_str(
-                    "
-",
-                );
+                doc.push_str("\n\n");
             }
-            doc.push_str(&format!(
-                "### {} — {}
-
-",
-                artifact.kind, artifact.id
-            ));
+            doc.push_str(&format!("### {} — {}\n\n", artifact.kind, artifact.id));
             doc.push_str(artifact.content.trim_end());
-            doc.push_str(
-                "
-",
-            );
+            doc.push_str("\n\n");
         }
     }
 
-    if let Some(summary) = agent::task_worktree::goal_branch_summary_for_task(&detail.summary.id) {
+    let task_ref: Option<agent::task_worktree::TaskRefArtifact> = artifacts
+        .iter()
+        .filter(|a| a.kind == "task_ref")
+        .find_map(|a| serde_json::from_str(&a.content).ok());
+
+    let conflict_files = task_ref
+        .as_ref()
+        .and_then(|tr| tr.merge_conflict.clone())
+        .unwrap_or_default();
+
+    if goal.is_some() || goal_git.is_some() || task_ref.is_some() {
         doc.push_str("\n## Goal Branch\n\n");
-        doc.push_str(&format!("- **Branch:** `{}`\n", summary.branch));
-        if let Some(sha) = &summary.tip_sha {
+        let branch_name = if let Some(git) = goal_git {
+            Some(git.branch.clone())
+        } else if let Some(g) = goal {
+            Some(format!("agent-goal/{}", g.goal_id))
+        } else {
+            task_ref.as_ref().map(|tr| tr.branch.clone())
+        };
+        if let Some(branch) = branch_name {
+            doc.push_str(&format!("- **Branch:** `{}`\n", branch));
+        }
+        let tip_sha = goal_git
+            .and_then(|g| g.tip_sha.as_deref())
+            .or_else(|| task_ref.as_ref().and_then(|tr| tr.head_sha.as_deref()));
+        if let Some(sha) = tip_sha {
             let short_sha = &sha[..7.min(sha.len())];
             doc.push_str(&format!("- **Tip SHA:** `{short_sha}` ({sha})\n"));
         }
-        doc.push_str(&format!(
-            "- **Merged tasks:** {}\n",
-            summary.merged_tasks_count
-        ));
-        if summary.has_conflict {
+        if let Some(g) = goal {
+            doc.push_str(&format!(
+                "- **Tasks:** {}/{}\n",
+                g.tasks_done, g.tasks_total
+            ));
+        }
+        if !conflict_files.is_empty() {
             doc.push_str("- **Status:** ⚠️ Merge conflict detected\n");
-            if let Some(files) = &summary.conflicts {
-                doc.push_str("  - Conflicting files:\n");
-                for f in files {
-                    doc.push_str(&format!("    - `{f}`\n"));
-                }
+            doc.push_str("  - Conflicting files:\n");
+            for f in &conflict_files {
+                doc.push_str(&format!("    - `{f}`\n"));
             }
         }
     }
@@ -994,7 +1572,7 @@ pub fn render_task_markdown(detail: &AgentTaskDetail, artifacts: &[AgentTaskArti
 ",
         );
         for event in &detail.events_tail {
-            let kind = event_kind_name(event.kind);
+            let kind = event_kind_name(&event.kind);
             doc.push_str(&format!(
                 "- `#{}` [{}] {}
 ",
@@ -1090,14 +1668,18 @@ pub struct TaskRow {
     pub depth: usize,
 }
 
-pub fn build_task_rows<'a>(
-    tasks: &[AgentTaskSummary],
-    events: impl IntoIterator<Item = &'a AgentTaskEvent>,
-    status_filters: &HashSet<AgentTaskStatus>,
+#[derive(Debug, Clone, PartialEq)]
+pub struct GoalGroup {
+    pub goal_id: Option<String>,
+    pub goal_summary: Option<AgentGoalSummary>,
+    pub rows: Vec<TaskRow>,
+}
+
+pub fn build_task_tree_rows(
+    visible_tasks: &[AgentTaskSummary],
+    timestamps: &HashMap<AgentTaskId, u64>,
 ) -> Vec<TaskRow> {
-    let timestamps = compute_task_creation_timestamps(events);
-    let visible = filter_visible_tasks(tasks, status_filters);
-    let roots = visible_roots(&visible, &timestamps);
+    let roots = visible_roots(visible_tasks, timestamps);
     let mut rows = Vec::new();
     let mut visited = HashSet::new();
 
@@ -1153,8 +1735,8 @@ pub fn build_task_rows<'a>(
     for root in roots {
         collect_node(
             root,
-            &visible,
-            &timestamps,
+            visible_tasks,
+            timestamps,
             "",
             "",
             0,
@@ -1166,15 +1748,88 @@ pub fn build_task_rows<'a>(
     rows
 }
 
+pub fn build_goal_groups<'a>(
+    tasks: &[AgentTaskSummary],
+    goals: &[AgentGoalSummary],
+    events: impl IntoIterator<Item = &'a AgentTaskEvent>,
+    status_filters: &HashSet<AgentTaskStatus>,
+) -> Vec<GoalGroup> {
+    let timestamps = compute_task_creation_timestamps(events);
+    let visible = filter_visible_tasks(tasks, status_filters);
+
+    let goals_by_id: HashMap<&str, &AgentGoalSummary> =
+        goals.iter().map(|g| (g.goal_id.as_str(), g)).collect();
+
+    let mut tasks_by_goal: HashMap<Option<String>, Vec<AgentTaskSummary>> = HashMap::new();
+    for task in visible {
+        tasks_by_goal
+            .entry(task.goal_id.clone())
+            .or_default()
+            .push(task);
+    }
+
+    let mut all_goal_ids: HashSet<String> = goals.iter().map(|g| g.goal_id.clone()).collect();
+    for id in tasks_by_goal.keys().flatten() {
+        all_goal_ids.insert(id.clone());
+    }
+
+    let mut sorted_goal_ids: Vec<String> = all_goal_ids.into_iter().collect();
+    sorted_goal_ids.sort_by(|a, b| {
+        let prio_a = goals_by_id.get(a.as_str()).map_or(i64::MAX, |g| g.priority);
+        let prio_b = goals_by_id.get(b.as_str()).map_or(i64::MAX, |g| g.priority);
+        prio_a.cmp(&prio_b).then_with(|| a.cmp(b))
+    });
+
+    let mut result = Vec::new();
+    for goal_id in sorted_goal_ids {
+        let summary = goals_by_id.get(goal_id.as_str()).copied().cloned();
+        let goal_tasks = tasks_by_goal
+            .remove(&Some(goal_id.clone()))
+            .unwrap_or_default();
+        let rows = build_task_tree_rows(&goal_tasks, &timestamps);
+        result.push(GoalGroup {
+            goal_id: Some(goal_id),
+            goal_summary: summary,
+            rows,
+        });
+    }
+
+    if let Some(no_goal_tasks) = tasks_by_goal.remove(&None) {
+        if !no_goal_tasks.is_empty() {
+            let rows = build_task_tree_rows(&no_goal_tasks, &timestamps);
+            result.push(GoalGroup {
+                goal_id: None,
+                goal_summary: None,
+                rows,
+            });
+        }
+    }
+
+    result
+}
+
+#[allow(dead_code)]
+pub fn build_task_rows<'a>(
+    tasks: &[AgentTaskSummary],
+    events: impl IntoIterator<Item = &'a AgentTaskEvent>,
+    status_filters: &HashSet<AgentTaskStatus>,
+) -> Vec<TaskRow> {
+    let timestamps = compute_task_creation_timestamps(events);
+    let visible = filter_visible_tasks(tasks, status_filters);
+    build_task_tree_rows(&visible, &timestamps)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent::{AgentTaskEvent, AgentTaskGraph, AgentTaskProvider, AgentTaskStatus};
+    use agent::{AgentTaskEvent, AgentTaskGraph, AgentTaskProvider, AgentTaskStatus, TaskGitState};
     use context_server::ContextServerId;
     use fs::FakeFs;
+    use git_ui::branch_diff::BranchDiff;
     use gpui::TestAppContext;
     use project::Project;
     use settings::SettingsStore;
+    use workspace::{Item, MultiWorkspace};
 
     #[derive(Default)]
     struct CallCounts {
@@ -1186,6 +1841,7 @@ mod tests {
     struct TestProvider {
         offline: bool,
         tasks: Vec<AgentTaskSummary>,
+        goals: Vec<AgentGoalSummary>,
         events: Vec<AgentTaskEvent>,
         calls: Arc<std::sync::Mutex<CallCounts>>,
     }
@@ -1194,15 +1850,46 @@ mod tests {
         fn default() -> Self {
             Self {
                 offline: false,
-                tasks: vec![AgentTaskSummary {
-                    id: AgentTaskId::from("TASK-1"),
-                    parent_id: None,
-                    title: "Test Task".to_string(),
-                    status: AgentTaskStatus::Ready,
-                    attempt: 1,
-                    assignee: None,
-                    write_scopes: vec![],
-                }],
+                goals: vec![
+                    AgentGoalSummary {
+                        goal_id: "GOAL-1".to_string(),
+                        title: "Goal 1".to_string(),
+                        status: "active".to_string(),
+                        priority: 1,
+                        tasks_total: 1,
+                        tasks_done: 0,
+                    },
+                    AgentGoalSummary {
+                        goal_id: "GOAL-2".to_string(),
+                        title: "Goal 2".to_string(),
+                        status: "active".to_string(),
+                        priority: 2,
+                        tasks_total: 0,
+                        tasks_done: 0,
+                    },
+                ],
+                tasks: vec![
+                    AgentTaskSummary {
+                        id: AgentTaskId::from("TASK-1"),
+                        parent_id: None,
+                        goal_id: Some("GOAL-1".to_string()),
+                        title: "Test Task".to_string(),
+                        status: AgentTaskStatus::Ready,
+                        attempt: 1,
+                        assignee: None,
+                        write_scopes: vec![],
+                    },
+                    AgentTaskSummary {
+                        id: AgentTaskId::from("TASK-2"),
+                        parent_id: None,
+                        goal_id: None,
+                        title: "No Goal Task".to_string(),
+                        status: AgentTaskStatus::Ready,
+                        attempt: 1,
+                        assignee: None,
+                        write_scopes: vec![],
+                    },
+                ],
                 events: vec![],
                 calls: Arc::new(std::sync::Mutex::new(CallCounts::default())),
             }
@@ -1220,6 +1907,7 @@ mod tests {
             } else {
                 Task::ready(Ok(AgentTaskGraph {
                     tasks: self.tasks.clone(),
+                    goals: self.goals.clone(),
                 }))
             }
         }
@@ -1237,6 +1925,7 @@ mod tests {
                 .unwrap_or_else(|| AgentTaskSummary {
                     id: id.clone(),
                     parent_id: None,
+                    goal_id: None,
                     title: "Test Task".to_string(),
                     status: AgentTaskStatus::Ready,
                     attempt: 1,
@@ -1353,7 +2042,8 @@ mod tests {
         panel.read_with(cx, |panel, cx| {
             let store = panel.store.read(cx);
             assert!(!store.is_offline());
-            assert_eq!(store.graph().tasks.len(), 1);
+            assert_eq!(store.graph().tasks.len(), 2);
+            assert_eq!(store.graph().goals.len(), 2);
             assert_eq!(store.graph().tasks[0].id.0.as_ref(), "TASK-1");
         });
 
@@ -1419,6 +2109,7 @@ mod tests {
         let root_completed = AgentTaskSummary {
             id: AgentTaskId::from("TASK-COMPLETED"),
             parent_id: None,
+            goal_id: None,
             title: "Completed Root".to_string(),
             status: AgentTaskStatus::Completed,
             attempt: 1,
@@ -1428,6 +2119,7 @@ mod tests {
         let child_failed = AgentTaskSummary {
             id: AgentTaskId::from("TASK-FAILED-CHILD"),
             parent_id: Some(AgentTaskId::from("TASK-COMPLETED")),
+            goal_id: None,
             title: "Failed Child".to_string(),
             status: AgentTaskStatus::Failed,
             attempt: 1,
@@ -1437,6 +2129,7 @@ mod tests {
         let standalone_ready = AgentTaskSummary {
             id: AgentTaskId::from("TASK-READY"),
             parent_id: None,
+            goal_id: None,
             title: "Ready Standalone".to_string(),
             status: AgentTaskStatus::Ready,
             attempt: 1,
@@ -1448,6 +2141,7 @@ mod tests {
         let provider = Arc::new(TestProvider {
             offline: false,
             tasks,
+            goals: vec![],
             events: vec![],
             ..Default::default()
         });
@@ -1533,6 +2227,7 @@ mod tests {
         let task_a = AgentTaskSummary {
             id: AgentTaskId::from("TASK-A"),
             parent_id: None,
+            goal_id: None,
             title: "Task A".to_string(),
             status: AgentTaskStatus::Ready,
             attempt: 1,
@@ -1542,6 +2237,7 @@ mod tests {
         let task_b = AgentTaskSummary {
             id: AgentTaskId::from("TASK-B"),
             parent_id: None,
+            goal_id: None,
             title: "Task B".to_string(),
             status: AgentTaskStatus::Running,
             attempt: 1,
@@ -1551,6 +2247,7 @@ mod tests {
         let task_b_child_1 = AgentTaskSummary {
             id: AgentTaskId::from("TASK-B-CHILD-1"),
             parent_id: Some(AgentTaskId::from("TASK-B")),
+            goal_id: None,
             title: "Task B Child 1".to_string(),
             status: AgentTaskStatus::Running,
             attempt: 1,
@@ -1560,6 +2257,7 @@ mod tests {
         let task_b_grandchild = AgentTaskSummary {
             id: AgentTaskId::from("TASK-B-GRANDCHILD"),
             parent_id: Some(AgentTaskId::from("TASK-B-CHILD-1")),
+            goal_id: None,
             title: "Task B Grandchild".to_string(),
             status: AgentTaskStatus::Ready,
             attempt: 1,
@@ -1569,6 +2267,7 @@ mod tests {
         let task_b_child_2 = AgentTaskSummary {
             id: AgentTaskId::from("TASK-B-CHILD-2"),
             parent_id: Some(AgentTaskId::from("TASK-B")),
+            goal_id: None,
             title: "Task B Child 2".to_string(),
             status: AgentTaskStatus::Ready,
             attempt: 1,
@@ -1578,6 +2277,7 @@ mod tests {
         let task_c = AgentTaskSummary {
             id: AgentTaskId::from("TASK-C"),
             parent_id: None,
+            goal_id: None,
             title: "Task C".to_string(),
             status: AgentTaskStatus::Blocked,
             attempt: 1,
@@ -1587,6 +2287,7 @@ mod tests {
         let task_no_events = AgentTaskSummary {
             id: AgentTaskId::from("TASK-NO-EVENTS"),
             parent_id: None,
+            goal_id: None,
             title: "Task No Events".to_string(),
             status: AgentTaskStatus::Ready,
             attempt: 1,
@@ -1678,6 +2379,7 @@ mod tests {
             summary: AgentTaskSummary {
                 id: AgentTaskId::from("TASK-35"),
                 parent_id: None,
+                goal_id: None,
                 title: "Rework Task Panel".to_string(),
                 status: AgentTaskStatus::Running,
                 attempt: 2,
@@ -1714,7 +2416,7 @@ mod tests {
             content: "LGTM approved".to_string(),
         }];
 
-        let md = render_task_markdown(&detail, &artifacts);
+        let md = render_task_markdown(&detail, &artifacts, None, None);
         assert!(md.contains("# Rework Task Panel"));
         assert!(md.contains("- **Status:** Running"));
         assert!(md.contains("- **Task ID:** TASK-35"));
@@ -1742,6 +2444,7 @@ LGTM approved"
             summary: AgentTaskSummary {
                 id: AgentTaskId::from("TASK-1"),
                 parent_id: None,
+                goal_id: None,
                 title: "Simple Task".to_string(),
                 status: AgentTaskStatus::Ready,
                 attempt: 1,
@@ -1752,7 +2455,7 @@ LGTM approved"
             acceptance_criteria: vec![],
             events_tail: vec![],
         };
-        let minimal_md = render_task_markdown(&minimal_detail, &[]);
+        let minimal_md = render_task_markdown(&minimal_detail, &[], None, None);
         assert!(minimal_md.contains("# Simple Task"));
         assert!(minimal_md.contains("- **Status:** Ready"));
         assert!(minimal_md.contains("- **Task ID:** TASK-1"));
@@ -1776,30 +2479,29 @@ LGTM approved"
     }
 
     #[test]
-    fn test_agent_task_panel_renders_goal_row_and_markdown() {
+    fn test_agent_task_panel_renders_goal_markdown_and_conflict() {
         let task_id = AgentTaskId::from("TASK-GOAL-ROW");
         let goal_id = "GOAL-UI-1";
-        agent::task_worktree::register_task_worktree_policy(
-            &task_id,
-            std::path::PathBuf::from("/tmp/fake"),
-            Some(format!("agent-goal/{goal_id}")),
-            None,
-            None,
-            None,
-        );
-        agent::task_worktree::record_goal_tip_sha(goal_id, "1234567890abcdef".to_string());
 
-        let summary = agent::task_worktree::goal_branch_summary_for_task(&task_id)
-            .expect("must produce goal branch summary");
-        assert_eq!(summary.branch, "agent-goal/GOAL-UI-1");
-        assert_eq!(summary.tip_sha, Some("1234567890abcdef".to_string()));
-        assert_eq!(summary.merged_tasks_count, 0);
-        assert!(!summary.has_conflict);
+        let goal_summary = AgentGoalSummary {
+            goal_id: goal_id.to_string(),
+            title: "Goal UI 1".to_string(),
+            status: "active".to_string(),
+            priority: 1,
+            tasks_total: 2,
+            tasks_done: 0,
+        };
+        let goal_git = GoalGitState {
+            branch: format!("agent-goal/{goal_id}"),
+            branch_exists: true,
+            tip_sha: Some("1234567890abcdef".to_string()),
+        };
 
         let detail = AgentTaskDetail {
             summary: AgentTaskSummary {
                 id: task_id.clone(),
                 parent_id: None,
+                goal_id: Some(goal_id.to_string()),
                 title: "Goal Row Task".to_string(),
                 status: AgentTaskStatus::Ready,
                 attempt: 1,
@@ -1811,47 +2513,42 @@ LGTM approved"
             events_tail: vec![],
         };
 
-        let md = render_task_markdown(&detail, &[]);
+        let md = render_task_markdown(&detail, &[], Some(&goal_summary), Some(&goal_git));
         assert!(md.contains("## Goal Branch"));
         assert!(md.contains("- **Branch:** `agent-goal/GOAL-UI-1`"));
         assert!(md.contains("- **Tip SHA:** `1234567` (1234567890abcdef)"));
-        assert!(md.contains("- **Merged tasks:** 0"));
+        assert!(md.contains("- **Tasks:** 0/2"));
         assert!(!md.contains("Merge conflict detected"));
 
-        // When conflict is recorded
-        agent::task_worktree::record_task_worktree_merge_conflict(
-            &task_id,
-            vec!["src/main.rs".to_string()],
-        );
-        let summary_conf = agent::task_worktree::goal_branch_summary_for_task(&task_id).unwrap();
-        assert!(summary_conf.has_conflict);
-        assert_eq!(
-            summary_conf.conflicts,
-            Some(vec!["src/main.rs".to_string()])
-        );
+        // When task_ref artifact contains merge conflict
+        let conflict_artifact = AgentTaskArtifact {
+            id: "art-task-ref".to_string(),
+            task_id,
+            kind: "task_ref".to_string(),
+            content: serde_json::to_string(&agent::task_worktree::TaskRefArtifact {
+                branch: "agent/TASK-GOAL-ROW".to_string(),
+                head_sha: Some("abcdef123456".to_string()),
+                merged_into: None,
+                merge_conflict: Some(vec!["src/main.rs".to_string()]),
+            })
+            .unwrap(),
+        };
 
-        let md_conf = render_task_markdown(&detail, &[]);
+        let md_conf = render_task_markdown(
+            &detail,
+            &[conflict_artifact],
+            Some(&goal_summary),
+            Some(&goal_git),
+        );
         assert!(md_conf.contains("- **Status:** ⚠️ Merge conflict detected"));
         assert!(md_conf.contains("`src/main.rs`"));
     }
 
     #[gpui::test]
-    async fn test_agent_task_panel_renders_goal_row_in_tree(cx: &mut TestAppContext) {
+    async fn test_agent_task_panel_goal_grouping_and_collapse(cx: &mut TestAppContext) {
         init_test(cx);
         let file_system = FakeFs::new(cx.executor());
         let project = Project::test(file_system.clone(), [], cx).await;
-
-        let task_id = AgentTaskId::from("TASK-1");
-        agent::task_worktree::register_task_worktree_policy(
-            &task_id,
-            std::path::PathBuf::from("/fake/wt"),
-            Some("agent-goal/GOAL-TEST".to_string()),
-            None,
-            None,
-            None,
-        );
-        agent::task_worktree::record_goal_tip_sha("GOAL-TEST", "deadbeef012345".to_string());
-
         let provider = Arc::new(TestProvider::default());
         let store = cx.update(|cx| cx.new(|cx| AgentTaskStore::new(provider, cx)));
 
@@ -1860,12 +2557,295 @@ LGTM approved"
         });
         cx.run_until_parked();
 
-        panel.read_with(cx, |panel, cx| {
-            let summary = agent::task_worktree::goal_branch_summary_for_task(&task_id).unwrap();
-            assert_eq!(summary.branch, "agent-goal/GOAL-TEST");
-            assert_eq!(summary.tip_sha, Some("deadbeef012345".to_string()));
-            assert!(!panel.store.read(cx).is_offline());
+        // Populate snapshot with goal git state
+        panel.update(cx, |panel, cx| {
+            panel.worktree_status.update(cx, |status, cx| {
+                let mut snap = TaskGitSnapshot::default();
+                snap.goals.insert(
+                    "GOAL-1".to_string(),
+                    GoalGitState {
+                        branch: "agent-goal/GOAL-1".to_string(),
+                        branch_exists: true,
+                        tip_sha: Some("1234567890abcdef".to_string()),
+                    },
+                );
+                snap.goals.insert(
+                    "GOAL-2".to_string(),
+                    GoalGitState {
+                        branch: "agent-goal/GOAL-2".to_string(),
+                        branch_exists: false,
+                        tip_sha: None,
+                    },
+                );
+                status.set_snapshot_for_test(snap, cx);
+            });
         });
+        cx.run_until_parked();
+
+        // Check group headers are rendered
+        cx.debug_bounds("goal-group-header-GOAL-1")
+            .expect("GOAL-1 header should be rendered");
+        cx.debug_bounds("goal-group-header-GOAL-2")
+            .expect("GOAL-2 header should be rendered");
+        cx.debug_bounds("goal-group-header-no-goal")
+            .expect("No goal header should be rendered");
+
+        // TASK-1 (under GOAL-1) and TASK-2 (under No goal) should be rendered
+        cx.debug_bounds("task-node-TASK-1")
+            .expect("TASK-1 should be rendered initially");
+        cx.debug_bounds("task-node-TASK-2")
+            .expect("TASK-2 should be rendered initially");
+
+        // Click GOAL-1 header to collapse it
+        let goal_1_header_bounds = cx.debug_bounds("goal-group-header-GOAL-1").unwrap();
+        cx.simulate_click(goal_1_header_bounds.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+
+        // TASK-1 should now be hidden because GOAL-1 is collapsed
+        assert!(cx.debug_bounds("task-node-TASK-1").is_none());
+        // TASK-2 (in No goal) is still visible
+        assert!(cx.debug_bounds("task-node-TASK-2").is_some());
+
+        // Click GOAL-1 header again to expand
+        cx.simulate_click(goal_1_header_bounds.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("task-node-TASK-1").is_some());
+    }
+
+    #[gpui::test]
+    async fn test_agent_task_panel_unknown_status_filter_and_display(cx: &mut TestAppContext) {
+        init_test(cx);
+        let file_system = FakeFs::new(cx.executor());
+        let project = Project::test(file_system.clone(), [], cx).await;
+
+        let cancelled_status = AgentTaskStatus::Other(gpui::SharedString::from("cancelled"));
+        let provider = Arc::new(TestProvider {
+            offline: false,
+            goals: vec![],
+            tasks: vec![AgentTaskSummary {
+                id: AgentTaskId::from("TASK-UNKNOWN"),
+                parent_id: None,
+                goal_id: None,
+                title: "Unknown Status Task".to_string(),
+                status: cancelled_status.clone(),
+                attempt: 1,
+                assignee: None,
+                write_scopes: vec![],
+            }],
+            events: vec![],
+            ..Default::default()
+        });
+        let store = cx.update(|cx| cx.new(|cx| AgentTaskStore::new(provider, cx)));
+
+        let (panel, cx) = cx.add_window_view(|_window, cx| {
+            AgentTaskPanel::new(store, WeakEntity::new_invalid(), project, file_system, cx)
+        });
+        cx.run_until_parked();
+
+        // Task is displayed in the tree
+        cx.debug_bounds("task-node-TASK-UNKNOWN")
+            .expect("TASK-UNKNOWN should be rendered");
+
+        // Verify status label and icon helper functions
+        assert_eq!(status_label(&cancelled_status), "cancelled");
+        assert_eq!(status_icon(&cancelled_status), IconName::Circle);
+        assert_eq!(status_color(&cancelled_status), Color::Muted);
+
+        // Open status filter dropdown menu
+        let filter_menu_btn = cx
+            .debug_bounds("ICON-Filter")
+            .expect("status filter menu button should be rendered");
+        cx.simulate_click(filter_menu_btn.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+
+        // "cancelled" appears in the filter menu
+        let cancelled_entry = cx
+            .debug_bounds("MENU_ITEM-cancelled")
+            .expect("cancelled status entry should be in menu");
+
+        // Toggle "cancelled" off
+        cx.simulate_click(cancelled_entry.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+
+        panel.read_with(cx, |panel, _| {
+            assert!(!panel.status_filters.contains(&cancelled_status));
+        });
+
+        // TASK-UNKNOWN should now be filtered out
+        assert!(cx.debug_bounds("task-node-TASK-UNKNOWN").is_none());
+    }
+
+    #[gpui::test]
+    async fn test_agent_task_panel_cleanup_button_state(cx: &mut TestAppContext) {
+        init_test(cx);
+        let file_system = FakeFs::new(cx.executor());
+        file_system
+            .insert_tree(
+                "/main-repo",
+                serde_json::json!({
+                    ".git": {},
+                    "main.rs": "fn main() {}",
+                }),
+            )
+            .await;
+        let project = Project::test(
+            file_system.clone(),
+            [std::path::Path::new("/main-repo")],
+            cx,
+        )
+        .await;
+
+        // 1. Goal with active task -> cleanup button is disabled
+        let provider = Arc::new(TestProvider {
+            goals: vec![AgentGoalSummary {
+                goal_id: "GOAL-1".to_string(),
+                title: "Goal 1".to_string(),
+                status: "active".to_string(),
+                priority: 1,
+                tasks_total: 1,
+                tasks_done: 0,
+            }],
+            tasks: vec![AgentTaskSummary {
+                id: AgentTaskId::from("TASK-1"),
+                parent_id: None,
+                goal_id: Some("GOAL-1".to_string()),
+                title: "Active Task".to_string(),
+                status: AgentTaskStatus::Ready,
+                attempt: 1,
+                assignee: None,
+                write_scopes: vec![],
+            }],
+            ..Default::default()
+        });
+        let store = cx.update(|cx| cx.new(|cx| AgentTaskStore::new(provider, cx)));
+        let (panel, cx) = cx.add_window_view(|_window, cx| {
+            AgentTaskPanel::new(
+                store,
+                WeakEntity::new_invalid(),
+                project.clone(),
+                file_system.clone(),
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        panel.update(cx, |panel, cx| {
+            panel.worktree_status.update(cx, |status, cx| {
+                let mut snap = TaskGitSnapshot::default();
+                snap.goals.insert(
+                    "GOAL-1".to_string(),
+                    GoalGitState {
+                        branch: "agent-goal/GOAL-1".to_string(),
+                        branch_exists: true,
+                        tip_sha: Some("1234567890abcdef".to_string()),
+                    },
+                );
+                status.set_snapshot_for_test(snap, cx);
+            });
+        });
+        cx.run_until_parked();
+
+        // Cleanup button is rendered in DOM
+        let cleanup_btn = cx
+            .debug_bounds("cleanup-goal-GOAL-1")
+            .expect("cleanup button should be rendered");
+
+        // Active task exists -> cleanup should be disabled: click does not execute cleanup
+        cx.simulate_click(cleanup_btn.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        assert!(
+            panel.read_with(cx, |panel, _| panel.goal_cleanup_result.is_none()),
+            "cleanup should not execute when button is disabled due to active tasks"
+        );
+
+        // 2. Now with completed task
+        let completed_provider = Arc::new(TestProvider {
+            goals: vec![AgentGoalSummary {
+                goal_id: "GOAL-1".to_string(),
+                title: "Goal 1".to_string(),
+                status: "active".to_string(),
+                priority: 1,
+                tasks_total: 1,
+                tasks_done: 1,
+            }],
+            tasks: vec![AgentTaskSummary {
+                id: AgentTaskId::from("TASK-1"),
+                parent_id: None,
+                goal_id: Some("GOAL-1".to_string()),
+                title: "Completed Task".to_string(),
+                status: AgentTaskStatus::Completed,
+                attempt: 1,
+                assignee: None,
+                write_scopes: vec![],
+            }],
+            ..Default::default()
+        });
+        panel.update(cx, |panel, cx| {
+            panel.store.update(cx, |store, cx| {
+                store.set_provider(completed_provider, cx);
+            });
+        });
+        cx.run_until_parked();
+
+        // Restore snapshot with existing branch for completed task
+        panel.update(cx, |panel, cx| {
+            panel.worktree_status.update(cx, |status, cx| {
+                let mut snap = TaskGitSnapshot::default();
+                snap.goals.insert(
+                    "GOAL-1".to_string(),
+                    GoalGitState {
+                        branch: "agent-goal/GOAL-1".to_string(),
+                        branch_exists: true,
+                        tip_sha: Some("1234567890abcdef".to_string()),
+                    },
+                );
+                status.set_snapshot_for_test(snap, cx);
+            });
+        });
+        cx.run_until_parked();
+
+        // Cleanup button is enabled: clicking it executes cleanup
+        let cleanup_btn = cx
+            .debug_bounds("cleanup-goal-GOAL-1")
+            .expect("cleanup button should still be rendered");
+        cx.simulate_click(cleanup_btn.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+
+        panel.read_with(cx, |panel, _| {
+            let res = panel
+                .goal_cleanup_result
+                .as_ref()
+                .expect("cleanup should have executed when button is enabled");
+            assert_eq!(res.goal_id, "GOAL-1");
+        });
+
+        // 3. Goal branch does not exist -> cleanup button is disabled
+        panel.update(cx, |panel, cx| {
+            panel.worktree_status.update(cx, |status, cx| {
+                let mut snap = TaskGitSnapshot::default();
+                snap.goals.insert(
+                    "GOAL-1".to_string(),
+                    GoalGitState {
+                        branch: "agent-goal/GOAL-1".to_string(),
+                        branch_exists: false,
+                        tip_sha: None,
+                    },
+                );
+                status.set_snapshot_for_test(snap, cx);
+            });
+            panel.goal_cleanup_result = None;
+        });
+        cx.run_until_parked();
+
+        let cleanup_btn = cx
+            .debug_bounds("cleanup-goal-GOAL-1")
+            .expect("cleanup button should still be rendered");
+        cx.simulate_click(cleanup_btn.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        assert!(
+            panel.read_with(cx, |panel, _| panel.goal_cleanup_result.is_none()),
+            "cleanup should not execute when goal branch does not exist"
+        );
     }
 
     #[gpui::test]
@@ -1877,6 +2857,7 @@ LGTM approved"
         let task_active = AgentTaskSummary {
             id: AgentTaskId::from("TASK-ACTIVE"),
             parent_id: None,
+            goal_id: None,
             title: "Active Task".to_string(),
             status: AgentTaskStatus::Ready,
             attempt: 1,
@@ -1886,6 +2867,7 @@ LGTM approved"
         let task_archived = AgentTaskSummary {
             id: AgentTaskId::from("TASK-ARCHIVED"),
             parent_id: None,
+            goal_id: None,
             title: "Archived Task".to_string(),
             status: AgentTaskStatus::Archived,
             attempt: 1,
@@ -1897,6 +2879,7 @@ LGTM approved"
         let provider = Arc::new(TestProvider {
             offline: false,
             tasks: vec![task_active, task_archived],
+            goals: vec![],
             events: vec![],
             calls: calls.clone(),
         });
@@ -2054,5 +3037,534 @@ LGTM approved"
         panel.read_with(cx, |panel, _| {
             assert_eq!(panel.activation_priority(), 0);
         });
+    }
+
+    #[gpui::test]
+    async fn test_agent_task_panel_task_row_action_buttons(cx: &mut TestAppContext) {
+        init_test(cx);
+        let file_system = FakeFs::new(cx.executor());
+        file_system
+            .insert_tree(
+                "/main-repo",
+                serde_json::json!({
+                    ".git": {},
+                    "main.rs": "fn main() {}",
+                }),
+            )
+            .await;
+        let project = Project::test(
+            file_system.clone(),
+            [std::path::Path::new("/main-repo")],
+            cx,
+        )
+        .await;
+        let provider = Arc::new(TestProvider::default());
+        let store = cx.update(|cx| cx.new(|cx| AgentTaskStore::new(provider, cx)));
+
+        let switched_worktrees = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let opened_in_new_window = Arc::new(parking_lot::Mutex::new(Vec::new()));
+
+        struct ActionCaptureView {
+            panel: Entity<AgentTaskPanel>,
+            focus_handle: FocusHandle,
+            switched: Arc<parking_lot::Mutex<Vec<SwitchWorktree>>>,
+            opened: Arc<parking_lot::Mutex<Vec<OpenWorktreeInNewWindow>>>,
+        }
+
+        impl Focusable for ActionCaptureView {
+            fn focus_handle(&self, _cx: &App) -> FocusHandle {
+                self.focus_handle.clone()
+            }
+        }
+
+        impl Render for ActionCaptureView {
+            fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                let switched = self.switched.clone();
+                let opened = self.opened.clone();
+                h_flex()
+                    .track_focus(&self.focus_handle)
+                    .size_full()
+                    .on_action(
+                        cx.listener(move |_this, action: &SwitchWorktree, _window, _cx| {
+                            switched.lock().push(action.clone());
+                        }),
+                    )
+                    .on_action(cx.listener(
+                        move |_this, action: &OpenWorktreeInNewWindow, _window, _cx| {
+                            opened.lock().push(action.clone());
+                        },
+                    ))
+                    .child(self.panel.clone())
+            }
+        }
+
+        let (capture_view, cx) = cx.add_window_view(|_window, cx| {
+            let panel = cx.new(|cx| {
+                AgentTaskPanel::new(
+                    store,
+                    WeakEntity::new_invalid(),
+                    project.clone(),
+                    file_system.clone(),
+                    cx,
+                )
+            });
+            ActionCaptureView {
+                panel,
+                focus_handle: cx.focus_handle(),
+                switched: switched_worktrees.clone(),
+                opened: opened_in_new_window.clone(),
+            }
+        });
+        cx.run_until_parked();
+
+        let panel = capture_view.read_with(cx, |view, _| view.panel.clone());
+        cx.focus(&capture_view);
+
+        // 1. Action buttons exist for task
+        let open_btn_bounds = cx.debug_bounds("open-worktree-TASK-1");
+        assert!(open_btn_bounds.is_some());
+        let diff_btn_bounds = cx.debug_bounds("diff-task-TASK-1");
+        assert!(diff_btn_bounds.is_some());
+        let remove_btn_bounds = cx.debug_bounds("remove-worktree-TASK-1");
+        assert!(remove_btn_bounds.is_some());
+
+        // 2a. Populate snapshot with goal branch existing, but worktree NOT on disk (has_worktree = false)
+        panel.update(cx, |panel, cx| {
+            panel.worktree_status.update(cx, |status, cx| {
+                let mut snap = TaskGitSnapshot::default();
+                snap.tasks.insert(
+                    AgentTaskId::from("TASK-1"),
+                    TaskGitState {
+                        worktree_path: std::path::PathBuf::from("/fake/task-1"),
+                        exists_on_disk: false,
+                    },
+                );
+                snap.goals.insert(
+                    "GOAL-1".to_string(),
+                    GoalGitState {
+                        branch: "agent-goal/GOAL-1".to_string(),
+                        branch_exists: true,
+                        tip_sha: Some("1234567890abcdef".to_string()),
+                    },
+                );
+                status.set_snapshot_for_test(snap, cx);
+            });
+        });
+        cx.run_until_parked();
+
+        // When worktree does not exist on disk, open_btn is disabled, and diff_btn is disabled
+        let open_btn = cx
+            .debug_bounds("open-worktree-TASK-1")
+            .expect("open worktree button should exist");
+        let diff_btn = cx
+            .debug_bounds("diff-task-TASK-1")
+            .expect("diff task button should exist");
+        cx.simulate_click(open_btn.center(), gpui::Modifiers::default());
+        cx.simulate_click(diff_btn.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        assert!(
+            switched_worktrees.lock().is_empty(),
+            "no switch action should be dispatched when worktree does not exist on disk"
+        );
+
+        // 2b. Populate snapshot with worktree on disk (has_worktree = true) and goal branch existing
+        panel.update(cx, |panel, cx| {
+            panel.worktree_status.update(cx, |status, cx| {
+                let mut snap = TaskGitSnapshot::default();
+                snap.tasks.insert(
+                    AgentTaskId::from("TASK-1"),
+                    TaskGitState {
+                        worktree_path: std::path::PathBuf::from("/fake/task-1"),
+                        exists_on_disk: true,
+                    },
+                );
+                snap.goals.insert(
+                    "GOAL-1".to_string(),
+                    GoalGitState {
+                        branch: "agent-goal/GOAL-1".to_string(),
+                        branch_exists: true,
+                        tip_sha: Some("1234567890abcdef".to_string()),
+                    },
+                );
+                status.set_snapshot_for_test(snap, cx);
+            });
+        });
+        cx.run_until_parked();
+
+        // Buttons exist and are clickable
+        let open_btn = cx
+            .debug_bounds("open-worktree-TASK-1")
+            .expect("open worktree button should exist");
+        let diff_btn = cx
+            .debug_bounds("diff-task-TASK-1")
+            .expect("diff task button should exist");
+        let remove_btn = cx
+            .debug_bounds("remove-worktree-TASK-1")
+            .expect("remove worktree button should exist");
+
+        // Simulate left click on open worktree (triggers SwitchWorktree action with agent-task-{id})
+        cx.simulate_click(open_btn.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+
+        let switched = switched_worktrees.lock().clone();
+        assert_eq!(switched.len(), 1);
+        assert_eq!(switched[0].display_name, "agent-task-TASK-1");
+        assert_eq!(switched[0].path, std::path::PathBuf::from("/fake/task-1"));
+
+        // Simulate right click on open worktree (triggers OpenWorktreeInNewWindow action)
+        cx.simulate_mouse_down(
+            open_btn.center(),
+            gpui::MouseButton::Right,
+            gpui::Modifiers::default(),
+        );
+        cx.simulate_mouse_up(
+            open_btn.center(),
+            gpui::MouseButton::Right,
+            gpui::Modifiers::default(),
+        );
+        cx.run_until_parked();
+
+        let opened = opened_in_new_window.lock().clone();
+        assert_eq!(opened.len(), 1);
+        assert_eq!(opened[0].path, std::path::PathBuf::from("/fake/task-1"));
+
+        // Simulate click on diff button:
+        // since /fake/task-1 does not exist on disk, find_or_create_worktree (creatable=false)
+        // returns an error, so no worktree is added to project
+        cx.simulate_click(diff_btn.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        assert!(
+            project.read_with(cx, |p, cx| {
+                p.worktrees(cx)
+                    .all(|w| w.read(cx).abs_path().as_ref() != std::path::Path::new("/fake/task-1"))
+            }),
+            "non-existent worktree path must not be created or registered in project"
+        );
+
+        // Simulate click on remove worktree button:
+        // triggers remove_task_worktree and refreshes worktree snapshot
+        cx.simulate_click(remove_btn.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+
+        // After remove worktree, refresh_worktree_status has updated the snapshot:
+        // /fake/task-1 does not exist on disk, so exists_on_disk becomes false
+        panel.read_with(cx, |panel, cx| {
+            let snap = panel.worktree_status.read(cx).snapshot();
+            if let Some(snap) = snap {
+                if let Some(task_state) = snap.tasks.get(&AgentTaskId::from("TASK-1")) {
+                    assert!(
+                        !task_state.exists_on_disk,
+                        "task worktree must no longer exist on disk after remove"
+                    );
+                }
+            }
+        });
+    }
+
+    #[gpui::test]
+    async fn test_agent_task_panel_diff_button_targets_task_worktree_repository(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let file_system = FakeFs::new(cx.executor());
+        file_system
+            .insert_tree(
+                "/main-repo",
+                serde_json::json!({
+                    ".git": {},
+                    "main.rs": "fn main() {}",
+                }),
+            )
+            .await;
+        file_system
+            .insert_tree(
+                "/fake/task-1",
+                serde_json::json!({
+                    ".git": {},
+                    "task.rs": "fn task() {}",
+                }),
+            )
+            .await;
+
+        let project = Project::test(
+            file_system.clone(),
+            [std::path::Path::new("/main-repo")],
+            cx,
+        )
+        .await;
+        cx.run_until_parked();
+
+        let active_repo = project.read_with(cx, |project, cx| {
+            project
+                .active_repository(cx)
+                .expect("main-repo should be active repository")
+        });
+        let active_work_dir =
+            active_repo.read_with(cx, |repo, _| repo.snapshot().work_directory_abs_path);
+        assert_eq!(active_work_dir.as_ref(), std::path::Path::new("/main-repo"));
+
+        let provider = Arc::new(TestProvider::default());
+        let store = cx.update(|cx| cx.new(|cx| AgentTaskStore::new(provider, cx)));
+
+        let multi_workspace =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+
+        let workspace = multi_workspace
+            .read_with(cx, |multi_workspace, _cx| {
+                multi_workspace.workspace().clone()
+            })
+            .unwrap();
+
+        let mut cx = gpui::VisualTestContext::from_window(multi_workspace.into(), cx);
+
+        let workspace_weak = workspace.downgrade();
+        let panel = workspace.update_in(&mut cx, |workspace, window, cx| {
+            let panel = cx.new(|cx| {
+                AgentTaskPanel::new(
+                    store,
+                    workspace_weak,
+                    project.clone(),
+                    file_system.clone(),
+                    cx,
+                )
+            });
+            workspace.add_panel(panel.clone(), window, cx);
+            workspace.focus_panel::<AgentTaskPanel>(window, cx);
+            panel
+        });
+        cx.run_until_parked();
+
+        panel.update(&mut cx, |panel, cx| {
+            panel.worktree_status.update(cx, |status, cx| {
+                let mut snap = TaskGitSnapshot::default();
+                snap.tasks.insert(
+                    AgentTaskId::from("TASK-1"),
+                    TaskGitState {
+                        worktree_path: std::path::PathBuf::from("/fake/task-1"),
+                        exists_on_disk: true,
+                    },
+                );
+                snap.goals.insert(
+                    "GOAL-1".to_string(),
+                    GoalGitState {
+                        branch: "agent-goal/GOAL-1".to_string(),
+                        branch_exists: true,
+                        tip_sha: Some("1234567890abcdef".to_string()),
+                    },
+                );
+                status.set_snapshot_for_test(snap, cx);
+            });
+        });
+        cx.run_until_parked();
+
+        // 1. Task repo is not yet in project.repositories
+        let task_worktree_path = std::path::Path::new("/fake/task-1");
+        assert!(project.read_with(&cx, |_, cx| {
+            find_repository_for_worktree_path(&project, task_worktree_path, cx).is_none()
+        }));
+
+        // 2. Click diff button: should find or create worktree, resolve task repository, and deploy BranchDiff
+        let diff_btn = cx
+            .debug_bounds("diff-task-TASK-1")
+            .expect("diff task button should exist");
+        cx.simulate_click(diff_btn.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+
+        // Task repository was resolved and loaded into project
+        let task_repo = project
+            .read_with(&cx, |_, cx| {
+                find_repository_for_worktree_path(&project, task_worktree_path, cx)
+            })
+            .expect("task repository should now be resolved in project");
+        let task_work_dir =
+            task_repo.read_with(&cx, |repo, _| repo.snapshot().work_directory_abs_path);
+        assert_eq!(task_work_dir.as_ref(), task_worktree_path);
+        let task_repo_id = task_repo.read_with(&cx, |repo, _| repo.id);
+        let active_repo_id = active_repo.read_with(&cx, |repo, _| repo.id);
+        assert_ne!(
+            task_repo_id, active_repo_id,
+            "task repository must be different from active repository"
+        );
+
+        // BranchDiff was deployed in the workspace for the goal base ref
+        let diff_items: Vec<_> =
+            workspace.read_with(&cx, |ws, cx| ws.items_of_type::<BranchDiff>(cx).collect());
+        assert_eq!(
+            diff_items.len(),
+            1,
+            "exactly one branch diff should be deployed"
+        );
+
+        let tab_text = diff_items[0].read_with(&cx, |item, cx| item.tab_content_text(0, cx));
+        assert_eq!(
+            tab_text, "Changes since agent-goal/GOAL-1",
+            "diff tab text must reflect agent-goal/GOAL-1"
+        );
+
+        // Re-deploying with task_repo matches and reuses existing BranchDiff item
+        workspace.update_in(&mut cx, |ws, window, cx| {
+            BranchDiff::deploy_branch_diff_with_base_ref(
+                ws,
+                project.clone(),
+                task_repo.clone(),
+                "agent-goal/GOAL-1".into(),
+                None,
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        let count = workspace.read_with(&cx, |ws, cx| ws.items_of_type::<BranchDiff>(cx).count());
+        assert_eq!(
+            count, 1,
+            "deploying with task_repo should reuse the existing item"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_agent_task_panel_orphan_worktrees_rendering_and_delete(cx: &mut TestAppContext) {
+        init_test(cx);
+        let file_system = FakeFs::new(cx.executor());
+        file_system
+            .insert_tree(
+                "/main-repo",
+                serde_json::json!({
+                    ".git": {},
+                    "main.rs": "fn main() {}",
+                }),
+            )
+            .await;
+        file_system
+            .create_dir(std::path::Path::new("/fake/orphan-42"))
+            .await
+            .unwrap();
+
+        let project = Project::test(
+            file_system.clone(),
+            [std::path::Path::new("/main-repo")],
+            cx,
+        )
+        .await;
+        let provider = Arc::new(TestProvider::default());
+        let store = cx.update(|cx| cx.new(|cx| AgentTaskStore::new(provider, cx)));
+
+        let (panel, cx) = cx.add_window_view(|_window, cx| {
+            AgentTaskPanel::new(
+                store,
+                WeakEntity::new_invalid(),
+                project.clone(),
+                file_system.clone(),
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        // Initially no orphan worktrees
+        assert!(cx.debug_bounds("orphan-worktrees-section").is_none());
+
+        // Populate snapshot with an orphan worktree
+        panel.update(cx, |panel, cx| {
+            panel.worktree_status.update(cx, |status, cx| {
+                let mut snap = TaskGitSnapshot::default();
+                snap.orphan_worktrees.push(OrphanWorktree {
+                    task_id_hint: "ORPHAN-42".to_string(),
+                    path: std::path::PathBuf::from("/fake/orphan-42"),
+                });
+                status.set_snapshot_for_test(snap, cx);
+            });
+        });
+        cx.run_until_parked();
+
+        // Orphan section and orphan item are rendered
+        assert!(
+            file_system
+                .is_dir(std::path::Path::new("/fake/orphan-42"))
+                .await
+        );
+        assert!(cx.debug_bounds("orphan-worktrees-section").is_some());
+        assert!(cx.debug_bounds("orphan-worktree-ORPHAN-42").is_some());
+
+        // Click delete orphan button
+        let delete_orphan_btn = cx
+            .debug_bounds("delete-orphan-ORPHAN-42")
+            .expect("delete orphan button should be rendered");
+        cx.simulate_click(delete_orphan_btn.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+
+        // The orphan directory was deleted from the file system
+        assert!(
+            !file_system
+                .is_dir(std::path::Path::new("/fake/orphan-42"))
+                .await,
+            "orphan worktree folder should be removed from disk"
+        );
+
+        // After deletion and snapshot refresh, the orphan section and item disappeared from the DOM
+        assert!(cx.debug_bounds("orphan-worktree-ORPHAN-42").is_none());
+        assert!(cx.debug_bounds("orphan-worktrees-section").is_none());
+    }
+
+    #[gpui::test]
+    async fn test_agent_task_panel_worktree_status_error_banner(cx: &mut TestAppContext) {
+        init_test(cx);
+        let file_system = FakeFs::new(cx.executor());
+        // 1. Project with git repo -> snapshot refresh succeeds without error banner
+        file_system
+            .insert_tree(
+                "/main-repo",
+                serde_json::json!({
+                    ".git": {},
+                    "main.rs": "fn main() {}",
+                }),
+            )
+            .await;
+        let project = Project::test(
+            file_system.clone(),
+            [std::path::Path::new("/main-repo")],
+            cx,
+        )
+        .await;
+        let provider = Arc::new(TestProvider::default());
+        let store = cx.update(|cx| cx.new(|cx| AgentTaskStore::new(provider.clone(), cx)));
+
+        let (_panel, cx) = cx.add_window_view(|_window, cx| {
+            AgentTaskPanel::new(
+                store,
+                WeakEntity::new_invalid(),
+                project.clone(),
+                file_system.clone(),
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        // Initially no error banner when snapshot is error-free
+        assert!(cx.debug_bounds("worktree_status_error_banner").is_none());
+
+        // 2. Panel with empty project has last_error and renders warning banner
+        let empty_project = Project::test(file_system.clone(), [], cx).await;
+        let store_empty = cx.update(|_window, cx| cx.new(|cx| AgentTaskStore::new(provider, cx)));
+        let (panel_empty, cx) = cx.add_window_view(|_window, cx| {
+            AgentTaskPanel::new(
+                store_empty,
+                WeakEntity::new_invalid(),
+                empty_project,
+                file_system.clone(),
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        // Status should now have last_error
+        panel_empty.read_with(cx, |panel, cx| {
+            assert!(panel.worktree_status.read(cx).last_error().is_some());
+        });
+
+        // The error banner is rendered in the DOM
+        assert!(
+            cx.debug_bounds("worktree_status_error_banner").is_some(),
+            "worktree_status_error_banner should be rendered when last_error is present"
+        );
     }
 }

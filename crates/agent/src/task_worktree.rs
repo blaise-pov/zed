@@ -24,11 +24,16 @@ use crate::{AgentTaskId, AgentTaskSummary};
 #[error("no git repository found in project")]
 pub struct NoGitRepositoryError;
 
+fn system_git_binary() -> Option<PathBuf> {
+    static CACHED_GIT: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    CACHED_GIT.get_or_init(|| which::which("git").ok()).clone()
+}
+
 /// Resolves the repository a task worktree should be linked to, plus the data
 /// needed to compute its path. Deterministic: prefer the repository backing
 /// the project's primary worktree, then any non-linked (main) repository,
 /// then any repository at all.
-fn task_worktree_context(
+pub(crate) fn task_worktree_context(
     project: &Project,
     cx: &App,
 ) -> Result<(Entity<Repository>, PathBuf, PathStyle, String, Arc<dyn Fs>)> {
@@ -78,7 +83,7 @@ fn task_worktree_context(
     ))
 }
 
-fn task_worktree_path(
+pub(crate) fn task_worktree_path(
     anchor_path: &PathBuf,
     worktree_setting: &str,
     path_style: PathStyle,
@@ -134,8 +139,9 @@ pub fn ensure_goal_branch(
                 anyhow::Ok(task_worktree_context(project, cx))
             })??;
         let dot_git = anchor_path.join(".git");
+        let git_binary = system_git_binary();
         let git_repo = file_system
-            .open_repo(&dot_git, None)
+            .open_repo(&dot_git, git_binary.as_deref())
             .with_context(|| format!("opening repo at {}", dot_git.display()))?;
 
         let goal_branch = format!("agent-goal/{}", goal_id);
@@ -196,6 +202,7 @@ pub fn ensure_task_worktree_with_policy(
     cx: &mut App,
 ) -> Task<Result<PathBuf>> {
     let task_id = task.id.clone();
+    let goal_id = goal_id.or_else(|| task.goal_id.clone());
     cx.spawn(async move |cx| {
         if on_branch.is_some() && base_branch.is_some() {
             anyhow::bail!("on_branch and base_branch are mutually exclusive");
@@ -210,8 +217,9 @@ pub fn ensure_task_worktree_with_policy(
             })??;
 
         let dot_git = anchor_path.join(".git");
+        let git_binary = system_git_binary();
         let git_repo = file_system
-            .open_repo(&dot_git, None)
+            .open_repo(&dot_git, git_binary.as_deref())
             .with_context(|| format!("opening repo at {}", dot_git.display()))?;
 
         let (target_checkout_branch, base_ref, base_sha_for_worktree, goal_branch) =
@@ -923,6 +931,120 @@ pub fn remove_task_worktree(
     })
 }
 
+async fn prune_git_worktrees(anchor_path: &std::path::Path) {
+    if let Some(git_binary) = system_git_binary() {
+        let mut command = util::command::new_command(git_binary);
+        command.args(["worktree", "prune"]);
+        command.current_dir(anchor_path);
+        match command.output().await {
+            Ok(output) if !output.status.success() => {
+                log::warn!(
+                    "git worktree prune failed in {}: {}",
+                    anchor_path.display(),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            Err(error) => {
+                log::warn!(
+                    "failed to execute git worktree prune in {}: {error}",
+                    anchor_path.display()
+                );
+            }
+            _ => {}
+        }
+    }
+}
+
+pub fn remove_orphan_worktree(
+    project: Entity<Project>,
+    path: std::path::PathBuf,
+    cx: &mut App,
+) -> Task<Result<()>> {
+    cx.spawn(async move |cx| {
+        let (repository, anchor_path, _path_style, _worktree_setting, file_system) = project
+            .update(cx, |project, cx| {
+                anyhow::Ok(task_worktree_context(project, cx))
+            })??;
+
+        if file_system.is_dir(&path).await {
+            let remove_task = repository.update(cx, |repository, _| {
+                repository.remove_worktree(path.clone(), true)
+            });
+            let git_remove_result = match remove_task.await {
+                Ok(inner_result) => inner_result,
+                Err(canceled) => Err(anyhow::anyhow!("remove_worktree task canceled: {canceled}")),
+            };
+
+            let directory_still_exists = file_system.is_dir(&path).await;
+            if let Err(git_error) = git_remove_result {
+                log::warn!(
+                    "git remove_worktree for orphan at {} failed: {git_error:#}; attempting fallback filesystem removal",
+                    path.display()
+                );
+                if directory_still_exists {
+                    file_system
+                        .remove_dir(
+                            &path,
+                            fs::RemoveOptions {
+                                recursive: true,
+                                ignore_if_not_exists: true,
+                            },
+                        )
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "failed to remove orphan worktree directory at {}: git remove failed ({:#}) and filesystem removal failed",
+                                path.display(),
+                                git_error
+                            )
+                        })?;
+
+                    prune_git_worktrees(&anchor_path).await;
+                }
+            } else if directory_still_exists {
+                file_system
+                    .remove_dir(
+                        &path,
+                        fs::RemoveOptions {
+                            recursive: true,
+                            ignore_if_not_exists: true,
+                        },
+                    )
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "failed to remove orphan worktree directory at {}",
+                            path.display()
+                        )
+                    })?;
+
+                prune_git_worktrees(&anchor_path).await;
+            }
+        }
+
+        let worktree_id = project.read_with(cx, |project, cx| {
+            project
+                .worktrees(cx)
+                .find(|w| {
+                    let w_abs = w.read(cx).abs_path();
+                    w_abs.as_ref() == path
+                        || util::paths::normalize_lexically(w_abs.as_ref())
+                            .ok()
+                            .as_deref()
+                            == util::paths::normalize_lexically(&path).ok().as_deref()
+                })
+                .map(|w| w.read(cx).id())
+        });
+        if let Some(id) = worktree_id {
+            project.update(cx, |project, cx| {
+                project.remove_worktree(id, cx);
+            });
+        }
+
+        Ok(())
+    })
+}
+
 pub fn auto_cleanup_task_worktree(
     project: Entity<Project>,
     task_id: &AgentTaskId,
@@ -1123,8 +1245,9 @@ pub async fn commit_task_worktree(
     cx: &mut AsyncApp,
 ) -> Result<SubagentIsolationDetails> {
     let dot_git = task_worktree.join(".git");
+    let git_binary = system_git_binary();
     let git_repo = fs
-        .open_repo(&dot_git, None)
+        .open_repo(&dot_git, git_binary.as_deref())
         .with_context(|| format!("opening repo at {}", dot_git.display()))?;
 
     let task_id_typed = AgentTaskId::from(task_id.clone());
@@ -1358,8 +1481,9 @@ pub fn merge_task_branch_into_goal(
             })??;
 
         let dot_git = anchor_path.join(".git");
+        let git_binary = system_git_binary();
         let git_repo = file_system
-            .open_repo(&dot_git, None)
+            .open_repo(&dot_git, git_binary.as_deref())
             .with_context(|| format!("opening repo at {}", dot_git.display()))?;
 
         let goal_ref = format!("refs/heads/{}", goal_branch);
@@ -1911,8 +2035,9 @@ pub fn prepare_goal_graduation(
                 anyhow::Ok(task_worktree_context(project, cx))
             })??;
         let dot_git = anchor_path.join(".git");
+        let git_binary = system_git_binary();
         let git_repo = file_system
-            .open_repo(&dot_git, None)
+            .open_repo(&dot_git, git_binary.as_deref())
             .with_context(|| format!("opening repo at {}", dot_git.display()))?;
 
         let goal_branch = format!("agent-goal/{}", goal_id);
@@ -2072,8 +2197,9 @@ pub fn cleanup_graduated_goal(
                 anyhow::Ok(task_worktree_context(project, cx))
             })??;
         let dot_git = anchor_path.join(".git");
+        let git_binary = system_git_binary();
         let git_repo = file_system
-            .open_repo(&dot_git, None)
+            .open_repo(&dot_git, git_binary.as_deref())
             .with_context(|| format!("opening repo at {}", dot_git.display()))?;
 
         let goal_branch = format!("agent-goal/{}", goal_id);
@@ -2317,6 +2443,7 @@ mod tests {
         let task = AgentTaskSummary {
             id: AgentTaskId::from("TASK-100"),
             parent_id: None,
+            goal_id: None,
             title: "Test worktree task".to_string(),
             status: AgentTaskStatus::Ready,
             attempt: 1,
@@ -2358,6 +2485,7 @@ mod tests {
         let first_task = AgentTaskSummary {
             id: AgentTaskId::from("TASK-DIST-1"),
             parent_id: None,
+            goal_id: None,
             title: "First task".to_string(),
             status: AgentTaskStatus::Ready,
             attempt: 1,
@@ -2367,6 +2495,7 @@ mod tests {
         let second_task = AgentTaskSummary {
             id: AgentTaskId::from("TASK-DIST-2"),
             parent_id: None,
+            goal_id: None,
             title: "Second task".to_string(),
             status: AgentTaskStatus::Ready,
             attempt: 1,
@@ -2493,6 +2622,7 @@ mod tests {
         let task1 = AgentTaskSummary {
             id: AgentTaskId::from("TASK-ENS-1"),
             parent_id: None,
+            goal_id: None,
             title: "Task 1".to_string(),
             status: AgentTaskStatus::Ready,
             attempt: 1,
@@ -2528,6 +2658,7 @@ mod tests {
         let task2 = AgentTaskSummary {
             id: AgentTaskId::from("TASK-ENS-2"),
             parent_id: None,
+            goal_id: None,
             title: "Task 2".to_string(),
             status: AgentTaskStatus::Ready,
             attempt: 1,
@@ -2561,6 +2692,7 @@ mod tests {
         let task3 = AgentTaskSummary {
             id: AgentTaskId::from("TASK-3"),
             parent_id: None,
+            goal_id: None,
             title: "Task 3".to_string(),
             status: AgentTaskStatus::Ready,
             attempt: 1,
@@ -2590,6 +2722,7 @@ mod tests {
         let task4 = AgentTaskSummary {
             id: AgentTaskId::from("TASK-4"),
             parent_id: None,
+            goal_id: None,
             title: "Task 4".to_string(),
             status: AgentTaskStatus::Ready,
             attempt: 1,
@@ -2616,6 +2749,7 @@ mod tests {
         let task5 = AgentTaskSummary {
             id: AgentTaskId::from("TASK-5"),
             parent_id: None,
+            goal_id: None,
             title: "Task 5".to_string(),
             status: AgentTaskStatus::Ready,
             attempt: 1,
@@ -2662,6 +2796,7 @@ mod tests {
         let task = AgentTaskSummary {
             id: AgentTaskId::from("TASK-FF-1"),
             parent_id: None,
+            goal_id: None,
             title: "FF Task".to_string(),
             status: AgentTaskStatus::Ready,
             attempt: 1,
@@ -2749,6 +2884,7 @@ mod tests {
         let task_a = AgentTaskSummary {
             id: AgentTaskId::from("TASK-NFF-A"),
             parent_id: None,
+            goal_id: None,
             title: "Task A".to_string(),
             status: AgentTaskStatus::Ready,
             attempt: 1,
@@ -2758,6 +2894,7 @@ mod tests {
         let task_b = AgentTaskSummary {
             id: AgentTaskId::from("TASK-NFF-B"),
             parent_id: None,
+            goal_id: None,
             title: "Task B".to_string(),
             status: AgentTaskStatus::Ready,
             attempt: 1,
@@ -2870,6 +3007,7 @@ mod tests {
         let task_c1 = AgentTaskSummary {
             id: AgentTaskId::from("TASK-CONF-1"),
             parent_id: None,
+            goal_id: None,
             title: "Task C1".to_string(),
             status: AgentTaskStatus::Ready,
             attempt: 1,
@@ -2879,6 +3017,7 @@ mod tests {
         let task_c2 = AgentTaskSummary {
             id: AgentTaskId::from("TASK-CONF-2"),
             parent_id: None,
+            goal_id: None,
             title: "Task C2".to_string(),
             status: AgentTaskStatus::Ready,
             attempt: 1,
@@ -3006,6 +3145,7 @@ mod tests {
         let task = AgentTaskSummary {
             id: AgentTaskId::from("TASK-INV-1"),
             parent_id: None,
+            goal_id: None,
             title: "Invariant Task".to_string(),
             status: AgentTaskStatus::Ready,
             attempt: 1,
@@ -3093,6 +3233,7 @@ mod tests {
         let task_a = AgentTaskSummary {
             id: AgentTaskId::from("TASK-E2E-A"),
             parent_id: None,
+            goal_id: None,
             title: "Task A".to_string(),
             status: AgentTaskStatus::Ready,
             attempt: 1,
@@ -3139,6 +3280,7 @@ mod tests {
         let task_b = AgentTaskSummary {
             id: AgentTaskId::from("TASK-E2E-B"),
             parent_id: None,
+            goal_id: None,
             title: "Task B".to_string(),
             status: AgentTaskStatus::Ready,
             attempt: 1,
@@ -3218,6 +3360,7 @@ mod tests {
         let task_a = AgentTaskSummary {
             id: AgentTaskId::from("TASK-REV-A"),
             parent_id: None,
+            goal_id: None,
             title: "Task A".to_string(),
             status: AgentTaskStatus::Ready,
             attempt: 1,
@@ -3265,6 +3408,7 @@ mod tests {
         let reviewer_task = AgentTaskSummary {
             id: AgentTaskId::from("TASK-REV-REVIEWER"),
             parent_id: None,
+            goal_id: None,
             title: "Reviewer Task".to_string(),
             status: AgentTaskStatus::Ready,
             attempt: 1,
@@ -3341,6 +3485,7 @@ mod tests {
         let task_x = AgentTaskSummary {
             id: AgentTaskId::from("TASK-X"),
             parent_id: None,
+            goal_id: None,
             title: "Task X".to_string(),
             status: AgentTaskStatus::Ready,
             attempt: 1,
@@ -3387,6 +3532,7 @@ mod tests {
         let inspector_task = AgentTaskSummary {
             id: AgentTaskId::from("TASK-INSPECTOR"),
             parent_id: None,
+            goal_id: None,
             title: "Inspector Task".to_string(),
             status: AgentTaskStatus::Ready,
             attempt: 1,
@@ -3462,6 +3608,7 @@ mod tests {
         let task1 = AgentTaskSummary {
             id: AgentTaskId::from("TASK-EXC-1"),
             parent_id: None,
+            goal_id: None,
             title: "Task 1".to_string(),
             status: AgentTaskStatus::Ready,
             attempt: 1,
@@ -3471,6 +3618,7 @@ mod tests {
         let task2 = AgentTaskSummary {
             id: AgentTaskId::from("TASK-EXC-2"),
             parent_id: None,
+            goal_id: None,
             title: "Task 2".to_string(),
             status: AgentTaskStatus::Ready,
             attempt: 1,
@@ -3569,6 +3717,7 @@ mod tests {
         let task = AgentTaskSummary {
             id: AgentTaskId::from("TASK-VAL"),
             parent_id: None,
+            goal_id: None,
             title: "Validation Task".to_string(),
             status: AgentTaskStatus::Ready,
             attempt: 1,
@@ -3656,6 +3805,7 @@ mod tests {
         let task_merge_agent = AgentTaskSummary {
             id: AgentTaskId::from("TASK-MERGE-AGENT"),
             parent_id: None,
+            goal_id: None,
             title: "Merge Agent".to_string(),
             status: AgentTaskStatus::Ready,
             attempt: 1,
@@ -3804,6 +3954,7 @@ mod tests {
         let task = AgentTaskSummary {
             id: AgentTaskId::from("TASK-GRAD-1"),
             parent_id: None,
+            goal_id: None,
             title: "Graduation Task".to_string(),
             status: AgentTaskStatus::Ready,
             attempt: 1,
