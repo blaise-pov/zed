@@ -11,14 +11,14 @@ an `agent_architect` subagent.
 ## Context map
 
 - `.zed/settings.json` — profiles, delegation, permissions
-- `.zed/prompts/**` — per-profile prompts (contract: `agent_architect.md`)
+- `.zed/prompts/core/` (system/title templates), `.zed/prompts/agents/` (profile prompts, contract: `agent_architect.md`)
 - `.agents/skills/**` — installed skills
 
 ## Workflow
 
 1. Survey the project: crate/layer layout, entry points and interfaces,
    test infrastructure, docs and roadmap; existing profiles in
-   `.zed/settings.json`, prompts in `.zed/prompts/`, current delegation
+   `.zed/settings.json`, prompts in `.zed/prompts/agents/`, current delegation
    edges. Read real paths — never invent them.
 2. Reuse gate: extend existing profiles when they cover ≥80% of a need;
    plan net-new agents only for uncovered boundaries.
