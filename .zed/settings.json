@@ -196,7 +196,12 @@
           "default": "allow"
         },
         "terminal": {
-          "default": "allow"
+          "default": "allow",
+          "always_confirm": [
+            {
+              "pattern": "\\bgit\\s+(-C\\s+\\S+\\s+)?(commit|rebase|merge|cherry-pick)\\b"
+            }
+          ]
         },
         "skill": {
           "default": "allow"
@@ -392,7 +397,7 @@
             "reviewer",
             "git_committer",
             "fork_merger",
-            "ci_runner",
+            "ci_release",
             "researcher",
             "code_mechanic"
           ],
@@ -902,13 +907,7 @@
               "get_server_details": true
             }
           },
-          "agent-bus": {
-            "tools": {
-              "send_feedback": true,
-              "read_feedback": true,
-              "resolve_feedback": true
-            }
-          },
+          "agent-bus": true,
           "taskgraph": {
             "tools": {
               "task_get": true,
@@ -1647,7 +1646,12 @@
               "default": "allow"
             },
             "terminal": {
-              "default": "allow"
+              "default": "allow",
+              "always_allow": [
+                {
+                  "pattern": "\\bgit\\s+(-C\\s+\\S+\\s+)?(commit|rebase|merge|cherry-pick)\\b"
+                }
+              ]
             },
             "mcp:agent-bus:send_feedback": {
               "default": "allow"
@@ -1791,10 +1795,10 @@
           }
         }
       },
-      "ci_runner": {
-        "name": "CI Runner",
-        "custom_prompt_path": ".zed/prompts/agents/ci_runner.md",
-        "description": "Triggers GitHub Actions builds, watches status, captures failure logs, and orchestrates fix-and-rebuild loops with the orchestrator until green",
+      "ci_release": {
+        "name": "CI Release",
+        "custom_prompt_path": ".zed/prompts/agents/ci_release.md",
+        "description": "Dispatches build-release.yml at repo HEAD on GitHub Actions, waits via gh run watch until green, delegates build-breaking code fixes to agent_engineer, and verifies all 8 release artifacts",
         "default_model": {
           "provider": "${MID_TIER_MODEL_PROVIDER}",
           "model": "${MID_TIER_MODEL}"
@@ -1821,7 +1825,7 @@
         },
         "delegation": {
           "allowed": [
-            "ci_fixer"
+            "agent_engineer"
           ],
           "max_depth": 2
         },
@@ -1847,61 +1851,6 @@
               "default": "allow"
             },
             "mcp:taskgraph:task_fail": {
-              "default": "allow"
-            }
-          }
-        }
-      },
-      "ci_fixer": {
-        "name": "CI Fixer",
-        "custom_prompt_path": ".zed/prompts/agents/ci_fixer.md",
-        "description": "Fixes compilation, clippy, and test failures detected by CI runner",
-        "default_model": {
-          "provider": "${MID_TIER_MODEL_PROVIDER}",
-          "model": "${MID_TIER_MODEL}"
-        },
-        "tools": {
-          "read_file": true,
-          "edit_file": true,
-          "grep": true,
-          "find_path": true,
-          "list_directory": true,
-          "terminal": true
-        },
-        "skills": ["gpui-test"],
-        "context_servers": {
-          "agent-bus": {
-            "tools": {
-              "send_feedback": true
-            }
-          }
-        },
-        "tool_permissions": {
-          "default": "deny",
-          "tools": {
-            "read_file": {
-              "default": "allow"
-            },
-            "edit_file": {
-              "default": "allow",
-              "write_scopes": [
-                "crates/**",
-                "script/**"
-              ]
-            },
-            "grep": {
-              "default": "allow"
-            },
-            "find_path": {
-              "default": "allow"
-            },
-            "list_directory": {
-              "default": "allow"
-            },
-            "terminal": {
-              "default": "allow"
-            },
-            "mcp:agent-bus:send_feedback": {
               "default": "allow"
             }
           }
@@ -1947,7 +1896,7 @@
             "ui_engineer",
             "collab_engineer",
             "reviewer",
-            "ci_runner",
+            "ci_release",
             "agent_tuner"
           ],
           "max_depth": 1
@@ -2133,6 +2082,62 @@
             },
             "diagnostics": {
               "default": "allow"
+            },
+            "mcp:agent-bus:send_feedback": {
+              "default": "allow"
+            }
+          }
+        }
+      },
+      "project_qa": {
+        "name": "Project QA",
+        "custom_prompt_path": ".zed/prompts/agents/project_qa.md",
+        "description": "Read-only Q&A companion: answers questions about this repo's code, architecture, and git history with path:line / commit citations; never edits files or runs builds",
+        "default_model": {
+          "provider": "${MID_TIER_MODEL_PROVIDER}",
+          "model": "${MID_TIER_MODEL}"
+        },
+        "tools": {
+          "read_file": true,
+          "grep": true,
+          "find_path": true,
+          "list_directory": true,
+          "diagnostics": true,
+          "terminal": true
+        },
+        "skills": [],
+        "context_servers": {
+          "agent-bus": {
+            "tools": {
+              "send_feedback": true
+            }
+          }
+        },
+        "tool_permissions": {
+          "default": "deny",
+          "tools": {
+            "read_file": {
+              "default": "allow"
+            },
+            "grep": {
+              "default": "allow"
+            },
+            "find_path": {
+              "default": "allow"
+            },
+            "list_directory": {
+              "default": "allow"
+            },
+            "diagnostics": {
+              "default": "allow"
+            },
+            "terminal": {
+              "default": "deny",
+              "always_allow": [
+                {
+                  "pattern": "^git\\s+(-C\\s+\\S+\\s+)?(--no-pager\\s+|--no-optional-locks\\s+)*(status|log|diff|show|branch|rev-parse|ls-files|blame|describe|cat-file|tag|remote|version|--version|config\\s+--get|shortlog).*"
+                }
+              ]
             },
             "mcp:agent-bus:send_feedback": {
               "default": "allow"
