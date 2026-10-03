@@ -34,6 +34,7 @@ use crate::{
 };
 
 pub mod branch_diff;
+pub use branch_diff::BranchDiff;
 pub mod branch_picker;
 mod commit_context_menu;
 mod commit_modal;
