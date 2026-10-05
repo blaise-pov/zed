@@ -1417,6 +1417,8 @@ mod tests {
             }),
             permission_mode: Some(agent_settings::AgentPermissionMode::Autonomous),
             terminal_wrapper_command: None,
+            task_isolation: agent_settings::TaskIsolation::default(),
+            task_worktree_language_servers: None,
         };
         cx.update(|cx| {
             let mut settings = agent_settings::AgentSettings::get_global(cx).clone();
@@ -1504,6 +1506,8 @@ mod tests {
             }),
             permission_mode: Some(agent_settings::AgentPermissionMode::Autonomous),
             terminal_wrapper_command: None,
+            task_isolation: agent_settings::TaskIsolation::default(),
+            task_worktree_language_servers: None,
         };
         cx.update(|cx| {
             let mut settings = agent_settings::AgentSettings::get_global(cx).clone();

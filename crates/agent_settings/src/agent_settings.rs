@@ -3,7 +3,7 @@ mod agent_profile;
 mod user_agents_md;
 
 pub use agent_graph::{check_delegation, child_remaining_budget, validate_profiles};
-pub use agent_profile::{Delegation, ProfileOrigin};
+pub use agent_profile::{Delegation, ProfileOrigin, TaskIsolation};
 
 use std::cmp::Ordering::{Equal, Greater, Less};
 use std::fmt;
@@ -293,6 +293,31 @@ fn parse_auto_compact_threshold(raw: &str) -> anyhow::Result<AutoCompactThreshol
 /// the agent task panel uses to find the task graph MCP server.
 pub const DEFAULT_TASK_GRAPH_SERVER_ID: &str = "tgs";
 
+/// Default limit on concurrently existing task worktrees.
+pub const DEFAULT_TASK_WORKTREE_LIMIT: usize = 3;
+
+/// Minimum allowed limit on concurrently existing task worktrees.
+pub const MIN_TASK_WORKTREE_LIMIT: usize = 1;
+
+/// Default setting for whether language servers should start in task worktrees.
+pub const DEFAULT_TASK_WORKTREE_LANGUAGE_SERVERS: bool = true;
+
+/// Clamps a configured `task_worktree_limit`.
+///
+/// A value of 0 is invalid and will be clamped to the minimum of 1.
+/// Values greater than 0 are preserved.
+/// `None` defaults to `DEFAULT_TASK_WORKTREE_LIMIT` (3).
+pub fn clamp_task_worktree_limit(limit: Option<usize>) -> usize {
+    match limit {
+        Some(0) => {
+            log::warn!("agent.task_worktree_limit of 0 is invalid; clamping to minimum of 1");
+            MIN_TASK_WORKTREE_LIMIT
+        }
+        Some(limit) => limit.max(MIN_TASK_WORKTREE_LIMIT),
+        None => DEFAULT_TASK_WORKTREE_LIMIT,
+    }
+}
+
 pub const DEFAULT_TERMINAL_WATCHDOG_ENABLED: bool = true;
 pub const DEFAULT_TERMINAL_WATCHDOG_IDLE_TIMEOUT_MS: u64 = 300_000;
 pub const DEFAULT_TERMINAL_WATCHDOG_IDLE_CPU_THRESHOLD_PERCENT: f32 = 5.0;
@@ -404,6 +429,23 @@ pub struct AgentSettings {
     pub show_merge_conflict_indicator: bool,
     pub tool_permissions: ToolPermissions,
     pub sandbox_permissions: SandboxPermissions,
+    /// Maximum number of concurrently existing task worktrees in the pool.
+    ///
+    /// Spawning a new task worktree acquires a slot in this bounded pool.
+    /// When full, the runtime first attempts LRU eviction of safe inactive
+    /// worktrees (no active sessions, no unrecovered commit error, salvaged dirty edits).
+    /// If the pool remains saturated, creation requests wait in a FIFO queue until a slot frees.
+    ///
+    /// A value of 0 is invalid and will be clamped to the minimum of 1.
+    ///
+    /// Default: 3
+    pub task_worktree_limit: usize,
+    /// Whether language servers should be started for task worktrees by default.
+    ///
+    /// Individual profiles can override this via `task_worktree_language_servers`.
+    ///
+    /// Default: true
+    pub task_worktree_language_servers: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1124,6 +1166,18 @@ impl Settings for AgentSettings {
     fn from_settings(content: &settings::SettingsContent) -> Self {
         let agent = content.agent.clone().unwrap();
         let threads_sidebar = agent.threads_sidebar.unwrap();
+
+        let profiles: IndexMap<AgentProfileId, AgentProfileSettings> = agent
+            .profiles
+            .clone()
+            .unwrap()
+            .into_iter()
+            .map(|(key, val)| (AgentProfileId(key), val.into()))
+            .collect();
+        for error in agent_graph::validate_profiles(&profiles) {
+            log::warn!("agent profile configuration error: {error}");
+        }
+
         Self {
             enabled: agent.enabled.unwrap(),
             button: agent.button.unwrap(),
@@ -1179,18 +1233,7 @@ impl Settings for AgentSettings {
                 .map(expand_model_selection)
                 .collect(),
             default_profile: AgentProfileId(agent.default_profile.unwrap()),
-            profiles: {
-                let profiles: IndexMap<AgentProfileId, AgentProfileSettings> = agent
-                    .profiles
-                    .unwrap()
-                    .into_iter()
-                    .map(|(key, val)| (AgentProfileId(key), val.into()))
-                    .collect();
-                for error in agent_graph::validate_profiles(&profiles) {
-                    log::warn!("agent profile configuration error: {error}");
-                }
-                profiles
-            },
+            profiles,
             nested_sub_agents: NestedSubAgentsSettings::from_content(
                 agent.nested_sub_agents.as_ref(),
             ),
@@ -1230,6 +1273,10 @@ impl Settings for AgentSettings {
             show_merge_conflict_indicator: agent.show_merge_conflict_indicator.unwrap(),
             tool_permissions: compile_tool_permissions(agent.tool_permissions),
             sandbox_permissions: compile_sandbox_permissions(agent.sandbox_permissions),
+            task_worktree_limit: clamp_task_worktree_limit(agent.task_worktree_limit),
+            task_worktree_language_servers: agent
+                .task_worktree_language_servers
+                .unwrap_or(DEFAULT_TASK_WORKTREE_LANGUAGE_SERVERS),
         }
     }
 }
@@ -1443,6 +1490,106 @@ mod tests {
     fn watchdog_from_json(value: serde_json::Value) -> anyhow::Result<TerminalWatchdogSettings> {
         let content: TerminalWatchdogSettingsContent = serde_json::from_value(value)?;
         Ok(TerminalWatchdogSettings::from_content(Some(&content)))
+    }
+
+    #[test]
+    fn test_task_worktree_limit_default_and_clamping() {
+        assert_eq!(DEFAULT_TASK_WORKTREE_LIMIT, 3);
+        assert_eq!(MIN_TASK_WORKTREE_LIMIT, 1);
+        assert_eq!(clamp_task_worktree_limit(None), 3);
+        assert_eq!(clamp_task_worktree_limit(Some(0)), 1);
+        assert_eq!(clamp_task_worktree_limit(Some(1)), 1);
+        assert_eq!(clamp_task_worktree_limit(Some(2)), 2);
+        assert_eq!(clamp_task_worktree_limit(Some(10)), 10);
+    }
+
+    #[test]
+    fn test_task_worktree_limit_parse_from_json() {
+        let custom: settings::AgentSettingsContent =
+            serde_json::from_str(r#"{"task_worktree_limit": 5}"#).unwrap();
+        assert_eq!(clamp_task_worktree_limit(custom.task_worktree_limit), 5);
+
+        let zero: settings::AgentSettingsContent =
+            serde_json::from_str(r#"{"task_worktree_limit": 0}"#).unwrap();
+        assert_eq!(clamp_task_worktree_limit(zero.task_worktree_limit), 1);
+
+        let omitted: settings::AgentSettingsContent = serde_json::from_str(r#"{}"#).unwrap();
+        assert_eq!(clamp_task_worktree_limit(omitted.task_worktree_limit), 3);
+    }
+
+    #[test]
+    fn test_task_isolation_defaults_and_parsing() {
+        assert_eq!(TaskIsolation::default(), TaskIsolation::Optional);
+        assert_eq!(
+            TaskIsolation::from_str_tolerant("required"),
+            TaskIsolation::Required
+        );
+        assert_eq!(
+            TaskIsolation::from_str_tolerant("optional"),
+            TaskIsolation::Optional
+        );
+        assert_eq!(
+            TaskIsolation::from_str_tolerant("disabled"),
+            TaskIsolation::Disabled
+        );
+        assert_eq!(
+            TaskIsolation::from_str_tolerant("unknown_value"),
+            TaskIsolation::Optional
+        );
+        assert_eq!(
+            TaskIsolation::from_str_tolerant("   required   "),
+            TaskIsolation::Required
+        );
+
+        let required: settings::AgentProfileContent =
+            serde_json::from_str(r#"{"name": "test", "task_isolation": "required"}"#).unwrap();
+        assert_eq!(required.task_isolation, Some(TaskIsolation::Required));
+        assert_eq!(required.task_worktree_language_servers, None);
+
+        let disabled: settings::AgentProfileContent = serde_json::from_str(r#"{"name": "test", "task_isolation": "disabled", "task_worktree_language_servers": false}"#).unwrap();
+        assert_eq!(disabled.task_isolation, Some(TaskIsolation::Disabled));
+        assert_eq!(disabled.task_worktree_language_servers, Some(false));
+
+        let omitted: settings::AgentProfileContent =
+            serde_json::from_str(r#"{"name": "test"}"#).unwrap();
+        assert_eq!(omitted.task_isolation, None);
+        assert_eq!(omitted.task_worktree_language_servers, None);
+    }
+
+    #[test]
+    fn test_task_settings_parsed_from_content() {
+        let json = r#"{
+            // comment test
+            "task_worktree_limit": 7,
+            "task_worktree_language_servers": false,
+            "profiles": {
+                "researcher": {
+                    "name": "Researcher",
+                    "task_isolation": "disabled",
+                },
+                "code_mechanic": {
+                    "name": "Code Mechanic",
+                    "task_isolation": "required",
+                    "task_worktree_language_servers": false,
+                },
+            },
+        }"#;
+
+        let agent_content: settings::AgentSettingsContent =
+            settings::parse_json_with_comments(json).unwrap();
+        assert_eq!(agent_content.task_worktree_limit, Some(7));
+        assert_eq!(agent_content.task_worktree_language_servers, Some(false));
+
+        let profiles = agent_content.profiles.unwrap();
+        let researcher_content = profiles.get("researcher").unwrap();
+        let researcher = AgentProfileSettings::from(researcher_content.clone());
+        assert_eq!(researcher.task_isolation, TaskIsolation::Disabled);
+        assert_eq!(researcher.task_worktree_language_servers, None);
+
+        let mechanic_content = profiles.get("code_mechanic").unwrap();
+        let mechanic = AgentProfileSettings::from(mechanic_content.clone());
+        assert_eq!(mechanic.task_isolation, TaskIsolation::Required);
+        assert_eq!(mechanic.task_worktree_language_servers, Some(false));
     }
 
     #[test]

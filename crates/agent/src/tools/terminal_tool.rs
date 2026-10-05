@@ -5519,6 +5519,8 @@ gamma"
             tool_permissions: None,
             permission_mode: None,
             terminal_wrapper_command: Some("profile_rtk".into()),
+            task_isolation: agent_settings::TaskIsolation::default(),
+            task_worktree_language_servers: None,
         };
         cx.update(|cx| {
             let mut settings = agent_settings::AgentSettings::get_global(cx).clone();
@@ -5562,6 +5564,8 @@ gamma"
             tool_permissions: None,
             permission_mode: None,
             terminal_wrapper_command: Some("".into()),
+            task_isolation: agent_settings::TaskIsolation::default(),
+            task_worktree_language_servers: None,
         };
         cx.update(|cx| {
             let mut settings = agent_settings::AgentSettings::get_global(cx).clone();
@@ -5609,6 +5613,8 @@ gamma"
             tool_permissions: None,
             permission_mode: None,
             terminal_wrapper_command: None,
+            task_isolation: agent_settings::TaskIsolation::default(),
+            task_worktree_language_servers: None,
         };
         cx.update(|cx| {
             let mut settings = agent_settings::AgentSettings::get_global(cx).clone();

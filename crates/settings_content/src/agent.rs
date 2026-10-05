@@ -528,6 +528,14 @@ pub struct AgentSettingsContent {
     /// These are populated when choosing "Allow always" from a sandbox
     /// escalation prompt.
     pub sandbox_permissions: Option<SandboxPermissionsContent>,
+    /// Maximum number of concurrently existing task worktrees in the pool.
+    ///
+    /// Default: 3
+    pub task_worktree_limit: Option<usize>,
+    /// Whether language servers should be started for task worktrees by default.
+    ///
+    /// Default: true
+    pub task_worktree_language_servers: Option<bool>,
 }
 
 impl AgentSettingsContent {
@@ -744,6 +752,57 @@ pub enum AgentPermissionMode {
     Unrestricted,
 }
 
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskIsolation {
+    Required,
+    #[default]
+    Optional,
+    Disabled,
+}
+
+impl TaskIsolation {
+    pub fn is_required(&self) -> bool {
+        matches!(self, Self::Required)
+    }
+
+    pub fn is_disabled(&self) -> bool {
+        matches!(self, Self::Disabled)
+    }
+
+    pub fn is_optional(&self) -> bool {
+        matches!(self, Self::Optional)
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Required => "required",
+            Self::Optional => "optional",
+            Self::Disabled => "disabled",
+        }
+    }
+
+    pub fn from_str_tolerant(s: &str) -> Self {
+        match s.trim() {
+            "required" => Self::Required,
+            "optional" => Self::Optional,
+            "disabled" => Self::Disabled,
+            unknown => {
+                log::warn!("unknown task_isolation value '{unknown}'; defaulting to 'optional'");
+                Self::Optional
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for TaskIsolation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
 #[with_fallible_options]
 #[derive(Debug, PartialEq, Clone, Serialize, Deserialize, JsonSchema, MergeFrom)]
 pub struct AgentProfileContent {
@@ -787,6 +846,13 @@ pub struct AgentProfileContent {
     /// - Empty string `""`: disable the wrapper for this profile.
     /// - Non-empty string: use this command instead.
     pub terminal_wrapper_command: Option<String>,
+    /// Task isolation mode for this profile: "required", "optional", or "disabled".
+    ///
+    /// Default: "optional"
+    pub task_isolation: Option<TaskIsolation>,
+    /// Override for whether language servers should be started for task worktrees
+    /// created by this profile. When unset, inherits `agent.task_worktree_language_servers`.
+    pub task_worktree_language_servers: Option<bool>,
 }
 
 #[with_fallible_options]

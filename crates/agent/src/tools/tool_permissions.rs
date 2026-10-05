@@ -1912,6 +1912,8 @@ mod tests {
             }),
             permission_mode: Some(AgentPermissionMode::Autonomous),
             terminal_wrapper_command: None,
+            task_isolation: agent_settings::TaskIsolation::default(),
+            task_worktree_language_servers: None,
         };
 
         cx.update(|cx| {
@@ -1985,6 +1987,8 @@ mod tests {
             }),
             permission_mode: Some(AgentPermissionMode::Autonomous),
             terminal_wrapper_command: None,
+            task_isolation: agent_settings::TaskIsolation::default(),
+            task_worktree_language_servers: None,
         };
 
         cx.update(|cx| {
@@ -2046,6 +2050,8 @@ mod tests {
             tool_permissions: None,
             permission_mode: Some(AgentPermissionMode::Interactive),
             terminal_wrapper_command: None,
+            task_isolation: agent_settings::TaskIsolation::default(),
+            task_worktree_language_servers: None,
         };
 
         cx.update(|cx| {
@@ -2127,6 +2133,8 @@ mod tests {
             }),
             permission_mode: Some(AgentPermissionMode::Autonomous),
             terminal_wrapper_command: None,
+            task_isolation: agent_settings::TaskIsolation::default(),
+            task_worktree_language_servers: None,
         };
 
         cx.update(|cx| {
@@ -2257,6 +2265,8 @@ mod tests {
             tool_permissions: None,
             permission_mode: Some(AgentPermissionMode::Interactive),
             terminal_wrapper_command: None,
+            task_isolation: agent_settings::TaskIsolation::default(),
+            task_worktree_language_servers: None,
         };
 
         cx.update(|cx| {
@@ -2345,6 +2355,8 @@ mod tests {
             }),
             permission_mode: Some(AgentPermissionMode::Autonomous),
             terminal_wrapper_command: None,
+            task_isolation: agent_settings::TaskIsolation::default(),
+            task_worktree_language_servers: None,
         };
 
         cx.update(|cx| {
@@ -2425,6 +2437,8 @@ mod tests {
             }),
             permission_mode: Some(AgentPermissionMode::Autonomous),
             terminal_wrapper_command: None,
+            task_isolation: agent_settings::TaskIsolation::default(),
+            task_worktree_language_servers: None,
         };
 
         cx.update(|cx| {
@@ -2498,6 +2512,8 @@ mod tests {
             }),
             permission_mode: Some(AgentPermissionMode::Autonomous),
             terminal_wrapper_command: None,
+            task_isolation: agent_settings::TaskIsolation::default(),
+            task_worktree_language_servers: None,
         };
 
         cx.update(|cx| {

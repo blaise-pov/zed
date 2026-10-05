@@ -229,6 +229,8 @@ mod tests {
             tool_permissions: None,
             permission_mode: None,
             terminal_wrapper_command: None,
+            task_isolation: crate::TaskIsolation::default(),
+            task_worktree_language_servers: None,
         }
     }
 

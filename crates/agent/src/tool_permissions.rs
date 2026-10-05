@@ -745,6 +745,8 @@ mod tests {
                 position: settings::SidebarDockPosition::Left,
             },
             thinking_display: Default::default(),
+            task_worktree_limit: agent_settings::DEFAULT_TASK_WORKTREE_LIMIT,
+            task_worktree_language_servers: agent_settings::DEFAULT_TASK_WORKTREE_LANGUAGE_SERVERS,
         }
     }
 
@@ -2602,6 +2604,8 @@ mod tests {
             }),
             permission_mode: None,
             terminal_wrapper_command: None,
+            task_isolation: agent_settings::TaskIsolation::default(),
+            task_worktree_language_servers: None,
         };
 
         let settings = test_agent_settings(ToolPermissions::default());
@@ -2724,6 +2728,8 @@ mod tests {
             }),
             permission_mode: None,
             terminal_wrapper_command: None,
+            task_isolation: agent_settings::TaskIsolation::default(),
+            task_worktree_language_servers: None,
         };
 
         // Global Deny takes precedence over profile's allow
@@ -2757,6 +2763,8 @@ mod tests {
             }),
             permission_mode: None,
             terminal_wrapper_command: None,
+            task_isolation: agent_settings::TaskIsolation::default(),
+            task_worktree_language_servers: None,
         };
 
         let settings = test_agent_settings(ToolPermissions {
@@ -2791,6 +2799,8 @@ mod tests {
             tool_permissions: None,
             permission_mode: Some(AgentPermissionMode::Autonomous),
             terminal_wrapper_command: None,
+            task_isolation: agent_settings::TaskIsolation::default(),
+            task_worktree_language_servers: None,
         };
 
         let settings = test_agent_settings(ToolPermissions::default());
@@ -2827,6 +2837,8 @@ mod tests {
             tool_permissions: None,
             permission_mode: Some(AgentPermissionMode::Unrestricted),
             terminal_wrapper_command: None,
+            task_isolation: agent_settings::TaskIsolation::default(),
+            task_worktree_language_servers: None,
         };
 
         let settings = test_agent_settings(ToolPermissions::default());
@@ -2858,6 +2870,8 @@ mod tests {
             tool_permissions: None,
             permission_mode: Some(AgentPermissionMode::Interactive),
             terminal_wrapper_command: None,
+            task_isolation: agent_settings::TaskIsolation::default(),
+            task_worktree_language_servers: None,
         };
 
         let settings = test_agent_settings(ToolPermissions {

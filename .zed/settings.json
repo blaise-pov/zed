@@ -334,6 +334,7 @@
     "profiles": {
       "orchestrator": {
         "name": "Orchestrator",
+        "task_isolation": "optional",
         "custom_prompt_path": ".zed/prompts/agents/orchestrator.md",
         "description": "Decomposes project requirements into architectural modules and coordinates layer engineers and reviewers",
         "default_model": {
@@ -526,6 +527,7 @@
       },
       "agent_architect": {
         "name": "Agent Architect",
+        "task_isolation": "optional",
         "custom_prompt_path": ".zed/prompts/agents/agent_architect.md",
         "description": "Creates one new agent profile end-to-end: boundary, prompt file, settings patch, scopes, model tier. Fleet design belongs to agent_fleet_planner.",
         "tools": {
@@ -668,6 +670,7 @@
       },
       "agent_fleet_planner": {
         "name": "Agent Fleet Planner",
+        "task_isolation": "optional",
         "custom_prompt_path": ".zed/prompts/agents/agent_fleet_planner.md",
         "description": "Analyzes the whole project, decides which agents development needs, and creates them all by delegating each build to agent_architect.",
         "tools": {
@@ -737,6 +740,7 @@
       },
       "agent_tuner": {
         "name": "Agent Tuner",
+        "task_isolation": "optional",
         "custom_prompt_path": ".zed/prompts/agents/agent_tuner.md",
         "description": "Manual-only. Reads agent-bus feedback, tunes profiles/prompts, resolves tickets after owner approval.",
         "tools": {
@@ -878,6 +882,7 @@
       },
       "agent_reviewer": {
         "name": "Agent & Settings Reviewer",
+        "task_isolation": "optional",
         "custom_prompt_path": ".zed/prompts/agents/agent_reviewer.md",
         "description": "Reviews and optimizes agent profiles and prompts using a frontier model, validates settings via tests",
         "default_model": {
@@ -994,6 +999,7 @@
       },
       "agent_engineer": {
         "name": "Agent Runtime Engineer",
+        "task_isolation": "required",
         "custom_prompt_path": ".zed/prompts/agents/agent_engineer.md",
         "description": "Implements agent runtime, ACP thread handling, task graph integration, and LLM integrations",
         "default_model": {
@@ -1125,6 +1131,7 @@
       },
       "editor_engineer": {
         "name": "Editor & Language Engineer",
+        "task_isolation": "required",
         "custom_prompt_path": ".zed/prompts/agents/editor_engineer.md",
         "description": "Implements core editor buffers, display maps, project worktrees, and LSP integrations",
         "default_model": {
@@ -1251,6 +1258,7 @@
       },
       "ui_engineer": {
         "name": "GPUI & UI Engineer",
+        "task_isolation": "required",
         "custom_prompt_path": ".zed/prompts/agents/ui_engineer.md",
         "description": "Implements GPUI framework features, UI components, themes, and platform renderers",
         "default_model": {
@@ -1376,6 +1384,7 @@
       },
       "collab_engineer": {
         "name": "Collab & Network Engineer",
+        "task_isolation": "required",
         "custom_prompt_path": ".zed/prompts/agents/collab_engineer.md",
         "description": "Implements collaboration backend server, RPC protocol, network sync, and database migrations",
         "default_model": {
@@ -1491,6 +1500,7 @@
       },
       "reviewer": {
         "name": "Code Reviewer & QA",
+        "task_isolation": "optional",
         "custom_prompt_path": ".zed/prompts/agents/reviewer.md",
         "description": "Independent read-only reviewer for diffs, clippy diagnostics, tests, and acceptance criteria",
         "default_model": {
@@ -1601,6 +1611,7 @@
       },
       "git_committer": {
         "name": "Git Committer",
+        "task_isolation": "optional",
         "custom_prompt_path": ".zed/prompts/agents/git_committer.md",
         "description": "Decomposes disparate changes into atomic, well-scoped commits following Zed repository conventions",
         "default_model": {
@@ -1673,6 +1684,7 @@
       },
       "fork_merger": {
         "name": "Fork Merger",
+        "task_isolation": "optional",
         "custom_prompt_path": ".zed/prompts/agents/fork_merger.md",
         "description": "Detects the latest zed-industries/zed release (including -pre), merges into this fork, pushes fork tags, and publishes releases with changelog",
         "default_model": {
@@ -1797,6 +1809,7 @@
       },
       "ci_release": {
         "name": "CI Release",
+        "task_isolation": "optional",
         "custom_prompt_path": ".zed/prompts/agents/ci_release.md",
         "description": "Dispatches build-release.yml at repo HEAD on GitHub Actions, waits via gh run watch until green, delegates build-breaking code fixes to agent_engineer, and verifies all 8 release artifacts",
         "default_model": {
@@ -1858,6 +1871,9 @@
       },
       "e2e_tester": {
         "name": "Live Runtime & Agent E2E Tester",
+        "task_isolation": "optional",
+        "system_prompt_template": ".zed/prompts/core/e2e_tester_system_prompt.md",
+        "custom_prompt_path": ".zed/prompts/agents/e2e_tester.md",
         "description": "Manual-only black-box runtime verification, agent settings hypothesis testing, and E2E test suite authoring",
         "default_model": {
           "provider": "${MID_TIER_MODEL_PROVIDER}",
@@ -1954,6 +1970,7 @@
       },
       "researcher": {
         "name": "Researcher",
+        "task_isolation": "disabled",
         "custom_prompt_path": ".zed/prompts/agents/researcher.md",
         "description": "Background research against primary sources; publishes cited Markdown findings as taskgraph artifacts",
         "default_model": {
@@ -2036,6 +2053,8 @@
       },
       "code_mechanic": {
         "name": "Code Mechanic",
+        "task_isolation": "required",
+        "task_worktree_language_servers": false,
         "custom_prompt_path": ".zed/prompts/agents/code_mechanic.md",
         "description": "Cheap-tier executor for fully-specified mechanical work: code extraction, search fan-out, and exact repeated edits; never decides what code should do",
         "default_model": {
@@ -2091,6 +2110,7 @@
       },
       "project_qa": {
         "name": "Project QA",
+        "task_isolation": "disabled",
         "custom_prompt_path": ".zed/prompts/agents/project_qa.md",
         "description": "Read-only Q&A companion: answers questions about this repo's code, architecture, and git history with path:line / commit citations; never edits files or runs builds",
         "default_model": {

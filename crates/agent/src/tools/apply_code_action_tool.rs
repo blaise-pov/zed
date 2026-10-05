@@ -198,6 +198,8 @@ mod tests {
             tool_permissions: Some(ToolPermissions::default()),
             permission_mode: None,
             terminal_wrapper_command: None,
+            task_isolation: agent_settings::TaskIsolation::default(),
+            task_worktree_language_servers: None,
         }
     }
 

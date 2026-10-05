@@ -11,7 +11,7 @@ use settings::{
     Settings as _, SettingsContent, SettingsLocation, SettingsStore, update_settings_file,
 };
 
-pub use settings::AgentPermissionMode;
+pub use settings::{AgentPermissionMode, TaskIsolation};
 use util::ResultExt as _;
 
 use crate::{AgentProfileId, AgentSettings, ToolPermissions, compile_tool_permissions};
@@ -117,6 +117,13 @@ impl AgentProfile {
         let terminal_wrapper_command = base_profile
             .as_ref()
             .and_then(|profile| profile.terminal_wrapper_command.clone());
+        let task_isolation = base_profile
+            .as_ref()
+            .map(|profile| profile.task_isolation)
+            .unwrap_or_default();
+        let task_worktree_language_servers = base_profile
+            .as_ref()
+            .and_then(|profile| profile.task_worktree_language_servers);
 
         let profile_settings = AgentProfileSettings {
             name: name.into(),
@@ -133,6 +140,8 @@ impl AgentProfile {
             tool_permissions,
             permission_mode,
             terminal_wrapper_command,
+            task_isolation,
+            task_worktree_language_servers,
         };
 
         match &origin {
@@ -218,6 +227,8 @@ pub struct AgentProfileSettings {
     pub tool_permissions: Option<ToolPermissions>,
     pub permission_mode: Option<AgentPermissionMode>,
     pub terminal_wrapper_command: Option<SharedString>,
+    pub task_isolation: TaskIsolation,
+    pub task_worktree_language_servers: Option<bool>,
 }
 
 /// Which sub-agents a profile may spawn, and how deeply they may nest.
@@ -377,6 +388,8 @@ impl AgentProfileSettings {
                     .terminal_wrapper_command
                     .clone()
                     .map(|s| s.to_string()),
+                task_isolation: Some(self.task_isolation),
+                task_worktree_language_servers: self.task_worktree_language_servers,
             },
         );
 
@@ -554,6 +567,8 @@ impl From<AgentProfileContent> for AgentProfileSettings {
             tool_permissions,
             permission_mode,
             terminal_wrapper_command,
+            task_isolation,
+            task_worktree_language_servers,
         } = content;
 
         let custom_prompt_path_shared = custom_prompt_path
@@ -578,6 +593,8 @@ impl From<AgentProfileContent> for AgentProfileSettings {
             tool_permissions: tool_permissions.map(|tp| compile_tool_permissions(Some(tp))),
             permission_mode,
             terminal_wrapper_command: terminal_wrapper_command.map(SharedString::from),
+            task_isolation: task_isolation.unwrap_or_default(),
+            task_worktree_language_servers,
         }
     }
 }
@@ -628,6 +645,8 @@ mod tests {
             tool_permissions: None,
             permission_mode: None,
             terminal_wrapper_command: None,
+            task_isolation: TaskIsolation::default(),
+            task_worktree_language_servers: None,
         }
     }
 
