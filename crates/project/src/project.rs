@@ -2237,6 +2237,27 @@ impl Project {
         self.lsp_store.clone()
     }
 
+    pub fn set_worktree_language_servers_suppressed(
+        &self,
+        worktree_id: WorktreeId,
+        suppressed: bool,
+        cx: &mut App,
+    ) {
+        self.lsp_store.update(cx, |lsp_store, _cx| {
+            lsp_store.set_worktree_language_servers_suppressed(worktree_id, suppressed);
+        });
+    }
+
+    pub fn is_worktree_language_servers_suppressed(
+        &self,
+        worktree_id: WorktreeId,
+        cx: &App,
+    ) -> bool {
+        self.lsp_store
+            .read(cx)
+            .is_worktree_language_servers_suppressed(worktree_id)
+    }
+
     #[inline]
     pub fn worktree_store(&self) -> Entity<WorktreeStore> {
         self.worktree_store.clone()

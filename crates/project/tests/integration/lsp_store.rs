@@ -228,6 +228,91 @@ async fn test_removing_invisible_worktree_cleans_reused_lsp_bookkeeping(cx: &mut
 }
 
 #[gpui::test]
+async fn test_worktree_language_servers_suppression(cx: &mut TestAppContext) {
+    init_test(cx);
+    cx.executor().allow_parking();
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(path!("/suppressed"), json!({ "main.rs": "fn main() {}" }))
+        .await;
+    fs.insert_tree(path!("/normal"), json!({ "main.rs": "fn main() {}" }))
+        .await;
+
+    let project = Project::test(
+        fs,
+        [path!("/suppressed").as_ref(), path!("/normal").as_ref()],
+        cx,
+    )
+    .await;
+    let language_registry = project.read_with(cx, |project, _| project.languages().clone());
+    language_registry.add(rust_lang());
+    let mut fake_servers = language_registry.register_fake_lsp("Rust", FakeLspAdapter::default());
+
+    let (suppressed_worktree_id, normal_worktree_id) = project.read_with(cx, |project, cx| {
+        let mut worktrees = project.worktrees(cx);
+        let first = worktrees.next().unwrap().read(cx).id();
+        let second = worktrees.next().unwrap().read(cx).id();
+        (first, second)
+    });
+
+    // Suppress language servers for the first worktree
+    project.update(cx, |project, cx| {
+        project.set_worktree_language_servers_suppressed(suppressed_worktree_id, true, cx);
+    });
+
+    assert!(project.read_with(cx, |project, cx| {
+        project.is_worktree_language_servers_suppressed(suppressed_worktree_id, cx)
+    }));
+    assert!(!project.read_with(cx, |project, cx| {
+        project.is_worktree_language_servers_suppressed(normal_worktree_id, cx)
+    }));
+
+    // Opening buffer in suppressed worktree must NOT launch/register language server
+    let _suppressed_buffer = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer_with_lsp(path!("/suppressed/main.rs"), cx)
+        })
+        .await
+        .unwrap();
+
+    cx.run_until_parked();
+
+    // Verify no language servers started
+    project.read_with(cx, |project, cx| {
+        assert_eq!(
+            project
+                .lsp_store()
+                .read(cx)
+                .language_server_statuses()
+                .count(),
+            0
+        );
+    });
+
+    // Opening buffer in normal worktree DOES launch language server
+    let _normal_buffer = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer_with_lsp(path!("/normal/main.rs"), cx)
+        })
+        .await
+        .unwrap();
+
+    fake_servers.next().await.unwrap();
+    cx.run_until_parked();
+
+    project.read_with(cx, |project, cx| {
+        assert_eq!(
+            project
+                .lsp_store()
+                .read(cx)
+                .language_server_statuses()
+                .count(),
+            1
+        );
+    });
+}
+
+#[gpui::test]
 async fn test_open_buffer_via_lsp_case_variant_no_duplicate(cx: &mut TestAppContext) {
     init_test(cx);
     cx.executor().allow_parking();

@@ -359,6 +359,7 @@ pub struct LocalLspStore {
     restricted_worktrees_tasks: HashMap<WorktreeId, (Subscription, watch::Receiver<bool>)>,
     all_language_servers_stopped: bool,
     stopped_language_servers: HashSet<LanguageServerName>,
+    pub suppressed_worktree_ids: HashSet<WorktreeId>,
 
     buffers_to_refresh_hash_set: HashSet<BufferId>,
     buffers_to_refresh_queue: VecDeque<BufferId>,
@@ -3121,6 +3122,9 @@ impl LocalLspStore {
         };
         let initial_snapshot = buffer.text_snapshot();
         let worktree_id = file.worktree_id(cx);
+        if self.suppressed_worktree_ids.contains(&worktree_id) {
+            return;
+        }
 
         let Some(language) = buffer.language().cloned() else {
             return;
@@ -3997,6 +4001,7 @@ impl LocalLspStore {
         cx: &mut Context<LspStore>,
     ) -> Vec<LanguageServerId> {
         self.restricted_worktrees_tasks.remove(&id_to_remove);
+        self.suppressed_worktree_ids.remove(&id_to_remove);
         self.diagnostics.remove(&id_to_remove);
         self.prettier_store.update(cx, |prettier_store, cx| {
             prettier_store.remove_worktree(id_to_remove, cx);
@@ -4822,6 +4827,25 @@ impl LspStore {
         }
     }
 
+    pub fn set_worktree_language_servers_suppressed(
+        &mut self,
+        worktree_id: WorktreeId,
+        suppressed: bool,
+    ) {
+        if let Some(local) = self.as_local_mut() {
+            if suppressed {
+                local.suppressed_worktree_ids.insert(worktree_id);
+            } else {
+                local.suppressed_worktree_ids.remove(&worktree_id);
+            }
+        }
+    }
+
+    pub fn is_worktree_language_servers_suppressed(&self, worktree_id: WorktreeId) -> bool {
+        self.as_local()
+            .is_some_and(|local| local.suppressed_worktree_ids.contains(&worktree_id))
+    }
+
     pub fn upstream_client(&self) -> Option<(AnyProtoClient, u64)> {
         match &self.mode {
             LspStoreMode::Remote(RemoteLspStore {
@@ -4913,6 +4937,7 @@ impl LspStore {
                 restricted_worktrees_tasks: HashMap::default(),
                 all_language_servers_stopped: false,
                 stopped_language_servers: HashSet::default(),
+                suppressed_worktree_ids: HashSet::default(),
                 watched_manifest_filenames: ManifestProvidersStore::global(cx)
                     .manifest_file_names(),
             }),
@@ -6367,6 +6392,9 @@ impl LspStore {
                 .sorted_by_key(|(file, _, _)| Reverse(file.worktree.read(cx).is_visible()));
             for (file, language, buffer_id) in buffers {
                 let worktree_id = file.worktree_id(cx);
+                if local.suppressed_worktree_ids.contains(&worktree_id) {
+                    continue;
+                }
                 let Some(worktree) = local
                     .worktree_store
                     .read(cx)
