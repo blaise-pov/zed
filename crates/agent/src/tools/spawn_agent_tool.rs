@@ -9,8 +9,8 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use crate::task_worktree::SubagentIsolationDetails;
-use acp_thread::AgentModelId;
 use crate::{AgentTool, ThreadEnvironment, ToolCallEventStream, ToolInput};
+use acp_thread::AgentModelId;
 use settings::Settings as _;
 
 /// Spawn a sub-agent for a well-scoped task.
@@ -53,10 +53,10 @@ pub struct SpawnAgentToolInput {
     /// Session ID of an existing agent session to continue instead of creating a new one. Omit to create a new agent.
     #[serde(default, deserialize_with = "deserialize_session_id")]
     pub session_id: Option<acp::SessionId>,
-    /// Optional opaque reference to a task managed outside Zed (e.g.
-    /// `TASK-42` in an external task-graph system). Zed does not resolve it;
-    /// the spawned agent is told to fetch the task details itself via its
-    /// tools (typically an MCP server).
+    /// Optional reference to a task managed in the Task Graph Service (e.g. `TASK-42`).
+    /// The runtime registers or links this task in the task graph service (get-or-create,
+    /// best-effort) before spawning, and the spawned agent is expected to fetch details
+    /// and drive the task to completion via the task tools.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_id: Option<String>,
     /// Optional profile ID to use for this subagent. If not specified, the subagent will use the default profile.
@@ -294,6 +294,20 @@ impl AgentTool for SpawnAgentTool {
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
                 .map(str::to_string);
+
+            if (input.base_branch.is_some() || input.on_branch.is_some())
+                && raw_task_id.is_none()
+                && input.session_id.is_none()
+            {
+                return Err(SpawnAgentToolOutput::Error {
+                    session_id: input.session_id.clone(),
+                    error: "base_branch/on_branch requires task_id: git isolation is task-scoped".to_string(),
+                    session_info: None,
+                    isolation: None,
+                    isolation_details: None,
+                });
+            }
+
             let task_id = if raw_task_id.is_some() {
                 raw_task_id
             } else if let Some(session_id) = &input.session_id {
@@ -302,7 +316,88 @@ impl AgentTool for SpawnAgentTool {
                 None
             };
 
-            let (worktree_path, isolation) = if let Some(ref task_id) = task_id {
+            let (effective_profile_id, task_isolation, enable_lsp) = cx.update(|cx| {
+                let location = event_stream.settings_location(cx);
+                if let Some(error) = validate_profile(input.profile.as_ref(), location, cx) {
+                    return Err(SpawnAgentToolOutput::Error {
+                        session_id: input.session_id.clone(),
+                        error,
+                        session_info: None,
+                        isolation: None,
+                        isolation_details: None,
+                    });
+                }
+
+                let settings = agent_settings::AgentSettings::get(location, cx);
+                let effective_profile_id = if let Some(ref profile_id) = input.profile {
+                    profile_id.clone()
+                } else if let Some(caller_profile_id) = event_stream.profile_id(cx) {
+                    caller_profile_id
+                } else {
+                    settings.default_profile.clone()
+                };
+
+                let profile_settings = settings.profiles.get(&effective_profile_id);
+                let task_isolation = profile_settings
+                    .map(|p| p.task_isolation)
+                    .unwrap_or(agent_settings::TaskIsolation::Optional);
+
+                let enable_lsp = profile_settings
+                    .and_then(|p| p.task_worktree_language_servers)
+                    .unwrap_or(settings.task_worktree_language_servers);
+
+                Ok((effective_profile_id, task_isolation, enable_lsp))
+            })?;
+
+            if task_isolation.is_required() && task_id.is_none() {
+                return Err(SpawnAgentToolOutput::Error {
+                    session_id: input.session_id.clone(),
+                    error: format!(
+                        "profile '{effective_profile_id}' requires task-scoped isolation; pass task_id"
+                    ),
+                    session_info: None,
+                    isolation: None,
+                    isolation_details: None,
+                });
+            }
+
+            if task_isolation.is_disabled() && (input.base_branch.is_some() || input.on_branch.is_some()) {
+                return Err(SpawnAgentToolOutput::Error {
+                    session_id: input.session_id.clone(),
+                    error: format!(
+                        "profile '{effective_profile_id}' has isolation disabled; base_branch/on_branch are not applicable"
+                    ),
+                    session_info: None,
+                    isolation: None,
+                    isolation_details: None,
+                });
+            }
+
+            let session_guard = if let Some(ref task_id) = task_id {
+                let task_id_typed = crate::AgentTaskId::from(task_id.clone());
+                if crate::task_worktree::has_active_subagent_session(&task_id_typed) {
+                    return Err(SpawnAgentToolOutput::Error {
+                        session_id: input.session_id.clone(),
+                        error: format!(
+                            "task {task_id} already has an active session; wait for it to finish or resume via session_id later"
+                        ),
+                        session_info: None,
+                        isolation: None,
+                        isolation_details: None,
+                    });
+                }
+                Some(crate::task_worktree::SubagentSessionGuard::new(
+                    task_id_typed,
+                ))
+            } else {
+                None
+            };
+
+            let (worktree_path, isolation) = if task_isolation.is_disabled() {
+                (None, Some("shared:profile-disabled".to_string()))
+            } else if let Some(ref task_id) = task_id {
+                let task_id_typed = crate::AgentTaskId::from(task_id.clone());
+                crate::task_worktree::set_task_lsp_suppressed(&task_id_typed, !enable_lsp);
                 match self
                     .environment
                     .ensure_subagent_worktree(
@@ -315,7 +410,6 @@ impl AgentTool for SpawnAgentTool {
                     .await
                 {
                     Ok(path) => {
-                        let task_id_typed = crate::AgentTaskId::from(task_id.clone());
                         let isolation_str = if let Some(target) = crate::task_worktree::task_worktree_checkout_target(&task_id_typed) {
                             format!("checkout:{target}")
                         } else if let Some(ref on_b) = input.on_branch {
@@ -358,15 +452,22 @@ impl AgentTool for SpawnAgentTool {
             };
 
             let (subagent, mut session_info) = cx.update(|cx| {
-                let location = event_stream.settings_location(cx);
-                if let Some(error) = validate_profile(input.profile.as_ref(), location, cx) {
-                    return Err(SpawnAgentToolOutput::Error {
-                        session_id: input.session_id.clone(),
-                        error,
-                        session_info: None,
-                        isolation: isolation.clone(),
-                        isolation_details: None,
-                    });
+                if let Some(ref path) = worktree_path {
+                    if let Some(project) = event_stream.project() {
+                        let worktree_id = project.read_with(cx, |project, cx| {
+                            project.worktrees(cx).find(|w| {
+                                let w_abs = w.read(cx).abs_path();
+                                w_abs.as_ref() == path
+                                    || util::paths::normalize_lexically(w_abs.as_ref()).ok().as_deref()
+                                        == util::paths::normalize_lexically(path).ok().as_deref()
+                            }).map(|w| w.read(cx).id())
+                        });
+                        if let Some(worktree_id) = worktree_id {
+                            project.update(cx, |project, cx| {
+                                project.set_worktree_language_servers_suppressed(worktree_id, !enable_lsp, cx);
+                            });
+                        }
+                    }
                 }
                 let subagent = if let Some(session_id) = input.session_id {
                     self.environment.resume_subagent(
@@ -377,7 +478,7 @@ impl AgentTool for SpawnAgentTool {
                     )
                 } else {
                     self.environment.create_subagent(
-                        input.label,
+                        input.label.clone(),
                         input.profile,
                         input.model.map(AgentModelId::from),
                         worktree_path.clone(),
@@ -421,11 +522,17 @@ impl AgentTool for SpawnAgentTool {
                 Ok((subagent, session_info))
             })?;
 
-            let session_guard = task_id.as_ref().map(|id| {
-                crate::task_worktree::SubagentSessionGuard::new(crate::AgentTaskId::from(
-                    id.clone(),
-                ))
-            });
+            if let Some(ref task_id) = task_id {
+                if let Err(error) = self
+                    .environment
+                    .ensure_task_registered(task_id, &input.label, &mut cx)
+                    .await
+                {
+                    log::warn!(
+                        "failed to ensure task {task_id} registered in task graph service: {error:#}"
+                    );
+                }
+            }
 
             let send_result = {
                 let message = match input.task_id.as_deref() {
@@ -452,6 +559,23 @@ impl AgentTool for SpawnAgentTool {
 
             session_info.message_end_index =
                 cx.update(|cx| Some(subagent.num_entries(cx).saturating_sub(1)));
+
+            if let Err(ref error) = send_result {
+                if let Some(ref task_id) = task_id {
+                    let error_message = error.to_string();
+                    if crate::classify_send_error(&error_message) == crate::SendErrorKind::Definitive {
+                        if let Err(failure_error) = self
+                            .environment
+                            .fail_task_registered(task_id, &error_message, &mut cx)
+                            .await
+                        {
+                            log::warn!(
+                                "failed to auto-fail task {task_id} in task graph service: {failure_error:#}"
+                            );
+                        }
+                    }
+                }
+            }
 
             let is_error = send_result.is_err();
             let isolation_details =
