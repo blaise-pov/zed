@@ -2899,6 +2899,7 @@ impl acp_thread::AgentConnection for NativeAgentConnection {
     }
 
     fn cancel(&self, session_id: &acp::SessionId, cx: &mut App) {
+        log::info!("[cancel-audit] session={} source=user_stop", session_id);
         log::info!("Cancelling on session: {}", session_id);
         self.0.update(cx, |agent, cx| {
             if let Some(session) = agent.sessions.get(session_id) {
@@ -3762,6 +3763,78 @@ impl ThreadEnvironment for NativeThreadEnvironment {
         })
     }
 
+    fn ensure_task_registered(
+        &self,
+        task_id: &str,
+        title: &str,
+        cx: &mut AsyncApp,
+    ) -> Task<Result<()>> {
+        let Some(parent_thread_entity) = self.thread.upgrade() else {
+            return Task::ready(Err(anyhow!("Parent thread no longer exists")));
+        };
+        let (project, task_id_typed, title_string) = cx.update(|cx| {
+            let project = parent_thread_entity.read(cx).project().clone();
+            (
+                project,
+                crate::AgentTaskId::from(task_id.to_string()),
+                title.to_string(),
+            )
+        });
+        cx.spawn(async move |cx| {
+            let task = cx.update(|cx| {
+                let context_server_store = project.read(cx).context_server_store();
+                let server_id = context_server::ContextServerId(
+                    agent_settings::AgentSettings::get_for_project(project.read(cx), cx)
+                        .task_graph_server_id
+                        .clone()
+                        .into(),
+                );
+                let provider = crate::mcp_agent_task_provider::McpAgentTaskProvider::new(
+                    context_server_store,
+                    server_id,
+                );
+                provider.ensure_task(&task_id_typed, &title_string, cx)
+            });
+            task.await
+        })
+    }
+
+    fn fail_task_registered(
+        &self,
+        task_id: &str,
+        reason: &str,
+        cx: &mut AsyncApp,
+    ) -> Task<Result<()>> {
+        let Some(parent_thread_entity) = self.thread.upgrade() else {
+            return Task::ready(Err(anyhow!("Parent thread no longer exists")));
+        };
+        let (project, task_id_typed, reason_string) = cx.update(|cx| {
+            let project = parent_thread_entity.read(cx).project().clone();
+            (
+                project,
+                crate::AgentTaskId::from(task_id.to_string()),
+                reason.to_string(),
+            )
+        });
+        cx.spawn(async move |cx| {
+            let task = cx.update(|cx| {
+                let context_server_store = project.read(cx).context_server_store();
+                let server_id = context_server::ContextServerId(
+                    agent_settings::AgentSettings::get_for_project(project.read(cx), cx)
+                        .task_graph_server_id
+                        .clone()
+                        .into(),
+                );
+                let provider = crate::mcp_agent_task_provider::McpAgentTaskProvider::new(
+                    context_server_store,
+                    server_id,
+                );
+                provider.fail_task(&task_id_typed, &reason_string, cx)
+            });
+            task.await
+        })
+    }
+
     fn create_sibling_thread(
         &self,
         request: SiblingThreadRequest,
@@ -3841,6 +3914,7 @@ impl SubagentHandle for NativeSubagentHandle {
         let parent_thread = self.parent_thread.clone();
 
         cx.spawn(async move |cx| {
+            let start_time = std::time::Instant::now();
             let (task, token_limit_rx, _subscription) = cx.update(|cx| {
                 parent_thread
                     .update(cx, |parent_thread, _cx| {
@@ -3878,6 +3952,10 @@ impl SubagentHandle for NativeSubagentHandle {
                     if thread.read_with(cx, |thread, _| thread.is_turn_complete()) {
                         task.await
                     } else {
+                        log::info!(
+                            "[cancel-audit] session={} source=subagent_token_limit_cancel",
+                            subagent_session_id
+                        );
                         thread.update(cx, |thread, cx| thread.cancel(cx)).await;
                         Err(anyhow!(
                             "The agent is nearing the end of its context window and has been \
@@ -3894,7 +3972,32 @@ impl SubagentHandle for NativeSubagentHandle {
             );
             let result = match response {
                 Ok(Some(response)) => match response.stop_reason {
-                    acp::StopReason::Cancelled => Err(anyhow!("User canceled")),
+                    acp::StopReason::Cancelled => {
+                        let (parent_id, parent_canceling, parent_was_canceled, parent_turn_complete) =
+                            parent_thread
+                                .read_with(cx, |parent, _| {
+                                    (
+                                        parent.id().clone(),
+                                        parent.is_canceling(),
+                                        parent.was_canceled(),
+                                        parent.is_turn_complete(),
+                                    )
+                                })
+                                .unwrap_or_else(|_| (acp::SessionId::from("unknown"), false, false, false));
+                        let subagent_task_id = thread
+                            .read_with(cx, |t, _| t.task_id().unwrap_or("-").to_string());
+                        log::info!(
+                            "[cancel-audit] session={} task_id={} parent_id={} parent_canceling={} parent_was_canceled={} parent_turn_complete={} elapsed_ms={} source=subagent_stop_cancelled",
+                            subagent_session_id,
+                            subagent_task_id,
+                            parent_id,
+                            parent_canceling,
+                            parent_was_canceled,
+                            parent_turn_complete,
+                            start_time.elapsed().as_millis(),
+                        );
+                        Err(anyhow!("User canceled"))
+                    }
                     acp::StopReason::MaxTokens => Err(anyhow!("The agent reached the maximum number of tokens.")),
                     acp::StopReason::MaxTurnRequests => Err(anyhow!("The agent reached the maximum number of allowed requests between user turns. Try prompting again.")),
                     acp::StopReason::Refusal => Err(anyhow!("The agent refused to process that prompt. Try again.")),
@@ -3948,6 +4051,27 @@ impl SubagentHandle for NativeSubagentHandle {
         self.subagent_thread.update(cx, |thread, _cx| {
             thread.set_task_id(task_id);
         });
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SendErrorKind {
+    Definitive,
+    Transient,
+}
+
+pub fn classify_send_error(error_message: &str) -> SendErrorKind {
+    let lower = error_message.to_lowercase();
+    if lower.contains("parent thread no longer exists")
+        || lower.contains("subagent thread no longer exists")
+        || lower.contains("parent session not found")
+        || lower.contains("session not found")
+        || lower.contains("thread entity dropped")
+        || lower.contains("entity dropped")
+    {
+        SendErrorKind::Definitive
+    } else {
+        SendErrorKind::Transient
     }
 }
 

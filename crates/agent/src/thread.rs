@@ -947,6 +947,24 @@ pub trait ThreadEnvironment {
         Task::ready(Ok(false))
     }
 
+    fn ensure_task_registered(
+        &self,
+        _task_id: &str,
+        _title: &str,
+        _cx: &mut AsyncApp,
+    ) -> Task<Result<()>> {
+        Task::ready(Ok(()))
+    }
+
+    fn fail_task_registered(
+        &self,
+        _task_id: &str,
+        _reason: &str,
+        _cx: &mut AsyncApp,
+    ) -> Task<Result<()>> {
+        Task::ready(Ok(()))
+    }
+
     /// Creates an independent sibling thread visible in the agent sidebar.
     /// Unlike subagents, sibling threads are first-class threads that persist
     /// and run in parallel without reporting results back to the parent.
@@ -1331,8 +1349,14 @@ pub struct ToolCallAuthorization {
 
 fn ensure_tool_call_authorization_not_interrupted(
     outcome: &acp_thread::SelectedPermissionOutcome,
+    tool_call_id: &acp::ToolCallId,
 ) -> Result<()> {
     if outcome.option_id.0.as_ref() == FOLLOW_UP_PERMISSION_DENIED_OPTION_ID {
+        // [cancel-audit] logs allow reconstructing cancellation causal chains across parent and subagent threads.
+        log::info!(
+            "[cancel-audit] tool_call={} source=tool_interrupted_by_follow_up",
+            tool_call_id
+        );
         Err(anyhow!(TOOL_CALL_INTERRUPTED_BY_FOLLOW_UP_MESSAGE))
     } else {
         Ok(())
@@ -1479,6 +1503,8 @@ pub struct Thread {
     delegation_budget: u8,
     task_worktree: Option<PathBuf>,
     task_id: Option<String>,
+    is_canceling: bool,
+    was_canceled: bool,
 }
 
 impl Thread {
@@ -1519,6 +1545,14 @@ impl Thread {
 
     pub fn set_task_id(&mut self, task_id: Option<String>) {
         self.task_id = task_id;
+    }
+
+    pub fn is_canceling(&self) -> bool {
+        self.is_canceling
+    }
+
+    pub fn was_canceled(&self) -> bool {
+        self.was_canceled
     }
 
     pub fn worktree_root_path(&self, cx: &App) -> Option<Arc<Path>> {
@@ -1573,17 +1607,19 @@ impl Thread {
         thread.task_worktree = task_worktree;
         thread.subagent_slot_pool = parent_thread.read(cx).subagent_slot_pool.clone();
         thread.inherit_parent_settings(parent_thread, cx);
-        let model_selection = model_selection
-            .cloned()
-            .or_else(|| {
-                if thread.pinned_profile().is_some()
-                    && Self::profile_specifies_model(&thread.profile_id, thread.settings_location(cx), cx)
-                {
-                    None
-                } else {
-                    thread.agent_settings(cx).subagent_model.clone()
-                }
-            });
+        let model_selection = model_selection.cloned().or_else(|| {
+            if thread.pinned_profile().is_some()
+                && Self::profile_specifies_model(
+                    &thread.profile_id,
+                    thread.settings_location(cx),
+                    cx,
+                )
+            {
+                None
+            } else {
+                thread.agent_settings(cx).subagent_model.clone()
+            }
+        });
         if let Some(model_selection) = model_selection {
             thread.inherits_parent_model_settings = false;
             thread.apply_model_selection(&model_selection, cx);
@@ -1733,6 +1769,8 @@ impl Thread {
             delegation_budget,
             task_worktree: None,
             task_id: None,
+            is_canceling: false,
+            was_canceled: false,
         }
     }
 
@@ -2167,6 +2205,8 @@ impl Thread {
             delegation_budget,
             task_worktree: None,
             task_id: None,
+            is_canceling: false,
+            was_canceled: false,
         }
     }
 
@@ -2657,14 +2697,42 @@ impl Thread {
     }
 
     pub fn cancel(&mut self, cx: &mut Context<Self>) -> Task<()> {
+        self.was_canceled = true;
+        self.is_canceling = true;
+        let thread_id = self.id.clone();
+        let task_id = self.task_id.as_deref().unwrap_or("-");
+        let active_turn = self.running_turn.is_some();
+        let subagent_count = self.running_subagents.len();
+        log::info!(
+            "[cancel-audit] thread={} task_id={} source=thread_cancel active_turn={} subagents={}",
+            thread_id,
+            task_id,
+            active_turn,
+            subagent_count
+        );
+
         for subagent in self.running_subagents.drain(..) {
             if let Some(subagent) = subagent.upgrade() {
+                let (subagent_id, subagent_task_id) =
+                    subagent.read_with(cx, |subagent_thread, _| {
+                        (
+                            subagent_thread.id.clone(),
+                            subagent_thread.task_id().unwrap_or("-").to_string(),
+                        )
+                    });
+                log::info!(
+                    "[cancel-audit] thread={} source=cascade_to_subagent subagent={} subagent_task_id={}",
+                    thread_id,
+                    subagent_id,
+                    subagent_task_id
+                );
                 subagent.update(cx, |thread, cx| thread.cancel(cx)).detach();
             }
         }
 
         let Some(running_turn) = self.running_turn.take() else {
             self.flush_pending_message(cx);
+            self.is_canceling = false;
             return Task::ready(());
         };
 
@@ -2673,6 +2741,11 @@ impl Thread {
         cx.spawn(async move |this, cx| {
             turn_task.await;
             this.update(cx, |this, cx| {
+                this.is_canceling = false;
+                log::info!(
+                    "[cancel-audit] thread={} source=thread_cancel_complete",
+                    thread_id
+                );
                 this.flush_pending_message(cx);
             })
             .ok();
@@ -2764,6 +2837,11 @@ impl Thread {
         client_user_message_id: ClientUserMessageId,
         cx: &mut Context<Self>,
     ) -> Result<()> {
+        log::info!(
+            "[cancel-audit] thread={} message_id={:?} source=truncate",
+            self.id,
+            client_user_message_id
+        );
         self.cancel(cx).detach();
         // Clear pending message since cancel will try to flush it asynchronously,
         // and we don't want that content to be added after we truncate
@@ -2955,11 +3033,19 @@ impl Thread {
             .compaction_model(cx)
             .ok_or_else(|| anyhow!(NoModelConfiguredError))?;
 
+        let active_turn = self.running_turn.is_some();
+        log::info!(
+            "[cancel-audit] thread={} source=compact_start active_turn={}",
+            self.id,
+            active_turn
+        );
+
         // Flush any pending message and cancel an in-flight turn before we
         // start, mirroring `run_turn` so a stray completion can't race with the
         // compaction we're about to perform.
         self.flush_pending_message(cx);
         self.cancel(cx).detach();
+        self.was_canceled = false;
 
         let compaction = self.forced_compaction_target_ix().map(|request_end_ix| {
             self.advance_prompt_id();
@@ -3000,6 +3086,13 @@ impl Thread {
                 // If we were cancelled, `cancel()` already took `running_turn`
                 // (possibly for a new turn), so leave it alone.
                 if *cancellation_rx.borrow() {
+                    let thread_id = this.read_with(cx, |this, _| this.id.clone()).ok();
+                    if let Some(thread_id) = thread_id {
+                        log::info!(
+                            "[cancel-audit] thread={} source=compact_task_cancelled",
+                            thread_id
+                        );
+                    }
                     this.update(cx, |this, _| {
                         this.emit_compaction_telemetry_outcome("canceled", None)
                     })
@@ -3029,6 +3122,7 @@ impl Thread {
             }
         });
         self.running_turn = Some(RunningTurn::new(
+            self.id.clone(),
             event_stream,
             BTreeMap::default(),
             cancellation_tx,
@@ -3079,11 +3173,18 @@ impl Thread {
         &mut self,
         cx: &mut Context<Self>,
     ) -> Result<mpsc::UnboundedReceiver<Result<ThreadEvent>>> {
+        if self.running_turn.is_some() {
+            log::info!(
+                "[cancel-audit] thread={} source=new_message_while_turn_active",
+                self.id
+            );
+        }
         // Flush the old pending message synchronously before cancelling,
         // to avoid a race where the detached cancel task might flush the NEW
         // turn's pending message instead of the old one.
         self.flush_pending_message(cx);
         self.cancel(cx).detach();
+        self.was_canceled = false;
 
         let (events_tx, events_rx) = mpsc::unbounded::<Result<ThreadEvent>>();
         let event_stream = ThreadEventStream::new(events_tx);
@@ -3104,6 +3205,13 @@ impl Thread {
                 // and we shouldn't touch it (it might be a NEW turn now)
                 let was_cancelled = *cancellation_rx.borrow();
                 if was_cancelled {
+                    let thread_id = this.read_with(cx, |this, _| this.id.clone()).ok();
+                    if let Some(thread_id) = thread_id {
+                        log::info!(
+                            "[cancel-audit] thread={} source=turn_completed_cancelled",
+                            thread_id
+                        );
+                    }
                     log::debug!("Turn was cancelled, skipping cleanup");
                     return;
                 }
@@ -3135,7 +3243,13 @@ impl Thread {
                 _ = this.update(cx, |this, _| this.running_turn.take());
             }
         });
-        self.running_turn = Some(RunningTurn::new(event_stream, tools, cancellation_tx, task));
+        self.running_turn = Some(RunningTurn::new(
+            self.id.clone(),
+            event_stream,
+            tools,
+            cancellation_tx,
+            task,
+        ));
         Ok(events_rx)
     }
 
@@ -3164,6 +3278,13 @@ impl Thread {
                 // `handle_completion_event`).
                 Ok(ControlFlow::Continue(())) => {}
                 Ok(ControlFlow::Break(())) => {
+                    let thread_id = this.read_with(cx, |this, _| this.id.clone()).ok();
+                    if let Some(thread_id) = thread_id {
+                        log::info!(
+                            "[cancel-audit] thread={} source=turn_aborted_compaction_break",
+                            thread_id
+                        );
+                    }
                     this.update(cx, |this, _| {
                         this.emit_compaction_telemetry_outcome("canceled", None)
                     })?;
@@ -3186,6 +3307,15 @@ impl Thread {
                             .await
                             {
                                 Ok(ControlFlow::Break(())) => {
+                                    let thread_id =
+                                        this.read_with(cx, |this, _| this.id.clone()).ok();
+                                    if let Some(thread_id) = thread_id {
+                                        log::info!(
+                                            "[cancel-audit] thread={} source=turn_aborted_retry_break attempt={}",
+                                            thread_id,
+                                            attempt
+                                        );
+                                    }
                                     this.update(cx, |this, _| {
                                         this.emit_compaction_telemetry_outcome("canceled", None)
                                     })?;
@@ -3281,6 +3411,7 @@ impl Thread {
                             })
                             .unwrap_or(false);
 
+                        let tool_use_id = tool_result.tool_use_id.clone();
                         early_tool_results.push((owning_message_ix, tool_result));
 
                         // Only break if the tool errored and we are still
@@ -3289,12 +3420,28 @@ impl Thread {
                         // are parallel tool calls) we want to continue
                         // processing those tool inputs.
                         if is_error && is_still_streaming {
+                            let thread_id = this.read_with(cx, |this, _| this.id.clone()).ok();
+                            if let Some(thread_id) = thread_id {
+                                log::info!(
+                                    "[cancel-audit] thread={} tool_use_id={} source=tool_error_while_streaming owning_message_ix={}",
+                                    thread_id,
+                                    tool_use_id,
+                                    owning_message_ix
+                                );
+                            }
                             break;
                         }
                         continue;
                     }
                     _ = cancellation_rx.changed().fuse() => {
                         if *cancellation_rx.borrow() {
+                            let thread_id = this.read_with(cx, |this, _| this.id.clone()).ok();
+                            if let Some(thread_id) = thread_id {
+                                log::info!(
+                                    "[cancel-audit] thread={} source=cancellation_rx_turn_internal",
+                                    thread_id
+                                );
+                            }
                             cancelled = true;
                             break;
                         }
@@ -3347,6 +3494,14 @@ impl Thread {
 
                 tool_results.extend(batch_result.0);
                 if let Some(err) = batch_result.1 {
+                    let thread_id = this.read_with(cx, |this, _| this.id.clone()).ok();
+                    if let Some(thread_id) = thread_id {
+                        log::info!(
+                            "[cancel-audit] thread={} source=turn_completion_batch_error error={}",
+                            thread_id,
+                            err
+                        );
+                    }
                     let is_refusal = err
                         .downcast_ref::<CompletionError>()
                         .is_some_and(|e| matches!(e, CompletionError::Refusal));
@@ -3374,6 +3529,13 @@ impl Thread {
                 if let Some(running_turn) = this.running_turn.as_mut() {
                     if running_turn.streaming_tool_inputs.is_empty() {
                         return;
+                    }
+                    for tool_use_id in running_turn.streaming_tool_inputs.keys() {
+                        log::info!(
+                            "[cancel-audit] thread={} tool_use_id={} source=streaming_tool_input_dropped",
+                            this.id,
+                            tool_use_id
+                        );
                     }
                     log::warn!("Dropping partial tool inputs because the stream ended");
                     running_turn.streaming_tool_inputs.drain();
@@ -3450,6 +3612,13 @@ impl Thread {
             })?;
 
             if cancelled {
+                let thread_id = this.read_with(cx, |this, _| this.id.clone()).ok();
+                if let Some(thread_id) = thread_id {
+                    log::info!(
+                        "[cancel-audit] thread={} source=turn_aborted_by_cancellation",
+                        thread_id
+                    );
+                }
                 log::debug!("Turn cancelled by user, exiting");
                 return Ok(());
             }
@@ -3466,7 +3635,17 @@ impl Thread {
                 )
                 .await?
                 {
-                    ControlFlow::Break(_) => return Ok(()),
+                    ControlFlow::Break(_) => {
+                        let thread_id = this.read_with(cx, |this, _| this.id.clone()).ok();
+                        if let Some(thread_id) = thread_id {
+                            log::info!(
+                                "[cancel-audit] thread={} source=turn_aborted_retry_break attempt={}",
+                                thread_id,
+                                attempt
+                            );
+                        }
+                        return Ok(());
+                    }
                     ControlFlow::Continue(_) => {}
                 }
                 this.update(cx, |this, _cx| {
@@ -3514,6 +3693,14 @@ impl Thread {
             _ = timer.fuse() => {}
             _ = cancellation_rx.changed().fuse() => {
                 if *cancellation_rx.borrow() {
+                    let thread_id = this.read_with(cx, |this, _| this.id.clone()).ok();
+                    if let Some(thread_id) = thread_id {
+                        log::info!(
+                            "[cancel-audit] thread={} source=cancellation_rx_retry_delay attempt={}",
+                            thread_id,
+                            attempt
+                        );
+                    }
                     log::debug!("Turn cancelled during retry delay, exiting");
                     return Ok(ControlFlow::Break(()));
                 }
@@ -3567,6 +3754,13 @@ impl Thread {
         cx: &mut AsyncApp,
     ) -> Result<ControlFlow<()>> {
         if *cancellation_rx.borrow() {
+            let thread_id = this.read_with(cx, |this, _| this.id.clone()).ok();
+            if let Some(thread_id) = thread_id {
+                log::info!(
+                    "[cancel-audit] thread={} source=compaction_cancelled_at_start",
+                    thread_id
+                );
+            }
             return Ok(ControlFlow::Break(()));
         }
 
@@ -3581,6 +3775,13 @@ impl Thread {
                 result = model.stream_completion(request, cx).fuse() => result,
                 _ = cancellation_rx.changed().fuse() => {
                     if *cancellation_rx.borrow() {
+                        let thread_id = this.read_with(cx, |this, _| this.id.clone()).ok();
+                        if let Some(thread_id) = thread_id {
+                            log::info!(
+                                "[cancel-audit] thread={} source=compaction_cancelled_before_request",
+                                thread_id
+                            );
+                        }
                         log::debug!("Compaction cancelled before request started");
                         return Ok(ControlFlow::Break(()));
                     }
@@ -3595,6 +3796,13 @@ impl Thread {
                     event = stream.next().fuse() => event,
                     _ = cancellation_rx.changed().fuse() => {
                         if *cancellation_rx.borrow() {
+                            let thread_id = this.read_with(cx, |this, _| this.id.clone()).ok();
+                            if let Some(thread_id) = thread_id {
+                                log::info!(
+                                    "[cancel-audit] thread={} source=compaction_cancelled_while_summarizing",
+                                    thread_id
+                                );
+                            }
                             log::debug!("Compaction cancelled while summarizing");
                             return Ok(ControlFlow::Break(()));
                         }
@@ -3630,6 +3838,13 @@ impl Thread {
             }
 
             if *cancellation_rx.borrow() {
+                let thread_id = this.read_with(cx, |this, _| this.id.clone()).ok();
+                if let Some(thread_id) = thread_id {
+                    log::info!(
+                        "[cancel-audit] thread={} source=compaction_cancelled_after_summarizing",
+                        thread_id
+                    );
+                }
                 log::debug!("Compaction cancelled after summarizing");
                 return Ok(ControlFlow::Break(()));
             }
@@ -4610,6 +4825,12 @@ impl Thread {
             };
 
             if !message.tool_results.contains_key(&tool_use.id) {
+                log::info!(
+                    "[cancel-audit] thread={} tool_use_id={} tool_name={} source=flush_pending_message_canceled_sentinel",
+                    self.id,
+                    tool_use.id,
+                    tool_use.name
+                );
                 message.tool_results.insert(
                     tool_use.id.clone(),
                     LanguageModelToolResult {
@@ -5576,6 +5797,7 @@ enum CompactionInsertion {
 }
 
 struct RunningTurn {
+    thread_id: acp::SessionId,
     /// Holds the task that handles agent interaction until the end of the turn.
     /// Survives across multiple requests as the model performs tool calls and
     /// we run tools, report their results.
@@ -5596,12 +5818,14 @@ struct RunningTurn {
 
 impl RunningTurn {
     fn new(
+        thread_id: acp::SessionId,
         event_stream: ThreadEventStream,
         tools: BTreeMap<SharedString, Arc<dyn AnyAgentTool>>,
         cancellation_tx: watch::Sender<bool>,
         task: Task<()>,
     ) -> Self {
         Self {
+            thread_id,
             _task: task,
             event_stream,
             tools,
@@ -5612,6 +5836,10 @@ impl RunningTurn {
 
     fn cancel(mut self) -> Task<()> {
         log::debug!("Cancelling in progress turn");
+        log::info!(
+            "[cancel-audit] thread={} source=cancellation_tx_signaled",
+            self.thread_id
+        );
         self.cancellation_tx.send(true).ok();
         self.event_stream.send_canceled();
         self._task
@@ -6289,6 +6517,7 @@ impl ThreadEventStream {
     }
 
     fn send_canceled(&self) {
+        log::info!("[cancel-audit] source=event_stream_send_canceled");
         // The bridge stops consuming at Stop, and its entry cancellation scan
         // may have run before the queued compaction-start event was applied.
         let compaction_id = self.active_compaction.replace(None);
@@ -6418,6 +6647,7 @@ impl ToolCallEventStream {
     /// Signal cancellation for this event stream. Only available in tests.
     #[cfg(any(test, feature = "test-support"))]
     pub fn signal_cancellation_with_sender(cancellation_tx: &mut watch::Sender<bool>) {
+        log::info!("[cancel-audit] source=test_signal_cancellation");
         cancellation_tx.send(true).ok();
     }
 
@@ -6499,12 +6729,24 @@ impl ToolCallEventStream {
     /// Tools should select on this alongside their main work to detect user cancellation.
     pub fn cancelled_by_user(&self) -> impl std::future::Future<Output = ()> + '_ {
         let mut rx = self.cancellation_rx.clone();
+        let tool_call_id = self.tool_call_id.clone();
+        let tool_use_id = self.tool_use_id.clone();
         async move {
             loop {
                 if *rx.borrow() {
+                    log::info!(
+                        "[cancel-audit] tool_call={} tool_use_id={} source=tool_cancelled_by_user",
+                        tool_call_id,
+                        tool_use_id
+                    );
                     return;
                 }
                 if rx.changed().await.is_err() {
+                    log::info!(
+                        "[cancel-audit] tool_call={} tool_use_id={} source=tool_cancellation_channel_dropped",
+                        tool_call_id,
+                        tool_use_id
+                    );
                     // Sender dropped, will never be cancelled
                     std::future::pending::<()>().await;
                 }
@@ -6783,6 +7025,7 @@ impl ToolCallEventStream {
         let fs = self.fs.clone();
         let stream = self.stream.clone();
         let tool_call_id = self.tool_call_id.clone();
+        let tool_use_id = self.tool_use_id.clone();
         let sandbox_grants = self.sandbox_grants.clone();
         let thread = self.thread.clone();
         let project = self.project.clone();
@@ -6834,8 +7077,15 @@ impl ToolCallEventStream {
                 };
                 futures::select_biased! {
                     outcome = (&mut response_rx).fuse() => {
-                        let outcome = outcome.map_err(|_| anyhow!("authorization channel closed"))?;
-                        ensure_tool_call_authorization_not_interrupted(&outcome)?;
+                        let outcome = outcome.map_err(|_| {
+                            log::info!(
+                                "[cancel-audit] tool_call={} tool_use_id={} source=sandbox_authorization_channel_closed",
+                                tool_call_id,
+                                tool_use_id
+                            );
+                            anyhow!("authorization channel closed")
+                        })?;
+                        ensure_tool_call_authorization_not_interrupted(&outcome, &tool_call_id)?;
                         return Self::handle_sandbox_permission_outcome(
                             &outcome,
                             &request,
@@ -6917,6 +7167,7 @@ impl ToolCallEventStream {
         // which tears down the stream and turns the prompt into a phantom
         // decline.
         let tool_call_id = self.tool_call_id.clone();
+        let tool_use_id = self.tool_use_id.clone();
         cx.spawn(async move |_cx| {
             let (response_tx, response_rx) = oneshot::channel();
             if let Err(error) =
@@ -6925,7 +7176,7 @@ impl ToolCallEventStream {
                     .unbounded_send(Ok(ThreadEvent::ToolCallAuthorization(
                         ToolCallAuthorization {
                             tool_call: acp::ToolCallUpdate::new(
-                                tool_call_id,
+                                tool_call_id.clone(),
                                 // Leave the title untouched so the card keeps
                                 // showing the command (matching the escalation
                                 // flow).
@@ -6947,8 +7198,15 @@ impl ToolCallEventStream {
 
             let outcome = response_rx
                 .await
-                .map_err(|_| anyhow!("authorization channel closed"))?;
-            ensure_tool_call_authorization_not_interrupted(&outcome)?;
+                .map_err(|_| {
+                    log::info!(
+                        "[cancel-audit] tool_call={} tool_use_id={} source=windows_fs_warning_authorization_channel_closed",
+                        tool_call_id,
+                        tool_use_id
+                    );
+                    anyhow!("authorization channel closed")
+                })?;
+            ensure_tool_call_authorization_not_interrupted(&outcome, &tool_call_id)?;
             match acp_thread::SandboxPermission::from_id(outcome.option_id.0.as_ref()) {
                 Some(acp_thread::SandboxPermission::AllowOnce) => Ok(()),
                 _ => Err(anyhow!("Windows-drive write aborted by user")),
@@ -7190,6 +7448,7 @@ impl ToolCallEventStream {
         let fs = self.fs.clone();
         let stream = self.stream.clone();
         let tool_call_id = self.tool_call_id.clone();
+        let tool_use_id = self.tool_use_id.clone();
         let sandbox_grants = self.sandbox_grants.clone();
         let thread = self.thread.clone();
         cx.spawn(async move |cx| {
@@ -7226,8 +7485,15 @@ impl ToolCallEventStream {
 
             let outcome = response_rx
                 .await
-                .map_err(|_| anyhow!("authorization channel closed"))?;
-            ensure_tool_call_authorization_not_interrupted(&outcome)?;
+                .map_err(|_| {
+                    log::info!(
+                        "[cancel-audit] tool_call={} tool_use_id={} source=sandbox_fallback_authorization_channel_closed",
+                        tool_call_id,
+                        tool_use_id
+                    );
+                    anyhow!("authorization channel closed")
+                })?;
+            ensure_tool_call_authorization_not_interrupted(&outcome, &tool_call_id)?;
 
             let option_id = outcome.option_id.0.as_ref();
             if option_id == acp_thread::SANDBOX_FALLBACK_RETRY_OPTION_ID {
@@ -7298,6 +7564,7 @@ impl ToolCallEventStream {
         let options = acp_thread::PermissionOptions::Flat(options);
         let stream = self.stream.clone();
         let tool_call_id = self.tool_call_id.clone();
+        let tool_use_id = self.tool_use_id.clone();
         cx.spawn(async move |_cx| {
             let mut fields = acp::ToolCallUpdateFields::new();
             if let Some(title) = title {
@@ -7327,8 +7594,15 @@ impl ToolCallEventStream {
 
             let outcome = response_rx
                 .await
-                .map_err(|_| anyhow!("authorization channel closed"))?;
-            ensure_tool_call_authorization_not_interrupted(&outcome)?;
+                .map_err(|_| {
+                    log::info!(
+                        "[cancel-audit] tool_call={} tool_use_id={} source=decision_prompt_authorization_channel_closed",
+                        tool_call_id,
+                        tool_use_id
+                    );
+                    anyhow!("authorization channel closed")
+                })?;
+            ensure_tool_call_authorization_not_interrupted(&outcome, &tool_call_id)?;
             Ok(outcome.option_id)
         })
     }
@@ -7416,6 +7690,7 @@ impl ToolCallEventStream {
         let fs = self.fs.clone();
         let stream = self.stream.clone();
         let tool_call_id = self.tool_call_id.clone();
+        let tool_use_id = self.tool_use_id.clone();
         let auto_resolution_outcomes = if check_settings.is_some() {
             match (
                 auto_resolve_permission_outcome(&options, true),
@@ -7452,8 +7727,15 @@ impl ToolCallEventStream {
             let Some(check_settings) = check_settings else {
                 let outcome = response_rx
                     .await
-                    .map_err(|_| anyhow!("authorization channel closed"))?;
-                ensure_tool_call_authorization_not_interrupted(&outcome)?;
+                    .map_err(|_| {
+                        log::info!(
+                            "[cancel-audit] tool_call={} tool_use_id={} source=tool_authorization_channel_closed",
+                            tool_call_id,
+                            tool_use_id
+                        );
+                        anyhow!("authorization channel closed")
+                    })?;
+                ensure_tool_call_authorization_not_interrupted(&outcome, &tool_call_id)?;
 
                 return Self::persist_permission_outcome(&outcome, fs, cx);
             };
@@ -7481,8 +7763,15 @@ impl ToolCallEventStream {
                 };
                 futures::select_biased! {
                     outcome = (&mut response_rx).fuse() => {
-                        let outcome = outcome.map_err(|_| anyhow!("authorization channel closed"))?;
-                        ensure_tool_call_authorization_not_interrupted(&outcome)?;
+                        let outcome = outcome.map_err(|_| {
+                            log::info!(
+                                "[cancel-audit] tool_call={} tool_use_id={} source=tool_authorization_channel_closed",
+                                tool_call_id,
+                                tool_use_id
+                            );
+                            anyhow!("authorization channel closed")
+                        })?;
+                        ensure_tool_call_authorization_not_interrupted(&outcome, &tool_call_id)?;
                         return Self::persist_permission_outcome(&outcome, fs.clone(), cx);
                     }
                     _ = settings_changed.fuse() => {
