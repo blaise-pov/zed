@@ -216,6 +216,12 @@ pub trait AgentTaskProvider: 'static + Send + Sync {
     fn server_id(&self) -> ContextServerId;
     fn fetch_graph(&self, cx: &mut App) -> Task<Result<AgentTaskGraph>>;
     fn get_task(&self, id: &AgentTaskId, cx: &mut App) -> Task<Result<AgentTaskDetail>>;
+    fn ensure_task(&self, id: &AgentTaskId, title: &str, cx: &mut App) -> Task<Result<()>> {
+        let _ = id;
+        let _ = title;
+        let _ = cx;
+        Task::ready(Ok(()))
+    }
     fn complete_task(&self, id: &AgentTaskId, cx: &mut App) -> Task<Result<()>>;
     fn fail_task(&self, id: &AgentTaskId, reason: &str, cx: &mut App) -> Task<Result<()>>;
     fn archive_task(&self, id: &AgentTaskId, cx: &mut App) -> Task<Result<()>>;
