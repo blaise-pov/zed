@@ -434,6 +434,8 @@ impl PickerDelegate for ToolPickerDelegate {
                         .terminal_wrapper_command
                         .clone()
                         .map(|s| s.to_string()),
+                    task_isolation: Some(default_profile.task_isolation),
+                    task_worktree_language_servers: default_profile.task_worktree_language_servers,
                 });
 
             match item {
