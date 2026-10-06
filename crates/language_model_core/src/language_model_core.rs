@@ -141,10 +141,32 @@ pub enum ProviderErrorCategory {
     Other,
 }
 
+/// Returns whether the message indicates an upstream connection or transport network failure
+/// from a gateway, proxy, or upstream service.
+pub fn is_upstream_network_failure(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("client error (connect)")
+        || lower.contains("error sending request for url")
+        || lower.contains("upstream interface network connection failed")
+        || lower.contains("failed to connect to upstream")
+        || lower.contains("upstream connection failed")
+        || lower.contains("upstream connection error")
+        || lower.contains("connection refused")
+        || lower.contains("connection reset by peer")
+        || message.contains("请求上游接口网络连接失败")
+        || message.contains("上游接口网络连接失败")
+        || message.contains("网关诊断：请求上游")
+        || message.contains("网关诊断")
+}
+
 impl ProviderErrorCategory {
     /// Classifies a rejection from an HTTP status that the provider actually
     /// returned, with message inspection for ambiguous bad-request responses.
     pub fn from_http_status(status: StatusCode, message: &str) -> Self {
+        if is_upstream_network_failure(message) {
+            return Self::Timeout;
+        }
+
         match status {
             StatusCode::BAD_REQUEST if is_invalid_encrypted_content_message(message) => {
                 Self::InvalidEncryptedContent
@@ -169,7 +191,9 @@ impl ProviderErrorCategory {
                 tokens: parse_prompt_too_long(message),
             },
             StatusCode::CONFLICT => Self::Conflict,
-            StatusCode::REQUEST_TIMEOUT | StatusCode::GATEWAY_TIMEOUT => Self::Timeout,
+            StatusCode::REQUEST_TIMEOUT
+            | StatusCode::GATEWAY_TIMEOUT
+            | StatusCode::BAD_GATEWAY => Self::Timeout,
             StatusCode::TOO_MANY_REQUESTS => Self::RateLimit,
             StatusCode::SERVICE_UNAVAILABLE => Self::Overloaded,
             // There is no `StatusCode` variant for the unofficial HTTP 529
@@ -377,6 +401,7 @@ impl LanguageModelCompletionError {
                 status,
                 retry_after,
                 category,
+                message,
                 ..
             } => {
                 *category != ProviderErrorCategory::PaymentRequired
@@ -388,7 +413,8 @@ impl LanguageModelCompletionError {
                                 | ProviderErrorCategory::Timeout
                                 | ProviderErrorCategory::InternalServer
                         )
-                        || retry_after.is_some())
+                        || retry_after.is_some()
+                        || is_upstream_network_failure(message))
             }
             Self::ApiReadResponseError { .. } | Self::HttpSend { .. } => true,
             Self::DataRetentionConsentRequired { .. }
@@ -396,8 +422,8 @@ impl LanguageModelCompletionError {
             | Self::SerializeRequest { .. }
             | Self::BuildRequestBody { .. }
             | Self::DeserializeResponse { .. }
-            | Self::StreamEndedUnexpectedly { .. }
-            | Self::Other(_) => false,
+            | Self::StreamEndedUnexpectedly { .. } => false,
+            Self::Other(error) => is_upstream_network_failure(&format!("{error:#}")),
         }
     }
 
@@ -420,6 +446,9 @@ impl LanguageModelCompletionError {
             Self::ApiReadResponseError { .. } | Self::HttpSend { .. } => {
                 exponential_backoff(attempt)
             }
+            Self::Other(error) if is_upstream_network_failure(&format!("{error:#}")) => {
+                exponential_backoff(attempt)
+            }
             Self::DataRetentionConsentRequired { .. }
             | Self::NoApiKey { .. }
             | Self::SerializeRequest { .. }
@@ -432,6 +461,9 @@ impl LanguageModelCompletionError {
 }
 
 fn category_from_cloud_failure(code: &str, message: &str) -> ProviderErrorCategory {
+    if is_upstream_network_failure(message) {
+        return ProviderErrorCategory::Timeout;
+    }
     if let Some(tokens) = parse_prompt_too_long(message) {
         return ProviderErrorCategory::PromptTooLarge {
             tokens: Some(tokens),
@@ -1327,5 +1359,42 @@ mod tests {
         assert_eq!(deserialized.id, original.id);
         assert_eq!(deserialized.name, original.name);
         assert_eq!(deserialized.thought_signature, None);
+    }
+    #[test]
+    fn test_bad_gateway_and_upstream_network_failure_classification() {
+        let error = LanguageModelCompletionError::from_http_status(
+            ANTHROPIC_PROVIDER_NAME,
+            StatusCode::BAD_GATEWAY,
+            "Bad Gateway".to_string(),
+            None,
+        );
+        match &error {
+            LanguageModelCompletionError::ProviderRejection { category, .. } => {
+                assert_eq!(*category, ProviderErrorCategory::Timeout);
+            }
+            _ => panic!("expected ProviderRejection"),
+        }
+        assert!(error.is_transient());
+
+        let upstream_err_msg = "【网络请求异常（非服务端故障）】网关诊断：请求上游接口网络连接失败（非网关服务端故障，请排查网络或代理）：HTTP request failed at https://cloudcode-pa.googleapis.com/v1internal: error sending request for url (https://cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse): client error (Connect)";
+        let error = LanguageModelCompletionError::from_http_status(
+            GOOGLE_PROVIDER_NAME,
+            StatusCode::BAD_REQUEST,
+            upstream_err_msg.to_string(),
+            None,
+        );
+        match &error {
+            LanguageModelCompletionError::ProviderRejection { category, .. } => {
+                assert_eq!(*category, ProviderErrorCategory::Timeout);
+            }
+            _ => panic!("expected ProviderRejection"),
+        }
+        assert!(error.is_transient());
+
+        let other_err = LanguageModelCompletionError::Other(anyhow::anyhow!(
+            "error sending request for url (...): client error (Connect)"
+        ));
+        assert!(other_err.is_transient());
+        assert_eq!(other_err.retry_delay(1), Some(Duration::from_secs(5)));
     }
 }
