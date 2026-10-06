@@ -6,10 +6,25 @@ use http_client::{
     AsyncBody, CustomHeaders, HttpClient, Method, Request as HttpRequest, RequestBuilderExt,
 };
 pub use language_model_core::ModelMode as GoogleModelMode;
+use language_model_core::{
+    GOOGLE_PROVIDER_NAME, LanguageModelCompletionError, ProviderErrorCategory,
+};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 pub mod completion;
 
 pub const API_URL: &str = "https://generativelanguage.googleapis.com";
+
+#[derive(Deserialize)]
+struct GoogleErrorEnvelope {
+    error: GoogleErrorDetail,
+}
+
+#[derive(Deserialize)]
+struct GoogleErrorDetail {
+    message: String,
+    status: Option<String>,
+}
+
 
 pub async fn stream_generate_content(
     client: &dyn HttpClient,
@@ -17,23 +32,44 @@ pub async fn stream_generate_content(
     api_key: &str,
     mut request: GenerateContentRequest,
     extra_headers: &CustomHeaders,
-) -> Result<BoxStream<'static, Result<GenerateContentResponse>>> {
+) -> Result<BoxStream<'static, Result<GenerateContentResponse>>, LanguageModelCompletionError> {
     let api_key = api_key.trim();
-    validate_generate_content_request(&request)?;
+    validate_generate_content_request(&request)
+        .map_err(LanguageModelCompletionError::Other)?;
 
     // The `model` field is emptied as it is provided as a path parameter.
     let model_id = mem::take(&mut request.model.model_id);
 
     let uri =
-        format!("{api_url}/v1beta/models/{model_id}:streamGenerateContent?alt=sse&key={api_key}",);
+        format!("{api_url}/v1beta/models/{model_id}:streamGenerateContent?alt=sse&key={api_key}");
+
+    let host = api_url.to_string();
+    let request_body = serde_json::to_string(&request).map_err(|error| {
+        LanguageModelCompletionError::SerializeRequest {
+            provider: GOOGLE_PROVIDER_NAME,
+            error,
+        }
+    })?;
 
     let request = HttpRequest::builder()
         .method(Method::POST)
         .uri(uri)
         .header("Content-Type", "application/json")
         .extra_headers(extra_headers)
-        .body(AsyncBody::from(serde_json::to_string(&request)?))?;
-    let mut response = client.send(request).await?;
+        .body(AsyncBody::from(request_body))
+        .map_err(|error| LanguageModelCompletionError::BuildRequestBody {
+            provider: GOOGLE_PROVIDER_NAME,
+            error,
+        })?;
+
+    let mut response = client.send(request).await.map_err(|error| {
+        LanguageModelCompletionError::HttpSend {
+            provider: GOOGLE_PROVIDER_NAME,
+            host: host.clone(),
+            error,
+        }
+    })?;
+
     if response.status().is_success() {
         let reader = BufReader::new(response.into_body());
         Ok(reader
@@ -54,7 +90,8 @@ pub async fn stream_generate_content(
                             match serde_json::from_str(line) {
                                 Ok(response) => Some(Ok(response)),
                                 Err(error) => Some(Err(anyhow!(format!(
-                                    "Error parsing JSON: {error:?}\n{line:?}"
+                                    "Error parsing JSON: {error:?}
+{line:?}"
                                 )))),
                             }
                         } else {
@@ -67,11 +104,37 @@ pub async fn stream_generate_content(
             .boxed())
     } else {
         let mut text = String::new();
-        response.body_mut().read_to_string(&mut text).await?;
-        Err(anyhow!(
-            "error during streamGenerateContent, status code: {:?}, body: {}",
-            response.status(),
-            text
+        response
+            .body_mut()
+            .read_to_string(&mut text)
+            .await
+            .map_err(|error| LanguageModelCompletionError::ApiReadResponseError {
+                provider: GOOGLE_PROVIDER_NAME,
+                error,
+            })?;
+
+        let retry_after = response
+            .headers()
+            .get(http_client::http::header::RETRY_AFTER)
+            .and_then(|val| val.to_str().ok()?.parse::<u64>().ok())
+            .map(std::time::Duration::from_secs);
+
+        let (message, code) = if let Ok(envelope) =
+            serde_json::from_str::<GoogleErrorEnvelope>(&text)
+        {
+            (envelope.error.message, envelope.error.status)
+        } else {
+            (text, None)
+        };
+
+        let category = ProviderErrorCategory::from_http_status(response.status(), &message);
+        Err(LanguageModelCompletionError::from_provider_response(
+            GOOGLE_PROVIDER_NAME,
+            Some(response.status()),
+            code,
+            message,
+            retry_after,
+            category,
         ))
     }
 }
