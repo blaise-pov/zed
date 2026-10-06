@@ -45,7 +45,7 @@ use language_model::{
     LanguageModelRequest, LanguageModelRequestMessage, LanguageModelRequestTool,
     LanguageModelToolResult, LanguageModelToolResultContent, LanguageModelToolUse,
     LanguageModelToolUseId, MessageContent, ProviderErrorCategory, Role, SelectedModel, Speed,
-    StopReason, TokenUsage, ZED_CLOUD_PROVIDER_ID,
+    StopReason, TokenUsage, ZED_CLOUD_PROVIDER_ID, is_upstream_network_failure,
 };
 use project::{Project, trusted_worktrees::TrustedWorktrees};
 use prompt_store::ProjectContext;
@@ -5525,33 +5525,53 @@ impl Thread {
         use LanguageModelCompletionError::*;
 
         match error {
-            // Rate limits park the turn: wait for the provider's reset
-            // guidance when available, otherwise poll adaptively within the
-            // policy's budget.
+            // Rate limits park the turn: poll adaptively within the policy's budget.
             ProviderRejection {
                 category: ProviderErrorCategory::RateLimit,
                 ..
             } => Some(RetryStrategy::ParkedPolling {
                 policy: rate_limit_policy,
             }),
-            // A rejection with no status (e.g. a content-policy rejection
-            // like `cyber_policy`) is permanent: retrying sends the same
-            // request and gets the same answer. A rejection with a
-            // non-retryable status (auth, payload too large, ...) is
-            // permanent for the same reason. Otherwise, honor the
-            // provider's requested delay when it gave one, and fall back to
-            // exponential backoff when it didn't.
-            ProviderRejection { retry_after, .. } => {
+            // If the provider returned an explicit retry delay (e.g. Retry-After header),
+            // honor the requested delay up to MAX_RETRY_ATTEMPTS.
+            ProviderRejection {
+                retry_after: Some(delay),
+                ..
+            } => {
                 if !error.is_transient() {
                     return None;
                 }
-                Some(match retry_after {
-                    Some(delay) => RetryStrategy::FixedDelay {
-                        delay: *delay,
-                        max_attempts: MAX_RETRY_ATTEMPTS,
-                    },
-                    None => RetryStrategy::ExponentialBackoff,
+                Some(RetryStrategy::FixedDelay {
+                    delay: *delay,
+                    max_attempts: MAX_RETRY_ATTEMPTS,
                 })
+            }
+            // Infrastructure, gateway, timeout, overload, and upstream connection failures
+            // without explicit provider guidance park adaptively within the policy's budget
+            // instead of quickly exhausting fixed retries.
+            ProviderRejection {
+                category,
+                status,
+                message,
+                ..
+            } if matches!(
+                category,
+                ProviderErrorCategory::Timeout | ProviderErrorCategory::Overloaded
+            ) || status
+                .is_some_and(|status| matches!(status.as_u16(), 502 | 503 | 504 | 408 | 529))
+                || is_upstream_network_failure(message) =>
+            {
+                Some(RetryStrategy::ParkedPolling {
+                    policy: rate_limit_policy,
+                })
+            }
+            // Deterministic server errors (e.g. 500 Internal Server Error without
+            // gateway/timeout symptoms) use exponential backoff up to MAX_RETRY_ATTEMPTS.
+            ProviderRejection { .. } => {
+                if !error.is_transient() {
+                    return None;
+                }
+                Some(RetryStrategy::ExponentialBackoff)
             }
             // Connection and stream failures (network drops, interrupted
             // responses, truncated payloads) point to a transient outage on
@@ -5574,6 +5594,13 @@ impl Thread {
             // Retrying won't help until the user consents to data retention
             // or switches models.
             DataRetentionConsentRequired { .. } => None,
+            // Upstream connection/transport errors in `Other` (e.g. "client error (Connect)")
+            // park the turn adaptively instead of exhausting fixed retries.
+            Other(err) if is_upstream_network_failure(&format!("{err:#}")) => {
+                Some(RetryStrategy::ParkedPolling {
+                    policy: rate_limit_policy,
+                })
+            }
             // `Other` includes mid-stream mapping failures that can be caused by
             // a transient malformed or interrupted provider event.
             Other(..) => Some(RetryStrategy::FixedDelay {
@@ -10340,41 +10367,88 @@ mod tests {
 
     #[test]
     fn test_retry_strategy_uses_exponential_backoff_without_retry_after() {
+        let status = http_client::StatusCode::INTERNAL_SERVER_ERROR;
+        let error = LanguageModelCompletionError::from_http_status(
+            language_model::LanguageModelProviderName::new("Anthropic"),
+            status,
+            "internal server error".to_string(),
+            None,
+        );
+        let strategy = Thread::retry_strategy_for(&error, parking_policy())
+            .unwrap_or_else(|| panic!("expected a retry strategy for status {status}"));
+        assert_eq!(
+            strategy,
+            RetryStrategy::ExponentialBackoff,
+            "status {status} should use exponential backoff when no retry_after is given"
+        );
+        assert_eq!(strategy.delay_after(&error, 0), None);
+        assert_eq!(
+            strategy.delay_after(&error, 1),
+            Some(BASE_RETRY_DELAY),
+            "first retry should use the base delay"
+        );
+        assert_eq!(
+            strategy.delay_after(&error, 2),
+            Some(BASE_RETRY_DELAY * 2),
+            "second retry should double the delay"
+        );
+        assert_eq!(
+            strategy.delay_after(&error, MAX_RETRY_ATTEMPTS + 1),
+            None,
+            "retrying should stop once attempts are exhausted"
+        );
+    }
+
+    #[test]
+    fn test_retry_strategy_parks_gateway_timeout_and_upstream_failures() {
         for status in [
-            http_client::StatusCode::INTERNAL_SERVER_ERROR,
+            http_client::StatusCode::BAD_GATEWAY,
             http_client::StatusCode::SERVICE_UNAVAILABLE,
+            http_client::StatusCode::GATEWAY_TIMEOUT,
+            http_client::StatusCode::REQUEST_TIMEOUT,
             http_client::StatusCode::from_u16(529).unwrap(),
         ] {
             let error = LanguageModelCompletionError::from_http_status(
                 language_model::LanguageModelProviderName::new("Anthropic"),
                 status,
-                "upstream failure".to_string(),
+                "server or gateway error".to_string(),
                 None,
             );
-            let strategy = Thread::retry_strategy_for(&error, parking_policy())
-                .unwrap_or_else(|| panic!("expected a retry strategy for status {status}"));
             assert_eq!(
-                strategy,
-                RetryStrategy::ExponentialBackoff,
-                "status {status} should use exponential backoff when no retry_after is given"
-            );
-            assert_eq!(strategy.delay_after(&error, 0), None);
-            assert_eq!(
-                strategy.delay_after(&error, 1),
-                Some(BASE_RETRY_DELAY),
-                "first retry should use the base delay"
-            );
-            assert_eq!(
-                strategy.delay_after(&error, 2),
-                Some(BASE_RETRY_DELAY * 2),
-                "second retry should double the delay"
-            );
-            assert_eq!(
-                strategy.delay_after(&error, MAX_RETRY_ATTEMPTS + 1),
-                None,
-                "retrying should stop once attempts are exhausted"
+                Thread::retry_strategy_for(&error, parking_policy()),
+                Some(RetryStrategy::ParkedPolling {
+                    policy: parking_policy(),
+                }),
+                "status {status} should park adaptively with ParkedPolling"
             );
         }
+
+        // Upstream connection failure message on 400 Bad Request or 500 should park
+        let upstream_rejection = LanguageModelCompletionError::from_http_status(
+            language_model::LanguageModelProviderName::new("Google"),
+            http_client::StatusCode::BAD_REQUEST,
+            "网关诊断：请求上游接口网络连接失败: client error (Connect)".to_string(),
+            None,
+        );
+        assert_eq!(
+            Thread::retry_strategy_for(&upstream_rejection, parking_policy()),
+            Some(RetryStrategy::ParkedPolling {
+                policy: parking_policy(),
+            }),
+            "rejections with upstream network failures should park adaptively"
+        );
+
+        // Upstream connection failure wrapped in Other(..) should also park
+        let other_upstream_error = LanguageModelCompletionError::Other(anyhow::anyhow!(
+            "HTTP request failed: error sending request for url: client error (Connect)"
+        ));
+        assert_eq!(
+            Thread::retry_strategy_for(&other_upstream_error, parking_policy()),
+            Some(RetryStrategy::ParkedPolling {
+                policy: parking_policy(),
+            }),
+            "Other(..) with upstream network failures should park adaptively"
+        );
     }
 
     #[test]
