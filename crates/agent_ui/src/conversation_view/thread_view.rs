@@ -10746,6 +10746,34 @@ impl ThreadView {
             }
         };
 
+        let goal_id = tool_call
+            .raw_input
+            .as_ref()
+            .and_then(|input| input.get("goal_id"))
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(|id| {
+                if id.starts_with("GOAL-") {
+                    id.to_string()
+                } else {
+                    format!("GOAL-{id}")
+                }
+            });
+
+        let task_id = tool_call
+            .raw_input
+            .as_ref()
+            .and_then(|input| input.get("task_id"))
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(|id| {
+                if id.starts_with("TASK-") {
+                    id.to_string()
+                } else {
+                    format!("TASK-{id}")
+                }
+            });
+
         let card_header_id = format!("subagent-header-{}", entry_ix);
         let status_icon = format!("status-icon-{}", entry_ix);
         let diff_stat_id = format!("subagent-diff-{}", entry_ix);
@@ -10795,6 +10823,97 @@ impl ThreadView {
 
         let error_message = self.subagent_error_message(&tool_call.status, tool_call, cx);
 
+        let title_line = h_flex()
+            .min_w_0()
+            .gap_1p5()
+            .items_center()
+            .child(icon)
+            .child(
+                Label::new(title.clone())
+                    .size(LabelSize::Custom(self.tool_name_font_size()))
+                    .flex_1()
+                    .truncate(),
+            );
+
+        let mut metadata_segments: Vec<AnyElement> = Vec::new();
+
+        metadata_segments.push(
+            Label::new(profile_label.clone())
+                .size(LabelSize::Custom(self.tool_name_font_size()))
+                .color(Color::Muted)
+                .flex_none()
+                .into_any_element(),
+        );
+
+        if let Some(model_name) = model_name {
+            metadata_segments.push(
+                Label::new(model_name)
+                    .size(LabelSize::Custom(self.tool_name_font_size()))
+                    .color(Color::Muted)
+                    .flex_none()
+                    .into_any_element(),
+            );
+        }
+
+        if let Some(goal_id) = goal_id {
+            metadata_segments.push(
+                Label::new(goal_id)
+                    .size(LabelSize::Custom(self.tool_name_font_size()))
+                    .color(Color::Muted)
+                    .flex_none()
+                    .into_any_element(),
+            );
+        }
+
+        if let Some(task_id) = task_id {
+            metadata_segments.push(
+                Label::new(task_id)
+                    .size(LabelSize::Custom(self.tool_name_font_size()))
+                    .color(Color::Muted)
+                    .flex_none()
+                    .into_any_element(),
+            );
+        }
+
+        if files_changed > 0 {
+            metadata_segments.push(
+                h_flex()
+                    .flex_none()
+                    .gap_1()
+                    .child(
+                        Label::new(format!(
+                            "{} {}",
+                            files_changed,
+                            if files_changed == 1 { "file" } else { "files" }
+                        ))
+                        .size(LabelSize::Custom(self.tool_name_font_size()))
+                        .color(Color::Muted),
+                    )
+                    .child(
+                        DiffStat::new(
+                            diff_stat_id,
+                            diff_stats.lines_added as usize,
+                            diff_stats.lines_removed as usize,
+                        )
+                        .label_size(LabelSize::Custom(self.tool_name_font_size())),
+                    )
+                    .into_any_element(),
+            );
+        }
+
+        let mut metadata_line = h_flex().gap_1().min_w_0().overflow_hidden().items_center();
+        for (segment_index, segment) in metadata_segments.into_iter().enumerate() {
+            if segment_index > 0 {
+                metadata_line = metadata_line.child(
+                    Label::new("·")
+                        .size(LabelSize::Custom(self.tool_name_font_size()))
+                        .color(Color::Muted)
+                        .flex_none(),
+                );
+            }
+            metadata_line = metadata_line.child(segment);
+        }
+
         v_flex()
             .w_full()
             .rounded_md()
@@ -10805,9 +10924,10 @@ impl ThreadView {
             .child(
                 h_flex()
                     .group(&card_header_id)
-                    .h_8()
-                    .p_1()
+                    .px_1()
+                    .py_1()
                     .w_full()
+                    .items_center()
                     .justify_between()
                     .when(!has_no_title_or_canceled, |this| {
                         this.bg(self.tool_card_header_bg(cx))
@@ -10816,81 +10936,21 @@ impl ThreadView {
                         h_flex()
                             .id(format!("subagent-title-{}", entry_ix))
                             .px_1()
+                            .py_0p5()
                             .min_w_0()
-                            .size_full()
+                            .flex_1()
                             .gap_2()
+                            .items_center()
                             .justify_between()
                             .rounded_sm()
                             .overflow_hidden()
                             .child(
-                                h_flex()
+                                v_flex()
                                     .min_w_0()
                                     .flex_1()
-                                    .gap_1p5()
-                                    .justify_between()
-                                    .child(
-                                        h_flex()
-                                            .min_w_0()
-                                            .flex_initial()
-                                            .gap_1p5()
-                                            .child(icon)
-                                            .child(
-                                                Label::new(title.to_string())
-                                                    .size(LabelSize::Custom(
-                                                        self.tool_name_font_size(),
-                                                    ))
-                                                    .flex_1()
-                                                    .truncate(),
-                                            )
-                                            .when_some(model_name, |this, model_name| {
-                                                this.child(
-                                                    Label::new(format!("· {model_name}"))
-                                                        .size(LabelSize::Custom(
-                                                            self.tool_name_font_size(),
-                                                        ))
-                                                        .color(Color::Muted)
-                                                        .truncate(),
-                                                )
-                                            }),
-                                    )
-                                    .child(
-                                        Label::new(format!("({profile_label})"))
-                                            .size(LabelSize::Custom(self.tool_name_font_size()))
-                                            .color(Color::Muted)
-                                            .truncate(),
-                                    )
-                                    .when(files_changed > 0, |this| {
-                                        this.child(
-                                            h_flex()
-                                                .flex_none()
-                                                .gap_1p5()
-                                                .child(
-                                                    Label::new(format!(
-                                                        "— {} {} changed",
-                                                        files_changed,
-                                                        if files_changed == 1 {
-                                                            "file"
-                                                        } else {
-                                                            "files"
-                                                        }
-                                                    ))
-                                                    .size(LabelSize::Custom(
-                                                        self.tool_name_font_size(),
-                                                    ))
-                                                    .color(Color::Muted),
-                                                )
-                                                .child(
-                                                    DiffStat::new(
-                                                        diff_stat_id.clone(),
-                                                        diff_stats.lines_added as usize,
-                                                        diff_stats.lines_removed as usize,
-                                                    )
-                                                    .label_size(LabelSize::Custom(
-                                                        self.tool_name_font_size(),
-                                                    )),
-                                                ),
-                                        )
-                                    }),
+                                    .gap_0p5()
+                                    .child(title_line)
+                                    .child(metadata_line),
                             )
                             .when(!has_no_title_or_canceled && !is_pending_tool_call, |this| {
                                 let tooltip_title = format!("{title} ({profile_label})");
@@ -10907,7 +10967,7 @@ impl ThreadView {
                                 this.cursor_pointer()
                                     .hover(|s| s.bg(cx.theme().colors().element_hover))
                                     .child(
-                                        div().visible_on_hover(card_header_id).child(
+                                        div().flex_none().visible_on_hover(card_header_id).child(
                                             Icon::new(if is_expanded {
                                                 IconName::ChevronUp
                                             } else {
