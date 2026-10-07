@@ -202,8 +202,10 @@ pub fn ensure_task_worktree_with_policy(
     cx: &mut App,
 ) -> Task<Result<PathBuf>> {
     let task_id = task.id.clone();
+    let task_title = task.title.clone();
     let goal_id = goal_id.or_else(|| task.goal_id.clone());
     cx.spawn(async move |cx| {
+        record_task_title(&task_id, &task_title);
         if on_branch.is_some() && base_branch.is_some() {
             anyhow::bail!("on_branch and base_branch are mutually exclusive");
         }
@@ -544,6 +546,7 @@ struct TaskWorktreeRegistry {
     task_files: HashMap<AgentTaskId, HashMap<PathBuf, Vec<u8>>>,
     goal_tip_shas: HashMap<String, String>,
     goal_graduations: HashMap<String, GoalGraduationSummary>,
+    task_titles: HashMap<AgentTaskId, String>,
 }
 
 #[derive(Clone, Debug)]
@@ -1297,6 +1300,20 @@ fn stale_worktree_tasks_for_branch(
         .collect()
 }
 
+pub fn record_task_title(task_id: &AgentTaskId, title: &str) {
+    // Store only the first non-empty trimmed line so commit subjects stay single-line.
+    if let Some(first_line) = title.lines().map(str::trim).find(|line| !line.is_empty()) {
+        REGISTRY
+            .write()
+            .task_titles
+            .insert(task_id.clone(), first_line.to_string());
+    }
+}
+
+pub fn task_worktree_title(task_id: &AgentTaskId) -> Option<String> {
+    REGISTRY.read().task_titles.get(task_id).cloned()
+}
+
 pub fn task_worktree_checkout_target(task_id: &AgentTaskId) -> Option<String> {
     let reg = REGISTRY.read();
     reg.entries
@@ -1924,6 +1941,9 @@ pub fn startup_sweep(
 
     let tasks = tasks.to_vec();
     cx.spawn(async move |cx| {
+        for task in &tasks {
+            record_task_title(&task.id, &task.title);
+        }
         let (repository, anchor_path, path_style, worktree_setting, file_system) = project
             .update(cx, |project, cx| {
                 anyhow::Ok(task_worktree_context(project, cx))
@@ -2303,7 +2323,8 @@ pub async fn commit_task_worktree(
     let commit_message = if is_error {
         format!("WIP: {branch} error checkpoint")
     } else {
-        format!("{branch}: completed task work")
+        task_worktree_title(&task_id_typed)
+            .unwrap_or_else(|| format!("{branch}: completed task work"))
     };
 
     let askpass = AskPassDelegate::new(cx, |_, _, _| {});
@@ -6533,5 +6554,276 @@ mod tests {
         );
         assert!(fs.is_dir(&path2).await, "task 2 must be preserved");
         assert!(fs.is_dir(&path3).await, "task 3 must be preserved");
+    }
+
+    #[test]
+    fn test_task_title_recording_and_sanitization() {
+        let task_1 = AgentTaskId::from("TASK-TITLES-UNIT-1");
+        record_task_title(&task_1, "  Add login page\nsecond line");
+        assert_eq!(
+            task_worktree_title(&task_1),
+            Some("Add login page".to_string())
+        );
+
+        let task_2 = AgentTaskId::from("TASK-TITLES-UNIT-2");
+        record_task_title(&task_2, "\n\n   Fix memory leak   \nmore text");
+        assert_eq!(
+            task_worktree_title(&task_2),
+            Some("Fix memory leak".to_string())
+        );
+
+        let task_empty = AgentTaskId::from("TASK-TITLES-UNIT-EMPTY");
+        record_task_title(&task_empty, "");
+        assert_eq!(task_worktree_title(&task_empty), None);
+
+        let task_whitespace = AgentTaskId::from("TASK-TITLES-UNIT-WS");
+        record_task_title(&task_whitespace, "   \n\t  \n  ");
+        assert_eq!(task_worktree_title(&task_whitespace), None);
+
+        let task_unknown = AgentTaskId::from("TASK-TITLES-UNIT-UNKNOWN");
+        assert_eq!(task_worktree_title(&task_unknown), None);
+    }
+
+    #[gpui::test]
+    async fn test_commit_task_worktree_uses_task_title(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/root"),
+            json!({
+                ".git": {
+                    "HEAD": "ref: refs/heads/main\n"
+                }
+            }),
+        )
+        .await;
+
+        let dot_git = std::path::Path::new(path!("/root/.git"));
+        fs.with_git_state(dot_git, true, |state| {
+            state
+                .refs
+                .insert("refs/heads/main".into(), "main-sha-title".into());
+            state.refs.insert("HEAD".into(), "main-sha-title".into());
+            state.branches.insert("main".into());
+        })
+        .unwrap();
+
+        let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
+
+        let task = AgentTaskSummary {
+            id: AgentTaskId::from("TASK-TITLES-E2E-1"),
+            parent_id: None,
+            goal_id: None,
+            title: "  Meaningful task title\nsecond line description".to_string(),
+            status: AgentTaskStatus::Ready,
+            attempt: 1,
+            assignee: None,
+            write_scopes: vec![],
+        };
+
+        let worktree_path = cx
+            .update(|cx| ensure_task_worktree(project.clone(), &task, cx))
+            .await
+            .unwrap();
+
+        fs.save(
+            &worktree_path.join("task_file.txt"),
+            &"worktree edit content".into(),
+            text::LineEnding::Unix,
+        )
+        .await
+        .unwrap();
+
+        let details = cx
+            .spawn({
+                let fs = fs.clone();
+                let worktree_path = worktree_path.clone();
+                let task_id = task.id.to_string();
+                |mut cx| async move {
+                    commit_task_worktree(fs, worktree_path, task_id, false, &mut cx).await
+                }
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(details.commit_error, None);
+
+        let snapshot = fs
+            .with_git_state(&worktree_path.join(".git"), false, |state| {
+                state.commit_history.last().cloned()
+            })
+            .unwrap()
+            .expect("commit snapshot must exist in commit history");
+
+        assert_eq!(snapshot.message, "Meaningful task title");
+
+        // Error checkpoint path continues to use WIP message format
+        fs.save(
+            &worktree_path.join("error_file.txt"),
+            &"error checkpoint content".into(),
+            text::LineEnding::Unix,
+        )
+        .await
+        .unwrap();
+
+        let err_details = cx
+            .spawn({
+                let fs = fs.clone();
+                let worktree_path = worktree_path.clone();
+                let task_id = task.id.to_string();
+                |mut cx| async move {
+                    commit_task_worktree(fs, worktree_path, task_id, true, &mut cx).await
+                }
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(err_details.commit_error, None);
+
+        let err_snapshot = fs
+            .with_git_state(&worktree_path.join(".git"), false, |state| {
+                state.commit_history.last().cloned()
+            })
+            .unwrap()
+            .expect("error commit snapshot must exist in commit history");
+
+        let branch = format!("agent-task/{}", task.id);
+        assert_eq!(
+            err_snapshot.message,
+            format!("WIP: {branch} error checkpoint")
+        );
+    }
+
+    #[gpui::test]
+    async fn test_commit_task_worktree_fallback_when_no_title_recorded(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/root"),
+            json!({
+                ".git": {
+                    "HEAD": "ref: refs/heads/main\n"
+                }
+            }),
+        )
+        .await;
+
+        let dot_git = std::path::Path::new(path!("/root/.git"));
+        fs.with_git_state(dot_git, true, |state| {
+            state
+                .refs
+                .insert("refs/heads/main".into(), "main-sha-fallback".into());
+            state.refs.insert("HEAD".into(), "main-sha-fallback".into());
+            state.branches.insert("main".into());
+        })
+        .unwrap();
+
+        let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
+
+        let task = AgentTaskSummary {
+            id: AgentTaskId::from("TASK-TITLES-FALLBACK-1"),
+            parent_id: None,
+            goal_id: None,
+            title: "Temporary Title".to_string(),
+            status: AgentTaskStatus::Ready,
+            attempt: 1,
+            assignee: None,
+            write_scopes: vec![],
+        };
+
+        let worktree_path = cx
+            .update(|cx| ensure_task_worktree(project.clone(), &task, cx))
+            .await
+            .unwrap();
+
+        // Clear recorded title to simulate missing title (e.g. post-restart without TGS summary)
+        REGISTRY.write().task_titles.remove(&task.id);
+        assert_eq!(task_worktree_title(&task.id), None);
+
+        fs.save(
+            &worktree_path.join("fallback_file.txt"),
+            &"some edits".into(),
+            text::LineEnding::Unix,
+        )
+        .await
+        .unwrap();
+
+        let branch = format!("agent-task/{}", task.id);
+        let expected_message = format!("{branch}: completed task work");
+
+        let details = cx
+            .spawn({
+                let fs = fs.clone();
+                let worktree_path = worktree_path.clone();
+                let task_id = task.id.to_string();
+                |mut cx| async move {
+                    commit_task_worktree(fs, worktree_path, task_id, false, &mut cx).await
+                }
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(details.commit_error, None);
+
+        let snapshot = fs
+            .with_git_state(&worktree_path.join(".git"), false, |state| {
+                state.commit_history.last().cloned()
+            })
+            .unwrap()
+            .expect("commit snapshot must exist in commit history");
+
+        assert_eq!(snapshot.message, expected_message);
+    }
+
+    #[gpui::test]
+    async fn test_startup_sweep_seeds_task_titles(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/root"),
+            json!({
+                ".git": {
+                    "HEAD": "ref: refs/heads/main\n"
+                }
+            }),
+        )
+        .await;
+
+        let dot_git = std::path::Path::new(path!("/root/.git"));
+        fs.with_git_state(dot_git, true, |state| {
+            state
+                .refs
+                .insert("refs/heads/main".into(), "main-sha-swp-title".into());
+            state
+                .refs
+                .insert("HEAD".into(), "main-sha-swp-title".into());
+            state.branches.insert("main".into());
+        })
+        .unwrap();
+
+        let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
+
+        let task = AgentTaskSummary {
+            id: AgentTaskId::from("TASK-TITLES-SWEEP-1"),
+            parent_id: None,
+            goal_id: None,
+            title: "  Swept task title \n Details".to_string(),
+            status: AgentTaskStatus::Completed,
+            attempt: 1,
+            assignee: None,
+            write_scopes: vec![],
+        };
+
+        assert_eq!(task_worktree_title(&task.id), None);
+
+        let _ = cx
+            .update(|cx| startup_sweep(project.clone(), Some(std::slice::from_ref(&task)), cx))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            task_worktree_title(&task.id),
+            Some("Swept task title".to_string())
+        );
     }
 }

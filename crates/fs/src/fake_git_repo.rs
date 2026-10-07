@@ -48,6 +48,7 @@ pub struct FakeCommitSnapshot {
     pub head_contents: HashMap<RepoPath, Vec<u8>>,
     pub index_contents: HashMap<RepoPath, Vec<u8>>,
     pub sha: String,
+    pub message: String,
 }
 
 #[derive(Debug, Clone)]
@@ -1232,7 +1233,7 @@ impl GitRepository for FakeGitRepository {
 
     fn commit(
         &self,
-        _message: gpui::SharedString,
+        message: gpui::SharedString,
         _name_and_email: Option<(gpui::SharedString, gpui::SharedString)>,
         options: CommitOptions,
         _askpass: AskPassDelegate,
@@ -1249,6 +1250,7 @@ impl GitRepository for FakeGitRepository {
                 head_contents: state.head_contents.clone(),
                 index_contents: state.index_contents.clone(),
                 sha: old_sha,
+                message: message.to_string(),
             });
 
             state.head_contents = state.index_contents.clone();
@@ -1818,6 +1820,7 @@ impl GitRepository for FakeGitRepository {
                 head_contents: state.head_contents.clone(),
                 index_contents: state.index_contents.clone(),
                 sha: commit_oid.to_string(),
+                message: message.clone(),
             });
 
             state
