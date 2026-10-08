@@ -1904,6 +1904,230 @@ async fn test_per_model_custom_instructions_appended_to_profile_prompt(cx: &mut 
 }
 
 #[gpui::test]
+async fn test_templated_profile_prompt_interpolates_variables(cx: &mut TestAppContext) {
+    let ThreadTest {
+        model,
+        thread,
+        project_context,
+        fs,
+        ..
+    } = setup(cx, TestModel::Fake).await;
+    let fake_model = model.as_fake();
+
+    project_context.update(cx, |pc, _| {
+        pc.os = "custom-os".into();
+        pc.worktrees = vec![prompt_store::WorktreeContext {
+            root_name: "test-root".into(),
+            abs_path: std::sync::Arc::from(std::path::Path::new("/test/path")),
+            rules_file: None,
+        }];
+    });
+
+    let profile_prompt_path = std::env::temp_dir().join(format!(
+        "zed-test-profile-prompt-var-{}-{}.md",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::write(
+        &profile_prompt_path,
+        "Target OS is {{os}}. {{#if worktrees}}Has worktrees.{{/if}}",
+    )
+    .unwrap();
+
+    fs.insert_file(
+        paths::settings_file(),
+        json!({
+            "agent": {
+                "default_profile": "test-profile",
+                "profiles": {
+                    "test-profile": {
+                        "name": "Test Profile",
+                        "custom_prompt_path": profile_prompt_path.to_string_lossy(),
+                        "tools": {
+                            EchoTool::NAME: true,
+                        }
+                    }
+                }
+            }
+        })
+        .to_string()
+        .into_bytes(),
+    )
+    .await;
+    cx.run_until_parked();
+
+    thread.update(cx, |thread, _| thread.add_tool(EchoTool));
+    thread
+        .update(cx, |thread, cx| {
+            thread.send(ClientUserMessageId::new(), ["test message"], cx)
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    let mut pending_completions = fake_model.pending_completions();
+    assert_eq!(pending_completions.len(), 1);
+    let pending_completion = pending_completions.pop().unwrap();
+    let MessageContent::Text(system_prompt) = &pending_completion.messages[0].content[0] else {
+        panic!("Expected text content");
+    };
+    assert!(
+        system_prompt.contains("Target OS is custom-os."),
+        "expected system prompt to contain 'Target OS is custom-os.': {system_prompt}"
+    );
+    assert!(
+        system_prompt.contains("Has worktrees."),
+        "expected system prompt to contain 'Has worktrees.': {system_prompt}"
+    );
+
+    std::fs::remove_file(&profile_prompt_path).log_err();
+}
+
+#[gpui::test]
+async fn test_templated_profile_prompt_includes_worktree_partial(cx: &mut TestAppContext) {
+    let ThreadTest {
+        model, thread, fs, ..
+    } = setup(cx, TestModel::Fake).await;
+    let fake_model = model.as_fake();
+
+    let worktree_dir = tempfile::tempdir().unwrap();
+    let prompts_dir = worktree_dir.path().join(".zed").join("prompts");
+    std::fs::create_dir_all(&prompts_dir).unwrap();
+    std::fs::write(
+        prompts_dir.join("worktree_include.md"),
+        "Content included from worktree prompt partial",
+    )
+    .unwrap();
+
+    thread.update(cx, |thread, _| {
+        thread.set_task_worktree(Some(worktree_dir.path().to_path_buf()));
+    });
+
+    let profile_prompt_path = std::env::temp_dir().join(format!(
+        "zed-test-profile-prompt-partial-{}-{}.md",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::write(
+        &profile_prompt_path,
+        "Profile prompt start: {{> worktree_include}} :end",
+    )
+    .unwrap();
+
+    fs.insert_file(
+        paths::settings_file(),
+        json!({
+            "agent": {
+                "default_profile": "test-profile",
+                "profiles": {
+                    "test-profile": {
+                        "name": "Test Profile",
+                        "custom_prompt_path": profile_prompt_path.to_string_lossy(),
+                        "tools": {
+                            EchoTool::NAME: true,
+                        }
+                    }
+                }
+            }
+        })
+        .to_string()
+        .into_bytes(),
+    )
+    .await;
+    cx.run_until_parked();
+
+    thread.update(cx, |thread, _| thread.add_tool(EchoTool));
+    thread
+        .update(cx, |thread, cx| {
+            thread.send(ClientUserMessageId::new(), ["test message"], cx)
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    let mut pending_completions = fake_model.pending_completions();
+    assert_eq!(pending_completions.len(), 1);
+    let pending_completion = pending_completions.pop().unwrap();
+    let MessageContent::Text(system_prompt) = &pending_completion.messages[0].content[0] else {
+        panic!("Expected text content");
+    };
+    assert!(
+        system_prompt.contains("Content included from worktree prompt partial"),
+        "expected system prompt to contain partial content: {system_prompt}"
+    );
+
+    std::fs::remove_file(&profile_prompt_path).log_err();
+}
+
+#[gpui::test]
+async fn test_templated_profile_prompt_invalid_template_falls_back_to_raw_text(
+    cx: &mut TestAppContext,
+) {
+    let ThreadTest {
+        model, thread, fs, ..
+    } = setup(cx, TestModel::Fake).await;
+    let fake_model = model.as_fake();
+
+    let raw_prompt = "Raw profile prompt with invalid syntax {{#if unclosed_block}} here";
+    let profile_prompt_path = std::env::temp_dir().join(format!(
+        "zed-test-profile-prompt-invalid-{}-{}.md",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::write(&profile_prompt_path, raw_prompt).unwrap();
+
+    fs.insert_file(
+        paths::settings_file(),
+        json!({
+            "agent": {
+                "default_profile": "test-profile",
+                "profiles": {
+                    "test-profile": {
+                        "name": "Test Profile",
+                        "custom_prompt_path": profile_prompt_path.to_string_lossy(),
+                        "tools": {
+                            EchoTool::NAME: true,
+                        }
+                    }
+                }
+            }
+        })
+        .to_string()
+        .into_bytes(),
+    )
+    .await;
+    cx.run_until_parked();
+
+    thread.update(cx, |thread, _| thread.add_tool(EchoTool));
+    thread
+        .update(cx, |thread, cx| {
+            thread.send(ClientUserMessageId::new(), ["test message"], cx)
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    let mut pending_completions = fake_model.pending_completions();
+    assert_eq!(pending_completions.len(), 1);
+    let pending_completion = pending_completions.pop().unwrap();
+    let MessageContent::Text(system_prompt) = &pending_completion.messages[0].content[0] else {
+        panic!("Expected text content");
+    };
+    assert!(
+        system_prompt.contains(raw_prompt),
+        "expected system prompt to fall back to raw prompt text: {system_prompt}"
+    );
+
+    std::fs::remove_file(&profile_prompt_path).log_err();
+}
+
+#[gpui::test]
 async fn test_prompt_caching(cx: &mut TestAppContext) {
     let ThreadTest { model, thread, .. } = setup(cx, TestModel::Fake).await;
     let fake_model = model.as_fake();

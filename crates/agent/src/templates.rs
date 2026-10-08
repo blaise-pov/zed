@@ -1,7 +1,10 @@
 use anyhow::Result;
+use collections::{HashMap, HashSet};
 use gpui::SharedString;
-use handlebars::Handlebars;
+use handlebars::{Handlebars, Template as HandlebarsTemplate};
+use parking_lot::Mutex;
 use serde::Serialize;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 // Dev builds read the checkout's templates at runtime instead of embedding
@@ -13,7 +16,20 @@ util::fs_embed! {
     include = ["*.hbs"],
 }
 
-pub struct Templates(Handlebars<'static>);
+pub struct Templates(Mutex<Handlebars<'static>>);
+
+struct PartialsGuard<'a> {
+    handlebars: &'a mut Handlebars<'static>,
+    registered_names: Vec<String>,
+}
+
+impl<'a> Drop for PartialsGuard<'a> {
+    fn drop(&mut self) {
+        for name in &self.registered_names {
+            self.handlebars.unregister_template(name);
+        }
+    }
+}
 
 impl Templates {
     pub fn new() -> Arc<Self> {
@@ -21,16 +37,229 @@ impl Templates {
         handlebars.set_strict_mode(true);
         handlebars.register_helper("contains", Box::new(contains));
         handlebars.register_embed_templates::<Assets>().unwrap();
-        Arc::new(Self(handlebars))
+        Arc::new(Self(Mutex::new(handlebars)))
     }
 
     pub fn render_custom_template<T: serde::Serialize>(
         &self,
         template_str: &str,
         data: &T,
+        worktree_root: Option<&Path>,
     ) -> anyhow::Result<String> {
-        Ok(self.0.render_template(template_str, data)?)
+        let directories = agent_settings::prompt_partials_dirs(worktree_root);
+        self.render_custom_template_with_dirs(template_str, data, &directories)
     }
+
+    pub fn render_custom_template_with_dirs<T: serde::Serialize>(
+        &self,
+        template_str: &str,
+        data: &T,
+        directories: &[PathBuf],
+    ) -> anyhow::Result<String> {
+        let root_template = HandlebarsTemplate::compile(template_str)?;
+        let partials = load_prompt_partials(directories);
+        let mut handlebars = self.0.lock();
+
+        let mut visited = HashSet::default();
+        let mut stack = Vec::new();
+        collect_partial_references(&root_template, &mut stack);
+
+        while let Some(name) = stack.pop() {
+            if !visited.insert(name.clone()) {
+                continue;
+            }
+            if let Some(partial_template) = partials.get(&name) {
+                collect_partial_references(partial_template, &mut stack);
+            } else if handlebars.get_template(&name).is_some() {
+                // Built-in template (e.g. system_prompt.hbs)
+            } else {
+                anyhow::bail!("prompt partial not found: {name}");
+            }
+        }
+
+        let mut guard = PartialsGuard {
+            handlebars: &mut handlebars,
+            registered_names: Vec::new(),
+        };
+        for (name, template) in partials {
+            guard.handlebars.register_template(&name, template);
+            guard.registered_names.push(name);
+        }
+        let rendered = guard.handlebars.render_template(template_str, data)?;
+        Ok(rendered)
+    }
+}
+
+fn extract_partial_name(param: &handlebars::template::Parameter) -> Option<String> {
+    match param {
+        handlebars::template::Parameter::Name(name) => {
+            let trimmed = name.trim();
+            let unquoted = if (trimmed.starts_with('\'') && trimmed.ends_with('\''))
+                || (trimmed.starts_with('"') && trimmed.ends_with('"'))
+            {
+                if trimmed.len() >= 2 {
+                    &trimmed[1..trimmed.len() - 1]
+                } else {
+                    trimmed
+                }
+            } else {
+                trimmed
+            };
+            Some(unquoted.to_string())
+        }
+        _ => None,
+    }
+}
+
+fn collect_partial_references(template: &HandlebarsTemplate, references: &mut Vec<String>) {
+    for element in &template.elements {
+        match element {
+            handlebars::template::TemplateElement::PartialExpression(partial) => {
+                if let Some(name) = extract_partial_name(&partial.name) {
+                    references.push(name);
+                }
+            }
+            handlebars::template::TemplateElement::PartialBlock(partial) => {
+                if let Some(name) = extract_partial_name(&partial.name) {
+                    references.push(name);
+                }
+                if let Some(inner) = &partial.template {
+                    collect_partial_references(inner, references);
+                }
+            }
+            handlebars::template::TemplateElement::HelperBlock(helper) => {
+                if let Some(inner) = &helper.template {
+                    collect_partial_references(inner, references);
+                }
+                if let Some(inner) = &helper.inverse {
+                    collect_partial_references(inner, references);
+                }
+            }
+            handlebars::template::TemplateElement::DecoratorBlock(decorator) => {
+                if let Some(inner) = &decorator.template {
+                    collect_partial_references(inner, references);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn is_in_cycle(start: &str, edges: &HashMap<String, Vec<String>>) -> bool {
+    let mut visited = HashSet::default();
+    let mut stack = Vec::new();
+    if let Some(neighbors) = edges.get(start) {
+        for next in neighbors {
+            if next == start {
+                return true;
+            }
+            stack.push(next.as_str());
+        }
+    }
+
+    while let Some(current) = stack.pop() {
+        if !visited.insert(current) {
+            continue;
+        }
+        if let Some(neighbors) = edges.get(current) {
+            for next in neighbors {
+                if next == start {
+                    return true;
+                }
+                if !visited.contains(next.as_str()) {
+                    stack.push(next.as_str());
+                }
+            }
+        }
+    }
+
+    false
+}
+
+fn load_prompt_partials(directories: &[PathBuf]) -> HashMap<String, HandlebarsTemplate> {
+    let mut candidate_partials: HashMap<String, (PathBuf, String)> = HashMap::default();
+
+    for directory in directories {
+        let Ok(read_dir) = std::fs::read_dir(directory) else {
+            continue;
+        };
+
+        let mut entries: Vec<_> = read_dir.flatten().collect();
+        entries.sort_by_key(|entry| entry.file_name());
+
+        for entry in entries {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+
+            let Some(extension) = path.extension().and_then(|ext| ext.to_str()) else {
+                continue;
+            };
+            if extension != "md" && extension != "hbs" {
+                continue;
+            }
+
+            let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+                continue;
+            };
+            if stem.is_empty() {
+                continue;
+            }
+
+            match std::fs::read_to_string(&path) {
+                Ok(content) => {
+                    candidate_partials.insert(stem.to_string(), (path, content));
+                }
+                Err(err) => {
+                    log::warn!(
+                        "failed to read prompt partial file from {}: {err}",
+                        path.display()
+                    );
+                }
+            }
+        }
+    }
+
+    let mut parsed_partials: HashMap<String, (PathBuf, HandlebarsTemplate)> = HashMap::default();
+    for (name, (path, content)) in candidate_partials {
+        match HandlebarsTemplate::compile(&content) {
+            Ok(template) => {
+                parsed_partials.insert(name, (path, template));
+            }
+            Err(err) => {
+                log::warn!(
+                    "failed to parse prompt partial template from {}: {err}",
+                    path.display()
+                );
+            }
+        }
+    }
+
+    let mut edges: HashMap<String, Vec<String>> = HashMap::default();
+    for (name, (_, template)) in &parsed_partials {
+        let mut references = Vec::new();
+        collect_partial_references(template, &mut references);
+        let valid_edges = references
+            .into_iter()
+            .filter(|referenced_name| parsed_partials.contains_key(referenced_name))
+            .collect();
+        edges.insert(name.clone(), valid_edges);
+    }
+
+    let mut valid_partials = HashMap::default();
+    for (name, (path, template)) in parsed_partials {
+        if is_in_cycle(&name, &edges) {
+            log::warn!(
+                "prompt partial '{name}' from {} participates in a recursive include cycle and was skipped",
+                path.display()
+            );
+        } else {
+            valid_partials.insert(name, template);
+        }
+    }
+
+    valid_partials
 }
 
 pub trait Template: Sized {
@@ -40,7 +269,7 @@ pub trait Template: Sized {
     where
         Self: Serialize + Sized,
     {
-        Ok(templates.0.render(Self::TEMPLATE_NAME, self)?)
+        Ok(templates.0.lock().render(Self::TEMPLATE_NAME, self)?)
     }
 }
 
@@ -130,6 +359,7 @@ mod tests {
                 &Data {
                     name: "Zed".to_string(),
                 },
+                None,
             )
             .unwrap();
         assert_eq!(rendered, "Hello, Zed!");
@@ -140,6 +370,7 @@ mod tests {
             &Data {
                 name: "Zed".to_string(),
             },
+            None,
         );
         assert!(err.is_err());
     }
@@ -489,5 +720,136 @@ mod tests {
 
         assert!(!rendered.contains("The user has specified the following rules"));
         assert!(!rendered.contains("Rules title:"));
+    }
+
+    #[test]
+    fn test_render_custom_template_basic_include() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        std::fs::write(temp_dir.path().join("greeting.md"), "Hello from partial!").unwrap();
+
+        let templates = Templates::new();
+        let rendered = templates
+            .render_custom_template_with_dirs(
+                "Start {{> greeting}} End",
+                &(),
+                &[temp_dir.path().to_path_buf()],
+            )
+            .unwrap();
+        assert_eq!(rendered, "Start Hello from partial! End");
+    }
+
+    #[test]
+    fn test_render_custom_template_precedence() {
+        let config_dir = tempfile::tempdir().unwrap();
+        let worktree_dir = tempfile::tempdir().unwrap();
+        std::fs::write(config_dir.path().join("greeting.md"), "From config").unwrap();
+        std::fs::write(worktree_dir.path().join("greeting.hbs"), "From worktree").unwrap();
+
+        let templates = Templates::new();
+        let dirs = vec![
+            config_dir.path().to_path_buf(),
+            worktree_dir.path().to_path_buf(),
+        ];
+        let rendered = templates
+            .render_custom_template_with_dirs("{{> greeting}}", &(), &dirs)
+            .unwrap();
+        assert_eq!(rendered, "From worktree");
+    }
+
+    #[test]
+    fn test_render_custom_template_nesting_and_variables() {
+        #[derive(serde::Serialize)]
+        struct Context {
+            variable: String,
+        }
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        std::fs::write(temp_dir.path().join("inner.md"), "inner: {{variable}}").unwrap();
+        std::fs::write(temp_dir.path().join("outer.hbs"), "outer: [{{> inner}}]").unwrap();
+
+        let templates = Templates::new();
+        let rendered = templates
+            .render_custom_template_with_dirs(
+                "root: {{> outer}}",
+                &Context {
+                    variable: "interpolated_value".to_string(),
+                },
+                &[temp_dir.path().to_path_buf()],
+            )
+            .unwrap();
+        assert_eq!(rendered, "root: outer: [inner: interpolated_value]");
+    }
+
+    #[test]
+    fn test_render_custom_template_self_recursive() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        std::fs::write(temp_dir.path().join("recurse.md"), "hello {{> recurse}}").unwrap();
+
+        let templates = Templates::new();
+        let result = templates.render_custom_template_with_dirs(
+            "start {{> recurse}}",
+            &(),
+            &[temp_dir.path().to_path_buf()],
+        );
+        assert!(result.is_err(), "expected error, got: {:?}", result);
+    }
+
+    #[test]
+    fn test_render_custom_template_mutual_recursive() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        std::fs::write(temp_dir.path().join("cycle_a.md"), "a: {{> cycle_b}}").unwrap();
+        std::fs::write(temp_dir.path().join("cycle_b.md"), "b: {{> cycle_a}}").unwrap();
+
+        let templates = Templates::new();
+        let result = templates.render_custom_template_with_dirs(
+            "start {{> cycle_a}}",
+            &(),
+            &[temp_dir.path().to_path_buf()],
+        );
+        assert!(result.is_err(), "expected error, got: {:?}", result);
+    }
+
+    #[test]
+    fn test_render_custom_template_missing_partial() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let templates = Templates::new();
+        let result = templates.render_custom_template_with_dirs(
+            "{{> missing_partial}}",
+            &(),
+            &[temp_dir.path().to_path_buf()],
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_render_custom_template_includes_builtin_system_prompt() {
+        let project = prompt_store::ProjectContext::default();
+        let template_data = SystemPromptTemplate {
+            project: &project,
+            available_tools: vec!["echo".into()],
+            model_name: Some("test-model".to_string()),
+            date: "2026-01-01".to_string(),
+            user_agents_md: None,
+            sandboxing: false,
+            is_linux: false,
+            is_windows: false,
+            custom_instructions: None,
+            subagent_delegation_note: None,
+            available_agents: None,
+        };
+
+        let templates = Templates::new();
+        let rendered = templates
+            .render_custom_template(
+                "Prefix\n{{> system_prompt.hbs}}\nSuffix",
+                &template_data,
+                None,
+            )
+            .unwrap();
+
+        assert!(rendered.starts_with("Prefix\n"));
+        assert!(rendered.ends_with("\nSuffix"));
+        assert!(rendered.contains("You are the Zed coding agent"));
+        assert!(rendered.contains("test-model"));
     }
 }

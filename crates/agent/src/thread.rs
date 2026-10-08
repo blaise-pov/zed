@@ -5243,32 +5243,6 @@ impl Thread {
         let worktree_root = self.worktree_root_path(cx);
         let worktree_root = worktree_root.as_deref();
 
-        // Custom instructions from the active agent profile and/or model parameters.
-        let mut custom_instructions = settings
-            .profiles
-            .get(&self.profile_id)
-            .and_then(|profile| {
-                agent_settings::resolve_custom_prompt(
-                    Some(&self.profile_id),
-                    profile.custom_prompt_path.as_deref(),
-                    worktree_root,
-                )
-            })
-            .map(|prompt| prompt.to_string());
-        if let Some(model_instructions) = self
-            .model()
-            .and_then(|model| AgentSettings::custom_instructions_for_model(model, cx))
-        {
-            match custom_instructions.as_mut() {
-                Some(existing) => {
-                    existing.push_str("\n\n");
-                    existing.push_str(&model_instructions);
-                }
-                None => {
-                    custom_instructions = Some(model_instructions);
-                }
-            }
-        }
         // Catalog of agents this profile may delegate to, rendered into the
         // delegation section of the system prompt.
         let available_agents = settings
@@ -5296,7 +5270,7 @@ impl Thread {
                     Some(agents)
                 }
             });
-        let system_prompt_data = SystemPromptTemplate {
+        let mut system_prompt_data = SystemPromptTemplate {
             project: project_context,
             available_tools,
             model_name: self.model().map(|m| m.name().0.to_string()),
@@ -5308,10 +5282,53 @@ impl Thread {
             ),
             is_linux: cfg!(target_os = "linux"),
             is_windows: cfg!(target_os = "windows"),
-            custom_instructions,
+            custom_instructions: None,
             subagent_delegation_note: self.subagent_delegation_note(cx),
             available_agents,
         };
+
+        // Custom instructions from the active agent profile and/or model parameters.
+        let mut custom_instructions = settings
+            .profiles
+            .get(&self.profile_id)
+            .and_then(|profile| {
+                agent_settings::resolve_custom_prompt(
+                    Some(&self.profile_id),
+                    profile.custom_prompt_path.as_deref(),
+                    worktree_root,
+                )
+            })
+            .map(|prompt| {
+                match self.templates.render_custom_template(
+                    &prompt,
+                    &system_prompt_data,
+                    worktree_root,
+                ) {
+                    Ok(rendered) => rendered,
+                    Err(err) => {
+                        log::warn!(
+                            "failed to render custom prompt for profile {:?}: {err}",
+                            self.profile_id
+                        );
+                        prompt.to_string()
+                    }
+                }
+            });
+        if let Some(model_instructions) = self
+            .model()
+            .and_then(|model| AgentSettings::custom_instructions_for_model(model, cx))
+        {
+            match custom_instructions.as_mut() {
+                Some(existing) => {
+                    existing.push_str("\n\n");
+                    existing.push_str(&model_instructions);
+                }
+                None => {
+                    custom_instructions = Some(model_instructions);
+                }
+            }
+        }
+        system_prompt_data.custom_instructions = custom_instructions;
         let model_template_path = self
             .model()
             .and_then(|model| AgentSettings::system_prompt_template_for_model(model, cx));
@@ -5329,7 +5346,7 @@ impl Thread {
         let system_prompt = if let Some(path) = custom_template_path {
             match agent_settings::read_prompt_file(path, worktree_root).map(|content| {
                 self.templates
-                    .render_custom_template(&content, &system_prompt_data)
+                    .render_custom_template(&content, &system_prompt_data, worktree_root)
             }) {
                 Some(Ok(rendered)) => rendered,
                 Some(Err(err)) => {

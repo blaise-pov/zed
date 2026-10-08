@@ -441,6 +441,15 @@ pub fn prompt_search_roots(worktree_root: Option<&Path>) -> Vec<PathBuf> {
     roots
 }
 
+pub fn prompt_partials_dirs(worktree_root: Option<&Path>) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    dirs.push(paths::config_dir().join("prompts"));
+    if let Some(worktree) = worktree_root {
+        dirs.push(worktree.join(".zed").join("prompts"));
+    }
+    dirs
+}
+
 pub fn resolve_prompt(path_str: &str, anchors: &[PathBuf]) -> Result<String, PromptResolveError> {
     let trimmed = path_str.trim();
     if trimmed.is_empty() {
@@ -1566,6 +1575,20 @@ mod tests {
             !global
                 .profiles
                 .contains_key(&AgentProfileId("project1-profile".into()))
+        );
+    }
+
+    #[test]
+    fn test_prompt_partials_dirs() {
+        let config_prompts = paths::config_dir().join("prompts");
+        let dirs_without_worktree = prompt_partials_dirs(None);
+        assert_eq!(dirs_without_worktree, vec![config_prompts.clone()]);
+
+        let worktree_path = Path::new("/workspace/project");
+        let dirs_with_worktree = prompt_partials_dirs(Some(worktree_path));
+        assert_eq!(
+            dirs_with_worktree,
+            vec![config_prompts, worktree_path.join(".zed").join("prompts"),]
         );
     }
 }
