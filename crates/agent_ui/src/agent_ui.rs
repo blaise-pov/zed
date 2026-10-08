@@ -1025,6 +1025,8 @@ mod tests {
             },
             thinking_display: Default::default(),
             terminal_watchdog: Default::default(),
+            task_worktree_limit: agent_settings::DEFAULT_TASK_WORKTREE_LIMIT,
+            task_worktree_language_servers: agent_settings::DEFAULT_TASK_WORKTREE_LANGUAGE_SERVERS,
         };
 
         cx.update(|cx| {

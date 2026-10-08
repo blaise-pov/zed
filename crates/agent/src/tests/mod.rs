@@ -12714,6 +12714,9 @@ async fn test_auto_cleanup_terminal_task_removes_worktree_preserves_branch(
         attempt: 1,
         assignee: None,
         write_scopes: vec![],
+        created_at: None,
+        assigned_profile: None,
+        model: None,
     };
 
     let worktree_path = cx
@@ -12796,6 +12799,9 @@ async fn test_auto_cleanup_retains_worktree_on_commit_error(cx: &mut TestAppCont
         attempt: 1,
         assignee: None,
         write_scopes: vec![],
+        created_at: None,
+        assigned_profile: None,
+        model: None,
     };
 
     let worktree_path = cx
@@ -12872,6 +12878,9 @@ async fn test_startup_sweep_cleans_only_terminal_tasks(cx: &mut TestAppContext) 
         attempt: 1,
         assignee: None,
         write_scopes: vec![],
+        created_at: None,
+        assigned_profile: None,
+        model: None,
     };
     let task2 = AgentTaskSummary {
         id: AgentTaskId::from("TASK-SWEEP-2"),
@@ -12882,6 +12891,9 @@ async fn test_startup_sweep_cleans_only_terminal_tasks(cx: &mut TestAppContext) 
         attempt: 1,
         assignee: None,
         write_scopes: vec![],
+        created_at: None,
+        assigned_profile: None,
+        model: None,
     };
     let task3 = AgentTaskSummary {
         id: AgentTaskId::from("TASK-SWEEP-3"),
@@ -12892,6 +12904,9 @@ async fn test_startup_sweep_cleans_only_terminal_tasks(cx: &mut TestAppContext) 
         attempt: 1,
         assignee: None,
         write_scopes: vec![],
+        created_at: None,
+        assigned_profile: None,
+        model: None,
     };
 
     let path1 = cx

@@ -154,6 +154,7 @@ pub enum WatchdogDecision {
 
 #[derive(Debug, Clone)]
 pub struct WatchdogState {
+    #[allow(dead_code)]
     pub started_at: Instant,
     pub last_progress: Instant,
     pub last_output_counter: u64,
@@ -252,6 +253,7 @@ impl<P: ActivityProbe> TerminalWatchdog<P> {
         self
     }
 
+    #[allow(dead_code)]
     pub fn with_now_fn(mut self, now_fn: Arc<dyn Fn() -> Instant + Send + Sync>) -> Self {
         let now = (now_fn)();
         self.state.started_at = now;

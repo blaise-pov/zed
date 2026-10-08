@@ -3697,6 +3697,9 @@ impl ThreadEnvironment for NativeThreadEnvironment {
             attempt: 1,
             assignee: None,
             write_scopes: Vec::new(),
+            created_at: None,
+            assigned_profile: None,
+            model: None,
         };
         cx.update(|cx| {
             crate::task_worktree::ensure_task_worktree_with_policy(

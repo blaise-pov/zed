@@ -4,8 +4,8 @@ use gpui::{App, Entity, Task};
 use project::context_server_store::ContextServerStore;
 
 use crate::agent_task::{
-    AgentTaskArtifact, AgentTaskDetail, AgentTaskEvent, AgentTaskGraph, AgentTaskId,
-    AgentTaskProvider,
+    AgentGoalStatus, AgentTaskArtifact, AgentTaskDetail, AgentTaskEvent, AgentTaskGraph,
+    AgentTaskId, AgentTaskProvider, AgentTaskStatus, AgentUnifiedItem,
 };
 
 pub struct McpAgentTaskProvider {
@@ -256,6 +256,124 @@ impl AgentTaskProvider for McpAgentTaskProvider {
             let artifact: AgentTaskArtifact = serde_json::from_value(value)
                 .context("failed to parse AgentTaskArtifact from artifact_get response")?;
             Ok(artifact)
+        })
+    }
+
+    fn fetch_items(&self, cx: &mut App) -> Task<Result<Vec<AgentUnifiedItem>>> {
+        let task = self.call_tool("item_list", Some(serde_json::Map::new()), cx);
+        cx.spawn(async move |_cx| {
+            let value = task.await?;
+            let items_value = match value {
+                serde_json::Value::Array(_) => value,
+                serde_json::Value::Object(mut map) => map
+                    .remove("items")
+                    .unwrap_or(serde_json::Value::Array(Vec::new())),
+                _ => serde_json::Value::Array(Vec::new()),
+            };
+            let items: Vec<AgentUnifiedItem> = serde_json::from_value(items_value)
+                .context("failed to parse Vec<AgentUnifiedItem> from item_list response")?;
+            Ok(items)
+        })
+    }
+
+    fn set_task_status(
+        &self,
+        id: &AgentTaskId,
+        status: &AgentTaskStatus,
+        cx: &mut App,
+    ) -> Task<Result<()>> {
+        let (tool_name, extra_args) = match status {
+            AgentTaskStatus::Ready => ("task_retry", None),
+            AgentTaskStatus::Running => ("task_start", None),
+            AgentTaskStatus::Completed => ("task_complete", None),
+            AgentTaskStatus::Failed => (
+                "task_fail",
+                Some(("reason", "marked failed from Agent Task Panel".to_string())),
+            ),
+            AgentTaskStatus::Cancelled => ("task_cancel", None),
+            AgentTaskStatus::Archived => ("task_archive", None),
+            other => {
+                return Task::ready(Err(anyhow::anyhow!(
+                    "cannot set task status {:?} via MCP",
+                    other
+                )));
+            }
+        };
+
+        let mut args = serde_json::Map::new();
+        args.insert(
+            "task_id".to_string(),
+            serde_json::Value::String(id.to_string()),
+        );
+        if let Some((key, val)) = extra_args {
+            args.insert(key.to_string(), serde_json::Value::String(val));
+        }
+
+        let task = self.call_tool(tool_name, Some(args), cx);
+        cx.spawn(async move |_cx| {
+            task.await?;
+            Ok(())
+        })
+    }
+
+    fn set_goal_status(
+        &self,
+        goal_id: &str,
+        status: &AgentGoalStatus,
+        cx: &mut App,
+    ) -> Task<Result<()>> {
+        let mut args = serde_json::Map::new();
+        args.insert(
+            "goal_id".to_string(),
+            serde_json::Value::String(goal_id.to_string()),
+        );
+        args.insert(
+            "status".to_string(),
+            serde_json::Value::String(status.as_str().to_string()),
+        );
+        let task = self.call_tool("goal_update", Some(args), cx);
+        cx.spawn(async move |_cx| {
+            task.await?;
+            Ok(())
+        })
+    }
+
+    fn archive_goal(&self, goal_id: &str, cx: &mut App) -> Task<Result<()>> {
+        let mut args = serde_json::Map::new();
+        args.insert(
+            "goal_id".to_string(),
+            serde_json::Value::String(goal_id.to_string()),
+        );
+        let task = self.call_tool("goal_archive", Some(args), cx);
+        cx.spawn(async move |_cx| {
+            task.await?;
+            Ok(())
+        })
+    }
+
+    fn unarchive_goal(&self, goal_id: &str, cx: &mut App) -> Task<Result<()>> {
+        let mut args = serde_json::Map::new();
+        args.insert(
+            "goal_id".to_string(),
+            serde_json::Value::String(goal_id.to_string()),
+        );
+        let task = self.call_tool("goal_unarchive", Some(args), cx);
+        cx.spawn(async move |_cx| {
+            task.await?;
+            Ok(())
+        })
+    }
+
+    fn delete_goal(&self, goal_id: &str, cx: &mut App) -> Task<Result<()>> {
+        let mut args = serde_json::Map::new();
+        args.insert(
+            "goal_id".to_string(),
+            serde_json::Value::String(goal_id.to_string()),
+        );
+        let task = self.call_tool("goal_delete", Some(args), cx);
+        cx.spawn(async move |_cx| {
+            task.await?;
+            Ok(())
         })
     }
 }

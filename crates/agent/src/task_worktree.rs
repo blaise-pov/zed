@@ -24,7 +24,7 @@ use crate::{AgentTaskId, AgentTaskSummary};
 #[error("no git repository found in project")]
 pub struct NoGitRepositoryError;
 
-fn system_git_binary() -> Option<PathBuf> {
+pub(crate) fn system_git_binary() -> Option<PathBuf> {
     static CACHED_GIT: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
     CACHED_GIT.get_or_init(|| which::which("git").ok()).clone()
 }
@@ -3410,6 +3410,9 @@ mod tests {
             attempt: 1,
             assignee: None,
             write_scopes: vec!["src/".to_string()],
+            created_at: None,
+            assigned_profile: None,
+            model: None,
         };
 
         let path1 = cx
@@ -3452,6 +3455,9 @@ mod tests {
             attempt: 1,
             assignee: None,
             write_scopes: vec!["src/".to_string()],
+            created_at: None,
+            assigned_profile: None,
+            model: None,
         };
         let second_task = AgentTaskSummary {
             id: AgentTaskId::from("TASK-DIST-2"),
@@ -3462,6 +3468,9 @@ mod tests {
             attempt: 1,
             assignee: None,
             write_scopes: vec!["docs/".to_string()],
+            created_at: None,
+            assigned_profile: None,
+            model: None,
         };
 
         let first_path = cx
@@ -3514,6 +3523,9 @@ mod tests {
             attempt: 1,
             assignee: None,
             write_scopes: vec!["src/".to_string()],
+            created_at: None,
+            assigned_profile: None,
+            model: None,
         };
 
         let initial_visible_count =
@@ -3690,6 +3702,9 @@ mod tests {
             attempt: 1,
             assignee: None,
             write_scopes: vec![],
+            created_at: None,
+            assigned_profile: None,
+            model: None,
         };
 
         // Case 1: task with goal_id forks from goal-tip
@@ -3726,6 +3741,9 @@ mod tests {
             attempt: 1,
             assignee: None,
             write_scopes: vec![],
+            created_at: None,
+            assigned_profile: None,
+            model: None,
         };
         let path2 = cx
             .update(|cx| {
@@ -3760,6 +3778,9 @@ mod tests {
             attempt: 1,
             assignee: None,
             write_scopes: vec![],
+            created_at: None,
+            assigned_profile: None,
+            model: None,
         };
         let path3 = cx
             .update(|cx| {
@@ -3790,6 +3811,9 @@ mod tests {
             attempt: 1,
             assignee: None,
             write_scopes: vec![],
+            created_at: None,
+            assigned_profile: None,
+            model: None,
         };
         let result4 = cx
             .update(|cx| {
@@ -3817,6 +3841,9 @@ mod tests {
             attempt: 1,
             assignee: None,
             write_scopes: vec![],
+            created_at: None,
+            assigned_profile: None,
+            model: None,
         };
         let path5 = cx
             .update(|cx| ensure_task_worktree(project.clone(), &task5, cx))
@@ -3864,6 +3891,9 @@ mod tests {
             attempt: 1,
             assignee: None,
             write_scopes: vec![],
+            created_at: None,
+            assigned_profile: None,
+            model: None,
         };
 
         let worktree_path = cx
@@ -3952,6 +3982,9 @@ mod tests {
             attempt: 1,
             assignee: None,
             write_scopes: vec![],
+            created_at: None,
+            assigned_profile: None,
+            model: None,
         };
         let task_b = AgentTaskSummary {
             id: AgentTaskId::from("TASK-NFF-B"),
@@ -3962,6 +3995,9 @@ mod tests {
             attempt: 1,
             assignee: None,
             write_scopes: vec![],
+            created_at: None,
+            assigned_profile: None,
+            model: None,
         };
 
         let path_a = cx
@@ -4075,6 +4111,9 @@ mod tests {
             attempt: 1,
             assignee: None,
             write_scopes: vec![],
+            created_at: None,
+            assigned_profile: None,
+            model: None,
         };
         let task_c2 = AgentTaskSummary {
             id: AgentTaskId::from("TASK-CONF-2"),
@@ -4085,6 +4124,9 @@ mod tests {
             attempt: 1,
             assignee: None,
             write_scopes: vec![],
+            created_at: None,
+            assigned_profile: None,
+            model: None,
         };
 
         let path_c1 = cx
@@ -4213,6 +4255,9 @@ mod tests {
             attempt: 1,
             assignee: None,
             write_scopes: vec![],
+            created_at: None,
+            assigned_profile: None,
+            model: None,
         };
 
         let worktree_path = cx
@@ -4301,6 +4346,9 @@ mod tests {
             attempt: 1,
             assignee: None,
             write_scopes: vec![],
+            created_at: None,
+            assigned_profile: None,
+            model: None,
         };
 
         let path_a = cx
@@ -4348,6 +4396,9 @@ mod tests {
             attempt: 1,
             assignee: None,
             write_scopes: vec![],
+            created_at: None,
+            assigned_profile: None,
+            model: None,
         };
 
         let path_b = cx
@@ -4428,6 +4479,9 @@ mod tests {
             attempt: 1,
             assignee: None,
             write_scopes: vec![],
+            created_at: None,
+            assigned_profile: None,
+            model: None,
         };
 
         let path_a = cx
@@ -4476,6 +4530,9 @@ mod tests {
             attempt: 1,
             assignee: None,
             write_scopes: vec![],
+            created_at: None,
+            assigned_profile: None,
+            model: None,
         };
 
         let path_reviewer = cx
@@ -4553,6 +4610,9 @@ mod tests {
             attempt: 1,
             assignee: None,
             write_scopes: vec![],
+            created_at: None,
+            assigned_profile: None,
+            model: None,
         };
 
         let path_x = cx
@@ -4600,6 +4660,9 @@ mod tests {
             attempt: 1,
             assignee: None,
             write_scopes: vec![],
+            created_at: None,
+            assigned_profile: None,
+            model: None,
         };
 
         let path_insp = cx
@@ -4676,6 +4739,9 @@ mod tests {
             attempt: 1,
             assignee: None,
             write_scopes: vec![],
+            created_at: None,
+            assigned_profile: None,
+            model: None,
         };
         let task2 = AgentTaskSummary {
             id: AgentTaskId::from("TASK-EXC-2"),
@@ -4686,6 +4752,9 @@ mod tests {
             attempt: 1,
             assignee: None,
             write_scopes: vec![],
+            created_at: None,
+            assigned_profile: None,
+            model: None,
         };
 
         // Task 1 checks out shared-branch
@@ -4790,6 +4859,9 @@ mod tests {
             attempt: 1,
             assignee: None,
             write_scopes: vec![],
+            created_at: None,
+            assigned_profile: None,
+            model: None,
         };
 
         let task_a = AgentTaskSummary {
@@ -4801,6 +4873,9 @@ mod tests {
             attempt: 1,
             assignee: None,
             write_scopes: vec![],
+            created_at: None,
+            assigned_profile: None,
+            model: None,
         };
 
         let task_rec = AgentTaskSummary {
@@ -4812,6 +4887,9 @@ mod tests {
             attempt: 1,
             assignee: None,
             write_scopes: vec![],
+            created_at: None,
+            assigned_profile: None,
+            model: None,
         };
 
         // Both Task B and Task A create worktrees branched from the same initial goal state
@@ -4942,6 +5020,9 @@ mod tests {
             attempt: 1,
             assignee: None,
             write_scopes: vec![],
+            created_at: None,
+            assigned_profile: None,
+            model: None,
         };
         let task2 = AgentTaskSummary {
             id: AgentTaskId::from("TASK-C-2"),
@@ -4952,6 +5033,9 @@ mod tests {
             attempt: 1,
             assignee: None,
             write_scopes: vec![],
+            created_at: None,
+            assigned_profile: None,
+            model: None,
         };
 
         // Task 1 checks out branch-c with an active session guard
@@ -5051,6 +5135,9 @@ mod tests {
             attempt: 1,
             assignee: None,
             write_scopes: vec![],
+            created_at: None,
+            assigned_profile: None,
+            model: None,
         };
         let task2 = AgentTaskSummary {
             id: AgentTaskId::from("TASK-D-2"),
@@ -5061,6 +5148,9 @@ mod tests {
             attempt: 1,
             assignee: None,
             write_scopes: vec![],
+            created_at: None,
+            assigned_profile: None,
+            model: None,
         };
 
         let path1 = cx
@@ -5142,6 +5232,9 @@ mod tests {
             attempt: 1,
             assignee: None,
             write_scopes: vec![],
+            created_at: None,
+            assigned_profile: None,
+            model: None,
         };
 
         // 1. on_branch + base_branch mutually exclusive
@@ -5230,6 +5323,9 @@ mod tests {
             attempt: 1,
             assignee: None,
             write_scopes: vec![],
+            created_at: None,
+            assigned_profile: None,
+            model: None,
         };
 
         let path = cx
@@ -5382,6 +5478,9 @@ mod tests {
             attempt: 1,
             assignee: None,
             write_scopes: vec![],
+            created_at: None,
+            assigned_profile: None,
+            model: None,
         };
 
         let worktree_path = cx
@@ -5813,6 +5912,9 @@ mod tests {
             attempt: 1,
             assignee: None,
             write_scopes: vec![],
+            created_at: None,
+            assigned_profile: None,
+            model: None,
         };
         let task2 = AgentTaskSummary {
             id: AgentTaskId::from("TASK-POOL-2"),
@@ -5823,6 +5925,9 @@ mod tests {
             attempt: 1,
             assignee: None,
             write_scopes: vec![],
+            created_at: None,
+            assigned_profile: None,
+            model: None,
         };
         let task3 = AgentTaskSummary {
             id: AgentTaskId::from("TASK-POOL-3"),
@@ -5833,6 +5938,9 @@ mod tests {
             attempt: 1,
             assignee: None,
             write_scopes: vec![],
+            created_at: None,
+            assigned_profile: None,
+            model: None,
         };
         let task4 = AgentTaskSummary {
             id: AgentTaskId::from("TASK-POOL-4"),
@@ -5843,6 +5951,9 @@ mod tests {
             attempt: 1,
             assignee: None,
             write_scopes: vec![],
+            created_at: None,
+            assigned_profile: None,
+            model: None,
         };
 
         // Task 1 and Task 2 active sessions
@@ -5980,6 +6091,9 @@ mod tests {
             attempt: 1,
             assignee: None,
             write_scopes: vec![],
+            created_at: None,
+            assigned_profile: None,
+            model: None,
         };
         let task2 = AgentTaskSummary {
             id: AgentTaskId::from("TASK-LRU-2"),
@@ -5990,6 +6104,9 @@ mod tests {
             attempt: 1,
             assignee: None,
             write_scopes: vec![],
+            created_at: None,
+            assigned_profile: None,
+            model: None,
         };
         let task3 = AgentTaskSummary {
             id: AgentTaskId::from("TASK-LRU-3"),
@@ -6000,6 +6117,9 @@ mod tests {
             attempt: 1,
             assignee: None,
             write_scopes: vec![],
+            created_at: None,
+            assigned_profile: None,
+            model: None,
         };
 
         // Create Task 1 with guard
@@ -6116,6 +6236,9 @@ mod tests {
             attempt: 1,
             assignee: None,
             write_scopes: vec![],
+            created_at: None,
+            assigned_profile: None,
+            model: None,
         };
         let task_dirty = AgentTaskSummary {
             id: AgentTaskId::from("TASK-SAFE-DIRTY"),
@@ -6126,6 +6249,9 @@ mod tests {
             attempt: 1,
             assignee: None,
             write_scopes: vec![],
+            created_at: None,
+            assigned_profile: None,
+            model: None,
         };
         let task_new = AgentTaskSummary {
             id: AgentTaskId::from("TASK-SAFE-NEW"),
@@ -6136,6 +6262,9 @@ mod tests {
             attempt: 1,
             assignee: None,
             write_scopes: vec![],
+            created_at: None,
+            assigned_profile: None,
+            model: None,
         };
 
         // Task Err is created, guard dropped, but has commit_error
@@ -6258,6 +6387,9 @@ mod tests {
             attempt: 1,
             assignee: None,
             write_scopes: vec![],
+            created_at: None,
+            assigned_profile: None,
+            model: None,
         };
         let task2 = AgentTaskSummary {
             id: AgentTaskId::from("TASK-ACT-SAFE-2"),
@@ -6268,6 +6400,9 @@ mod tests {
             attempt: 1,
             assignee: None,
             write_scopes: vec![],
+            created_at: None,
+            assigned_profile: None,
+            model: None,
         };
 
         // Task 1 has active session guard
@@ -6358,6 +6493,9 @@ mod tests {
             attempt: 1,
             assignee: None,
             write_scopes: vec![],
+            created_at: None,
+            assigned_profile: None,
+            model: None,
         };
         let task2 = AgentTaskSummary {
             id: AgentTaskId::from("TASK-NONTERM-2"),
@@ -6368,6 +6506,9 @@ mod tests {
             attempt: 1,
             assignee: None,
             write_scopes: vec![],
+            created_at: None,
+            assigned_profile: None,
+            model: None,
         };
         let task3 = AgentTaskSummary {
             id: AgentTaskId::from("TASK-NONTERM-3"),
@@ -6378,6 +6519,9 @@ mod tests {
             attempt: 1,
             assignee: None,
             write_scopes: vec![],
+            created_at: None,
+            assigned_profile: None,
+            model: None,
         };
 
         // Tasks 1 and 2 occupy the entire pool (limit = 2) with active sessions.
@@ -6481,6 +6625,9 @@ mod tests {
             attempt: 1,
             assignee: None,
             write_scopes: vec![],
+            created_at: None,
+            assigned_profile: None,
+            model: None,
         };
         let task2 = AgentTaskSummary {
             id: AgentTaskId::from("TASK-SWP-2"),
@@ -6491,6 +6638,9 @@ mod tests {
             attempt: 1,
             assignee: None,
             write_scopes: vec![],
+            created_at: None,
+            assigned_profile: None,
+            model: None,
         };
         let task3 = AgentTaskSummary {
             id: AgentTaskId::from("TASK-SWP-3"),
@@ -6501,6 +6651,9 @@ mod tests {
             attempt: 1,
             assignee: None,
             write_scopes: vec![],
+            created_at: None,
+            assigned_profile: None,
+            model: None,
         };
 
         let g1 = SubagentSessionGuard::new(task1.id.clone());
