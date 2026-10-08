@@ -508,6 +508,7 @@
                 "specs/**",
                 "ARCHITECTURE.md",
                 "README.md",
+                ".gitignore",
                 ".zed/**"
               ]
             },
@@ -517,7 +518,8 @@
                 "docs/**",
                 "specs/**",
                 "ARCHITECTURE.md",
-                "README.md"
+                "README.md",
+                ".gitignore"
               ]
             },
             "spawn_agent": {
