@@ -255,6 +255,39 @@ When `custom_instructions` is set in `model_parameters`, it is appended to any p
 }
 ```
 
+## Prompt Includes and Profile Prompt Templates {#prompt-includes}
+
+Templates rendered by the agent — custom system prompt templates and profile prompt files — support including other prompt files as Handlebars partials:
+
+```handlebars
+{{> coding-style}}
+```
+
+- The partial name is the file name without extension. Prompt files are resolved from:
+  1. `prompts/` in your Zed config directory (for example `~/.config/zed/prompts/`)
+  2. `.zed/prompts/` in the worktree root, which takes precedence when both define the same name
+- Only top-level `.md` and `.hbs` files are registered; subdirectories are not scanned.
+- Included content is itself rendered as a template: variables and nested `{{> ...}}` includes work inside included files. Built-in templates can be included too — for example, `{{> system_prompt.hbs}}` starts a custom system prompt template from the default prompt so you can extend it.
+- Partials are re-read from disk on every render, so edits to prompt files apply to new requests without restarting Zed.
+
+Profile prompt files (`custom_prompt_path`, or the conventional `.zed/prompts/<profile_id>.md` and `prompts/<profile_id>.md` in the config directory) are rendered as Handlebars templates with the same data as the system prompt:
+
+| Variable | Description |
+| --- | --- |
+| `os`, `arch`, `shell` | Platform information |
+| `date` | Today's date (`YYYY-MM-DD`) |
+| `worktrees` | Project root directories (`abs_path`, `root_name`, `rules_file`) |
+| `available_tools` | Tools available to the agent in this thread |
+| `model_name` | Name of the active language model |
+| `skills`, `has_skills` | Available agent skills |
+| `has_rules`, `user_agents_md` | Personal and project instructions |
+| `sandboxing`, `is_linux`, `is_windows` | Terminal sandbox state and platform |
+| `available_agents`, `subagent_delegation_note` | Delegation catalog and notes |
+
+A `contains` helper is available for conditionals over lists: `{{#if (contains available_tools 'grep')}}`. `custom_instructions` is empty while a profile prompt itself is being rendered; per-model `custom_instructions` from `model_parameters` is appended as plain text after the profile prompt is rendered and is not templated.
+
+Templates are rendered in strict mode: referencing an unknown variable, a missing partial, a partial that participates in an include cycle, or invalid template syntax fails the render. Zed then logs a warning and falls back — profile prompts fall back to their raw unrendered text, and custom system prompt templates fall back to the built-in system prompt.
+
 ## Rules, Skills, and Instructions {#rules-skills-instructions}
 
 Reusable Rules have been replaced by [Skills](./skills.md). Always-on Rules have moved to [Instructions](./instructions.md), including personal `AGENTS.md` and project instruction files.
