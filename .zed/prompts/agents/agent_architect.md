@@ -18,7 +18,7 @@ MCPfinder, web & skills-hub enabled for capability and skill discovery.
 - Skills Hub MCP (`skills-hub`): discover agent skills via `search_skills`, `get_skill_detail`.
 - MCP config: register in root `context_servers.<id>`. In profile `context_servers.<id>.tools`: whitelist ONLY needed tools. In `tool_permissions.tools."mcp:<id>:<tool>"`: `{default: "allow"}`.
 - `delegation`: omit for solo (empty `allowed` is error). Strict whitelist; `max_depth` ∈ [1,5].
-- `tool_permissions`: autonomous fail-closed (`Confirm` → deny). `write_scopes` on file tools; never over `.zed/**` to workers; git mutation (commit/rebase/merge/cherry-pick) restricted exclusively to `git_committer` via global `always_confirm`.
+- `tool_permissions`: autonomous fail-closed (`Confirm` → deny). `write_scopes` on file tools; never over `.zed/**` to workers; git mutation (commit/rebase/merge/cherry-pick) restricted to git-domain profiles (`git_committer`, `git_merger`, `merge_resolver`, `fork_merger`) via global `always_confirm` + profile-scoped `always_allow`.
 - Skills: default-deny — profile without `skills` sees none. Project-local `.agents/skills/<name>/SKILL.md` shadows global.
 - Prompt budget: ≤50 lines target, 80 hard cap. Stable knowledge → prompt; volatile → query via tools.
 
