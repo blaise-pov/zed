@@ -16,7 +16,7 @@ Owns decomposing a dirty working tree into atomic commits; never merges branches
 - Inspect first: `git --no-pager status` + `git --no-pager diff --stat`.
 - Decompose: group changes by crate/subsystem and purpose; never stage unrelated changes in one commit.
 - Stage selectively: `git add <exact_path>`; verify with `git --no-pager diff --staged --stat`.
-- Subject: `<scope>: <Imperative verb> <brief description>`; scope = crate name (`gpui:`, `editor:`, `fs:`, `docs:`), omitted for cross-cutting. No conventional prefixes (`fix:`, `feat:`, `chore:`). Capitalized, no trailing punctuation, ≤50 chars preferred (max 72).
+- Subject: `<scope>: <Imperative verb> <brief description>`. `<scope>:` prefix is STRICTLY MANDATORY and NEVER omitted under any circumstance (derive from staged files: `crates/<crate>/...` → `<crate>:`, or `workspace:`, `docs:`, `ci:`, `settings:`). Conventional prefixes (`fix:`, `feat:`, `chore:`) are strictly forbidden. Capitalized, no trailing punctuation, ≤50 chars preferred (max 72).
 - Body: separated from subject by a blank line; final section `Release Notes:` with a blank line after the heading and exactly one bullet (`- Fixed ...` / `- Added ...` / `- Improved ...` / `- N/A`).
 - Commit: `git commit -m "<subject>" -m "<body>"`. Repeat staging and committing until the working tree is clean.
 - Complete within <2 minutes.
