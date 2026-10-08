@@ -1342,30 +1342,15 @@ impl ThreadMetadataStore {
             crate::draft_prompt_store::delete(thread_id, cx).detach_and_log_err(cx);
         }
 
-        let fresh_model = view
-            .root_thread_view()
-            .and_then(|active| active.read(cx).model_selector.clone())
-            .and_then(|selector| selector.read(cx).active_model(cx))
-            .map(|model| SharedString::from(model.id.as_str()))
-            .or_else(|| {
-                view.as_native_thread(cx)
-                    .and_then(|thread| thread.read(cx).model().map(|m| m.id().0))
-            });
+        let root_thread_view = view.root_thread_view();
+        let fresh_model = root_thread_view
+            .as_ref()
+            .and_then(|thread_view| thread_view.read(cx).active_model_id(cx));
         let model = fresh_model.or_else(|| existing_thread.and_then(|t| t.model.clone()));
 
-        let fresh_agent_label = if let Some(native_thread) = view.as_native_thread(cx) {
-            let profile_id = native_thread.read(cx).profile().clone();
-            let default_profile_id = <agent_settings::AgentSettings as settings::Settings>::try_get(cx)
-                .map(|s| s.default_profile.clone())
-                .unwrap_or_default();
-            if profile_id == default_profile_id {
-                None
-            } else {
-                Some(SharedString::from(profile_id.0))
-            }
-        } else {
-            Some(thread_ref.connection().agent_id().0)
-        };
+        let fresh_agent_label = root_thread_view
+            .as_ref()
+            .and_then(|thread_view| thread_view.read(cx).agent_display_label(cx));
         let agent_label =
             fresh_agent_label.or_else(|| existing_thread.and_then(|t| t.agent_label.clone()));
 
@@ -2024,6 +2009,84 @@ mod tests {
         assert_eq!(rows[0].title.as_deref(), Some("Agent Generated Title"));
         assert_eq!(rows[0].title_override.as_deref(), Some("User Title"));
         assert_eq!(rows[0].title().as_deref(), Some("User Title"));
+    }
+
+    #[gpui::test]
+    async fn test_database_round_trips_model_and_agent_label(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let thread = std::thread::current();
+        let test_name = thread.name().unwrap_or("unknown_test");
+        let db_name = format!("THREAD_METADATA_DB_{}", test_name);
+        let db = ThreadMetadataDb(gpui::block_on(db::open_test_db::<ThreadMetadataDb>(
+            &db_name,
+        )));
+
+        let mut populated_metadata = make_metadata(
+            "session-populated",
+            "Populated Thread",
+            Utc::now(),
+            PathList::default(),
+        );
+        populated_metadata.model = Some("glm-5.3".into());
+        populated_metadata.agent_label = Some("agent_engineer".into());
+        let populated_thread_id = populated_metadata.thread_id;
+
+        let mut empty_string_metadata = make_metadata(
+            "session-empty-string",
+            "Empty String Thread",
+            Utc::now(),
+            PathList::default(),
+        );
+        empty_string_metadata.model = Some("".into());
+        empty_string_metadata.agent_label = Some("".into());
+        let empty_string_thread_id = empty_string_metadata.thread_id;
+
+        cx.update(|cx| {
+            let store = ThreadMetadataStore::global(cx);
+            store.update(cx, |store, cx| {
+                store.save(populated_metadata, cx);
+                store.save(empty_string_metadata, cx);
+            });
+        });
+
+        cx.run_until_parked();
+
+        let rows = db.list().expect("failed to list metadata rows from db");
+        let populated_row = rows
+            .iter()
+            .find(|row| row.thread_id == populated_thread_id)
+            .expect("populated row should exist in db");
+        assert_eq!(populated_row.model.as_deref(), Some("glm-5.3"));
+        assert_eq!(populated_row.agent_label.as_deref(), Some("agent_engineer"));
+
+        let empty_row = rows
+            .iter()
+            .find(|row| row.thread_id == empty_string_thread_id)
+            .expect("empty string row should exist in db");
+        assert_eq!(empty_row.model, None);
+        assert_eq!(empty_row.agent_label, None);
+
+        let fresh_store = cx.update(|cx| cx.new(|cx| ThreadMetadataStore::new(db.clone(), cx)));
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            let store = fresh_store.read(cx);
+            let populated_entry = store
+                .entry(populated_thread_id)
+                .expect("populated thread should exist in reloaded store");
+            assert_eq!(populated_entry.model.as_deref(), Some("glm-5.3"));
+            assert_eq!(
+                populated_entry.agent_label.as_deref(),
+                Some("agent_engineer")
+            );
+
+            let empty_entry = store
+                .entry(empty_string_thread_id)
+                .expect("empty string thread should exist in reloaded store");
+            assert_eq!(empty_entry.model, None);
+            assert_eq!(empty_entry.agent_label, None);
+        });
     }
 
     #[gpui::test]

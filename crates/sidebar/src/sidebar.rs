@@ -8119,29 +8119,8 @@ fn all_thread_infos_for_workspace(
 
             let diff_stats = thread.action_log().read(cx).diff_stats(cx);
 
-            let model = thread_view_ref
-                .model_selector
-                .clone()
-                .and_then(|s| s.read(cx).active_model(cx).map(|m| SharedString::from(m.id.as_str())))
-                .or_else(|| {
-                    thread_view_ref
-                        .as_native_thread(cx)
-                        .and_then(|t| t.read(cx).model().map(|m| m.id().0))
-                });
-
-            let agent_label = if let Some(native_thread) = thread_view_ref.as_native_thread(cx) {
-                let profile_id = native_thread.read(cx).profile().clone();
-                let default_profile_id = AgentSettings::try_get(cx)
-                    .map(|s| s.default_profile.clone())
-                    .unwrap_or_default();
-                if profile_id == default_profile_id {
-                    None
-                } else {
-                    Some(SharedString::from(profile_id.0))
-                }
-            } else {
-                Some(thread_view_ref.agent_id.0.clone())
-            };
+            let model = thread_view_ref.active_model_id(cx);
+            let agent_label = thread_view_ref.agent_display_label(cx);
 
             Some(ActiveThreadInfo {
                 session_id,

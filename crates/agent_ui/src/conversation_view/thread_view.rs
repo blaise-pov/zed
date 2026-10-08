@@ -1197,6 +1197,33 @@ impl ThreadView {
             .thread(acp_thread.session_id(), cx)
     }
 
+    pub fn active_model_id(&self, cx: &App) -> Option<SharedString> {
+        self.model_selector
+            .as_ref()
+            .and_then(|selector| selector.read(cx).active_model(cx))
+            .map(|model| SharedString::from(model.id.as_str()))
+            .or_else(|| {
+                self.as_native_thread(cx)
+                    .and_then(|thread| thread.read(cx).model().map(|model| model.id().0))
+            })
+    }
+
+    pub fn agent_display_label(&self, cx: &App) -> Option<SharedString> {
+        if let Some(native_thread) = self.as_native_thread(cx) {
+            let profile_id = native_thread.read(cx).profile().clone();
+            let default_profile_id = AgentSettings::try_get(cx)
+                .map(|settings| settings.default_profile.clone())
+                .unwrap_or_default();
+            if profile_id == default_profile_id {
+                None
+            } else {
+                Some(SharedString::from(profile_id.0))
+            }
+        } else {
+            Some(self.agent_id.0.clone())
+        }
+    }
+
     /// Resolves the message editor's contents into content blocks. For profiles
     /// that do not enable any tools, directory mentions are expanded to inline
     /// file contents since the agent can't read files on its own.
