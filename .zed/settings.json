@@ -80,6 +80,29 @@
         "@mcpfinder/server"
       ]
     },
+    "github": {
+      "command": "github-mcp-server",
+      "args": ["stdio"],
+      "env": {
+        "GITHUB_PERSONAL_ACCESS_TOKEN": "${GITHUB_PERSONAL_ACCESS_TOKEN}",
+        "GITHUB_TOOLSETS": "repos,issues,pull_requests",
+        "GITHUB_READ_ONLY": "1"
+      },
+      "platforms": {
+        "darwin-arm64": { "command": ".zed/mcp/github/bin/github-mcp-server-darwin-arm64" },
+        "darwin-amd64": { "command": ".zed/mcp/github/bin/github-mcp-server-darwin-amd64" },
+        "darwin-x64": { "command": ".zed/mcp/github/bin/github-mcp-server-darwin-amd64" },
+        "linux-arm64": { "command": ".zed/mcp/github/bin/github-mcp-server-linux-arm64" },
+        "linux-amd64": { "command": ".zed/mcp/github/bin/github-mcp-server-linux-amd64" },
+        "linux-x64": { "command": ".zed/mcp/github/bin/github-mcp-server-linux-amd64" },
+        "windows-arm64": { "command": ".zed/mcp/github/bin/github-mcp-server-windows-arm64.exe" },
+        "windows-amd64": { "command": ".zed/mcp/github/bin/github-mcp-server-windows-amd64.exe" },
+        "windows-x64": { "command": ".zed/mcp/github/bin/github-mcp-server-windows-amd64.exe" },
+        "macos": { "command": ".zed/mcp/github/bin/github-mcp-server-darwin-arm64" },
+        "linux": { "command": ".zed/mcp/github/bin/github-mcp-server-linux-amd64" },
+        "windows": { "command": ".zed/mcp/github/bin/github-mcp-server-windows-amd64.exe" }
+      }
+    },
     "agent-bus": {
       "enabled": true,
       "command": "agent-bus",
@@ -242,6 +265,63 @@
         "mcp:skills-hub:get_skill_detail": {
           "default": "allow"
         },
+        "mcp:github:search_code": {
+          "default": "allow"
+        },
+        "mcp:github:search_repositories": {
+          "default": "allow"
+        },
+        "mcp:github:search_issues": {
+          "default": "allow"
+        },
+        "mcp:github:get_file_contents": {
+          "default": "allow"
+        },
+        "mcp:github:get_repository": {
+          "default": "allow"
+        },
+        "mcp:github:get_commit": {
+          "default": "allow"
+        },
+        "mcp:github:list_commits": {
+          "default": "allow"
+        },
+        "mcp:github:list_branches": {
+          "default": "allow"
+        },
+        "mcp:github:list_tags": {
+          "default": "allow"
+        },
+        "mcp:github:get_tag": {
+          "default": "allow"
+        },
+        "mcp:github:list_releases": {
+          "default": "allow"
+        },
+        "mcp:github:get_latest_release": {
+          "default": "allow"
+        },
+        "mcp:github:get_release_by_tag": {
+          "default": "allow"
+        },
+        "mcp:github:search_commits": {
+          "default": "allow"
+        },
+        "mcp:github:search_pull_requests": {
+          "default": "allow"
+        },
+        "mcp:github:issue_read": {
+          "default": "allow"
+        },
+        "mcp:github:pull_request_read": {
+          "default": "allow"
+        },
+        "mcp:github:list_issues": {
+          "default": "allow"
+        },
+        "mcp:github:list_pull_requests": {
+          "default": "allow"
+        },
         "mcp:taskgraph:goal_create": {
           "default": "allow"
         },
@@ -397,9 +477,11 @@
             "collab_engineer",
             "reviewer",
             "git_committer",
+            "git_merger",
             "fork_merger",
             "ci_release",
             "researcher",
+            "github_researcher",
             "code_mechanic"
           ],
           "max_depth": 3
@@ -1018,7 +1100,8 @@
         },
         "delegation": {
           "allowed": [
-            "code_mechanic"
+            "code_mechanic",
+            "github_researcher"
           ],
           "max_depth": 1
         },
@@ -1150,7 +1233,8 @@
         },
         "delegation": {
           "allowed": [
-            "code_mechanic"
+            "code_mechanic",
+            "github_researcher"
           ],
           "max_depth": 1
         },
@@ -1277,7 +1361,8 @@
         },
         "delegation": {
           "allowed": [
-            "code_mechanic"
+            "code_mechanic",
+            "github_researcher"
           ],
           "max_depth": 1
         },
@@ -1403,7 +1488,8 @@
         },
         "delegation": {
           "allowed": [
-            "code_mechanic"
+            "code_mechanic",
+            "github_researcher"
           ],
           "max_depth": 1
         },
@@ -1611,9 +1697,9 @@
       },
       "git_committer": {
         "name": "Git Committer",
-        "task_isolation": "optional",
+        "task_isolation": "disabled",
         "custom_prompt_path": ".zed/prompts/agents/git_committer.md",
-        "description": "Decomposes disparate changes into atomic, well-scoped commits following Zed repository conventions",
+        "description": "Decomposes a dirty working tree into atomic commits following Zed repository conventions; never merges branches, never runs tests",
         "default_model": {
           "provider": "${MID_TIER_MODEL_PROVIDER}",
           "model": "${MID_TIER_MODEL}"
@@ -1657,10 +1743,10 @@
               "default": "allow"
             },
             "terminal": {
-              "default": "allow",
+              "default": "deny",
               "always_allow": [
                 {
-                  "pattern": "\\bgit\\s+(-C\\s+\\S+\\s+)?(commit|rebase|merge|cherry-pick)\\b"
+                  "pattern": "^([A-Z_]+=\\S+\\s+)*git\\s+(-C\\s+\\S+\\s+)?(--no-pager\\s+|--no-optional-locks\\s+)*(status|diff|add|restore|commit|log|rev-parse|show|branch)\\b.*"
                 }
               ]
             },
@@ -1682,11 +1768,102 @@
           }
         }
       },
-      "fork_merger": {
-        "name": "Fork Merger",
-        "task_isolation": "optional",
-        "custom_prompt_path": ".zed/prompts/agents/fork_merger.md",
-        "description": "Detects the latest zed-industries/zed release (including -pre), merges into this fork, pushes fork tags, and publishes releases with changelog",
+      "git_merger": {
+        "name": "Git Merger",
+        "task_isolation": "disabled",
+        "custom_prompt_path": ".zed/prompts/agents/git_merger.md",
+        "description": "Squash-merges agent-goal/agent-task branches into main with taskgraph-sourced commit messages; delegates conflict resolution to merge_resolver",
+        "default_model": {
+          "provider": "${MID_TIER_MODEL_PROVIDER}",
+          "model": "${MID_TIER_MODEL}"
+        },
+        "tools": {
+          "read_file": true,
+          "grep": true,
+          "find_path": true,
+          "list_directory": true,
+          "terminal": true,
+          "spawn_agent": true
+        },
+        "skills": [],
+        "context_servers": {
+          "agent-bus": {
+            "tools": {
+              "send_feedback": true
+            }
+          },
+          "taskgraph": {
+            "tools": {
+              "goal_get": true,
+              "goal_tasks": true,
+              "task_get": true,
+              "task_start": true,
+              "task_complete": true,
+              "task_fail": true
+            }
+          }
+        },
+        "delegation": {
+          "allowed": [
+            "merge_resolver"
+          ],
+          "max_depth": 1
+        },
+        "tool_permissions": {
+          "default": "deny",
+          "tools": {
+            "read_file": {
+              "default": "allow"
+            },
+            "grep": {
+              "default": "allow"
+            },
+            "find_path": {
+              "default": "allow"
+            },
+            "list_directory": {
+              "default": "allow"
+            },
+            "terminal": {
+              "default": "deny",
+              "always_allow": [
+                {
+                  "pattern": "^([A-Z_]+=\\S+\\s+)*git\\s+(-C\\s+\\S+\\s+)?(--no-pager\\s+|--no-optional-locks\\s+)*(status|diff|log|show|branch|rev-parse|merge-base|switch|merge|reset|commit)\\b.*"
+                }
+              ]
+            },
+            "spawn_agent": {
+              "default": "allow"
+            },
+            "mcp:agent-bus:send_feedback": {
+              "default": "allow"
+            },
+            "mcp:taskgraph:goal_get": {
+              "default": "allow"
+            },
+            "mcp:taskgraph:goal_tasks": {
+              "default": "allow"
+            },
+            "mcp:taskgraph:task_get": {
+              "default": "allow"
+            },
+            "mcp:taskgraph:task_start": {
+              "default": "allow"
+            },
+            "mcp:taskgraph:task_complete": {
+              "default": "allow"
+            },
+            "mcp:taskgraph:task_fail": {
+              "default": "allow"
+            }
+          }
+        }
+      },
+      "merge_resolver": {
+        "name": "Merge Resolver",
+        "task_isolation": "disabled",
+        "custom_prompt_path": ".zed/prompts/agents/merge_resolver.md",
+        "description": "Redoes conflicted merges end-to-end in the caller's worktree: resolves by intent (fork-vs-upstream or branch-vs-main doctrine), regenerates Cargo.lock, runs cargo check/clippy build gate, completes the commit",
         "default_model": {
           "provider": "${FRONTIER_MODEL_PROVIDER}",
           "model": "${FRONTIER_MODEL}",
@@ -1700,8 +1877,7 @@
           "edit_file": true,
           "write_file": true,
           "terminal": true,
-          "diagnostics": true,
-          "fetch": true
+          "diagnostics": true
         },
         "skills": [],
         "context_servers": {
@@ -1734,59 +1910,176 @@
             "list_directory": {
               "default": "allow"
             },
+            "diagnostics": {
+              "default": "allow"
+            },
             "edit_file": {
               "default": "allow",
               "write_scopes": [
                 "crates/**",
-                "docs/**",
                 "extensions/**",
+                "assets/**",
+                "docs/**",
                 "script/**",
                 "tooling/**",
                 "nix/**",
                 ".github/**",
                 ".cargo/**",
                 ".config/**",
-                ".factory/**",
                 "corgi-patches/**",
                 "corgi.toml",
                 "clippy.toml",
                 "Cargo.toml",
                 "Cargo.lock",
                 "AGENTS.md",
-                "README.md",
-                ".zed/**"
+                "README.md"
               ]
             },
             "write_file": {
               "default": "allow",
               "write_scopes": [
                 "crates/**",
-                "docs/**",
                 "extensions/**",
+                "assets/**",
+                "docs/**",
                 "script/**",
                 "tooling/**",
                 "nix/**",
                 ".github/**",
                 ".cargo/**",
                 ".config/**",
-                ".factory/**",
                 "corgi-patches/**",
                 "corgi.toml",
                 "clippy.toml",
                 "Cargo.toml",
                 "Cargo.lock",
                 "AGENTS.md",
-                "README.md",
-                ".zed/**"
+                "README.md"
               ]
             },
             "terminal": {
+              "default": "deny",
+              "always_allow": [
+                {
+                  "pattern": "^([A-Z_]+=\\S+\\s+)*git\\s+(-C\\s+\\S+\\s+)?(--no-pager\\s+|--no-optional-locks\\s+)*(status|diff|log|show|branch|rev-parse|ls-files|merge-base|merge|checkout|add|commit|reset|restore)\\b.*"
+                },
+                {
+                  "pattern": "^cargo\\s+check\\b.*"
+                },
+                {
+                  "pattern": "^\\./?script/clippy\\b.*"
+                }
+              ]
+            },
+            "mcp:agent-bus:send_feedback": {
               "default": "allow"
+            },
+            "mcp:taskgraph:task_get": {
+              "default": "allow"
+            },
+            "mcp:taskgraph:task_start": {
+              "default": "allow"
+            },
+            "mcp:taskgraph:task_complete": {
+              "default": "allow"
+            },
+            "mcp:taskgraph:task_fail": {
+              "default": "allow"
+            }
+          }
+        }
+      },
+      "fork_merger": {
+        "name": "Fork Merger",
+        "task_isolation": "disabled",
+        "custom_prompt_path": ".zed/prompts/agents/fork_merger.md",
+        "description": "Syncs this fork with upstream zed-industries/zed: detects the newest release tag, clean merges (delegating conflicts to merge_resolver), pushes fork tags, and publishes releases with changelog",
+        "default_model": {
+          "provider": "${MID_TIER_MODEL_PROVIDER}",
+          "model": "${MID_TIER_MODEL}"
+        },
+        "tools": {
+          "read_file": true,
+          "grep": true,
+          "find_path": true,
+          "list_directory": true,
+          "edit_file": true,
+          "write_file": true,
+          "terminal": true,
+          "diagnostics": true,
+          "fetch": true,
+          "spawn_agent": true
+        },
+        "skills": [],
+        "context_servers": {
+          "agent-bus": {
+            "tools": {
+              "send_feedback": true
+            }
+          },
+          "taskgraph": {
+            "tools": {
+              "task_get": true,
+              "task_start": true,
+              "task_complete": true,
+              "task_fail": true
+            }
+          }
+        },
+        "delegation": {
+          "allowed": [
+            "merge_resolver"
+          ],
+          "max_depth": 1
+        },
+        "tool_permissions": {
+          "default": "deny",
+          "tools": {
+            "read_file": {
+              "default": "allow"
+            },
+            "grep": {
+              "default": "allow"
+            },
+            "find_path": {
+              "default": "allow"
+            },
+            "list_directory": {
+              "default": "allow"
+            },
+            "edit_file": {
+              "default": "allow",
+              "write_scopes": [
+                "target/**"
+              ]
+            },
+            "write_file": {
+              "default": "allow",
+              "write_scopes": [
+                "target/**"
+              ]
+            },
+            "terminal": {
+              "default": "deny",
+              "always_allow": [
+                {
+                  "pattern": "^([A-Z_]+=\\S+\\s+)*git\\s+(-C\\s+\\S+\\s+)?(--no-pager\\s+|--no-optional-locks\\s+)*(status|log|show|branch|rev-parse|remote|ls-remote|fetch|merge-base|merge|tag|push)\\b.*"
+                },
+                {
+                  "pattern": "^gh\\s+(release|auth)\\b.*"
+                },
+                {
+                  "pattern": "^cargo\\s+check\\b.*"
+                }
+              ]
             },
             "diagnostics": {
               "default": "allow"
             },
             "fetch": {
+              "default": "allow"
+            },
+            "spawn_agent": {
               "default": "allow"
             },
             "mcp:agent-bus:send_feedback": {
@@ -1889,7 +2182,9 @@
           "terminal": true,
           "spawn_agent": true
         },
-        "skills": [],
+        "skills": [
+          "blackbox-github-researcher"
+        ],
         "context_servers": {
           "agent-bus": {
             "tools": {
@@ -1913,7 +2208,8 @@
             "collab_engineer",
             "reviewer",
             "ci_release",
-            "agent_tuner"
+            "agent_tuner",
+            "github_researcher"
           ],
           "max_depth": 1
         },
@@ -2022,6 +2318,165 @@
               "default": "allow"
             },
             "list_directory": {
+              "default": "allow"
+            },
+            "mcp:agent-bus:send_feedback": {
+              "default": "allow"
+            },
+            "mcp:taskgraph:task_get": {
+              "default": "allow"
+            },
+            "mcp:taskgraph:task_start": {
+              "default": "allow"
+            },
+            "mcp:taskgraph:task_complete": {
+              "default": "allow"
+            },
+            "mcp:taskgraph:task_fail": {
+              "default": "allow"
+            },
+            "mcp:taskgraph:artifact_publish": {
+              "default": "allow"
+            },
+            "mcp:taskgraph:artifact_get": {
+              "default": "allow"
+            },
+            "mcp:taskgraph:artifact_list": {
+              "default": "allow"
+            }
+          }
+        }
+      },
+      "github_researcher": {
+        "name": "GitHub Researcher",
+        "task_isolation": "disabled",
+        "custom_prompt_path": ".zed/prompts/agents/github_researcher.md",
+        "description": "GitHub code archaeology: real-world library usage, reference implementations, package evaluation, CI and service configs, issue/PR history; publishes cited findings as taskgraph artifacts",
+        "default_model": {
+          "provider": "${MID_TIER_MODEL_PROVIDER}",
+          "model": "${MID_TIER_MODEL}"
+        },
+        "tools": {
+          "read_file": true,
+          "grep": true,
+          "find_path": true,
+          "list_directory": true,
+          "fetch": true
+        },
+        "context_servers": {
+          "github": {
+            "tools": {
+              "search_code": true,
+              "search_repositories": true,
+              "search_issues": true,
+              "get_file_contents": true,
+              "get_repository": true,
+              "get_commit": true,
+              "list_commits": true,
+              "list_branches": true,
+              "list_tags": true,
+              "get_tag": true,
+              "list_releases": true,
+              "get_latest_release": true,
+              "get_release_by_tag": true,
+              "search_commits": true,
+              "search_pull_requests": true,
+              "issue_read": true,
+              "pull_request_read": true,
+              "list_issues": true,
+              "list_pull_requests": true
+            }
+          },
+          "agent-bus": {
+            "tools": {
+              "send_feedback": true
+            }
+          },
+          "taskgraph": {
+            "tools": {
+              "task_get": true,
+              "task_start": true,
+              "task_complete": true,
+              "task_fail": true,
+              "artifact_publish": true,
+              "artifact_get": true,
+              "artifact_list": true
+            }
+          }
+        },
+        "tool_permissions": {
+          "default": "deny",
+          "tools": {
+            "read_file": {
+              "default": "allow"
+            },
+            "grep": {
+              "default": "allow"
+            },
+            "find_path": {
+              "default": "allow"
+            },
+            "list_directory": {
+              "default": "allow"
+            },
+            "fetch": {
+              "default": "allow"
+            },
+            "mcp:github:search_code": {
+              "default": "allow"
+            },
+            "mcp:github:search_repositories": {
+              "default": "allow"
+            },
+            "mcp:github:search_issues": {
+              "default": "allow"
+            },
+            "mcp:github:get_file_contents": {
+              "default": "allow"
+            },
+            "mcp:github:get_repository": {
+              "default": "allow"
+            },
+            "mcp:github:get_commit": {
+              "default": "allow"
+            },
+            "mcp:github:list_commits": {
+              "default": "allow"
+            },
+            "mcp:github:list_branches": {
+              "default": "allow"
+            },
+            "mcp:github:list_tags": {
+              "default": "allow"
+            },
+            "mcp:github:get_tag": {
+              "default": "allow"
+            },
+            "mcp:github:list_releases": {
+              "default": "allow"
+            },
+            "mcp:github:get_latest_release": {
+              "default": "allow"
+            },
+            "mcp:github:get_release_by_tag": {
+              "default": "allow"
+            },
+            "mcp:github:search_commits": {
+              "default": "allow"
+            },
+            "mcp:github:search_pull_requests": {
+              "default": "allow"
+            },
+            "mcp:github:issue_read": {
+              "default": "allow"
+            },
+            "mcp:github:pull_request_read": {
+              "default": "allow"
+            },
+            "mcp:github:list_issues": {
+              "default": "allow"
+            },
+            "mcp:github:list_pull_requests": {
               "default": "allow"
             },
             "mcp:agent-bus:send_feedback": {
