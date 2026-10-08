@@ -1058,14 +1058,17 @@ impl ActionLog {
 pub struct DiffStats {
     pub lines_added: u32,
     pub lines_removed: u32,
+    pub files_changed: u32,
 }
 
 impl DiffStats {
     pub fn single_file(diff: &BufferDiff) -> Self {
         let (lines_added, lines_removed) = diff.changed_row_counts();
+        let files_changed = if lines_added + lines_removed > 0 { 1 } else { 0 };
         DiffStats {
             lines_added,
             lines_removed,
+            files_changed,
         }
     }
 
@@ -1078,6 +1081,7 @@ impl DiffStats {
             let stats = DiffStats::single_file(diff.read(cx));
             total.lines_added += stats.lines_added;
             total.lines_removed += stats.lines_removed;
+            total.files_changed += stats.files_changed;
         }
         total
     }
@@ -1755,6 +1759,7 @@ mod tests {
             DiffStats {
                 lines_added: 2,
                 lines_removed: 3,
+                files_changed: 1,
             }
         );
     }

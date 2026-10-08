@@ -165,6 +165,20 @@ impl ThreadSwitcherEntry {
         }
     }
 
+    fn agent_name(&self) -> Option<SharedString> {
+        match self {
+            Self::Thread(entry) => entry.metadata.agent_label.clone(),
+            Self::Terminal(_) => None,
+        }
+    }
+
+    fn model_name(&self) -> Option<SharedString> {
+        match self {
+            Self::Thread(entry) => entry.metadata.model.clone(),
+            Self::Terminal(_) => None,
+        }
+    }
+
     #[cfg(test)]
     pub fn thread_id(&self) -> Option<agent_ui::ThreadId> {
         match self {
@@ -392,6 +406,11 @@ impl Render for ThreadSwitcher {
                             .when_some(entry.project_name(), |this, name| this.project_name(name))
                             .worktrees(entry.worktrees())
                             .timestamp(entry.timestamp())
+                            .agent_name(entry.agent_name())
+                            .model_name(entry.model_name())
+                            .when(diff_stats.files_changed > 0, |this| {
+                                this.files_changed(Some(diff_stats.files_changed))
+                            })
                             .title_generating(entry.is_title_generating())
                             .notified(entry.notified())
                             .when(diff_stats.lines_added > 0, |this| {

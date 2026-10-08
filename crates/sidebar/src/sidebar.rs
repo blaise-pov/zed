@@ -211,6 +211,8 @@ struct ActiveThreadInfo {
     is_background: bool,
     is_title_generating: bool,
     diff_stats: DiffStats,
+    agent_label: Option<SharedString>,
+    model: Option<SharedString>,
 }
 
 #[derive(Clone)]
@@ -364,6 +366,8 @@ struct ThreadEntry {
     highlight_positions: Vec<usize>,
     worktrees: Vec<ThreadItemWorktreeInfo>,
     diff_stats: DiffStats,
+    agent_label: Option<SharedString>,
+    model: Option<SharedString>,
 }
 
 #[derive(Clone)]
@@ -390,6 +394,8 @@ impl ThreadEntry {
         self.is_background = info.is_background;
         self.is_title_generating = info.is_title_generating;
         self.diff_stats = info.diff_stats;
+        self.agent_label = info.agent_label.clone().or_else(|| self.agent_label.clone());
+        self.model = info.model.clone().or_else(|| self.model.clone());
     }
 }
 
@@ -1620,6 +1626,8 @@ impl Sidebar {
                         // label can be derived.
                         let draft = row.is_draft().then_some(DraftKind::WithContent);
                         Arc::new(ThreadEntry {
+                            agent_label: row.agent_label.clone(),
+                            model: row.model.clone(),
                             metadata: row,
                             icon,
                             icon_from_external_svg,
@@ -6307,6 +6315,11 @@ impl Sidebar {
             })
             .worktrees(worktrees)
             .timestamp(timestamp)
+            .agent_name(thread.agent_label.clone())
+            .model_name(thread.model.clone())
+            .when(thread.diff_stats.files_changed > 0, |this| {
+                this.files_changed(Some(thread.diff_stats.files_changed))
+            })
             .highlight_positions(thread.highlight_positions.to_vec())
             .title_generating(title_generating)
             .notified(has_notification)
@@ -8106,6 +8119,30 @@ fn all_thread_infos_for_workspace(
 
             let diff_stats = thread.action_log().read(cx).diff_stats(cx);
 
+            let model = thread_view_ref
+                .model_selector
+                .clone()
+                .and_then(|s| s.read(cx).active_model(cx).map(|m| SharedString::from(m.id.as_str())))
+                .or_else(|| {
+                    thread_view_ref
+                        .as_native_thread(cx)
+                        .and_then(|t| t.read(cx).model().map(|m| m.id().0))
+                });
+
+            let agent_label = if let Some(native_thread) = thread_view_ref.as_native_thread(cx) {
+                let profile_id = native_thread.read(cx).profile().clone();
+                let default_profile_id = AgentSettings::try_get(cx)
+                    .map(|s| s.default_profile.clone())
+                    .unwrap_or_default();
+                if profile_id == default_profile_id {
+                    None
+                } else {
+                    Some(SharedString::from(profile_id.0))
+                }
+            } else {
+                Some(thread_view_ref.agent_id.0.clone())
+            };
+
             Some(ActiveThreadInfo {
                 session_id,
                 title,
@@ -8115,6 +8152,8 @@ fn all_thread_infos_for_workspace(
                 is_background,
                 is_title_generating,
                 diff_stats,
+                agent_label,
+                model,
             })
         });
 
