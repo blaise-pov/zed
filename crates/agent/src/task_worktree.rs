@@ -6772,6 +6772,9 @@ mod tests {
             attempt: 1,
             assignee: None,
             write_scopes: vec![],
+            created_at: None,
+            assigned_profile: None,
+            model: None,
         };
 
         let worktree_path = cx
@@ -6882,6 +6885,9 @@ mod tests {
             attempt: 1,
             assignee: None,
             write_scopes: vec![],
+            created_at: None,
+            assigned_profile: None,
+            model: None,
         };
 
         let worktree_path = cx
@@ -6965,6 +6971,9 @@ mod tests {
             attempt: 1,
             assignee: None,
             write_scopes: vec![],
+            created_at: None,
+            assigned_profile: None,
+            model: None,
         };
 
         assert_eq!(task_worktree_title(&task.id), None);

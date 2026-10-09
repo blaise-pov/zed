@@ -44,8 +44,8 @@ use multi_buffer::MultiBuffer;
 use project::{Project, git_store::Repository};
 use settings::{Settings, SettingsStore};
 use ui::{
-    Color, ContextMenu, DiffStat, Icon, IconButton, IconName, IconPosition, IconSize, Label,
-    LabelSize, PopoverMenu, Tooltip, prelude::*,
+    Color, CommonAnimationExt, ContextMenu, DiffStat, Icon, IconButton, IconName, IconPosition,
+    IconSize, Label, LabelSize, PopoverMenu, Tooltip, prelude::*,
 };
 use util::ResultExt;
 use workspace::Workspace;
@@ -1310,7 +1310,6 @@ impl AgentTaskPanel {
                 .unwrap_or_else(|| goal_id.clone());
 
             let goal_git = snapshot.and_then(|s| s.goals.get(&goal_id));
-            let branch_exists = goal_git.map_or(false, |g| g.branch_exists);
             let goal_diff = goal_git.and_then(|g| g.diff.as_ref());
 
             let (tasks_done, tasks_total) = if let Some(summary) = &group.goal_summary {
@@ -1365,6 +1364,46 @@ impl AgentTaskPanel {
                     (text, color)
                 });
 
+            let has_children = tasks_total > 0 || !group.rows.is_empty();
+
+            let chevron_or_spacer = if has_children {
+                div()
+                    .id(SharedString::from(format!("goal-chevron-{}", goal_id)))
+                    .debug_selector({
+                        let goal_id = goal_id.clone();
+                        move || format!("goal-chevron-{}", goal_id)
+                    })
+                    .w_4()
+                    .h_4()
+                    .flex_shrink_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .on_click(cx.listener({
+                        let goal_id = goal_id.clone();
+                        move |this, _event, _window, cx| {
+                            cx.stop_propagation();
+                            let entry =
+                                this.collapsed_goals.entry(goal_id.clone()).or_insert(false);
+                            *entry = !*entry;
+                            cx.notify();
+                        }
+                    }))
+                    .child(
+                        Icon::new(if is_collapsed {
+                            IconName::ChevronRight
+                        } else {
+                            IconName::ChevronDown
+                        })
+                        .size(IconSize::Small)
+                        .color(Color::Muted),
+                    )
+                    .into_any_element()
+            } else {
+                div().w_4().h_4().flex_shrink_0().into_any_element()
+            };
+
             let header = v_flex()
                 .id(SharedString::from(format!("goal-group-header-{}", goal_id)))
                 .debug_selector({
@@ -1392,10 +1431,8 @@ impl AgentTaskPanel {
                 }))
                 .on_click(cx.listener({
                     let goal_id = goal_id.clone();
-                    move |this, _event, _window, cx| {
-                        let entry = this.collapsed_goals.entry(goal_id.clone()).or_insert(false);
-                        *entry = !*entry;
-                        cx.notify();
+                    move |this, _event, window, cx| {
+                        this.open_item_preview(PreviewItem::Goal(goal_id.clone()), window, cx);
                     }
                 }))
                 .on_mouse_down(
@@ -1426,37 +1463,8 @@ impl AgentTaskPanel {
                                 .flex_1()
                                 .min_w_0()
                                 .overflow_hidden()
-                                .when(tasks_total > 0 || !group.rows.is_empty(), |this| {
-                                    this.child(
-                                        Icon::new(if is_collapsed {
-                                            IconName::ChevronRight
-                                        } else {
-                                            IconName::ChevronDown
-                                        })
-                                        .size(IconSize::Small)
-                                        .color(Color::Muted),
-                                    )
-                                })
+                                .child(chevron_or_spacer)
                                 .child(render_goal_status_icon(&goal_status))
-                                .when(!branch_exists, |this| {
-                                    this.child(
-                                        div()
-                                            .id(SharedString::from(format!(
-                                                "goal-branch-missing-{}",
-                                                goal_id
-                                            )))
-                                            .debug_selector({
-                                                let goal_id = goal_id.clone();
-                                                move || format!("goal-branch-missing-{}", goal_id)
-                                            })
-                                            .child(
-                                                Icon::new(IconName::Warning)
-                                                    .size(IconSize::Small)
-                                                    .color(Color::Warning),
-                                            )
-                                            .tooltip(Tooltip::text("Goal branch does not exist")),
-                                    )
-                                })
                                 .child(Label::new(title).size(LabelSize::Default).truncate()),
                         )
                         .child(h_flex().items_center().when(is_hovered, |this| {
@@ -1490,13 +1498,23 @@ impl AgentTaskPanel {
                             let goal_id = goal_id.clone();
                             move || format!("goal-meta-{}", goal_id)
                         })
-                        .pl_5()
                         .items_center()
                         .gap_1p5()
+                        .child(div().w_4().h_4().flex_shrink_0())
+                        .child(
+                            Label::new(goal_status_label(&goal_status))
+                                .size(LabelSize::Small)
+                                .color(goal_status_text_color(&goal_status)),
+                        )
+                        .child(dot_separator())
                         .child(
                             Label::new(format!("{tasks_done} / {tasks_total} tasks"))
                                 .size(LabelSize::Small)
-                                .color(Color::Muted),
+                                .color(if tasks_done == tasks_total && tasks_total > 0 {
+                                    Color::Success
+                                } else {
+                                    Color::Muted
+                                }),
                         )
                         .child(dot_separator())
                         .child({
@@ -1504,14 +1522,19 @@ impl AgentTaskPanel {
                                 group.goal_summary.as_ref().map(|g| g.priority).unwrap_or(0);
                             Label::new(format!("P{priority}"))
                                 .size(LabelSize::Small)
-                                .color(Color::Muted)
+                                .color(priority_color(priority))
                         })
                         .child(dot_separator())
-                        .child(
-                            Label::new(goal_id.clone())
+                        .child({
+                            let goal_label = if goal_id.starts_with("GOAL-") {
+                                goal_id.clone()
+                            } else {
+                                format!("GOAL-{goal_id}")
+                            };
+                            Label::new(goal_label)
                                 .size(LabelSize::Small)
-                                .color(Color::Muted),
-                        )
+                                .color(Color::Muted)
+                        })
                         .when_some(goal_diff, |this, diff| {
                             this.child(dot_separator())
                                 .child(
@@ -1553,6 +1576,41 @@ impl AgentTaskPanel {
                 .copied()
                 .unwrap_or(false);
 
+            let has_children = !group.rows.is_empty();
+            let chevron_or_spacer = if has_children {
+                div()
+                    .id("goal-chevron-no-goal")
+                    .debug_selector(|| "goal-chevron-no-goal".to_string())
+                    .w_4()
+                    .h_4()
+                    .flex_shrink_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .on_click(cx.listener(|this, _event, _window, cx| {
+                        cx.stop_propagation();
+                        let entry = this
+                            .collapsed_goals
+                            .entry(NO_GOAL_KEY.to_string())
+                            .or_insert(false);
+                        *entry = !*entry;
+                        cx.notify();
+                    }))
+                    .child(
+                        Icon::new(if is_collapsed {
+                            IconName::ChevronRight
+                        } else {
+                            IconName::ChevronDown
+                        })
+                        .size(IconSize::Small)
+                        .color(Color::Muted),
+                    )
+                    .into_any_element()
+            } else {
+                div().w_4().h_4().flex_shrink_0().into_any_element()
+            };
+
             let header = v_flex()
                 .id("goal-group-header-no-goal")
                 .debug_selector(|| "goal-group-header-no-goal".to_string())
@@ -1572,19 +1630,9 @@ impl AgentTaskPanel {
                 .child(
                     h_flex()
                         .h_6()
-                        .gap_2()
+                        .gap_1p5()
                         .items_center()
-                        .when(!group.rows.is_empty(), |this| {
-                            this.child(
-                                Icon::new(if is_collapsed {
-                                    IconName::ChevronRight
-                                } else {
-                                    IconName::ChevronDown
-                                })
-                                .size(IconSize::Small)
-                                .color(Color::Muted),
-                            )
-                        })
+                        .child(chevron_or_spacer)
                         .child(Label::new("No goal").size(LabelSize::Default))
                         .child(
                             Label::new(format!("({} tasks)", group.rows.len()))
@@ -1636,6 +1684,46 @@ impl AgentTaskPanel {
             .element_active
             .blend(cx.theme().colors().element_background.opacity(0.2));
 
+        let chevron_or_spacer = if row.has_children {
+            div()
+                .id(SharedString::from(format!("task-chevron-{}", task.id)))
+                .debug_selector({
+                    let task_id = task.id.clone();
+                    move || format!("task-chevron-{}", task_id)
+                })
+                .w_4()
+                .h_4()
+                .flex_shrink_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .cursor_pointer()
+                .on_click(cx.listener({
+                    let task_id = task.id.clone();
+                    move |this, _event, _window, cx| {
+                        cx.stop_propagation();
+                        if this.collapsed_tasks.contains(&task_id) {
+                            this.collapsed_tasks.remove(&task_id);
+                        } else {
+                            this.collapsed_tasks.insert(task_id.clone());
+                        }
+                        cx.notify();
+                    }
+                }))
+                .child(
+                    Icon::new(if row.is_collapsed {
+                        IconName::ChevronRight
+                    } else {
+                        IconName::ChevronDown
+                    })
+                    .size(IconSize::Small)
+                    .color(Color::Muted),
+                )
+                .into_any_element()
+        } else {
+            div().w_4().h_4().flex_shrink_0().into_any_element()
+        };
+
         v_flex()
             .id(SharedString::from(format!("task-node-{}", task.id)))
             .debug_selector({
@@ -1666,19 +1754,9 @@ impl AgentTaskPanel {
             }))
             .on_click(cx.listener({
                 let task_id = task.id.clone();
-                let has_children = row.has_children;
                 move |this, _event, window, cx| {
-                    if has_children {
-                        if this.collapsed_tasks.contains(&task_id) {
-                            this.collapsed_tasks.remove(&task_id);
-                        } else {
-                            this.collapsed_tasks.insert(task_id.clone());
-                        }
-                        this.selected_task_id = Some(task_id.clone());
-                        cx.notify();
-                    } else {
-                        this.select_task(task_id.clone(), window, cx);
-                    }
+                    this.select_task(task_id.clone(), window, cx);
+                    this.open_item_preview(PreviewItem::Task(task_id.clone()), window, cx);
                 }
             }))
             .on_mouse_down(
@@ -1713,21 +1791,29 @@ impl AgentTaskPanel {
                                 this.child(
                                     Label::new(row.prefix.clone())
                                         .size(LabelSize::Small)
+                                        .color(Color::Muted)
+                                        .buffer_font(cx),
+                                )
+                            })
+                            .child(chevron_or_spacer)
+                            .child(render_status_icon(&task.status))
+                            .child(
+                                Label::new(task.title.clone())
+                                    .size(LabelSize::Default)
+                                    .truncate(),
+                            )
+                            .when(task.attempt > 1, |this| {
+                                this.child(
+                                    Label::new(format!("#{}", task.attempt))
+                                        .size(LabelSize::Small)
                                         .color(Color::Muted),
                                 )
-                            })
-                            .when(row.has_children, |this| {
-                                this.child(
-                                    Icon::new(if row.is_collapsed {
-                                        IconName::ChevronRight
-                                    } else {
-                                        IconName::ChevronDown
-                                    })
-                                    .size(IconSize::Small)
-                                    .color(Color::Muted),
-                                )
-                            })
-                            .child(render_status_icon(&task.status))
+                            }),
+                    )
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_1()
                             .when_some(policy_denied, |this, denied_event| {
                                 let denied_message = denied_event.message;
                                 this.child(
@@ -1744,42 +1830,30 @@ impl AgentTaskPanel {
                                         .tooltip(Tooltip::text(denied_message)),
                                 )
                             })
-                            .child(
-                                Label::new(task.title.clone())
-                                    .size(LabelSize::Default)
-                                    .truncate(),
-                            )
-                            .when(task.attempt > 1, |this| {
+                            .when(is_hovered, |this| {
                                 this.child(
-                                    Label::new(format!("#{}", task.attempt))
-                                        .size(LabelSize::Small)
-                                        .color(Color::Muted),
+                                    IconButton::new(
+                                        SharedString::from(format!("task-menu-{}", task.id)),
+                                        IconName::Ellipsis,
+                                    )
+                                    .icon_size(IconSize::Small)
+                                    .tooltip(Tooltip::text("More Actions"))
+                                    .on_click(cx.listener({
+                                        let task_id = task.id.clone();
+                                        move |this, event: &gpui::ClickEvent, window, cx| {
+                                            cx.stop_propagation();
+                                            this.deploy_context_menu(
+                                                ContextMenuTarget::Task(task_id.clone()),
+                                                event.position(),
+                                                Some(gpui::Anchor::TopRight),
+                                                window,
+                                                cx,
+                                            );
+                                        }
+                                    })),
                                 )
                             }),
-                    )
-                    .child(h_flex().items_center().when(is_hovered, |this| {
-                        this.child(
-                            IconButton::new(
-                                SharedString::from(format!("task-menu-{}", task.id)),
-                                IconName::Ellipsis,
-                            )
-                            .icon_size(IconSize::Small)
-                            .tooltip(Tooltip::text("More Actions"))
-                            .on_click(cx.listener({
-                                let task_id = task.id.clone();
-                                move |this, event: &gpui::ClickEvent, window, cx| {
-                                    cx.stop_propagation();
-                                    this.deploy_context_menu(
-                                        ContextMenuTarget::Task(task_id.clone()),
-                                        event.position(),
-                                        Some(gpui::Anchor::TopRight),
-                                        window,
-                                        cx,
-                                    );
-                                }
-                            })),
-                        )
-                    })),
+                    ),
             )
             .child(
                 h_flex()
@@ -1792,27 +1866,34 @@ impl AgentTaskPanel {
                     .gap_1p5()
                     .when(!row.continuation_prefix.is_empty(), |this| {
                         this.child(
-                            Label::new(format!("{}   ", row.continuation_prefix))
+                            Label::new(row.continuation_prefix.clone())
                                 .size(LabelSize::Small)
-                                .color(Color::Muted),
+                                .color(Color::Muted)
+                                .buffer_font(cx),
                         )
                     })
-                    .when(row.continuation_prefix.is_empty(), |this| {
-                        this.child(Label::new("   ").size(LabelSize::Small).color(Color::Muted))
-                    })
+                    .child(div().w_4().h_4().flex_shrink_0())
                     .child(
-                        Label::new({
-                            let profile = task
-                                .assigned_profile
-                                .as_deref()
-                                .or(task.assignee.as_deref())
-                                .filter(|s| !s.is_empty())
-                                .unwrap_or("no profile");
-                            profile.to_string()
-                        })
-                        .size(LabelSize::Small)
-                        .color(Color::Muted),
+                        Label::new(status_label(&task.status))
+                            .size(LabelSize::Small)
+                            .color(task_status_text_color(&task.status)),
                     )
+                    .child(dot_separator())
+                    .child({
+                        let (profile_str, profile_color) = if let Some(p) = task
+                            .assigned_profile
+                            .as_deref()
+                            .or(task.assignee.as_deref())
+                            .filter(|s| !s.is_empty())
+                        {
+                            (p.to_string(), Color::Default)
+                        } else {
+                            ("no profile".to_string(), Color::Muted)
+                        };
+                        Label::new(profile_str)
+                            .size(LabelSize::Small)
+                            .color(profile_color)
+                    })
                     .when_some(
                         task.model.as_ref().filter(|m| !m.is_empty()),
                         |this, model| {
@@ -2260,9 +2341,64 @@ pub fn goal_status_color(status: &AgentGoalStatus) -> Color {
 }
 
 pub fn render_goal_status_icon(status: &AgentGoalStatus) -> impl IntoElement {
-    Icon::new(goal_status_icon(status))
-        .size(IconSize::Small)
-        .color(goal_status_color(status))
+    if *status == AgentGoalStatus::Running {
+        Icon::new(IconName::LoadCircle)
+            .size(IconSize::Small)
+            .color(Color::Accent)
+            .with_rotate_animation(3)
+            .into_any_element()
+    } else {
+        Icon::new(goal_status_icon(status))
+            .size(IconSize::Small)
+            .color(goal_status_color(status))
+            .into_any_element()
+    }
+}
+
+pub fn goal_status_label(status: &AgentGoalStatus) -> &str {
+    match status {
+        AgentGoalStatus::Running => "Running",
+        AgentGoalStatus::Blocked => "Blocked",
+        AgentGoalStatus::Failed => "Failed",
+        AgentGoalStatus::Completed => "Completed",
+        AgentGoalStatus::Cancelled => "Cancelled",
+        AgentGoalStatus::Archived => "Archived",
+        AgentGoalStatus::Other(name) => name.as_ref(),
+    }
+}
+
+pub fn goal_status_text_color(status: &AgentGoalStatus) -> Color {
+    match status {
+        AgentGoalStatus::Running => Color::Accent,
+        AgentGoalStatus::Completed => Color::Success,
+        AgentGoalStatus::Failed => Color::Error,
+        AgentGoalStatus::Blocked => Color::Warning,
+        AgentGoalStatus::Cancelled | AgentGoalStatus::Archived | AgentGoalStatus::Other(_) => {
+            Color::Muted
+        }
+    }
+}
+
+pub fn task_status_text_color(status: &AgentTaskStatus) -> Color {
+    match status {
+        AgentTaskStatus::Ready | AgentTaskStatus::Running | AgentTaskStatus::Review => {
+            Color::Accent
+        }
+        AgentTaskStatus::Completed => Color::Success,
+        AgentTaskStatus::Blocked | AgentTaskStatus::Stale => Color::Warning,
+        AgentTaskStatus::Failed => Color::Error,
+        AgentTaskStatus::Cancelled | AgentTaskStatus::Archived | AgentTaskStatus::Other(_) => {
+            Color::Muted
+        }
+    }
+}
+
+pub fn priority_color(priority: i64) -> Color {
+    match priority {
+        0 | 1 => Color::Error,
+        2 => Color::Warning,
+        _ => Color::Muted,
+    }
 }
 
 pub fn status_color(status: &AgentTaskStatus) -> Color {
@@ -2295,9 +2431,18 @@ pub fn status_icon(status: &AgentTaskStatus) -> IconName {
 }
 
 pub fn render_status_icon(status: &AgentTaskStatus) -> impl IntoElement {
-    Icon::new(status_icon(status))
-        .size(IconSize::Small)
-        .color(status_color(status))
+    if *status == AgentTaskStatus::Running {
+        Icon::new(IconName::LoadCircle)
+            .size(IconSize::Small)
+            .color(Color::Accent)
+            .with_rotate_animation(3)
+            .into_any_element()
+    } else {
+        Icon::new(status_icon(status))
+            .size(IconSize::Small)
+            .color(status_color(status))
+            .into_any_element()
+    }
 }
 
 pub fn status_label(status: &AgentTaskStatus) -> &str {
@@ -2472,14 +2617,14 @@ pub fn render_task_markdown(
 
 #[allow(dead_code)]
 pub fn format_task_meta_line(task: &AgentTaskSummary, diff: Option<&DiffShortStat>) -> String {
+    let mut parts = vec![status_label(&task.status).to_string()];
     let profile = task
         .assigned_profile
         .as_deref()
         .or(task.assignee.as_deref())
         .filter(|s| !s.is_empty())
         .unwrap_or("no profile");
-
-    let mut parts = vec![profile.to_string()];
+    parts.push(profile.to_string());
     if let Some(model) = task.model.as_ref().filter(|m| !m.is_empty()) {
         parts.push(model.to_string());
     }
@@ -2513,15 +2658,22 @@ pub fn format_task_meta_line(task: &AgentTaskSummary, diff: Option<&DiffShortSta
 #[allow(dead_code)]
 pub fn format_goal_meta_line(
     goal_id: &str,
+    status: &AgentGoalStatus,
     priority: i64,
     tasks_done: u64,
     tasks_total: u64,
     diff: Option<&DiffShortStat>,
 ) -> String {
+    let goal_seg = if goal_id.starts_with("GOAL-") {
+        goal_id.to_string()
+    } else {
+        format!("GOAL-{goal_id}")
+    };
     let mut parts = vec![
+        goal_status_label(status).to_string(),
         format!("{tasks_done} / {tasks_total} tasks"),
         format!("P{priority}"),
-        goal_id.to_string(),
+        goal_seg,
     ];
     if let Some(diff) = diff {
         let file_str = format!(
@@ -2686,8 +2838,10 @@ pub fn build_task_tree_rows(
     visible_tasks: &[AgentTaskSummary],
     timestamps: &HashMap<AgentTaskId, u64>,
     collapsed_tasks: &HashSet<AgentTaskId>,
+    under_goal: bool,
 ) -> Vec<TaskRow> {
     let roots = visible_roots(visible_tasks, timestamps);
+    let num_roots = roots.len();
     let mut rows = Vec::new();
     let mut visited = HashSet::new();
 
@@ -2725,25 +2879,15 @@ pub fn build_task_tree_rows(
             let num_children = children.len();
             for (index, child) in children.into_iter().enumerate() {
                 let is_last_child = index + 1 == num_children;
-                let child_prefix = format!(
-                    "{}{}",
-                    ancestor_continuation,
-                    if is_last_child {
-                        "└── "
-                    } else {
-                        "├── "
-                    }
-                );
-                let child_continuation = format!(
-                    "{}{}",
-                    ancestor_continuation,
-                    if is_last_child { "    " } else { "│   " }
-                );
-                let next_ancestor = format!(
-                    "{}{}",
-                    ancestor_continuation,
-                    if is_last_child { "    " } else { "│   " }
-                );
+                let branch = if is_last_child {
+                    "└── "
+                } else {
+                    "├── "
+                };
+                let cont = if is_last_child { "    " } else { "│   " };
+                let child_prefix = format!("{ancestor_continuation}{branch}");
+                let child_continuation = format!("{ancestor_continuation}{cont}");
+                let next_ancestor = format!("{ancestor_continuation}{cont}");
                 collect_node(
                     child,
                     visible,
@@ -2760,14 +2904,27 @@ pub fn build_task_tree_rows(
         }
     }
 
-    for root in roots {
+    for (root_idx, root) in roots.into_iter().enumerate() {
+        let is_last_root = root_idx + 1 == num_roots;
+        let (prefix, continuation_prefix, ancestor_continuation) = if under_goal {
+            let branch = if is_last_root {
+                "└── "
+            } else {
+                "├── "
+            };
+            let cont = if is_last_root { "    " } else { "│   " };
+            (branch, cont, cont)
+        } else {
+            ("", "", "")
+        };
+
         collect_node(
             root,
             visible_tasks,
             timestamps,
-            "",
-            "",
-            "",
+            prefix,
+            continuation_prefix,
+            ancestor_continuation,
             0,
             collapsed_tasks,
             &mut visited,
@@ -2909,7 +3066,7 @@ pub fn build_goal_groups<'a>(
 
         if !filtered_tasks.is_empty() || goal_title_matches || (!has_search && goal_status_matches)
         {
-            let rows = build_task_tree_rows(&filtered_tasks, &timestamps, collapsed_tasks);
+            let rows = build_task_tree_rows(&filtered_tasks, &timestamps, collapsed_tasks, true);
             result.push(GoalGroup {
                 goal_id: Some(goal_id),
                 goal_summary: summary,
@@ -2921,7 +3078,7 @@ pub fn build_goal_groups<'a>(
     if let Some(no_goal_tasks) = tasks_by_goal.remove(&None) {
         let filtered_no_goal = filter_task_set_by_search(no_goal_tasks);
         if !filtered_no_goal.is_empty() {
-            let rows = build_task_tree_rows(&filtered_no_goal, &timestamps, collapsed_tasks);
+            let rows = build_task_tree_rows(&filtered_no_goal, &timestamps, collapsed_tasks, false);
             result.push(GoalGroup {
                 goal_id: None,
                 goal_summary: None,
@@ -2943,7 +3100,7 @@ pub fn build_task_rows<'a>(
     let empty_others = HashSet::new();
     let empty_collapsed = HashSet::new();
     let visible = filter_visible_tasks(tasks, category_filters, &empty_others);
-    build_task_tree_rows(&visible, &timestamps, &empty_collapsed)
+    build_task_tree_rows(&visible, &timestamps, &empty_collapsed, false)
 }
 
 #[cfg(test)]
@@ -3867,14 +4024,14 @@ mod tests {
         cx.debug_bounds("task-node-TASK-2")
             .expect("TASK-2 should be rendered initially");
 
-        let goal_1_header_bounds = cx.debug_bounds("goal-group-header-GOAL-1").unwrap();
-        cx.simulate_click(goal_1_header_bounds.center(), gpui::Modifiers::default());
+        let goal_1_chevron_bounds = cx.debug_bounds("goal-chevron-GOAL-1").unwrap();
+        cx.simulate_click(goal_1_chevron_bounds.center(), gpui::Modifiers::default());
         cx.run_until_parked();
 
         assert!(cx.debug_bounds("task-node-TASK-1").is_none());
         assert!(cx.debug_bounds("task-node-TASK-2").is_some());
 
-        cx.simulate_click(goal_1_header_bounds.center(), gpui::Modifiers::default());
+        cx.simulate_click(goal_1_chevron_bounds.center(), gpui::Modifiers::default());
         cx.run_until_parked();
         assert!(cx.debug_bounds("task-node-TASK-1").is_some());
     }
@@ -3923,11 +4080,15 @@ mod tests {
         let meta = format_task_meta_line(&task_full, Some(&diff));
         assert_eq!(
             meta,
-            "agent_engineer · claude-3-7-sonnet · GOAL-1 · TASK-1 · 2 files +15 -3"
+            "Running · agent_engineer · claude-3-7-sonnet · GOAL-1 · TASK-1 · 2 files +15 -3"
         );
 
-        let goal_meta = format_goal_meta_line("GOAL-1", 2, 1, 3, Some(&diff));
-        assert_eq!(goal_meta, "1 / 3 tasks · P2 · GOAL-1 · 2 files +15 -3");
+        let goal_meta =
+            format_goal_meta_line("GOAL-1", &AgentGoalStatus::Running, 2, 1, 3, Some(&diff));
+        assert_eq!(
+            goal_meta,
+            "Running · 1 / 3 tasks · P2 · GOAL-1 · 2 files +15 -3"
+        );
 
         let single_diff = DiffShortStat {
             files: 1,
@@ -3935,17 +4096,24 @@ mod tests {
             removed: 0,
         };
         assert_eq!(
-            format_goal_meta_line("GOAL-1", 1, 0, 1, Some(&single_diff)),
-            "0 / 1 tasks · P1 · GOAL-1 · 1 file +4 -0"
+            format_goal_meta_line(
+                "GOAL-1",
+                &AgentGoalStatus::Running,
+                1,
+                0,
+                1,
+                Some(&single_diff)
+            ),
+            "Running · 0 / 1 tasks · P1 · GOAL-1 · 1 file +4 -0"
         );
 
         assert_eq!(
             format_task_meta_line(&task_full, None),
-            "agent_engineer · claude-3-7-sonnet · GOAL-1 · TASK-1"
+            "Running · agent_engineer · claude-3-7-sonnet · GOAL-1 · TASK-1"
         );
         assert_eq!(
-            format_goal_meta_line("GOAL-1", 1, 2, 2, None),
-            "2 / 2 tasks · P1 · GOAL-1"
+            format_goal_meta_line("GOAL-1", &AgentGoalStatus::Completed, 1, 2, 2, None),
+            "Completed · 2 / 2 tasks · P1 · GOAL-1"
         );
     }
 
@@ -3966,7 +4134,7 @@ mod tests {
         };
         assert_eq!(
             format_task_meta_line(&task_no_goal, None),
-            "code_mechanic · gemini-2.5-pro · TASK-2"
+            "Ready · code_mechanic · gemini-2.5-pro · TASK-2"
         );
 
         let task_assignee_fallback = AgentTaskSummary {
@@ -3984,7 +4152,7 @@ mod tests {
         };
         assert_eq!(
             format_task_meta_line(&task_assignee_fallback, None),
-            "backend_profile · GOAL-9 · TASK-3"
+            "Ready · backend_profile · GOAL-9 · TASK-3"
         );
 
         let task_no_profile = AgentTaskSummary {
@@ -4002,7 +4170,7 @@ mod tests {
         };
         assert_eq!(
             format_task_meta_line(&task_no_profile, None),
-            "no profile · TASK-4"
+            "Ready · no profile · TASK-4"
         );
 
         let task_both = AgentTaskSummary {
@@ -4020,7 +4188,7 @@ mod tests {
         };
         assert_eq!(
             format_task_meta_line(&task_both, None),
-            "primary_profile · TASK-5"
+            "Ready · primary_profile · TASK-5"
         );
     }
 
@@ -4071,8 +4239,8 @@ mod tests {
         assert!(cx.debug_bounds("task-node-TASK-PARENT").is_some());
         assert!(cx.debug_bounds("task-node-TASK-CHILD").is_some());
 
-        let parent_bounds = cx.debug_bounds("task-node-TASK-PARENT").unwrap();
-        cx.simulate_click(parent_bounds.center(), gpui::Modifiers::default());
+        let parent_chevron_bounds = cx.debug_bounds("task-chevron-TASK-PARENT").unwrap();
+        cx.simulate_click(parent_chevron_bounds.center(), gpui::Modifiers::default());
         cx.run_until_parked();
 
         panel.read_with(cx, |panel, _| {
@@ -4084,7 +4252,7 @@ mod tests {
         });
         assert!(cx.debug_bounds("task-node-TASK-CHILD").is_none());
 
-        cx.simulate_click(parent_bounds.center(), gpui::Modifiers::default());
+        cx.simulate_click(parent_chevron_bounds.center(), gpui::Modifiers::default());
         cx.run_until_parked();
 
         panel.read_with(cx, |panel, _| {
@@ -4702,5 +4870,298 @@ mod tests {
         );
         assert!(md_conf.contains("- **Status:** ⚠️ Merge conflict detected"));
         assert!(md_conf.contains("`src/main.rs`"));
+    }
+
+    #[test]
+    fn test_task_tree_branch_guides_under_goal_and_no_goal() {
+        let tasks = vec![
+            AgentTaskSummary {
+                id: AgentTaskId::from("TASK-ROOT-1"),
+                parent_id: None,
+                goal_id: Some("GOAL-1".to_string()),
+                title: "Root 1".to_string(),
+                status: AgentTaskStatus::Ready,
+                attempt: 1,
+                assignee: None,
+                write_scopes: vec![],
+                created_at: Some(10),
+                assigned_profile: None,
+                model: None,
+            },
+            AgentTaskSummary {
+                id: AgentTaskId::from("TASK-CHILD-1"),
+                parent_id: Some(AgentTaskId::from("TASK-ROOT-1")),
+                goal_id: Some("GOAL-1".to_string()),
+                title: "Child 1".to_string(),
+                status: AgentTaskStatus::Ready,
+                attempt: 1,
+                assignee: None,
+                write_scopes: vec![],
+                created_at: Some(20),
+                assigned_profile: None,
+                model: None,
+            },
+            AgentTaskSummary {
+                id: AgentTaskId::from("TASK-GRANDCHILD-1"),
+                parent_id: Some(AgentTaskId::from("TASK-CHILD-1")),
+                goal_id: Some("GOAL-1".to_string()),
+                title: "Grandchild 1".to_string(),
+                status: AgentTaskStatus::Ready,
+                attempt: 1,
+                assignee: None,
+                write_scopes: vec![],
+                created_at: Some(30),
+                assigned_profile: None,
+                model: None,
+            },
+            AgentTaskSummary {
+                id: AgentTaskId::from("TASK-CHILD-2"),
+                parent_id: Some(AgentTaskId::from("TASK-ROOT-1")),
+                goal_id: Some("GOAL-1".to_string()),
+                title: "Child 2".to_string(),
+                status: AgentTaskStatus::Ready,
+                attempt: 1,
+                assignee: None,
+                write_scopes: vec![],
+                created_at: Some(40),
+                assigned_profile: None,
+                model: None,
+            },
+            AgentTaskSummary {
+                id: AgentTaskId::from("TASK-ROOT-2"),
+                parent_id: None,
+                goal_id: Some("GOAL-1".to_string()),
+                title: "Root 2".to_string(),
+                status: AgentTaskStatus::Ready,
+                attempt: 1,
+                assignee: None,
+                write_scopes: vec![],
+                created_at: Some(50),
+                assigned_profile: None,
+                model: None,
+            },
+            AgentTaskSummary {
+                id: AgentTaskId::from("TASK-CHILD-3"),
+                parent_id: Some(AgentTaskId::from("TASK-ROOT-2")),
+                goal_id: Some("GOAL-1".to_string()),
+                title: "Child 3".to_string(),
+                status: AgentTaskStatus::Ready,
+                attempt: 1,
+                assignee: None,
+                write_scopes: vec![],
+                created_at: Some(60),
+                assigned_profile: None,
+                model: None,
+            },
+        ];
+
+        let mut timestamps = HashMap::new();
+        timestamps.insert(AgentTaskId::from("TASK-ROOT-1"), 10);
+        timestamps.insert(AgentTaskId::from("TASK-CHILD-1"), 20);
+        timestamps.insert(AgentTaskId::from("TASK-GRANDCHILD-1"), 30);
+        timestamps.insert(AgentTaskId::from("TASK-CHILD-2"), 40);
+        timestamps.insert(AgentTaskId::from("TASK-ROOT-2"), 50);
+        timestamps.insert(AgentTaskId::from("TASK-CHILD-3"), 60);
+
+        let collapsed = HashSet::new();
+
+        // Under goal: roots receive ├── / └── and subtasks inherit continuation prefix
+        let under_goal_rows = build_task_tree_rows(&tasks, &timestamps, &collapsed, true);
+        let under_goal_info: Vec<(&str, &str, &str)> = under_goal_rows
+            .iter()
+            .map(|r| {
+                (
+                    r.task.id.0.as_ref(),
+                    r.prefix.as_str(),
+                    r.continuation_prefix.as_str(),
+                )
+            })
+            .collect();
+
+        assert_eq!(
+            under_goal_info,
+            vec![
+                ("TASK-ROOT-2", "├── ", "│   "),
+                ("TASK-CHILD-3", "│   └── ", "│       "),
+                ("TASK-ROOT-1", "└── ", "    "),
+                ("TASK-CHILD-2", "    ├── ", "    │   "),
+                ("TASK-CHILD-1", "    └── ", "        "),
+                ("TASK-GRANDCHILD-1", "        └── ", "            "),
+            ]
+        );
+
+        // No goal: roots have "" and subtasks receive ├── / └──
+        let no_goal_rows = build_task_tree_rows(&tasks, &timestamps, &collapsed, false);
+        let no_goal_info: Vec<(&str, &str, &str)> = no_goal_rows
+            .iter()
+            .map(|r| {
+                (
+                    r.task.id.0.as_ref(),
+                    r.prefix.as_str(),
+                    r.continuation_prefix.as_str(),
+                )
+            })
+            .collect();
+
+        assert_eq!(
+            no_goal_info,
+            vec![
+                ("TASK-ROOT-2", "", ""),
+                ("TASK-CHILD-3", "└── ", "    "),
+                ("TASK-ROOT-1", "", ""),
+                ("TASK-CHILD-2", "├── ", "│   "),
+                ("TASK-CHILD-1", "└── ", "    "),
+                ("TASK-GRANDCHILD-1", "    └── ", "        "),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_status_and_priority_colors_and_labels() {
+        assert_eq!(goal_status_label(&AgentGoalStatus::Running), "Running");
+        assert_eq!(goal_status_label(&AgentGoalStatus::Completed), "Completed");
+        assert_eq!(goal_status_label(&AgentGoalStatus::Failed), "Failed");
+        assert_eq!(goal_status_label(&AgentGoalStatus::Blocked), "Blocked");
+        assert_eq!(goal_status_label(&AgentGoalStatus::Cancelled), "Cancelled");
+        assert_eq!(goal_status_label(&AgentGoalStatus::Archived), "Archived");
+
+        assert_eq!(
+            goal_status_text_color(&AgentGoalStatus::Running),
+            Color::Accent
+        );
+        assert_eq!(
+            goal_status_text_color(&AgentGoalStatus::Completed),
+            Color::Success
+        );
+        assert_eq!(
+            goal_status_text_color(&AgentGoalStatus::Failed),
+            Color::Error
+        );
+        assert_eq!(
+            goal_status_text_color(&AgentGoalStatus::Blocked),
+            Color::Warning
+        );
+        assert_eq!(
+            goal_status_text_color(&AgentGoalStatus::Cancelled),
+            Color::Muted
+        );
+        assert_eq!(
+            goal_status_text_color(&AgentGoalStatus::Archived),
+            Color::Muted
+        );
+
+        assert_eq!(
+            task_status_text_color(&AgentTaskStatus::Ready),
+            Color::Accent
+        );
+        assert_eq!(
+            task_status_text_color(&AgentTaskStatus::Running),
+            Color::Accent
+        );
+        assert_eq!(
+            task_status_text_color(&AgentTaskStatus::Completed),
+            Color::Success
+        );
+        assert_eq!(
+            task_status_text_color(&AgentTaskStatus::Blocked),
+            Color::Warning
+        );
+        assert_eq!(
+            task_status_text_color(&AgentTaskStatus::Failed),
+            Color::Error
+        );
+        assert_eq!(
+            task_status_text_color(&AgentTaskStatus::Cancelled),
+            Color::Muted
+        );
+        assert_eq!(
+            task_status_text_color(&AgentTaskStatus::Archived),
+            Color::Muted
+        );
+
+        assert_eq!(priority_color(0), Color::Error);
+        assert_eq!(priority_color(1), Color::Error);
+        assert_eq!(priority_color(2), Color::Warning);
+        assert_eq!(priority_color(3), Color::Muted);
+        assert_eq!(priority_color(4), Color::Muted);
+    }
+
+    #[gpui::test]
+    async fn test_click_separation_chevron_toggles_and_row_card_selects(cx: &mut TestAppContext) {
+        init_test(cx);
+        let file_system = FakeFs::new(cx.executor());
+        let project = Project::test(file_system.clone(), [], cx).await;
+
+        let task_parent = AgentTaskSummary {
+            id: AgentTaskId::from("TASK-P1"),
+            parent_id: None,
+            goal_id: Some("GOAL-1".to_string()),
+            title: "Parent Task 1".to_string(),
+            status: AgentTaskStatus::Ready,
+            attempt: 1,
+            assignee: None,
+            write_scopes: vec![],
+            created_at: Some(10),
+            assigned_profile: None,
+            model: None,
+        };
+        let task_child = AgentTaskSummary {
+            id: AgentTaskId::from("TASK-C1"),
+            parent_id: Some(AgentTaskId::from("TASK-P1")),
+            goal_id: Some("GOAL-1".to_string()),
+            title: "Child Task 1".to_string(),
+            status: AgentTaskStatus::Ready,
+            attempt: 1,
+            assignee: None,
+            write_scopes: vec![],
+            created_at: Some(20),
+            assigned_profile: None,
+            model: None,
+        };
+
+        let provider = Arc::new(TestProvider {
+            tasks: vec![task_parent, task_child],
+            ..Default::default()
+        });
+        let store = cx.update(|cx| cx.new(|cx| AgentTaskStore::new(provider, cx)));
+
+        let (panel, cx) = cx.add_window_view(|_window, cx| {
+            AgentTaskPanel::new(store, WeakEntity::new_invalid(), project, file_system, cx)
+        });
+        cx.run_until_parked();
+
+        assert!(cx.debug_bounds("task-node-TASK-P1").is_some());
+        assert!(cx.debug_bounds("task-node-TASK-C1").is_some());
+
+        // Clicking the row card selects the task, does NOT toggle collapse
+        let parent_card_bounds = cx.debug_bounds("task-node-TASK-P1").unwrap();
+        cx.simulate_click(parent_card_bounds.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(panel.selected_task_id, Some(AgentTaskId::from("TASK-P1")));
+            assert!(
+                !panel
+                    .collapsed_tasks
+                    .contains(&AgentTaskId::from("TASK-P1"))
+            );
+        });
+        // Child still visible
+        assert!(cx.debug_bounds("task-node-TASK-C1").is_some());
+
+        // Clicking the chevron toggles collapse
+        let chevron_bounds = cx.debug_bounds("task-chevron-TASK-P1").unwrap();
+        cx.simulate_click(chevron_bounds.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+
+        panel.read_with(cx, |panel, _| {
+            assert!(
+                panel
+                    .collapsed_tasks
+                    .contains(&AgentTaskId::from("TASK-P1"))
+            );
+        });
+        // Child is now collapsed
+        assert!(cx.debug_bounds("task-node-TASK-C1").is_none());
     }
 }

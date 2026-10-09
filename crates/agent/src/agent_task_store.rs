@@ -9,7 +9,7 @@ use util::ResultExt;
 use crate::agent_task::{
     AgentGoalStatus, AgentGoalSummary, AgentItemKind, AgentTaskArtifact, AgentTaskDetail,
     AgentTaskEvent, AgentTaskEventKind, AgentTaskGraph, AgentTaskId, AgentTaskProvider,
-    AgentTaskStatus, AgentUnifiedItem,
+    AgentTaskStatus, AgentTaskSummary, AgentUnifiedItem,
 };
 
 fn merge_items_into_graph(graph: &mut AgentTaskGraph, items: &[AgentUnifiedItem]) {
@@ -20,6 +20,15 @@ fn merge_items_into_graph(graph: &mut AgentTaskGraph, items: &[AgentUnifiedItem]
         if let Some(item) = items_by_id.get(task.id.as_str()) {
             if task.created_at.is_none() {
                 task.created_at = item.created_at;
+            }
+            if task.parent_id.is_none() {
+                task.parent_id = item.parent_id.as_deref().map(AgentTaskId::from);
+            }
+            if task.goal_id.is_none() {
+                task.goal_id = item.goal_id.clone();
+            }
+            if task.title.is_empty() {
+                task.title = item.title.clone();
             }
             let item_profile = item
                 .assigned_profile
@@ -34,6 +43,33 @@ fn merge_items_into_graph(graph: &mut AgentTaskGraph, items: &[AgentUnifiedItem]
             if task.model.is_none() {
                 task.model = item.model.clone();
             }
+        }
+    }
+
+    let mut existing_task_ids: std::collections::HashSet<AgentTaskId> =
+        graph.tasks.iter().map(|t| t.id.clone()).collect();
+
+    for item in items.iter().filter(|item| item.kind == AgentItemKind::Task) {
+        let task_id = AgentTaskId::from(item.id.as_str());
+        if !existing_task_ids.contains(&task_id) {
+            existing_task_ids.insert(task_id.clone());
+            let item_profile = item
+                .assigned_profile
+                .clone()
+                .or_else(|| item.assignee.clone());
+            graph.tasks.push(AgentTaskSummary {
+                id: task_id,
+                parent_id: item.parent_id.as_deref().map(AgentTaskId::from),
+                goal_id: item.goal_id.clone(),
+                title: item.title.clone(),
+                status: item.task_status(),
+                attempt: 1,
+                assignee: item.assignee.clone(),
+                write_scopes: Vec::new(),
+                created_at: item.created_at,
+                assigned_profile: item_profile,
+                model: item.model.clone(),
+            });
         }
     }
 
@@ -1003,5 +1039,166 @@ mod tests {
             task_with_profile.assigned_profile,
             Some(SharedString::from("senior_engineer"))
         );
+    }
+
+    #[test]
+    fn test_merge_items_synthesizes_missing_tasks_and_syncs_parent_and_goal_id() {
+        let mut graph = AgentTaskGraph {
+            tasks: vec![AgentTaskSummary {
+                id: AgentTaskId::from("TASK-EXISTING"),
+                parent_id: None,
+                goal_id: None,
+                title: "Existing Task".to_string(),
+                status: AgentTaskStatus::Running,
+                attempt: 1,
+                assignee: None,
+                write_scopes: vec![],
+                created_at: None,
+                assigned_profile: None,
+                model: None,
+            }],
+            goals: vec![],
+        };
+
+        let items = vec![
+            AgentUnifiedItem {
+                kind: AgentItemKind::Task,
+                id: "TASK-EXISTING".to_string(),
+                title: "Existing Task Title".to_string(),
+                status: "running".to_string(),
+                priority: 1,
+                created_at: Some(100),
+                failure_reason: None,
+                progress: None,
+                assignee: None,
+                assigned_profile: None,
+                model: None,
+                parent_id: Some("TASK-PARENT".to_string()),
+                goal_id: Some("GOAL-42".to_string()),
+            },
+            AgentUnifiedItem {
+                kind: AgentItemKind::Task,
+                id: "TASK-SYNTHESIZED".to_string(),
+                title: "Synthesized Task".to_string(),
+                status: "ready".to_string(),
+                priority: 2,
+                created_at: Some(200),
+                failure_reason: None,
+                progress: None,
+                assignee: Some(SharedString::from("coder")),
+                assigned_profile: Some(SharedString::from("code_mechanic")),
+                model: Some(SharedString::from("claude-3-7-sonnet")),
+                parent_id: Some("TASK-EXISTING".to_string()),
+                goal_id: Some("GOAL-42".to_string()),
+            },
+        ];
+
+        merge_items_into_graph(&mut graph, &items);
+
+        let existing = &graph.tasks[0];
+        assert_eq!(existing.parent_id, Some(AgentTaskId::from("TASK-PARENT")));
+        assert_eq!(existing.goal_id, Some("GOAL-42".to_string()));
+
+        assert_eq!(graph.tasks.len(), 2);
+        let synthesized = &graph.tasks[1];
+        assert_eq!(synthesized.id, AgentTaskId::from("TASK-SYNTHESIZED"));
+        assert_eq!(synthesized.title, "Synthesized Task");
+        assert_eq!(synthesized.status, AgentTaskStatus::Ready);
+        assert_eq!(
+            synthesized.parent_id,
+            Some(AgentTaskId::from("TASK-EXISTING"))
+        );
+        assert_eq!(synthesized.goal_id, Some("GOAL-42".to_string()));
+        assert_eq!(synthesized.created_at, Some(200));
+        assert_eq!(
+            synthesized.assigned_profile,
+            Some(SharedString::from("code_mechanic"))
+        );
+        assert_eq!(
+            synthesized.model,
+            Some(SharedString::from("claude-3-7-sonnet"))
+        );
+    }
+
+    #[test]
+    fn test_merge_items_parent_id_goal_id_and_synthesize_tasks() {
+        let mut graph = AgentTaskGraph {
+            tasks: vec![AgentTaskSummary {
+                id: AgentTaskId::from("TASK-EXISTING"),
+                parent_id: None,
+                goal_id: None,
+                title: "".to_string(),
+                status: AgentTaskStatus::Ready,
+                attempt: 1,
+                assignee: None,
+                write_scopes: vec![],
+                created_at: None,
+                assigned_profile: None,
+                model: None,
+            }],
+            goals: vec![],
+        };
+
+        let items = vec![
+            AgentUnifiedItem {
+                kind: AgentItemKind::Task,
+                id: "TASK-EXISTING".to_string(),
+                title: "Existing Task Title".to_string(),
+                status: "running".to_string(), // graph status Ready should win
+                priority: 2,
+                created_at: Some(1791500000000),
+                failure_reason: None,
+                progress: None,
+                assignee: Some(SharedString::from("assignee_fallback")),
+                assigned_profile: None,
+                model: Some(SharedString::from("gpt-4o")),
+                parent_id: Some("TASK-PARENT-1".to_string()),
+                goal_id: Some("GOAL-10".to_string()),
+            },
+            AgentUnifiedItem {
+                kind: AgentItemKind::Task,
+                id: "TASK-SYNTHESIZED".to_string(),
+                title: "Synthesized Task".to_string(),
+                status: "running".to_string(),
+                priority: 1,
+                created_at: Some(1791500001000),
+                failure_reason: None,
+                progress: None,
+                assignee: None,
+                assigned_profile: Some(SharedString::from("agent_engineer")),
+                model: Some(SharedString::from("claude-3-7-sonnet")),
+                parent_id: Some("TASK-EXISTING".to_string()),
+                goal_id: Some("GOAL-10".to_string()),
+            },
+        ];
+
+        merge_items_into_graph(&mut graph, &items);
+
+        assert_eq!(graph.tasks.len(), 2);
+        let existing = &graph.tasks[0];
+        assert_eq!(existing.parent_id, Some(AgentTaskId::from("TASK-PARENT-1")));
+        assert_eq!(existing.goal_id, Some("GOAL-10".to_string()));
+        assert_eq!(existing.title, "Existing Task Title");
+        assert_eq!(existing.status, AgentTaskStatus::Ready);
+        assert_eq!(existing.created_at, Some(1791500000000));
+        assert_eq!(
+            existing.assigned_profile,
+            Some(SharedString::from("assignee_fallback"))
+        );
+        assert_eq!(existing.model, Some(SharedString::from("gpt-4o")));
+
+        let synth = &graph.tasks[1];
+        assert_eq!(synth.id, AgentTaskId::from("TASK-SYNTHESIZED"));
+        assert_eq!(synth.parent_id, Some(AgentTaskId::from("TASK-EXISTING")));
+        assert_eq!(synth.goal_id, Some("GOAL-10".to_string()));
+        assert_eq!(synth.title, "Synthesized Task");
+        assert_eq!(synth.status, AgentTaskStatus::Running);
+        assert_eq!(synth.attempt, 1);
+        assert_eq!(synth.created_at, Some(1791500001000));
+        assert_eq!(
+            synth.assigned_profile,
+            Some(SharedString::from("agent_engineer"))
+        );
+        assert_eq!(synth.model, Some(SharedString::from("claude-3-7-sonnet")));
     }
 }
