@@ -1189,7 +1189,7 @@ impl AgentTaskPanel {
             }
         }
 
-        v_flex().gap_2().children(group_elements)
+        v_flex().children(group_elements)
     }
 
     fn render_orphan_worktrees(&self, orphans: &[OrphanWorktree], cx: &mut Context<Self>) -> Div {
@@ -1425,7 +1425,6 @@ impl AgentTaskPanel {
                     move || format!("goal-group-header-{}", goal_id)
                 })
                 .w_full()
-                .py_1()
                 .px_1p5()
                 .cursor_pointer()
                 .hover(move |s| s.bg(hover_color))
@@ -1466,7 +1465,7 @@ impl AgentTaskPanel {
                 )
                 .child(
                     h_flex()
-                        .h_6()
+                        .h_5()
                         .w_full()
                         .items_center()
                         .justify_between()
@@ -1512,6 +1511,7 @@ impl AgentTaskPanel {
                             let goal_id = goal_id.clone();
                             move || format!("goal-meta-{}", goal_id)
                         })
+                        .h_5()
                         .items_center()
                         .gap_1p5()
                         .child(if has_children && !is_collapsed {
@@ -1571,7 +1571,7 @@ impl AgentTaskPanel {
                         }),
                 );
 
-            let mut group_div = v_flex().w_full().gap_1().child(header);
+            let mut group_div = v_flex().w_full().child(header);
 
             if !is_collapsed {
                 let mut row_elements = Vec::with_capacity(group.rows.len());
@@ -1628,7 +1628,6 @@ impl AgentTaskPanel {
                 .id("goal-group-header-no-goal")
                 .debug_selector(|| "goal-group-header-no-goal".to_string())
                 .w_full()
-                .py_1()
                 .px_1p5()
                 .cursor_pointer()
                 .hover(move |s| s.bg(hover_color))
@@ -1642,7 +1641,7 @@ impl AgentTaskPanel {
                 }))
                 .child(
                     h_flex()
-                        .h_6()
+                        .h_5()
                         .gap_1p5()
                         .items_center()
                         .child(chevron_or_spacer)
@@ -1654,7 +1653,7 @@ impl AgentTaskPanel {
                         ),
                 );
 
-            let mut group_div = v_flex().w_full().gap_1().child(header);
+            let mut group_div = v_flex().w_full().child(header);
 
             if !is_collapsed {
                 let mut row_elements = Vec::with_capacity(group.rows.len());
@@ -1696,7 +1695,6 @@ impl AgentTaskPanel {
                 move || format!("task-node-{}", task_id)
             })
             .w_full()
-            .py_1()
             .px_1p5()
             .cursor_pointer()
             .when(is_selected, |this| {
@@ -1741,7 +1739,7 @@ impl AgentTaskPanel {
             )
             .child(
                 h_flex()
-                    .h_6()
+                    .h_5()
                     .w_full()
                     .items_center()
                     .justify_between()
@@ -1867,6 +1865,7 @@ impl AgentTaskPanel {
                         let task_id = task.id.clone();
                         move || format!("task-meta-{}", task_id)
                     })
+                    .h_5()
                     .items_center()
                     .gap_1p5()
                     .when(!row.continuation_prefix.is_empty(), |this| {
