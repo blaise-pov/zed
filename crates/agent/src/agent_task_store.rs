@@ -185,6 +185,8 @@ impl AgentTaskStore {
                 futures::join!(graph_task, items_task, events_task);
 
             this.update(cx, |store, cx| {
+                let mut changed = false;
+
                 match graph_result {
                     Ok(mut graph) => {
                         match items_result {
@@ -198,23 +200,48 @@ impl AgentTaskStore {
 
                         match events_result {
                             Ok(events) => {
-                                store.events = events.into();
+                                if store.events.make_contiguous() != events.as_slice() {
+                                    store.events = events.into();
+                                    changed = true;
+                                }
                             }
                             Err(err) => {
                                 log::error!("failed to fetch events: {err:?}");
                             }
                         }
 
-                        store.graph = graph;
-                        store.is_offline = false;
-                        store.last_error = None;
+                        if store.graph != graph {
+                            store.graph = graph;
+                            changed = true;
+                        }
+
+                        if store.is_offline {
+                            store.is_offline = false;
+                            changed = true;
+                        }
+
+                        if store.last_error.is_some() {
+                            store.last_error = None;
+                            changed = true;
+                        }
                     }
                     Err(err) => {
-                        store.is_offline = true;
-                        store.last_error = Some(err.to_string());
+                        if !store.is_offline {
+                            store.is_offline = true;
+                            changed = true;
+                        }
+
+                        let err_message = err.to_string();
+                        if store.last_error.as_deref() != Some(&err_message) {
+                            store.last_error = Some(err_message);
+                            changed = true;
+                        }
                     }
                 }
-                cx.notify();
+
+                if changed {
+                    cx.notify();
+                }
             })
             .log_err();
             Ok(())
@@ -1200,5 +1227,123 @@ mod tests {
             Some(SharedString::from("agent_engineer"))
         );
         assert_eq!(synth.model, Some(SharedString::from("claude-3-7-sonnet")));
+    }
+
+    #[gpui::test]
+    async fn test_agent_task_store_refresh_dirty_checking(cx: &mut TestAppContext) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct DynamicProvider {
+            graph: parking_lot::Mutex<AgentTaskGraph>,
+            events: parking_lot::Mutex<Vec<AgentTaskEvent>>,
+        }
+
+        impl AgentTaskProvider for DynamicProvider {
+            fn server_id(&self) -> ContextServerId {
+                ContextServerId("dynamic_test".into())
+            }
+
+            fn fetch_graph(&self, _cx: &mut App) -> Task<Result<AgentTaskGraph>> {
+                Task::ready(Ok(self.graph.lock().clone()))
+            }
+
+            fn get_task(&self, _id: &AgentTaskId, _cx: &mut App) -> Task<Result<AgentTaskDetail>> {
+                Task::ready(Err(anyhow::anyhow!("not implemented")))
+            }
+
+            fn complete_task(&self, _id: &AgentTaskId, _cx: &mut App) -> Task<Result<()>> {
+                Task::ready(Ok(()))
+            }
+
+            fn fail_task(
+                &self,
+                _id: &AgentTaskId,
+                _reason: &str,
+                _cx: &mut App,
+            ) -> Task<Result<()>> {
+                Task::ready(Ok(()))
+            }
+
+            fn archive_task(&self, _id: &AgentTaskId, _cx: &mut App) -> Task<Result<()>> {
+                Task::ready(Ok(()))
+            }
+
+            fn unarchive_task(&self, _id: &AgentTaskId, _cx: &mut App) -> Task<Result<()>> {
+                Task::ready(Ok(()))
+            }
+
+            fn delete_task(&self, _id: &AgentTaskId, _cx: &mut App) -> Task<Result<()>> {
+                Task::ready(Ok(()))
+            }
+
+            fn list_events(&self, _limit: u32, _cx: &mut App) -> Task<Result<Vec<AgentTaskEvent>>> {
+                Task::ready(Ok(self.events.lock().clone()))
+            }
+
+            fn list_artifacts(
+                &self,
+                _task_id: &AgentTaskId,
+                _cx: &mut App,
+            ) -> Task<Result<Vec<AgentTaskArtifact>>> {
+                Task::ready(Ok(vec![]))
+            }
+
+            fn get_artifact(
+                &self,
+                _artifact_id: &str,
+                _cx: &mut App,
+            ) -> Task<Result<AgentTaskArtifact>> {
+                Task::ready(Err(anyhow::anyhow!("not implemented")))
+            }
+        }
+
+        let initial_graph = AgentTaskGraph {
+            tasks: vec![AgentTaskSummary {
+                id: AgentTaskId::from("TASK-1"),
+                parent_id: None,
+                goal_id: None,
+                title: "Task 1".to_string(),
+                status: AgentTaskStatus::Ready,
+                attempt: 1,
+                assignee: None,
+                write_scopes: vec![],
+                created_at: None,
+                assigned_profile: None,
+                model: None,
+            }],
+            goals: vec![],
+        };
+
+        let provider = Arc::new(DynamicProvider {
+            graph: parking_lot::Mutex::new(initial_graph.clone()),
+            events: parking_lot::Mutex::new(Vec::new()),
+        });
+
+        let store = cx.update(|cx| cx.new(|cx| AgentTaskStore::new(provider.clone(), cx)));
+
+        let notify_count = Arc::new(AtomicUsize::new(0));
+        let notify_count_clone = notify_count.clone();
+        cx.update(|cx| {
+            cx.observe(&store, move |_, _| {
+                notify_count_clone.fetch_add(1, Ordering::SeqCst);
+            })
+            .detach();
+        });
+
+        cx.run_until_parked();
+        let initial_notifies = notify_count.load(Ordering::SeqCst);
+        assert!(initial_notifies >= 1);
+
+        let refresh_task = store.update(cx, |s, cx| s.refresh(cx));
+        refresh_task.await.ok();
+        assert_eq!(notify_count.load(Ordering::SeqCst), initial_notifies);
+
+        let mut updated_graph = initial_graph.clone();
+        updated_graph.tasks[0].status = AgentTaskStatus::Running;
+        *provider.graph.lock() = updated_graph;
+
+        let refresh_task = store.update(cx, |s, cx| s.refresh(cx));
+        refresh_task.await.ok();
+        assert_eq!(notify_count.load(Ordering::SeqCst), initial_notifies + 1);
     }
 }

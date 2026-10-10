@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result};
 use futures::StreamExt;
@@ -72,6 +73,35 @@ pub struct TaskGitSnapshot {
 
 pub type DiffCache = Arc<Mutex<HashMap<(String, String), DiffShortStat>>>;
 
+pub const SPEC_DIFF_CACHE_TTL: Duration = Duration::from_secs(30);
+
+static TIMED_DIFF_CACHE: std::sync::OnceLock<
+    Mutex<HashMap<(PathBuf, String), (Instant, Option<DiffShortStat>)>>,
+> = std::sync::OnceLock::new();
+
+fn timed_diff_cache() -> &'static Mutex<HashMap<(PathBuf, String), (Instant, Option<DiffShortStat>)>>
+{
+    TIMED_DIFF_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn get_timed_cached_diff(working_dir: &Path, diff_spec: &str) -> Option<Option<DiffShortStat>> {
+    let key = (working_dir.to_path_buf(), diff_spec.to_string());
+    let cache = timed_diff_cache().lock();
+    if let Some((timestamp, stat)) = cache.get(&key) {
+        if timestamp.elapsed() < SPEC_DIFF_CACHE_TTL {
+            return Some(*stat);
+        }
+    }
+    None
+}
+
+fn set_timed_cached_diff(working_dir: &Path, diff_spec: &str, stat: Option<DiffShortStat>) {
+    let key = (working_dir.to_path_buf(), diff_spec.to_string());
+    timed_diff_cache()
+        .lock()
+        .insert(key, (Instant::now(), stat));
+}
+
 static GLOBAL_DIFF_CACHE: std::sync::OnceLock<Mutex<HashMap<(String, String), DiffShortStat>>> =
     std::sync::OnceLock::new();
 
@@ -117,6 +147,8 @@ async fn compute_short_stat_for_diff(
         if let Some(cached) = get_cached_diff(cache, base, head) {
             return Some(cached);
         }
+    } else if let Some(cached) = get_timed_cached_diff(working_dir, diff_spec) {
+        return cached;
     }
 
     if !working_dir.is_dir() {
@@ -128,7 +160,7 @@ async fn compute_short_stat_for_diff(
     command.args(["diff", "--numstat", "--no-renames", diff_spec]);
     command.current_dir(working_dir);
 
-    match command.output().await {
+    let stat = match command.output().await {
         Ok(output) if output.status.success() => {
             let stdout = String::from_utf8_lossy(&output.stdout);
             let stat = DiffShortStat::from_numstat(&stdout);
@@ -152,7 +184,13 @@ async fn compute_short_stat_for_diff(
             );
             None
         }
+    };
+
+    if base_sha.is_none() || head_sha.is_none() {
+        set_timed_cached_diff(working_dir, diff_spec, stat);
     }
+
+    stat
 }
 
 pub fn snapshot(
@@ -427,6 +465,8 @@ pub struct TaskWorktreeStatus {
     last_error: Option<String>,
     current_epoch: u64,
     diff_cache: DiffCache,
+    last_tasks: Option<Vec<AgentTaskSummary>>,
+    last_goals: Option<Vec<AgentGoalSummary>>,
 }
 
 impl TaskWorktreeStatus {
@@ -438,6 +478,8 @@ impl TaskWorktreeStatus {
             last_error: None,
             current_epoch: 0,
             diff_cache: Arc::new(Mutex::new(HashMap::new())),
+            last_tasks: None,
+            last_goals: None,
         }
     }
 
@@ -463,12 +505,24 @@ impl TaskWorktreeStatus {
         goals: Vec<AgentGoalSummary>,
         cx: &mut Context<Self>,
     ) -> Task<Result<TaskGitSnapshot>> {
+        if self.snapshot.is_some()
+            && self.last_error.is_none()
+            && self.last_tasks.as_ref() == Some(&tasks)
+            && self.last_goals.as_ref() == Some(&goals)
+        {
+            if let Some(snapshot) = self.snapshot.clone() {
+                return Task::ready(Ok(snapshot));
+            }
+        }
+
         self.current_epoch = self.current_epoch.wrapping_add(1);
         let request_epoch = self.current_epoch;
         self.is_loading = true;
         self.last_error = None;
         cx.notify();
 
+        let tasks_clone = tasks.clone();
+        let goals_clone = goals.clone();
         let snapshot_task = snapshot_with_cache(
             &self.project,
             &tasks,
@@ -484,6 +538,8 @@ impl TaskWorktreeStatus {
                     match &result {
                         Ok(snapshot) => {
                             status.snapshot = Some(snapshot.clone());
+                            status.last_tasks = Some(tasks_clone);
+                            status.last_goals = Some(goals_clone);
                             status.last_error = None;
                         }
                         Err(err) => {
@@ -504,6 +560,8 @@ impl TaskWorktreeStatus {
 
     pub fn set_snapshot_for_test(&mut self, snapshot: TaskGitSnapshot, cx: &mut Context<Self>) {
         self.snapshot = Some(snapshot);
+        self.last_tasks = None;
+        self.last_goals = None;
         cx.notify();
     }
 }
@@ -966,5 +1024,92 @@ mod tests {
         let formatted = format!("{outer_err:#}");
         assert!(formatted.contains("opening repo at /test/.git"));
         assert!(formatted.contains("no git binary available"));
+    }
+
+    #[gpui::test]
+    async fn test_task_worktree_status_refresh_dirty_checking(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/root"),
+            json!({
+                ".git": {
+                    "HEAD": "ref: refs/heads/main\n"
+                }
+            }),
+        )
+        .await;
+
+        let dot_git = std::path::Path::new(path!("/root/.git"));
+        fs.with_git_state(dot_git, true, |state| {
+            state.branches.insert("main".into());
+            state
+                .refs
+                .insert("refs/heads/main".into(), "main-sha-100".into());
+            state.refs.insert("HEAD".into(), "main-sha-100".into());
+        })
+        .unwrap();
+
+        let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
+        let status_entity =
+            cx.update(|cx| cx.new(|cx| TaskWorktreeStatus::new(project.clone(), cx)));
+
+        let notify_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let notify_count_clone = notify_count.clone();
+        cx.update(|cx| {
+            cx.observe(&status_entity, move |_, _| {
+                notify_count_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            })
+            .detach();
+        });
+
+        let tasks = vec![AgentTaskSummary {
+            id: AgentTaskId::from("TASK-1"),
+            parent_id: None,
+            goal_id: None,
+            title: "Task 1".to_string(),
+            status: AgentTaskStatus::Running,
+            attempt: 1,
+            assignee: None,
+            write_scopes: vec![],
+            created_at: None,
+            assigned_profile: None,
+            model: None,
+        }];
+
+        let snap1 = status_entity
+            .update(cx, |s, cx| s.refresh(tasks.clone(), vec![], cx))
+            .await
+            .unwrap();
+        let notifies_after_first = notify_count.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(notifies_after_first > 0);
+
+        let snap2 = status_entity
+            .update(cx, |s, cx| s.refresh(tasks.clone(), vec![], cx))
+            .await
+            .unwrap();
+        assert_eq!(snap1, snap2);
+        assert_eq!(
+            notify_count.load(std::sync::atomic::Ordering::SeqCst),
+            notifies_after_first
+        );
+    }
+
+    #[gpui::test]
+    async fn test_compute_diff_short_stat_timed_cache_when_sha_missing() {
+        let test_dir = std::path::Path::new("/test/timed_cache_dir");
+        let diff_spec = "main...feature";
+        let expected = DiffShortStat {
+            files: 3,
+            added: 12,
+            removed: 5,
+        };
+
+        set_timed_cached_diff(test_dir, diff_spec, Some(expected));
+
+        let result =
+            compute_short_stat_for_diff(test_dir, diff_spec, None, Some("head_sha"), None).await;
+
+        assert_eq!(result, Some(expected));
     }
 }
