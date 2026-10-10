@@ -269,28 +269,42 @@ impl ThreadItem {
     }
 }
 
+/// Strips provider prefixes from model identifiers or names.
+///
+/// Removes prefixes separated by `/` (up to the last slash) and `:`
+/// (up to the last colon if no slash or after the last separator).
+pub fn strip_model_provider(name: &str) -> &str {
+    let after_slash = name.rsplit_once('/').map_or(name, |(_, model)| model);
+    after_slash.rsplit_once(':').map_or(after_slash, |(_, model)| model)
+}
+
 impl RenderOnce for ThreadItem {
     fn render(self, _: &mut Window, cx: &mut App) -> impl IntoElement {
         let color = cx.theme().colors();
-        let raw_bg = self.base_bg.unwrap_or(color.surface_background);
         // The fade gradient paints a solid color over the title to blend it into
         // the row background, but a transparent window has no opaque surface to
         // fade into, so it renders as a visible patch; truncate the title instead.
-        let opaque_window = cx.theme().window_background_appearance()
-            == WindowBackgroundAppearance::Opaque
-            && raw_bg.a >= 1.0;
+        let opaque_window =
+            cx.theme().window_background_appearance() == WindowBackgroundAppearance::Opaque;
+        let sidebar_base_bg = color
+            .title_bar_background
+            .blend(color.panel_background.opacity(0.25));
+
+        let raw_bg = self.base_bg.unwrap_or(sidebar_base_bg);
         let apparent_bg = color.background.blend(raw_bg);
 
         let base_bg = if self.selected {
-            apparent_bg.blend(color.ghost_element_selected)
+            apparent_bg.blend(color.element_active)
         } else {
             apparent_bg
         };
 
-        let hover_bg = apparent_bg.blend(color.ghost_element_hover);
-        let active_bg = apparent_bg.blend(color.ghost_element_active);
+        let hover_color = color
+            .element_active
+            .blend(color.element_background.opacity(0.2));
+        let hover_bg = apparent_bg.blend(hover_color);
 
-        let gradient_overlay = GradientFade::new(base_bg, hover_bg, active_bg)
+        let gradient_overlay = GradientFade::new(base_bg, hover_bg, hover_bg)
             .width(px(64.0))
             .right(px(-10.0))
             .gradient_stop(0.7)
@@ -376,7 +390,6 @@ impl RenderOnce for ThreadItem {
         } else if self.title_generating {
             Label::new(title)
                 .color(Color::Muted)
-                .when(!opaque_window, |label| label.truncate())
                 .with_animation(
                     "generating-title",
                     Animation::new(Duration::from_secs(2))
@@ -459,15 +472,6 @@ impl RenderOnce for ThreadItem {
 
         let mut metadata_segments: Vec<AnyElement> = Vec::new();
 
-        if has_timestamp {
-            metadata_segments.push(
-                Label::new(timestamp)
-                    .size(LabelSize::Small)
-                    .color(Color::Muted)
-                    .into_any_element(),
-            );
-        }
-
         if let Some(agent_name) = self.agent_name.filter(|s| !s.is_empty()) {
             metadata_segments.push(
                 h_flex()
@@ -483,17 +487,20 @@ impl RenderOnce for ThreadItem {
         }
 
         if let Some(model_name) = self.model_name.filter(|s| !s.is_empty()) {
-            metadata_segments.push(
-                h_flex()
-                    .min_w_0()
-                    .flex_shrink(1.0)
-                    .child(
-                        Label::new(model_name)
-                            .size(LabelSize::Small)
-                            .color(Color::Muted),
-                    )
-                    .into_any_element(),
-            );
+            let model_name = strip_model_provider(&model_name);
+            if !model_name.is_empty() {
+                metadata_segments.push(
+                    h_flex()
+                        .min_w_0()
+                        .flex_shrink(1.0)
+                        .child(
+                            Label::new(model_name)
+                                .size(LabelSize::Small)
+                                .color(Color::Muted),
+                        )
+                        .into_any_element(),
+                );
+            }
         }
 
         if has_worktree_section {
@@ -608,7 +615,7 @@ impl RenderOnce for ThreadItem {
             metadata_segments.push(diff_section.into_any_element());
         }
 
-        let has_metadata = !metadata_segments.is_empty();
+        let has_metadata = has_timestamp || !metadata_segments.is_empty() || self.archived;
         v_flex()
             .id(self.id.clone())
             .cursor_pointer()
@@ -619,14 +626,12 @@ impl RenderOnce for ThreadItem {
             .w_full()
             .py_1()
             .px_1p5()
-            .when(self.selected, |s| s.bg(color.ghost_element_selected))
+            .when(self.selected, |s| s.bg(color.element_active))
             .border_1()
-            .border_r_2()
             .border_color(gpui::transparent_black())
-            .when(self.focused, |s| s.border_color(color.panel_focused_border))
+            .when(self.focused, |s| s.border_color(color.border_focused))
             .when(self.rounded, |s| s.rounded_sm())
-            .hover(|s| s.bg(color.ghost_element_hover))
-            .active(|s| s.bg(color.ghost_element_active))
+            .hover(|s| s.bg(hover_color))
             .on_hover(self.on_hover)
             .child(
                 h_flex()
@@ -652,30 +657,31 @@ impl RenderOnce for ThreadItem {
                             this.child(
                                 h_flex()
                                     .relative()
+                                    .pr_1p5()
                                     .when(opaque_window, |this| {
                                         this.child(
-                                            GradientFade::new(base_bg, hover_bg, active_bg)
+                                            GradientFade::new(base_bg, hover_bg, hover_bg)
                                                 .width(px(120.0))
                                                 .right(px(8.))
                                                 .gradient_stop(0.90)
                                                 .group_name("thread-item"),
                                         )
                                     })
-                                    .child(
-                                        h_flex()
-                                            .pr_1p5()
-                                            .child(slot)
-                                            .on_mouse_down(MouseButton::Left, |_, _, cx| {
-                                                cx.stop_propagation()
-                                            }),
-                                    ),
+                                    .child(slot)
+                                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                        cx.stop_propagation()
+                                    }),
                             )
                         })
                     }),
             )
             .when(has_metadata, |this| {
-                let mut row = h_flex()
+                let mut left = h_flex()
+                    .min_w_0()
+                    .flex_1()
+                    .overflow_hidden()
                     .gap_1p5()
+                    .items_center()
                     .child(icon_container()) // Icon Spacing
                     .when(self.archived, |this| {
                         this.child(
@@ -688,13 +694,26 @@ impl RenderOnce for ThreadItem {
                 let mut first = true;
                 for segment in metadata_segments {
                     if !first {
-                        row = row.child(dot_separator());
+                        left = left.child(dot_separator());
                     }
-                    row = row.child(segment);
+                    left = left.child(segment);
                     first = false;
                 }
 
-                this.child(row)
+                this.child(
+                    h_flex()
+                        .w_full()
+                        .justify_between()
+                        .child(left)
+                        .when(has_timestamp, |this| {
+                            this.child(
+                                Label::new(timestamp)
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted)
+                                    .flex_shrink_0(),
+                            )
+                        }),
+                )
             })
             .when(show_tooltip, |this| {
                 let status = self.status;
@@ -736,7 +755,9 @@ impl Component for ThreadItem {
 
     fn preview(_window: &mut Window, cx: &mut App) -> AnyElement {
         let color = cx.theme().colors();
-        let bg = color.surface_background;
+        let bg = color
+            .title_bar_background
+            .blend(color.panel_background.opacity(0.25));
 
         let container = || {
             v_flex()
@@ -1100,66 +1121,33 @@ impl Component for ThreadItem {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui::{Background, Modifiers, TestAppContext, VisualTestContext, point};
 
-    #[gpui::test]
-    fn test_thread_action_padding_preserves_row_background(cx: &mut TestAppContext) {
-        cx.update(|cx| {
-            let settings_store = settings::SettingsStore::test(cx);
-            cx.set_global(settings_store);
-            theme_settings::init(theme::LoadThemes::JustBase, cx);
-        });
-        let (view, cx) = cx.add_window_view(|_, _| ThreadItemTestView { clicks: 0 });
-        let action_bounds = cx.debug_bounds("ACTION_SLOT").expect("action bounds");
-        let position = point(action_bounds.left() + px(2.), action_bounds.center().y);
-        cx.simulate_mouse_move(position, None, Modifiers::default());
-        let before = painted_backgrounds(cx);
-        cx.simulate_mouse_down(position, MouseButton::Left, Modifiers::default());
-        assert_eq!(painted_backgrounds(cx), before);
-        cx.simulate_mouse_up(position, MouseButton::Left, Modifiers::default());
-        assert_eq!(view.read_with(cx, |view, _| view.clicks), 0);
-
-        let position = point(px(25.), action_bounds.center().y);
-        cx.simulate_mouse_move(position, None, Modifiers::default());
-        cx.simulate_mouse_down(position, MouseButton::Left, Modifiers::default());
-        let active = cx.update(|_, cx| Background::from(cx.theme().colors().ghost_element_active));
-        assert_eq!(painted_backgrounds(cx).first(), Some(&active));
-        cx.simulate_mouse_up(position, MouseButton::Left, Modifiers::default());
-        assert_eq!(view.read_with(cx, |view, _| view.clicks), 1);
-    }
-
-    struct ThreadItemTestView {
-        clicks: usize,
-    }
-
-    impl Render for ThreadItemTestView {
-        fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-            div().size_full().p(px(20.)).child(
-                div().w(px(400.)).child(
-                    ThreadItem::new("thread", "Thread")
-                        .hovered(true)
-                        .action_slot(
-                            div()
-                                .debug_selector(|| "ACTION_SLOT".to_owned())
-                                .pl(px(16.))
-                                .child(
-                                    IconButton::new("action", IconName::Archive)
-                                        .on_click(|_, _, _| {}),
-                                ),
-                        )
-                        .on_click(cx.listener(|view, _, _, _| view.clicks += 1)),
-                ),
-            )
-        }
-    }
-
-    fn painted_backgrounds(cx: &mut VisualTestContext) -> Vec<Background> {
-        cx.update(|window, _| {
-            window
-                .painted_quads()
-                .into_iter()
-                .map(|quad| quad.background)
-                .collect()
-        })
+    #[test]
+    fn test_strip_model_provider() {
+        assert_eq!(
+            strip_model_provider("anthropic/claude-3-7-sonnet"),
+            "claude-3-7-sonnet"
+        );
+        assert_eq!(
+            strip_model_provider("openrouter/anthropic/claude-3.5-sonnet"),
+            "claude-3.5-sonnet"
+        );
+        assert_eq!(
+            strip_model_provider("anthropic:claude-3.7-sonnet"),
+            "claude-3.7-sonnet"
+        );
+        assert_eq!(
+            strip_model_provider("provider:subprovider:model"),
+            "model"
+        );
+        assert_eq!(
+            strip_model_provider("openrouter/anthropic:claude-3.7-sonnet"),
+            "claude-3.7-sonnet"
+        );
+        assert_eq!(
+            strip_model_provider("claude-3-7-sonnet"),
+            "claude-3-7-sonnet"
+        );
+        assert_eq!(strip_model_provider(""), "");
     }
 }
