@@ -8,7 +8,7 @@ pub mod util;
 
 use anyhow::{Context as _, Result, anyhow};
 use cloud_llm_client::CompletionRequestStatus;
-use http_client::{StatusCode, http};
+use http::StatusCode;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::ops::{Add, Sub};
@@ -30,6 +30,12 @@ pub use crate::util::{
     parse_tool_arguments,
 };
 pub use gpui_shared_string::SharedString;
+
+/// The events of a streaming completion, as produced by a provider.
+pub type LanguageModelCompletionStream = futures::stream::BoxStream<
+    'static,
+    Result<LanguageModelCompletionEvent, LanguageModelCompletionError>,
+>;
 
 /// A completion event from a language model.
 #[derive(Debug, PartialEq, Clone, Serialize, Deserialize)]
@@ -267,6 +273,13 @@ pub enum LanguageModelCompletionError {
     },
     #[error("stream from {provider} ended unexpectedly")]
     StreamEndedUnexpectedly { provider: LanguageModelProviderName },
+    /// The provider no longer offers a model with this id, for example after
+    /// its settings or fetched model list changed.
+    #[error("{provider} no longer offers the model {}", model.0)]
+    ModelUnavailable {
+        provider: LanguageModelProviderName,
+        model: LanguageModelId,
+    },
     #[error(transparent)]
     Other(#[from] anyhow::Error),
 }
@@ -422,7 +435,8 @@ impl LanguageModelCompletionError {
             | Self::SerializeRequest { .. }
             | Self::BuildRequestBody { .. }
             | Self::DeserializeResponse { .. }
-            | Self::StreamEndedUnexpectedly { .. } => false,
+            | Self::StreamEndedUnexpectedly { .. }
+            | Self::ModelUnavailable { .. } => false,
             Self::Other(error) => is_upstream_network_failure(&format!("{error:#}")),
         }
     }
@@ -455,6 +469,7 @@ impl LanguageModelCompletionError {
             | Self::BuildRequestBody { .. }
             | Self::DeserializeResponse { .. }
             | Self::StreamEndedUnexpectedly { .. }
+            | Self::ModelUnavailable { .. }
             | Self::Other(_) => None,
         }
     }
@@ -706,7 +721,7 @@ impl LanguageModelToolUseInput {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LanguageModelEffortLevel {
     pub name: SharedString,
     pub value: SharedString,
