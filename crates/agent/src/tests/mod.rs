@@ -9085,6 +9085,7 @@ async fn test_subagent_with_explicit_profile_model_not_overridden_by_parent(
                 speed: None,
             }),
         );
+        profile_model
     });
 
     let fs = FakeFs::new(cx.executor());
@@ -13036,7 +13037,7 @@ async fn test_spawn_agent_non_git_degrades_isolation(cx: &mut TestAppContext) {
 
 #[gpui::test]
 async fn test_spawn_agent_error_creates_wip_commit(cx: &mut TestAppContext) {
-    init_test(cx);
+    let fake = init_test(cx);
     always_allow_tools(cx);
     cx.update(|cx| {
         LanguageModelRegistry::test(cx);
@@ -13071,7 +13072,7 @@ async fn test_spawn_agent_error_creates_wip_commit(cx: &mut TestAppContext) {
     let thread = agent.read_with(cx, |agent, _| {
         agent.sessions.get(&session_id).unwrap().thread.clone()
     });
-    let model = Arc::new(FakeLanguageModel::default());
+    let model = fake.model("fake");
 
     thread.update(cx, |thread, cx| {
         thread.set_model(model.clone(), cx);
@@ -13080,7 +13081,7 @@ async fn test_spawn_agent_error_creates_wip_commit(cx: &mut TestAppContext) {
 
     let send = acp_thread.update(cx, |thread, cx| thread.send_raw("Start failing task", cx));
     cx.run_until_parked();
-    model.send_last_completion_stream_text_chunk("spawning subagent");
+    fake.send_last_text(&model, "spawning subagent");
     let subagent_input = SpawnAgentToolInput {
         label: "error task".to_string(),
         message: "do error task".to_string(),
@@ -13102,8 +13103,8 @@ async fn test_spawn_agent_error_creates_wip_commit(cx: &mut TestAppContext) {
         is_input_complete: true,
         thought_signature: None,
     };
-    model.send_last_completion_stream_event(LanguageModelCompletionEvent::ToolUse(tool_use));
-    model.end_last_completion_stream();
+    fake.send_last_event(&model, LanguageModelCompletionEvent::ToolUse(tool_use));
+    fake.end_last(&model);
     cx.run_until_parked();
 
     let subagent_session_id = thread.read_with(cx, |thread, cx| {
@@ -13138,15 +13139,16 @@ async fn test_spawn_agent_error_creates_wip_commit(cx: &mut TestAppContext) {
         is_input_complete: true,
         thought_signature: None,
     };
-    model.send_last_completion_stream_event(LanguageModelCompletionEvent::ToolUse(write_tool_use));
-    model.end_last_completion_stream();
+    fake.send_last_event(&model, LanguageModelCompletionEvent::ToolUse(write_tool_use));
+    fake.end_last(&model);
     cx.run_until_parked();
 
     // Now subagent model produces an error / cancelled
-    model.send_last_completion_stream_event(LanguageModelCompletionEvent::Stop(
-        language_model::StopReason::Refusal,
-    ));
-    model.end_last_completion_stream();
+    fake.send_last_event(
+        &model,
+        LanguageModelCompletionEvent::Stop(language_model::StopReason::Refusal),
+    );
+    fake.end_last(&model);
     cx.run_until_parked();
 
     // Verify WIP-commit exists in the worktree
@@ -13175,8 +13177,8 @@ async fn test_spawn_agent_error_creates_wip_commit(cx: &mut TestAppContext) {
     );
 
     // Parent completes turn
-    model.send_last_completion_stream_text_chunk("Parent response");
-    model.end_last_completion_stream();
+    fake.send_last_text(&model, "Parent response");
+    fake.end_last(&model);
     send.await.unwrap();
 }
 
@@ -13473,7 +13475,7 @@ async fn test_startup_sweep_cleans_only_terminal_tasks(cx: &mut TestAppContext) 
 
 #[gpui::test]
 async fn test_subagent_lsp_rename_denied_outside_task_worktree(cx: &mut TestAppContext) {
-    init_test(cx);
+    let fake = init_test(cx);
     always_allow_tools(cx);
     cx.update(|cx| {
         LanguageModelRegistry::test(cx);
@@ -13508,7 +13510,7 @@ async fn test_subagent_lsp_rename_denied_outside_task_worktree(cx: &mut TestAppC
     let thread = agent.read_with(cx, |agent, _| {
         agent.sessions.get(&session_id).unwrap().thread.clone()
     });
-    let model = Arc::new(FakeLanguageModel::default());
+    let model = fake.model("fake");
 
     thread.update(cx, |thread, cx| {
         thread.set_model(model.clone(), cx);
@@ -13518,7 +13520,7 @@ async fn test_subagent_lsp_rename_denied_outside_task_worktree(cx: &mut TestAppC
     // Spawn subagent with TASK-LSP
     let _send = acp_thread.update(cx, |thread, cx| thread.send_raw("Start subagent", cx));
     cx.run_until_parked();
-    model.send_last_completion_stream_text_chunk("spawning subagent");
+    fake.send_last_text(&model, "spawning subagent");
     let subagent_input = SpawnAgentToolInput {
         label: "lsp test".to_string(),
         message: "do lsp test".to_string(),
@@ -13540,8 +13542,8 @@ async fn test_subagent_lsp_rename_denied_outside_task_worktree(cx: &mut TestAppC
         is_input_complete: true,
         thought_signature: None,
     };
-    model.send_last_completion_stream_event(LanguageModelCompletionEvent::ToolUse(tool_use));
-    model.end_last_completion_stream();
+    fake.send_last_event(&model, LanguageModelCompletionEvent::ToolUse(tool_use));
+    fake.end_last(&model);
     cx.run_until_parked();
 
     // Subagent attempts to rename outside.txt
@@ -13563,12 +13565,12 @@ async fn test_subagent_lsp_rename_denied_outside_task_worktree(cx: &mut TestAppC
         is_input_complete: true,
         thought_signature: None,
     };
-    model.send_last_completion_stream_event(LanguageModelCompletionEvent::ToolUse(rename_tool_use));
-    model.end_last_completion_stream();
+    fake.send_last_event(&model, LanguageModelCompletionEvent::ToolUse(rename_tool_use));
+    fake.end_last(&model);
     cx.run_until_parked();
 
     // Verify subagent tool result is PolicyDenied
-    let completion = model
+    let completion = fake
         .pending_completions()
         .pop()
         .expect("expected subagent completion after rename");
@@ -13602,18 +13604,18 @@ async fn test_subagent_lsp_rename_denied_outside_task_worktree(cx: &mut TestAppC
     let outside_content = fs.load(path!("/root/outside.txt").as_ref()).await.unwrap();
     assert_eq!(outside_content, "outside content");
 
-    model.send_last_completion_stream_text_chunk("subagent finished");
-    model.end_last_completion_stream();
+    fake.send_last_text(&model, "subagent finished");
+    fake.end_last(&model);
     cx.run_until_parked();
 
-    model.send_last_completion_stream_text_chunk("parent finished");
-    model.end_last_completion_stream();
+    fake.send_last_text(&model, "parent finished");
+    fake.end_last(&model);
     _send.await.unwrap();
 }
 
 #[gpui::test]
 async fn test_spawn_agent_with_goal_id_and_base_branch(cx: &mut TestAppContext) {
-    init_test(cx);
+    let fake = init_test(cx);
     always_allow_tools(cx);
     cx.update(|cx| {
         LanguageModelRegistry::test(cx);
@@ -13650,7 +13652,7 @@ async fn test_spawn_agent_with_goal_id_and_base_branch(cx: &mut TestAppContext) 
     let thread = agent.read_with(cx, |agent, _| {
         agent.sessions.get(&session_id).unwrap().thread.clone()
     });
-    let model = Arc::new(FakeLanguageModel::default());
+    let model = fake.model("fake");
 
     thread.update(cx, |thread, cx| {
         thread.set_model(model.clone(), cx);
@@ -13660,7 +13662,7 @@ async fn test_spawn_agent_with_goal_id_and_base_branch(cx: &mut TestAppContext) 
     // 1. Unknown base_branch -> model-readable error before subagent starts
     let send1 = acp_thread.update(cx, |thread, cx| thread.send_raw("Start invalid branch", cx));
     cx.run_until_parked();
-    model.send_last_completion_stream_text_chunk("spawning subagent invalid");
+    fake.send_last_text(&model, "spawning subagent invalid");
     let invalid_input = SpawnAgentToolInput {
         label: "invalid branch test".to_string(),
         message: "do work".to_string(),
@@ -13682,12 +13684,12 @@ async fn test_spawn_agent_with_goal_id_and_base_branch(cx: &mut TestAppContext) 
         is_input_complete: true,
         thought_signature: None,
     };
-    model
-        .send_last_completion_stream_event(LanguageModelCompletionEvent::ToolUse(tool_use_invalid));
-    model.end_last_completion_stream();
+    fake
+        .send_last_event(&model, LanguageModelCompletionEvent::ToolUse(tool_use_invalid));
+    fake.end_last(&model);
     cx.run_until_parked();
 
-    let completion = model
+    let completion = fake
         .pending_completions()
         .pop()
         .expect("expected parent completion");
@@ -13706,14 +13708,14 @@ async fn test_spawn_agent_with_goal_id_and_base_branch(cx: &mut TestAppContext) 
         _ => panic!("expected text"),
     };
     assert!(err_str.contains("branch not found: nonexistent-branch"));
-    model.send_last_completion_stream_text_chunk("recovered");
-    model.end_last_completion_stream();
+    fake.send_last_text(&model, "recovered");
+    fake.end_last(&model);
     send1.await.unwrap();
 
     // 2. Goal branch lazy creation and task fork from goal-tip
     let send2 = acp_thread.update(cx, |thread, cx| thread.send_raw("Start goal task", cx));
     cx.run_until_parked();
-    model.send_last_completion_stream_text_chunk("spawning goal subagent");
+    fake.send_last_text(&model, "spawning goal subagent");
     let goal_input = SpawnAgentToolInput {
         label: "goal task".to_string(),
         message: "do goal work".to_string(),
@@ -13735,16 +13737,16 @@ async fn test_spawn_agent_with_goal_id_and_base_branch(cx: &mut TestAppContext) 
         is_input_complete: true,
         thought_signature: None,
     };
-    model.send_last_completion_stream_event(LanguageModelCompletionEvent::ToolUse(tool_use_goal));
-    model.end_last_completion_stream();
+    fake.send_last_event(&model, LanguageModelCompletionEvent::ToolUse(tool_use_goal));
+    fake.end_last(&model);
     cx.run_until_parked();
 
     // Subagent finishes work
-    model.send_last_completion_stream_text_chunk("done with goal task");
-    model.end_last_completion_stream();
+    fake.send_last_text(&model, "done with goal task");
+    fake.end_last(&model);
     cx.run_until_parked();
 
-    let completion2 = model
+    let completion2 = fake
         .pending_completions()
         .pop()
         .expect("expected parent completion");
@@ -13778,13 +13780,13 @@ async fn test_spawn_agent_with_goal_id_and_base_branch(cx: &mut TestAppContext) 
     );
 
     // 3. Task without goal_id/base_branch has None for base_branch in isolation_details
-    model.send_last_completion_stream_text_chunk("Parent response 2");
-    model.end_last_completion_stream();
+    fake.send_last_text(&model, "Parent response 2");
+    fake.end_last(&model);
     send2.await.unwrap();
 
     let _send3 = acp_thread.update(cx, |thread, cx| thread.send_raw("Start standard task", cx));
     cx.run_until_parked();
-    model.send_last_completion_stream_text_chunk("spawning standard subagent");
+    fake.send_last_text(&model, "spawning standard subagent");
     let standard_input = SpawnAgentToolInput {
         label: "standard task".to_string(),
         message: "do standard work".to_string(),
@@ -13806,17 +13808,18 @@ async fn test_spawn_agent_with_goal_id_and_base_branch(cx: &mut TestAppContext) 
         is_input_complete: true,
         thought_signature: None,
     };
-    model.send_last_completion_stream_event(LanguageModelCompletionEvent::ToolUse(
-        tool_use_standard,
-    ));
-    model.end_last_completion_stream();
+    fake.send_last_event(
+        &model,
+        LanguageModelCompletionEvent::ToolUse(tool_use_standard),
+    );
+    fake.end_last(&model);
     cx.run_until_parked();
 
-    model.send_last_completion_stream_text_chunk("done with standard task");
-    model.end_last_completion_stream();
+    fake.send_last_text(&model, "done with standard task");
+    fake.end_last(&model);
     cx.run_until_parked();
 
-    let completion3 = model
+    let completion3 = fake
         .pending_completions()
         .pop()
         .expect("expected parent completion");
@@ -13845,7 +13848,7 @@ async fn test_spawn_agent_with_goal_id_and_base_branch(cx: &mut TestAppContext) 
 
 #[gpui::test]
 async fn test_spawn_agent_with_on_branch_goal_and_exclusivity(cx: &mut TestAppContext) {
-    init_test(cx);
+    let fake = init_test(cx);
     always_allow_tools(cx);
     cx.update(|cx| {
         LanguageModelRegistry::test(cx);
@@ -13882,7 +13885,7 @@ async fn test_spawn_agent_with_on_branch_goal_and_exclusivity(cx: &mut TestAppCo
     let thread = agent.read_with(cx, |agent, _| {
         agent.sessions.get(&session_id).unwrap().thread.clone()
     });
-    let model = Arc::new(FakeLanguageModel::default());
+    let model = fake.model("fake");
 
     thread.update(cx, |thread, cx| {
         thread.set_model(model.clone(), cx);
@@ -13894,7 +13897,7 @@ async fn test_spawn_agent_with_on_branch_goal_and_exclusivity(cx: &mut TestAppCo
         thread.send_raw("Start mutual exclusivity", cx)
     });
     cx.run_until_parked();
-    model.send_last_completion_stream_text_chunk("spawning subagent mutual exclusivity");
+    fake.send_last_text(&model, "spawning subagent mutual exclusivity");
     let invalid_input1 = SpawnAgentToolInput {
         label: "mutually exclusive test".to_string(),
         message: "do work".to_string(),
@@ -13916,11 +13919,11 @@ async fn test_spawn_agent_with_on_branch_goal_and_exclusivity(cx: &mut TestAppCo
         is_input_complete: true,
         thought_signature: None,
     };
-    model.send_last_completion_stream_event(LanguageModelCompletionEvent::ToolUse(tool_use1));
-    model.end_last_completion_stream();
+    fake.send_last_event(&model, LanguageModelCompletionEvent::ToolUse(tool_use1));
+    fake.end_last(&model);
     cx.run_until_parked();
 
-    let completion1 = model
+    let completion1 = fake
         .pending_completions()
         .pop()
         .expect("expected parent completion");
@@ -13939,8 +13942,8 @@ async fn test_spawn_agent_with_on_branch_goal_and_exclusivity(cx: &mut TestAppCo
         _ => panic!("expected text"),
     };
     assert!(err_str1.contains("on_branch and base_branch are mutually exclusive"));
-    model.send_last_completion_stream_text_chunk("recovered from mutex error");
-    model.end_last_completion_stream();
+    fake.send_last_text(&model, "recovered from mutex error");
+    fake.end_last(&model);
     send1.await.unwrap();
 
     // 2. Validation error: on_branch: "goal" requires goal_id
@@ -13948,7 +13951,7 @@ async fn test_spawn_agent_with_on_branch_goal_and_exclusivity(cx: &mut TestAppCo
         thread.send_raw("Start goal without id", cx)
     });
     cx.run_until_parked();
-    model.send_last_completion_stream_text_chunk("spawning subagent goal without id");
+    fake.send_last_text(&model, "spawning subagent goal without id");
     let invalid_input2 = SpawnAgentToolInput {
         label: "goal without id test".to_string(),
         message: "do work".to_string(),
@@ -13970,11 +13973,11 @@ async fn test_spawn_agent_with_on_branch_goal_and_exclusivity(cx: &mut TestAppCo
         is_input_complete: true,
         thought_signature: None,
     };
-    model.send_last_completion_stream_event(LanguageModelCompletionEvent::ToolUse(tool_use2));
-    model.end_last_completion_stream();
+    fake.send_last_event(&model, LanguageModelCompletionEvent::ToolUse(tool_use2));
+    fake.end_last(&model);
     cx.run_until_parked();
 
-    let completion2 = model
+    let completion2 = fake
         .pending_completions()
         .pop()
         .expect("expected parent completion");
@@ -13994,14 +13997,14 @@ async fn test_spawn_agent_with_on_branch_goal_and_exclusivity(cx: &mut TestAppCo
         _ => panic!("expected text"),
     };
     assert!(err_str2.contains("on_branch 'goal' requires goal_id"));
-    model.send_last_completion_stream_text_chunk("recovered from missing goal_id error");
-    model.end_last_completion_stream();
+    fake.send_last_text(&model, "recovered from missing goal_id error");
+    fake.end_last(&model);
     send2.await.unwrap();
 
     // 3. Subagent 1 spawns on on_branch: "goal"
     let send3 = acp_thread.update(cx, |thread, cx| thread.send_raw("Start subagent 1", cx));
     cx.run_until_parked();
-    model.send_last_completion_stream_text_chunk("spawning subagent 1");
+    fake.send_last_text(&model, "spawning subagent 1");
     let subagent1_input = SpawnAgentToolInput {
         label: "subagent 1 on goal".to_string(),
         message: "do subagent 1 work".to_string(),
@@ -14023,8 +14026,8 @@ async fn test_spawn_agent_with_on_branch_goal_and_exclusivity(cx: &mut TestAppCo
         is_input_complete: true,
         thought_signature: None,
     };
-    model.send_last_completion_stream_event(LanguageModelCompletionEvent::ToolUse(tool_use3));
-    model.end_last_completion_stream();
+    fake.send_last_event(&model, LanguageModelCompletionEvent::ToolUse(tool_use3));
+    fake.end_last(&model);
     cx.run_until_parked();
 
     let subagent1_session_id = thread.read_with(cx, |thread, cx| {
@@ -14075,7 +14078,7 @@ async fn test_spawn_agent_with_on_branch_goal_and_exclusivity(cx: &mut TestAppCo
         thread.send_raw("Start concurrent subagent 2", cx)
     });
     cx.run_until_parked();
-    model.send_last_completion_stream_text_chunk("spawning subagent 2 on same goal");
+    fake.send_last_text(&model, "spawning subagent 2 on same goal");
     let subagent2_input = SpawnAgentToolInput {
         label: "subagent 2 on same goal".to_string(),
         message: "do subagent 2 work".to_string(),
@@ -14097,11 +14100,11 @@ async fn test_spawn_agent_with_on_branch_goal_and_exclusivity(cx: &mut TestAppCo
         is_input_complete: true,
         thought_signature: None,
     };
-    model.send_last_completion_stream_event(LanguageModelCompletionEvent::ToolUse(tool_use4));
-    model.end_last_completion_stream();
+    fake.send_last_event(&model, LanguageModelCompletionEvent::ToolUse(tool_use4));
+    fake.end_last(&model);
     cx.run_until_parked();
 
-    let completion_exc = model
+    let completion_exc = fake
         .pending_completions()
         .pop()
         .expect("expected completion for exclusivity error");
@@ -14126,17 +14129,17 @@ async fn test_spawn_agent_with_on_branch_goal_and_exclusivity(cx: &mut TestAppCo
         ),
         "expected exclusivity error, got: {err_str_exc}"
     );
-    model.send_last_completion_stream_text_chunk("recovered from exclusivity error");
-    model.end_last_completion_stream();
+    fake.send_last_text(&model, "recovered from exclusivity error");
+    fake.end_last(&model);
     send4.await.unwrap();
 
     // 5. Subagent 1 finishes work
-    model.send_last_completion_stream_text_chunk("subagent 1 finished work");
-    model.end_last_completion_stream();
+    fake.send_last_text(&model, "subagent 1 finished work");
+    fake.end_last(&model);
     cx.run_until_parked();
 
     // 6. Verify subagent 1 tool result: isolation == checkout:agent-goal/GOAL-EXC
-    let completion_sub1 = model
+    let completion_sub1 = fake
         .pending_completions()
         .pop()
         .expect("expected parent completion after subagent 1 finish");
@@ -14166,8 +14169,8 @@ async fn test_spawn_agent_with_on_branch_goal_and_exclusivity(cx: &mut TestAppCo
     assert!(parsed_sub1["isolation_details"]["merged_into"].is_null());
     assert_eq!(parsed_sub1["isolation_details"]["changed_files"], 0);
 
-    model.send_last_completion_stream_text_chunk("Parent finished");
-    model.end_last_completion_stream();
+    fake.send_last_text(&model, "Parent finished");
+    fake.end_last(&model);
     send3.await.unwrap();
 }
 

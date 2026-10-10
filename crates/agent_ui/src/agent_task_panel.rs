@@ -252,6 +252,7 @@ pub struct AgentTaskPanel {
     _search_subscription: Option<Subscription>,
     pub collapsed_goals: HashMap<String, bool>,
     pub collapsed_tasks: HashSet<AgentTaskId>,
+    pub seen_tasks: HashSet<AgentTaskId>,
     pub hovered_row: Option<HoveredRow>,
     pub context_menu: Option<DeployedContextMenu>,
     pub goal_cleanup_result: Option<agent::task_worktree::GoalCleanupResult>,
@@ -292,6 +293,9 @@ impl AgentTaskPanel {
                 this.refresh_worktree_status_if_needed(cx);
             }
             for task in &tasks {
+                if this.seen_tasks.insert(task.id.clone()) {
+                    this.collapsed_tasks.insert(task.id.clone());
+                }
                 if let AgentTaskStatus::Other(_) = &task.status {
                     if this.seen_other_statuses.insert(task.status.clone()) {
                         this.other_status_filters.insert(task.status.clone());
@@ -309,9 +313,14 @@ impl AgentTaskPanel {
 
         let mut seen_other_statuses = HashSet::new();
         let mut other_status_filters = HashSet::new();
+        let mut seen_tasks = HashSet::new();
+        let mut collapsed_tasks = HashSet::new();
         {
             let store_read = store.read(cx);
             for task in &store_read.graph().tasks {
+                if seen_tasks.insert(task.id.clone()) {
+                    collapsed_tasks.insert(task.id.clone());
+                }
                 if let AgentTaskStatus::Other(_) = &task.status {
                     if seen_other_statuses.insert(task.status.clone()) {
                         other_status_filters.insert(task.status.clone());
@@ -332,7 +341,8 @@ impl AgentTaskPanel {
             search_editor: None,
             _search_subscription: None,
             collapsed_goals: HashMap::new(),
-            collapsed_tasks: HashSet::new(),
+            collapsed_tasks,
+            seen_tasks,
             hovered_row: None,
             context_menu: None,
             goal_cleanup_result: None,
@@ -1301,11 +1311,7 @@ impl AgentTaskPanel {
         )
     }
 
-    fn render_goal_group(
-        &self,
-        group: GoalGroup,
-        cx: &mut Context<Self>,
-    ) -> Div {
+    fn render_goal_group(&self, group: GoalGroup, cx: &mut Context<Self>) -> Div {
         let hover_color = cx
             .theme()
             .colors()
@@ -1313,14 +1319,13 @@ impl AgentTaskPanel {
             .blend(cx.theme().colors().element_background.opacity(0.2));
 
         if let Some(goal_id) = group.goal_id {
-            let is_collapsed = self.collapsed_goals.get(&goal_id).copied().unwrap_or(false);
+            let is_collapsed = self.collapsed_goals.get(&goal_id).copied().unwrap_or(true);
 
             let title = group
                 .goal_summary
                 .as_ref()
                 .map(|g| g.title.clone())
                 .unwrap_or_else(|| goal_id.clone());
-
 
             let (tasks_done, tasks_total) = if let Some(summary) = &group.goal_summary {
                 (summary.tasks_done, summary.tasks_total)
@@ -1394,8 +1399,7 @@ impl AgentTaskPanel {
                         let goal_id = goal_id.clone();
                         move |this, _event, _window, cx| {
                             cx.stop_propagation();
-                            let entry =
-                                this.collapsed_goals.entry(goal_id.clone()).or_insert(false);
+                            let entry = this.collapsed_goals.entry(goal_id.clone()).or_insert(true);
                             *entry = !*entry;
                             cx.notify();
                         }
@@ -1510,7 +1514,7 @@ impl AgentTaskPanel {
                         })
                         .items_center()
                         .gap_1p5()
-                        .child(if has_children {
+                        .child(if has_children && !is_collapsed {
                             div()
                                 .w_4()
                                 .h_4()
@@ -1583,7 +1587,7 @@ impl AgentTaskPanel {
                 .collapsed_goals
                 .get(NO_GOAL_KEY)
                 .copied()
-                .unwrap_or(false);
+                .unwrap_or(true);
 
             let has_children = !group.rows.is_empty();
             let chevron_or_spacer = if has_children {
@@ -1602,7 +1606,7 @@ impl AgentTaskPanel {
                         let entry = this
                             .collapsed_goals
                             .entry(NO_GOAL_KEY.to_string())
-                            .or_insert(false);
+                            .or_insert(true);
                         *entry = !*entry;
                         cx.notify();
                     }))
@@ -1632,7 +1636,7 @@ impl AgentTaskPanel {
                     let entry = this
                         .collapsed_goals
                         .entry(NO_GOAL_KEY.to_string())
-                        .or_insert(false);
+                        .or_insert(true);
                     *entry = !*entry;
                     cx.notify();
                 }))
@@ -1664,11 +1668,7 @@ impl AgentTaskPanel {
         }
     }
 
-    fn render_task_row(
-        &self,
-        row: TaskRow,
-        cx: &mut Context<Self>,
-    ) -> gpui::AnyElement {
+    fn render_task_row(&self, row: TaskRow, cx: &mut Context<Self>) -> gpui::AnyElement {
         let task = row.task;
         let is_selected = self
             .selected_task_id
@@ -1682,7 +1682,6 @@ impl AgentTaskPanel {
             .read(cx)
             .policy_denied_event_for_task(&task.id)
             .cloned();
-
 
         let hover_color = cx
             .theme()
@@ -1878,7 +1877,7 @@ impl AgentTaskPanel {
                                 .buffer_font(cx),
                         )
                     })
-                    .when(row.has_children, |this| {
+                    .when(row.has_children && !row.is_collapsed, |this| {
                         this.child(
                             div()
                                 .w_4()
@@ -1894,9 +1893,11 @@ impl AgentTaskPanel {
                                 ),
                         )
                     })
-                    .when(!row.has_children && row.prefix.is_empty(), |this| {
-                        this.child(div().w_4().h_4().flex_shrink_0())
-                    })
+                    .when(
+                        (row.has_children && row.is_collapsed)
+                            || (!row.has_children && row.prefix.is_empty()),
+                        |this| this.child(div().w_4().h_4().flex_shrink_0()),
+                    )
                     .child(
                         Label::new(status_label(&task.status))
                             .size(LabelSize::Small)
@@ -1923,21 +1924,6 @@ impl AgentTaskPanel {
                         |this, model| {
                             this.child(dot_separator()).child(
                                 Label::new(model.to_string())
-                                    .size(LabelSize::Small)
-                                    .color(Color::Muted),
-                            )
-                        },
-                    )
-                    .when_some(
-                        task.goal_id.as_ref().filter(|g| !g.is_empty()),
-                        |this, goal_id| {
-                            let goal_seg = if goal_id.starts_with("GOAL-") {
-                                goal_id.clone()
-                            } else {
-                                format!("GOAL-{goal_id}")
-                            };
-                            this.child(dot_separator()).child(
-                                Label::new(goal_seg)
                                     .size(LabelSize::Small)
                                     .color(Color::Muted),
                             )
@@ -2635,14 +2621,6 @@ pub fn format_task_meta_line(task: &AgentTaskSummary, _diff: Option<&DiffShortSt
     if let Some(model) = task.model.as_ref().filter(|m| !m.is_empty()) {
         parts.push(model.to_string());
     }
-    if let Some(goal_id) = task.goal_id.as_ref().filter(|g| !g.is_empty()) {
-        let goal_seg = if goal_id.starts_with("GOAL-") {
-            goal_id.clone()
-        } else {
-            format!("GOAL-{goal_id}")
-        };
-        parts.push(goal_seg);
-    }
     let task_seg = if task.id.starts_with("TASK-") {
         task.id.to_string()
     } else {
@@ -3021,9 +2999,7 @@ pub fn build_goal_groups<'a>(
                     if !keep_ids.insert(parent_id.clone()) {
                         break;
                     }
-                    current_parent = parents_by_id
-                        .get(parent_id)
-                        .and_then(|p| p.as_ref());
+                    current_parent = parents_by_id.get(parent_id).and_then(|p| p.as_ref());
                 }
             }
         }
@@ -4023,21 +3999,33 @@ mod tests {
         cx.debug_bounds("goal-group-header-no-goal")
             .expect("No goal header should be rendered");
 
-        cx.debug_bounds("task-node-TASK-1")
-            .expect("TASK-1 should be rendered initially");
-        cx.debug_bounds("task-node-TASK-2")
-            .expect("TASK-2 should be rendered initially");
+        assert!(
+            cx.debug_bounds("task-node-TASK-1").is_none(),
+            "TASK-1 should be collapsed by default"
+        );
+        assert!(
+            cx.debug_bounds("task-node-TASK-2").is_none(),
+            "TASK-2 should be collapsed by default"
+        );
 
         let goal_1_chevron_bounds = cx.debug_bounds("goal-chevron-GOAL-1").unwrap();
         cx.simulate_click(goal_1_chevron_bounds.center(), gpui::Modifiers::default());
         cx.run_until_parked();
 
-        assert!(cx.debug_bounds("task-node-TASK-1").is_none());
+        assert!(cx.debug_bounds("task-node-TASK-1").is_some());
+        assert!(cx.debug_bounds("task-node-TASK-2").is_none());
+
+        let no_goal_chevron_bounds = cx.debug_bounds("goal-chevron-no-goal").unwrap();
+        cx.simulate_click(no_goal_chevron_bounds.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+
+        assert!(cx.debug_bounds("task-node-TASK-1").is_some());
         assert!(cx.debug_bounds("task-node-TASK-2").is_some());
 
         cx.simulate_click(goal_1_chevron_bounds.center(), gpui::Modifiers::default());
         cx.run_until_parked();
-        assert!(cx.debug_bounds("task-node-TASK-1").is_some());
+        assert!(cx.debug_bounds("task-node-TASK-1").is_none());
+        assert!(cx.debug_bounds("task-node-TASK-2").is_some());
     }
 
     #[gpui::test]
@@ -4055,10 +4043,19 @@ mod tests {
 
         cx.debug_bounds("goal-meta-GOAL-1")
             .expect("GOAL-1 line 2 meta should be rendered");
+        assert!(cx.debug_bounds("task-meta-TASK-1").is_none());
+        assert!(cx.debug_bounds("task-meta-TASK-2").is_none());
+
+        let goal_1_chevron_bounds = cx.debug_bounds("goal-chevron-GOAL-1").unwrap();
+        cx.simulate_click(goal_1_chevron_bounds.center(), gpui::Modifiers::default());
+        let no_goal_chevron_bounds = cx.debug_bounds("goal-chevron-no-goal").unwrap();
+        cx.simulate_click(no_goal_chevron_bounds.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+
         cx.debug_bounds("task-meta-TASK-1")
-            .expect("TASK-1 line 2 meta should be rendered");
+            .expect("TASK-1 line 2 meta should be rendered after expanding GOAL-1");
         cx.debug_bounds("task-meta-TASK-2")
-            .expect("TASK-2 line 2 meta should be rendered");
+            .expect("TASK-2 line 2 meta should be rendered after expanding No goal");
     }
 
     #[test]
@@ -4084,15 +4081,12 @@ mod tests {
         let meta = format_task_meta_line(&task_full, Some(&diff));
         assert_eq!(
             meta,
-            "Running · agent_engineer · claude-3-7-sonnet · GOAL-1 · TASK-1"
+            "Running · agent_engineer · claude-3-7-sonnet · TASK-1"
         );
 
         let goal_meta =
             format_goal_meta_line("GOAL-1", &AgentGoalStatus::Running, 2, 1, 3, Some(&diff));
-        assert_eq!(
-            goal_meta,
-            "Running · 1 / 3 tasks · P2 · GOAL-1"
-        );
+        assert_eq!(goal_meta, "Running · 1 / 3 tasks · P2 · GOAL-1");
 
         let single_diff = DiffShortStat {
             files: 1,
@@ -4113,7 +4107,7 @@ mod tests {
 
         assert_eq!(
             format_task_meta_line(&task_full, None),
-            "Running · agent_engineer · claude-3-7-sonnet · GOAL-1 · TASK-1"
+            "Running · agent_engineer · claude-3-7-sonnet · TASK-1"
         );
         assert_eq!(
             format_goal_meta_line("GOAL-1", &AgentGoalStatus::Completed, 1, 2, 2, None),
@@ -4156,7 +4150,7 @@ mod tests {
         };
         assert_eq!(
             format_task_meta_line(&task_assignee_fallback, None),
-            "Ready · backend_profile · GOAL-9 · TASK-3"
+            "Ready · backend_profile · TASK-3"
         );
 
         let task_no_profile = AgentTaskSummary {
@@ -4240,22 +4234,30 @@ mod tests {
         });
         cx.run_until_parked();
 
-        assert!(cx.debug_bounds("task-node-TASK-PARENT").is_some());
-        assert!(cx.debug_bounds("task-node-TASK-CHILD").is_some());
-
-        let parent_chevron_bounds = cx.debug_bounds("task-chevron-TASK-PARENT").unwrap();
-        cx.simulate_click(parent_chevron_bounds.center(), gpui::Modifiers::default());
-        cx.run_until_parked();
-
         panel.read_with(cx, |panel, _| {
             assert!(
                 panel
                     .collapsed_tasks
-                    .contains(&AgentTaskId::from("TASK-PARENT"))
+                    .contains(&AgentTaskId::from("TASK-PARENT")),
+                "tasks should start in collapsed_tasks by default"
             );
         });
-        assert!(cx.debug_bounds("task-node-TASK-CHILD").is_none());
+        assert!(
+            cx.debug_bounds("task-node-TASK-PARENT").is_none(),
+            "goal is collapsed by default so parent task is hidden"
+        );
 
+        let goal_1_chevron_bounds = cx.debug_bounds("goal-chevron-GOAL-1").unwrap();
+        cx.simulate_click(goal_1_chevron_bounds.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+
+        assert!(cx.debug_bounds("task-node-TASK-PARENT").is_some());
+        assert!(
+            cx.debug_bounds("task-node-TASK-CHILD").is_none(),
+            "parent task is collapsed by default so child task is hidden"
+        );
+
+        let parent_chevron_bounds = cx.debug_bounds("task-chevron-TASK-PARENT").unwrap();
         cx.simulate_click(parent_chevron_bounds.center(), gpui::Modifiers::default());
         cx.run_until_parked();
 
@@ -4267,6 +4269,37 @@ mod tests {
             );
         });
         assert!(cx.debug_bounds("task-node-TASK-CHILD").is_some());
+
+        // Refresh store and verify user expansion is preserved across store refreshes
+        panel.update(cx, |panel, cx| {
+            panel
+                .store
+                .update(cx, |store, cx| store.refresh(cx))
+                .detach();
+        });
+        cx.run_until_parked();
+
+        panel.read_with(cx, |panel, _| {
+            assert!(
+                !panel
+                    .collapsed_tasks
+                    .contains(&AgentTaskId::from("TASK-PARENT")),
+                "expanded task should remain expanded across store refreshes"
+            );
+        });
+        assert!(cx.debug_bounds("task-node-TASK-CHILD").is_some());
+
+        cx.simulate_click(parent_chevron_bounds.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+
+        panel.read_with(cx, |panel, _| {
+            assert!(
+                panel
+                    .collapsed_tasks
+                    .contains(&AgentTaskId::from("TASK-PARENT"))
+            );
+        });
+        assert!(cx.debug_bounds("task-node-TASK-CHILD").is_none());
     }
 
     #[gpui::test]
@@ -4702,6 +4735,12 @@ mod tests {
         });
         cx.run_until_parked();
 
+        let no_goal_chevron = cx
+            .debug_bounds("goal-chevron-no-goal")
+            .expect("no-goal chevron should be rendered");
+        cx.simulate_click(no_goal_chevron.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+
         cx.debug_bounds("task-node-TASK-CUSTOM")
             .expect("TASK-CUSTOM should be rendered");
 
@@ -5132,6 +5171,17 @@ mod tests {
         let (panel, cx) = cx.add_window_view(|_window, cx| {
             AgentTaskPanel::new(store, WeakEntity::new_invalid(), project, file_system, cx)
         });
+        cx.run_until_parked();
+
+        let goal_chevron = cx.debug_bounds("goal-chevron-GOAL-1").unwrap();
+        cx.simulate_click(goal_chevron.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+
+        assert!(cx.debug_bounds("task-node-TASK-P1").is_some());
+        assert!(cx.debug_bounds("task-node-TASK-C1").is_none());
+
+        let chevron_bounds = cx.debug_bounds("task-chevron-TASK-P1").unwrap();
+        cx.simulate_click(chevron_bounds.center(), gpui::Modifiers::default());
         cx.run_until_parked();
 
         assert!(cx.debug_bounds("task-node-TASK-P1").is_some());
