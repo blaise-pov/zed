@@ -12,9 +12,7 @@ use project::git_store::worktrees_directory_for_repo;
 use serde::{Deserialize, Serialize};
 
 use crate::agent_task::{AgentGoalSummary, AgentTaskId, AgentTaskSummary};
-use crate::task_worktree::{
-    resolve_ref_to_sha, system_git_binary, task_worktree_context, task_worktree_path,
-};
+use crate::task_worktree::{system_git_binary, task_worktree_context, task_worktree_path};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DiffShortStat {
@@ -73,17 +71,21 @@ pub struct TaskGitSnapshot {
 
 pub type DiffCache = Arc<Mutex<HashMap<(String, String), DiffShortStat>>>;
 
+#[allow(dead_code)]
 pub const SPEC_DIFF_CACHE_TTL: Duration = Duration::from_secs(30);
 
+#[allow(dead_code)]
 static TIMED_DIFF_CACHE: std::sync::OnceLock<
     Mutex<HashMap<(PathBuf, String), (Instant, Option<DiffShortStat>)>>,
 > = std::sync::OnceLock::new();
 
+#[allow(dead_code)]
 fn timed_diff_cache() -> &'static Mutex<HashMap<(PathBuf, String), (Instant, Option<DiffShortStat>)>>
 {
     TIMED_DIFF_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+#[allow(dead_code)]
 fn get_timed_cached_diff(working_dir: &Path, diff_spec: &str) -> Option<Option<DiffShortStat>> {
     let key = (working_dir.to_path_buf(), diff_spec.to_string());
     let cache = timed_diff_cache().lock();
@@ -95,6 +97,7 @@ fn get_timed_cached_diff(working_dir: &Path, diff_spec: &str) -> Option<Option<D
     None
 }
 
+#[allow(dead_code)]
 fn set_timed_cached_diff(working_dir: &Path, diff_spec: &str, stat: Option<DiffShortStat>) {
     let key = (working_dir.to_path_buf(), diff_spec.to_string());
     timed_diff_cache()
@@ -102,13 +105,16 @@ fn set_timed_cached_diff(working_dir: &Path, diff_spec: &str, stat: Option<DiffS
         .insert(key, (Instant::now(), stat));
 }
 
+#[allow(dead_code)]
 static GLOBAL_DIFF_CACHE: std::sync::OnceLock<Mutex<HashMap<(String, String), DiffShortStat>>> =
     std::sync::OnceLock::new();
 
+#[allow(dead_code)]
 fn global_diff_cache() -> &'static Mutex<HashMap<(String, String), DiffShortStat>> {
     GLOBAL_DIFF_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+#[allow(dead_code)]
 fn get_cached_diff(
     cache: Option<&DiffCache>,
     base_sha: &str,
@@ -122,6 +128,7 @@ fn get_cached_diff(
     }
 }
 
+#[allow(dead_code)]
 fn set_cached_diff(
     cache: Option<&DiffCache>,
     base_sha: String,
@@ -136,6 +143,7 @@ fn set_cached_diff(
     }
 }
 
+#[allow(dead_code)]
 async fn compute_short_stat_for_diff(
     working_dir: &Path,
     diff_spec: &str,
@@ -206,7 +214,7 @@ pub fn snapshot_with_cache(
     project: &Entity<Project>,
     tasks: &[AgentTaskSummary],
     goals: &[AgentGoalSummary],
-    diff_cache: Option<DiffCache>,
+    _diff_cache: Option<DiffCache>,
     cx: &mut App,
 ) -> Task<Result<TaskGitSnapshot>> {
     let tasks = tasks.to_vec();
@@ -214,19 +222,11 @@ pub fn snapshot_with_cache(
     let project = project.clone();
 
     cx.spawn(async move |cx| {
-        let (anchor_path, path_style, worktree_setting, file_system, default_branch_rx) =
+        let (anchor_path, path_style, worktree_setting, file_system) =
             project.update(cx, |project, cx| {
-                let (repository, anchor_path, path_style, worktree_setting, file_system) =
+                let (_repository, anchor_path, path_style, worktree_setting, file_system) =
                     task_worktree_context(project, cx)?;
-                let default_branch_rx =
-                    repository.update(cx, |repo, _| repo.default_branch(false));
-                anyhow::Ok((
-                    anchor_path,
-                    path_style,
-                    worktree_setting,
-                    file_system,
-                    default_branch_rx,
-                ))
+                anyhow::Ok((anchor_path, path_style, worktree_setting, file_system))
             })?;
 
         let dot_git = anchor_path.join(".git");
@@ -249,19 +249,9 @@ pub fn snapshot_with_cache(
             let branch_name = branch_name.strip_prefix("origin/").unwrap_or(branch_name);
             if let Some(goal_id) = branch_name.strip_prefix("agent-goal/") {
                 let canonical_branch = format!("agent-goal/{goal_id}");
-                let tip_sha = if let Some(commit) = branch.most_recent_commit {
-                    Some(commit.sha.to_string())
-                } else {
-                    match resolve_ref_to_sha(&git_repo, &canonical_branch).await {
-                        Ok(sha) => sha,
-                        Err(error) => {
-                            log::warn!(
-                                "failed to resolve tip sha for goal branch {canonical_branch}: {error:#}"
-                            );
-                            None
-                        }
-                    }
-                };
+                let tip_sha = branch
+                    .most_recent_commit
+                    .map(|commit| commit.sha.to_string());
                 let entry = existing_goal_branches.entry(goal_id.to_string());
                 match entry {
                     std::collections::hash_map::Entry::Vacant(vacant) => {
@@ -275,19 +265,9 @@ pub fn snapshot_with_cache(
                 }
             } else if let Some(task_id) = branch_name.strip_prefix("agent-task/") {
                 let canonical_branch = format!("agent-task/{task_id}");
-                let tip_sha = if let Some(commit) = branch.most_recent_commit {
-                    Some(commit.sha.to_string())
-                } else {
-                    match resolve_ref_to_sha(&git_repo, &canonical_branch).await {
-                        Ok(sha) => sha,
-                        Err(error) => {
-                            log::warn!(
-                                "failed to resolve tip sha for task branch {canonical_branch}: {error:#}"
-                            );
-                            None
-                        }
-                    }
-                };
+                let tip_sha = branch
+                    .most_recent_commit
+                    .map(|commit| commit.sha.to_string());
                 let entry = existing_task_branches.entry(task_id.to_string());
                 match entry {
                     std::collections::hash_map::Entry::Vacant(vacant) => {
@@ -336,39 +316,6 @@ pub fn snapshot_with_cache(
             });
         }
 
-        let default_branch = default_branch_rx
-            .await
-            .ok()
-            .and_then(|result| result.ok())
-            .flatten()
-            .map(|branch| branch.to_string());
-
-        if let Some(default_branch) = &default_branch {
-            let default_branch_tip_sha = match resolve_ref_to_sha(&git_repo, default_branch).await {
-                Ok(sha) => sha,
-                Err(error) => {
-                    log::warn!(
-                        "failed to resolve tip sha for default branch {default_branch}: {error:#}"
-                    );
-                    None
-                }
-            };
-
-            for goal_state in goals_map.values_mut() {
-                if goal_state.branch_exists {
-                    let diff_spec = format!("{default_branch}...{}", goal_state.branch);
-                    goal_state.diff = compute_short_stat_for_diff(
-                        &anchor_path,
-                        &diff_spec,
-                        default_branch_tip_sha.as_deref(),
-                        goal_state.tip_sha.as_deref(),
-                        diff_cache.as_ref(),
-                    )
-                    .await;
-                }
-            }
-        }
-
         let base_dir = worktrees_directory_for_repo(&anchor_path, &worktree_setting, path_style)?;
         let mut tasks_map = HashMap::new();
         let mut orphan_worktrees = Vec::new();
@@ -409,34 +356,13 @@ pub fn snapshot_with_cache(
                 task_worktree_path(&anchor_path, &worktree_setting, path_style, &task.id)?;
             let exists_on_disk = disk_task_entries.contains_key(task.id.as_str());
 
-            let (branch, branch_exists, task_tip_sha) =
-                if let Some((canonical_branch, tip_sha)) =
-                    existing_task_branches.get(task.id.as_str())
-                {
-                    (Some(canonical_branch.clone()), true, tip_sha.clone())
-                } else {
-                    (None, false, None)
-                };
-
-            let mut diff = None;
-            if exists_on_disk && branch_exists {
-                if let Some(goal_id) = &task.goal_id {
-                    if let Some(goal_state) = goals_map.get(goal_id) {
-                        if goal_state.branch_exists {
-                            let diff_spec =
-                                format!("agent-goal/{goal_id}...agent-task/{}", task.id);
-                            diff = compute_short_stat_for_diff(
-                                &worktree_path,
-                                &diff_spec,
-                                goal_state.tip_sha.as_deref(),
-                                task_tip_sha.as_deref(),
-                                diff_cache.as_ref(),
-                            )
-                            .await;
-                        }
-                    }
-                }
-            }
+            let (branch, branch_exists) = if let Some((canonical_branch, _tip_sha)) =
+                existing_task_branches.get(task.id.as_str())
+            {
+                (Some(canonical_branch.clone()), true)
+            } else {
+                (None, false)
+            };
 
             tasks_map.insert(
                 task.id.clone(),
@@ -445,7 +371,7 @@ pub fn snapshot_with_cache(
                     exists_on_disk,
                     branch,
                     branch_exists,
-                    diff,
+                    diff: None,
                 },
             );
         }
@@ -499,6 +425,41 @@ impl TaskWorktreeStatus {
         self.last_error.as_deref()
     }
 
+    pub fn refresh_if_needed(
+        &mut self,
+        tasks: Vec<AgentTaskSummary>,
+        goals: Vec<AgentGoalSummary>,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<TaskGitSnapshot>> {
+        if self.snapshot.is_some() && self.last_error.is_none() {
+            if let (Some(last_tasks), Some(last_goals)) = (&self.last_tasks, &self.last_goals) {
+                if last_tasks.len() == tasks.len() && last_goals.len() == goals.len() {
+                    let task_ids_match = last_tasks
+                        .iter()
+                        .map(|t| (&t.id, t.goal_id.as_deref()))
+                        .collect::<HashSet<_>>()
+                        == tasks
+                            .iter()
+                            .map(|t| (&t.id, t.goal_id.as_deref()))
+                            .collect::<HashSet<_>>();
+                    let goal_ids_match = last_goals
+                        .iter()
+                        .map(|g| &g.goal_id)
+                        .collect::<HashSet<_>>()
+                        == goals.iter().map(|g| &g.goal_id).collect::<HashSet<_>>();
+
+                    if task_ids_match && goal_ids_match {
+                        if let Some(snapshot) = self.snapshot.clone() {
+                            return Task::ready(Ok(snapshot));
+                        }
+                    }
+                }
+            }
+        }
+
+        self.refresh(tasks, goals, cx)
+    }
+
     pub fn refresh(
         &mut self,
         tasks: Vec<AgentTaskSummary>,
@@ -519,7 +480,6 @@ impl TaskWorktreeStatus {
         let request_epoch = self.current_epoch;
         self.is_loading = true;
         self.last_error = None;
-        cx.notify();
 
         let tasks_clone = tasks.clone();
         let goals_clone = goals.clone();
@@ -1093,6 +1053,103 @@ mod tests {
             notify_count.load(std::sync::atomic::Ordering::SeqCst),
             notifies_after_first
         );
+    }
+
+    #[gpui::test]
+    async fn test_task_worktree_status_refresh_if_needed(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/root"),
+            json!({
+                ".git": {
+                    "HEAD": "ref: refs/heads/main\n"
+                }
+            }),
+        )
+        .await;
+
+        let dot_git = std::path::Path::new(path!("/root/.git"));
+        fs.with_git_state(dot_git, true, |state| {
+            state.branches.insert("main".into());
+            state
+                .refs
+                .insert("refs/heads/main".into(), "main-sha-100".into());
+            state.refs.insert("HEAD".into(), "main-sha-100".into());
+        })
+        .unwrap();
+
+        let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
+        let status_entity =
+            cx.update(|cx| cx.new(|cx| TaskWorktreeStatus::new(project.clone(), cx)));
+
+        let tasks = vec![AgentTaskSummary {
+            id: AgentTaskId::from("TASK-1"),
+            parent_id: None,
+            goal_id: Some("GOAL-1".to_string()),
+            title: "Task 1".to_string(),
+            status: AgentTaskStatus::Running,
+            attempt: 1,
+            assignee: None,
+            write_scopes: vec![],
+            created_at: None,
+            assigned_profile: None,
+            model: None,
+        }];
+        let goals = vec![AgentGoalSummary {
+            goal_id: "GOAL-1".to_string(),
+            title: "Goal 1".to_string(),
+            status: AgentGoalStatus::Running,
+            priority: 1,
+            tasks_total: 1,
+            tasks_done: 0,
+            created_at: None,
+        }];
+
+        let snap1 = status_entity
+            .update(cx, |s, cx| s.refresh(tasks.clone(), goals.clone(), cx))
+            .await
+            .unwrap();
+
+        // Mutate task status and title, but keep (task.id, task.goal_id) and goal.goal_id identical
+        let mut modified_tasks = tasks.clone();
+        modified_tasks[0].title = "Task 1 renamed".to_string();
+        modified_tasks[0].status = AgentTaskStatus::Completed;
+
+        let mut modified_goals = goals.clone();
+        modified_goals[0].tasks_done = 1;
+
+        // refresh_if_needed should return cached snapshot because IDs did not change
+        let snap2 = status_entity
+            .update(cx, |s, cx| {
+                s.refresh_if_needed(modified_tasks.clone(), modified_goals.clone(), cx)
+            })
+            .await
+            .unwrap();
+        assert_eq!(snap1, snap2);
+
+        // Adding a new task changes IDs, so refresh_if_needed should refresh
+        modified_tasks.push(AgentTaskSummary {
+            id: AgentTaskId::from("TASK-2"),
+            parent_id: None,
+            goal_id: Some("GOAL-1".to_string()),
+            title: "Task 2".to_string(),
+            status: AgentTaskStatus::Ready,
+            attempt: 1,
+            assignee: None,
+            write_scopes: vec![],
+            created_at: None,
+            assigned_profile: None,
+            model: None,
+        });
+
+        let snap3 = status_entity
+            .update(cx, |s, cx| {
+                s.refresh_if_needed(modified_tasks, modified_goals, cx)
+            })
+            .await
+            .unwrap();
+        assert_eq!(snap3.tasks.len(), 2);
     }
 
     #[gpui::test]

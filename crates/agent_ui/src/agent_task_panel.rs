@@ -30,7 +30,7 @@ use std::sync::Arc;
 use agent::{
     AgentGoalStatus, AgentGoalSummary, AgentTaskArtifact, AgentTaskDetail, AgentTaskEvent,
     AgentTaskEventKind, AgentTaskId, AgentTaskStatus, AgentTaskStore, AgentTaskSummary,
-    DiffShortStat, GoalGitState, OrphanWorktree, TaskGitSnapshot, TaskWorktreeStatus,
+    DiffShortStat, GoalGitState, OrphanWorktree, TaskWorktreeStatus,
 };
 use agent_settings::AgentSettings;
 use editor::Editor;
@@ -44,8 +44,8 @@ use multi_buffer::MultiBuffer;
 use project::{Project, git_store::Repository};
 use settings::{Settings, SettingsStore};
 use ui::{
-    Color, CommonAnimationExt, ContextMenu, DiffStat, Icon, IconButton, IconName, IconPosition,
-    IconSize, Label, LabelSize, PopoverMenu, Tooltip, prelude::*,
+    Color, CommonAnimationExt, ContextMenu, Icon, IconButton, IconName, IconPosition, IconSize,
+    Label, LabelSize, PopoverMenu, Tooltip, prelude::*,
 };
 use util::ResultExt;
 use workspace::Workspace;
@@ -289,7 +289,7 @@ impl AgentTaskPanel {
                     agent::task_worktree::startup_sweep(project, Some(&tasks), cx)
                         .detach_and_log_err(cx);
                 }
-                this.refresh_worktree_status(cx);
+                this.refresh_worktree_status_if_needed(cx);
             }
             for task in &tasks {
                 if let AgentTaskStatus::Other(_) = &task.status {
@@ -348,6 +348,19 @@ impl AgentTaskPanel {
         }
 
         panel
+    }
+
+    pub fn refresh_worktree_status_if_needed(&mut self, cx: &mut Context<Self>) {
+        let (tasks, goals) = {
+            let store = self.store.read(cx);
+            let graph = store.graph();
+            (graph.tasks.clone(), graph.goals.clone())
+        };
+        self.worktree_status.update(cx, |status, cx| {
+            status
+                .refresh_if_needed(tasks, goals, cx)
+                .detach_and_log_err(cx);
+        });
     }
 
     pub fn refresh_worktree_status(&mut self, cx: &mut Context<Self>) {
@@ -1130,7 +1143,7 @@ impl AgentTaskPanel {
 
     fn render_task_tree(&self, cx: &mut Context<Self>) -> Div {
         let store = self.store.read(cx);
-        let graph = store.graph().clone();
+        let graph = store.graph();
         let events = store.events();
         let groups = build_goal_groups(
             &graph.tasks,
@@ -1157,7 +1170,7 @@ impl AgentTaskPanel {
 
         let mut group_elements = Vec::with_capacity(groups.len() + 1);
         for group in groups {
-            group_elements.push(self.render_goal_group(group, snapshot.as_ref(), cx));
+            group_elements.push(self.render_goal_group(group, cx));
         }
 
         if let Some(snapshot) = snapshot.as_ref() {
@@ -1291,7 +1304,6 @@ impl AgentTaskPanel {
     fn render_goal_group(
         &self,
         group: GoalGroup,
-        snapshot: Option<&TaskGitSnapshot>,
         cx: &mut Context<Self>,
     ) -> Div {
         let hover_color = cx
@@ -1309,8 +1321,6 @@ impl AgentTaskPanel {
                 .map(|g| g.title.clone())
                 .unwrap_or_else(|| goal_id.clone());
 
-            let goal_git = snapshot.and_then(|s| s.goals.get(&goal_id));
-            let goal_diff = goal_git.and_then(|g| g.diff.as_ref());
 
             let (tasks_done, tasks_total) = if let Some(summary) = &group.goal_summary {
                 (summary.tasks_done, summary.tasks_total)
@@ -1500,7 +1510,23 @@ impl AgentTaskPanel {
                         })
                         .items_center()
                         .gap_1p5()
-                        .child(div().w_4().h_4().flex_shrink_0())
+                        .child(if has_children {
+                            div()
+                                .w_4()
+                                .h_4()
+                                .flex_shrink_0()
+                                .flex()
+                                .items_center()
+                                .child(
+                                    Label::new("│")
+                                        .size(LabelSize::Small)
+                                        .color(Color::Muted)
+                                        .buffer_font(cx),
+                                )
+                                .into_any_element()
+                        } else {
+                            div().w_4().h_4().flex_shrink_0().into_any_element()
+                        })
                         .child(
                             Label::new(goal_status_label(&goal_status))
                                 .size(LabelSize::Small)
@@ -1527,30 +1553,13 @@ impl AgentTaskPanel {
                         .child(dot_separator())
                         .child({
                             let goal_label = if goal_id.starts_with("GOAL-") {
-                                goal_id.clone()
+                                goal_id
                             } else {
                                 format!("GOAL-{goal_id}")
                             };
                             Label::new(goal_label)
                                 .size(LabelSize::Small)
                                 .color(Color::Muted)
-                        })
-                        .when_some(goal_diff, |this, diff| {
-                            this.child(dot_separator())
-                                .child(
-                                    Label::new(format!(
-                                        "{} file{}",
-                                        diff.files,
-                                        if diff.files == 1 { "" } else { "s" }
-                                    ))
-                                    .size(LabelSize::Small)
-                                    .color(Color::Muted),
-                                )
-                                .child(DiffStat::new(
-                                    SharedString::from(format!("goal-diff-stat-{}", goal_id)),
-                                    diff.added as usize,
-                                    diff.removed as usize,
-                                ))
                         })
                         .when_some(cleanup_summary, |this, (text, color)| {
                             this.child(dot_separator())
@@ -1563,7 +1572,7 @@ impl AgentTaskPanel {
             if !is_collapsed {
                 let mut row_elements = Vec::with_capacity(group.rows.len());
                 for row in group.rows {
-                    row_elements.push(self.render_task_row(row, snapshot, cx));
+                    row_elements.push(self.render_task_row(row, cx));
                 }
                 group_div = group_div.children(row_elements);
             }
@@ -1646,7 +1655,7 @@ impl AgentTaskPanel {
             if !is_collapsed {
                 let mut row_elements = Vec::with_capacity(group.rows.len());
                 for row in group.rows {
-                    row_elements.push(self.render_task_row(row, snapshot, cx));
+                    row_elements.push(self.render_task_row(row, cx));
                 }
                 group_div = group_div.children(row_elements);
             }
@@ -1658,7 +1667,6 @@ impl AgentTaskPanel {
     fn render_task_row(
         &self,
         row: TaskRow,
-        snapshot: Option<&TaskGitSnapshot>,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let task = row.task;
@@ -1675,54 +1683,12 @@ impl AgentTaskPanel {
             .policy_denied_event_for_task(&task.id)
             .cloned();
 
-        let task_git = snapshot.and_then(|s| s.tasks.get(&task.id));
-        let task_diff = task_git.and_then(|g| g.diff.as_ref());
 
         let hover_color = cx
             .theme()
             .colors()
             .element_active
             .blend(cx.theme().colors().element_background.opacity(0.2));
-
-        let chevron_or_spacer = if row.has_children {
-            div()
-                .id(SharedString::from(format!("task-chevron-{}", task.id)))
-                .debug_selector({
-                    let task_id = task.id.clone();
-                    move || format!("task-chevron-{}", task_id)
-                })
-                .w_4()
-                .h_4()
-                .flex_shrink_0()
-                .flex()
-                .items_center()
-                .justify_center()
-                .cursor_pointer()
-                .on_click(cx.listener({
-                    let task_id = task.id.clone();
-                    move |this, _event, _window, cx| {
-                        cx.stop_propagation();
-                        if this.collapsed_tasks.contains(&task_id) {
-                            this.collapsed_tasks.remove(&task_id);
-                        } else {
-                            this.collapsed_tasks.insert(task_id.clone());
-                        }
-                        cx.notify();
-                    }
-                }))
-                .child(
-                    Icon::new(if row.is_collapsed {
-                        IconName::ChevronRight
-                    } else {
-                        IconName::ChevronDown
-                    })
-                    .size(IconSize::Small)
-                    .color(Color::Muted),
-                )
-                .into_any_element()
-        } else {
-            div().w_4().h_4().flex_shrink_0().into_any_element()
-        };
 
         v_flex()
             .id(SharedString::from(format!("task-node-{}", task.id)))
@@ -1795,7 +1761,47 @@ impl AgentTaskPanel {
                                         .buffer_font(cx),
                                 )
                             })
-                            .child(chevron_or_spacer)
+                            .when(row.has_children, |this| {
+                                this.child(
+                                    div()
+                                        .id(SharedString::from(format!("task-chevron-{}", task.id)))
+                                        .debug_selector({
+                                            let task_id = task.id.clone();
+                                            move || format!("task-chevron-{}", task_id)
+                                        })
+                                        .w_4()
+                                        .h_4()
+                                        .flex_shrink_0()
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .cursor_pointer()
+                                        .on_click(cx.listener({
+                                            let task_id = task.id.clone();
+                                            move |this, _event, _window, cx| {
+                                                cx.stop_propagation();
+                                                if this.collapsed_tasks.contains(&task_id) {
+                                                    this.collapsed_tasks.remove(&task_id);
+                                                } else {
+                                                    this.collapsed_tasks.insert(task_id.clone());
+                                                }
+                                                cx.notify();
+                                            }
+                                        }))
+                                        .child(
+                                            Icon::new(if row.is_collapsed {
+                                                IconName::ChevronRight
+                                            } else {
+                                                IconName::ChevronDown
+                                            })
+                                            .size(IconSize::Small)
+                                            .color(Color::Muted),
+                                        ),
+                                )
+                            })
+                            .when(!row.has_children && row.prefix.is_empty(), |this| {
+                                this.child(div().w_4().h_4().flex_shrink_0())
+                            })
                             .child(render_status_icon(&task.status))
                             .child(
                                 Label::new(task.title.clone())
@@ -1872,7 +1878,25 @@ impl AgentTaskPanel {
                                 .buffer_font(cx),
                         )
                     })
-                    .child(div().w_4().h_4().flex_shrink_0())
+                    .when(row.has_children, |this| {
+                        this.child(
+                            div()
+                                .w_4()
+                                .h_4()
+                                .flex_shrink_0()
+                                .flex()
+                                .items_center()
+                                .child(
+                                    Label::new("│")
+                                        .size(LabelSize::Small)
+                                        .color(Color::Muted)
+                                        .buffer_font(cx),
+                                ),
+                        )
+                    })
+                    .when(!row.has_children && row.prefix.is_empty(), |this| {
+                        this.child(div().w_4().h_4().flex_shrink_0())
+                    })
                     .child(
                         Label::new(status_label(&task.status))
                             .size(LabelSize::Small)
@@ -1930,24 +1954,7 @@ impl AgentTaskPanel {
                         })
                         .size(LabelSize::Small)
                         .color(Color::Muted),
-                    )
-                    .when_some(task_diff, |this, diff| {
-                        this.child(dot_separator())
-                            .child(
-                                Label::new(format!(
-                                    "{} file{}",
-                                    diff.files,
-                                    if diff.files == 1 { "" } else { "s" }
-                                ))
-                                .size(LabelSize::Small)
-                                .color(Color::Muted),
-                            )
-                            .child(DiffStat::new(
-                                SharedString::from(format!("task-diff-stat-{}", task.id)),
-                                diff.added as usize,
-                                diff.removed as usize,
-                            ))
-                    }),
+                    ),
             )
             .into_any_element()
     }
@@ -2616,7 +2623,7 @@ pub fn render_task_markdown(
 }
 
 #[allow(dead_code)]
-pub fn format_task_meta_line(task: &AgentTaskSummary, diff: Option<&DiffShortStat>) -> String {
+pub fn format_task_meta_line(task: &AgentTaskSummary, _diff: Option<&DiffShortStat>) -> String {
     let mut parts = vec![status_label(&task.status).to_string()];
     let profile = task
         .assigned_profile
@@ -2643,15 +2650,6 @@ pub fn format_task_meta_line(task: &AgentTaskSummary, diff: Option<&DiffShortSta
     };
     parts.push(task_seg);
 
-    if let Some(diff) = diff {
-        let file_str = format!(
-            "{} file{}",
-            diff.files,
-            if diff.files == 1 { "" } else { "s" }
-        );
-        let stat_str = format!("+{} -{}", diff.added, diff.removed);
-        parts.push(format!("{file_str} {stat_str}"));
-    }
     parts.join(" · ")
 }
 
@@ -2662,28 +2660,19 @@ pub fn format_goal_meta_line(
     priority: i64,
     tasks_done: u64,
     tasks_total: u64,
-    diff: Option<&DiffShortStat>,
+    _diff: Option<&DiffShortStat>,
 ) -> String {
     let goal_seg = if goal_id.starts_with("GOAL-") {
         goal_id.to_string()
     } else {
         format!("GOAL-{goal_id}")
     };
-    let mut parts = vec![
+    let parts = [
         goal_status_label(status).to_string(),
         format!("{tasks_done} / {tasks_total} tasks"),
         format!("P{priority}"),
         goal_seg,
     ];
-    if let Some(diff) = diff {
-        let file_str = format!(
-            "{} file{}",
-            diff.files,
-            if diff.files == 1 { "" } else { "s" }
-        );
-        let stat_str = format!("+{} -{}", diff.added, diff.removed);
-        parts.push(format!("{file_str} {stat_str}"));
-    }
     parts.join(" · ")
 }
 
@@ -2803,6 +2792,7 @@ pub fn visible_roots(
     roots
 }
 
+#[allow(dead_code)]
 pub fn visible_children(
     parent_id: &AgentTaskId,
     visible_tasks: &[AgentTaskSummary],
@@ -2845,10 +2835,22 @@ pub fn build_task_tree_rows(
     let mut rows = Vec::new();
     let mut visited = HashSet::new();
 
+    let mut children_by_parent: HashMap<AgentTaskId, Vec<AgentTaskSummary>> = HashMap::new();
+    for task in visible_tasks {
+        if let Some(parent_id) = &task.parent_id {
+            children_by_parent
+                .entry(parent_id.clone())
+                .or_default()
+                .push(task.clone());
+        }
+    }
+    for children in children_by_parent.values_mut() {
+        sort_tasks_newest_first(children, timestamps);
+    }
+
     fn collect_node(
         task: AgentTaskSummary,
-        visible: &[AgentTaskSummary],
-        timestamps: &HashMap<AgentTaskId, u64>,
+        children_by_parent: &mut HashMap<AgentTaskId, Vec<AgentTaskSummary>>,
         prefix: &str,
         continuation_prefix: &str,
         ancestor_continuation: &str,
@@ -2862,7 +2864,7 @@ pub fn build_task_tree_rows(
             return;
         }
 
-        let children = visible_children(&task.id, visible, timestamps);
+        let children = children_by_parent.remove(&task.id).unwrap_or_default();
         let has_children = !children.is_empty();
         let is_collapsed = collapsed_tasks.contains(&task.id);
 
@@ -2890,8 +2892,7 @@ pub fn build_task_tree_rows(
                 let next_ancestor = format!("{ancestor_continuation}{cont}");
                 collect_node(
                     child,
-                    visible,
-                    timestamps,
+                    children_by_parent,
                     &child_prefix,
                     &child_continuation,
                     &next_ancestor,
@@ -2920,8 +2921,7 @@ pub fn build_task_tree_rows(
 
         collect_node(
             root,
-            visible_tasks,
-            timestamps,
+            &mut children_by_parent,
             prefix,
             continuation_prefix,
             ancestor_continuation,
@@ -3010,16 +3010,20 @@ pub fn build_goal_groups<'a>(
             return Vec::new();
         }
 
+        let parents_by_id: HashMap<&AgentTaskId, &Option<AgentTaskId>> =
+            tasks.iter().map(|t| (&t.id, &t.parent_id)).collect();
+
         let mut keep_ids = matching_ids.clone();
         for task in &tasks {
             if matching_ids.contains(&task.id) {
-                let mut current_parent = task.parent_id.clone();
+                let mut current_parent = task.parent_id.as_ref();
                 while let Some(parent_id) = current_parent {
-                    keep_ids.insert(parent_id.clone());
-                    current_parent = tasks
-                        .iter()
-                        .find(|t| t.id == parent_id)
-                        .and_then(|t| t.parent_id.clone());
+                    if !keep_ids.insert(parent_id.clone()) {
+                        break;
+                    }
+                    current_parent = parents_by_id
+                        .get(parent_id)
+                        .and_then(|p| p.as_ref());
                 }
             }
         }
@@ -4080,14 +4084,14 @@ mod tests {
         let meta = format_task_meta_line(&task_full, Some(&diff));
         assert_eq!(
             meta,
-            "Running · agent_engineer · claude-3-7-sonnet · GOAL-1 · TASK-1 · 2 files +15 -3"
+            "Running · agent_engineer · claude-3-7-sonnet · GOAL-1 · TASK-1"
         );
 
         let goal_meta =
             format_goal_meta_line("GOAL-1", &AgentGoalStatus::Running, 2, 1, 3, Some(&diff));
         assert_eq!(
             goal_meta,
-            "Running · 1 / 3 tasks · P2 · GOAL-1 · 2 files +15 -3"
+            "Running · 1 / 3 tasks · P2 · GOAL-1"
         );
 
         let single_diff = DiffShortStat {
@@ -4104,7 +4108,7 @@ mod tests {
                 1,
                 Some(&single_diff)
             ),
-            "Running · 0 / 1 tasks · P1 · GOAL-1 · 1 file +4 -0"
+            "Running · 0 / 1 tasks · P1 · GOAL-1"
         );
 
         assert_eq!(
