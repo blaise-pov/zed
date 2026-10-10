@@ -75,7 +75,7 @@ mod visual_test_context;
 
 /// The duration for which native applications wait for futures returned from
 /// [Context::on_app_quit] before fully quitting.
-pub const SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(200);
+pub const SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(2000);
 
 /// Temporary(?) wrapper around [`RefCell<App>`] to help us debug any double borrows.
 /// Strongly consider removing after stabilization.

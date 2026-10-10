@@ -409,6 +409,22 @@ pub(crate) struct Callbacks {
     pub(crate) appearance_changed: Cell<Option<Box<dyn FnMut()>>>,
 }
 
+impl Callbacks {
+    pub(crate) fn clear(&self) {
+        self.request_frame.take();
+        self.input.take();
+        self.active_status_change.take();
+        self.visibility_change.take();
+        self.hovered_status_change.take();
+        self.resize.take();
+        self.moved.take();
+        self.should_close.take();
+        self.close.take();
+        self.hit_test_window_control.take();
+        self.appearance_changed.take();
+    }
+}
+
 struct WindowCreateContext {
     inner: Option<Result<Rc<WindowsWindowInner>>>,
     handle: AnyWindowHandle,
@@ -611,9 +627,8 @@ impl Drop for WindowsWindow {
     fn drop(&mut self) {
         self.0.dialog_owner.close();
         unsafe { ShowWindowAsync(self.0.hwnd, SW_HIDE).ok().log_err() };
-        // `DestroyWindow` below sends `WM_SHOWWINDOW`; without a callback the
-        // resulting visibility report has nothing to notify.
-        self.0.state.callbacks.visibility_change.take();
+        self.0.state.callbacks.clear();
+        self.0.state.input_handler.take();
         // clone this `Rc` to prevent early release of the pointer
         let this = self.0.clone();
         self.0
@@ -1441,18 +1456,27 @@ unsafe extern "system" fn window_procedure(
     lparam: LPARAM,
 ) -> LRESULT {
     if msg == WM_NCCREATE {
-        let window_params = unsafe { &*(lparam.0 as *const CREATESTRUCTW) };
-        let window_creation_context = window_params.lpCreateParams as *mut WindowCreateContext;
-        let window_creation_context = unsafe { &mut *window_creation_context };
-        return match WindowsWindowInner::new(window_creation_context, hwnd, window_params) {
-            Ok(window_state) => {
-                let weak = Box::new(Rc::downgrade(&window_state));
-                unsafe { set_window_long(hwnd, GWLP_USERDATA, Box::into_raw(weak) as isize) };
-                window_creation_context.inner = Some(Ok(window_state));
-                unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let window_params = unsafe { &*(lparam.0 as *const CREATESTRUCTW) };
+            let window_creation_context = window_params.lpCreateParams as *mut WindowCreateContext;
+            let window_creation_context = unsafe { &mut *window_creation_context };
+            match WindowsWindowInner::new(window_creation_context, hwnd, window_params) {
+                Ok(window_state) => {
+                    let weak = Box::new(Rc::downgrade(&window_state));
+                    unsafe { set_window_long(hwnd, GWLP_USERDATA, Box::into_raw(weak) as isize) };
+                    window_creation_context.inner = Some(Ok(window_state));
+                    unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+                }
+                Err(error) => {
+                    window_creation_context.inner = Some(Err(error));
+                    LRESULT(0)
+                }
             }
-            Err(error) => {
-                window_creation_context.inner = Some(Err(error));
+        }));
+        return match result {
+            Ok(result) => result,
+            Err(err) => {
+                log::error!("panic in window_procedure for msg {:#x}: {:?}", msg, err);
                 LRESULT(0)
             }
         };
@@ -1467,7 +1491,15 @@ unsafe extern "system" fn window_procedure(
         if msg == WM_NCDESTROY {
             inner.dialog_owner.close();
         }
-        inner.handle_msg(hwnd, msg, wparam, lparam)
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            inner.handle_msg(hwnd, msg, wparam, lparam)
+        })) {
+            Ok(result) => result,
+            Err(err) => {
+                log::error!("panic in window_procedure for msg {:#x}: {:?}", msg, err);
+                unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+            }
+        }
     } else {
         unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
     };
