@@ -1280,7 +1280,6 @@ impl ToolCall {
         let subagent_session_info = subagent_session_info_from_meta(&meta);
         let sandbox_authorization_details = sandbox_authorization_details_from_meta(&meta);
         let sandbox_fallback_authorization_details =
-        let sandbox_fallback_authorization_details =
             sandbox_fallback_authorization_details_from_meta(&meta);
         let sandbox_not_applied = sandbox_not_applied_from_meta(&meta);
         let terminal_wrapper_warning = terminal_wrapper_warning_from_meta(&meta);

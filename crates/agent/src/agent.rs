@@ -3753,7 +3753,7 @@ impl ThreadEnvironment for NativeThreadEnvironment {
         })
     }
 
-    fn subagent_task_id(&self, session_id: &acp::SessionId, cx: &App) -> Option<String> {
+    fn subagent_task_id(&self, session_id: &acp_v1::SessionId, cx: &App) -> Option<String> {
         let agent_entity = self.agent.upgrade()?;
         let agent = agent_entity.read(cx);
         let session = agent.sessions.get(session_id)?;

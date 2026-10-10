@@ -8408,7 +8408,7 @@ mod tests {
         cx: &mut TestAppContext,
     ) {
         crate::task_worktree::reset_registry_for_tests();
-        let (thread, event_stream) = setup_thread_for_test(cx).await;
+        let (thread, event_stream, _fake) = setup_thread_for_test(cx).await;
 
         struct MockTaskCompleteTool {
             run_called: Arc<std::sync::atomic::AtomicBool>,
@@ -9956,11 +9956,11 @@ mod tests {
 
     #[gpui::test]
     async fn test_cancel_drains_subagent_chain_of_depth_three(cx: &mut TestAppContext) {
-        crate::tests::init_test(cx);
+        let fake = crate::tests::init_test(cx);
 
         let fs = fs::FakeFs::new(cx.background_executor.clone());
         let project = Project::test(fs, [], cx).await;
-        let model = Arc::new(FakeLanguageModel::default());
+        let model = fake.model("fake");
 
         let (root, child, grandchild) = cx.update(|cx| {
             let project_context = cx.new(|_cx| prompt_store::ProjectContext::default());
@@ -11056,7 +11056,7 @@ mod tests {
 
     #[gpui::test]
     async fn test_authorize_third_party_tool_during_thread_update(cx: &mut TestAppContext) {
-        let (thread, event_stream) = setup_thread_for_test(cx).await;
+        let (thread, event_stream, _fake) = setup_thread_for_test(cx).await;
 
         let (_cancellation_tx, cancellation_rx) = watch::channel(false);
         let weak_thread = thread.downgrade();

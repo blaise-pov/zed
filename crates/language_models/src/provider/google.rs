@@ -299,7 +299,6 @@ impl LanguageModelClient for GoogleLanguageModelProvider {
             request.max_output_tokens =
                 request.effective_max_output_tokens(config.max_output_tokens());
         }
-        }
         let request = match into_google(request, config.request_id().to_string(), config.mode()) {
             Ok(request) => request,
             Err(error) => return async move { Err(error.into()) }.boxed(),

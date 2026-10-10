@@ -1569,10 +1569,7 @@ async fn test_system_prompt_without_tools(cx: &mut TestAppContext) {
 
 #[gpui::test]
 async fn test_per_model_system_prompt_template_matched(cx: &mut TestAppContext) {
-    let ThreadTest {
-        model, thread, fs, ..
-    } = setup(cx, TestModel::Fake).await;
-    let fake_model = model.as_fake();
+    let ThreadTest { thread, fs, fake, .. } = setup(cx, TestModel::Fake).await;
 
     let template_path = std::env::temp_dir().join(format!(
         "zed-test-per-model-matched-{}-{}.hbs",
@@ -1620,7 +1617,7 @@ async fn test_per_model_system_prompt_template_matched(cx: &mut TestAppContext) 
         .unwrap();
     cx.run_until_parked();
 
-    let mut pending_completions = fake_model.pending_completions();
+    let mut pending_completions = fake.pending_completions();
     assert_eq!(pending_completions.len(), 1);
     let pending_completion = pending_completions.pop().unwrap();
     let MessageContent::Text(system_prompt) = &pending_completion.messages[0].content[0] else {
@@ -1633,10 +1630,7 @@ async fn test_per_model_system_prompt_template_matched(cx: &mut TestAppContext) 
 
 #[gpui::test]
 async fn test_per_model_system_prompt_template_beats_global(cx: &mut TestAppContext) {
-    let ThreadTest {
-        model, thread, fs, ..
-    } = setup(cx, TestModel::Fake).await;
-    let fake_model = model.as_fake();
+    let ThreadTest { thread, fs, fake, .. } = setup(cx, TestModel::Fake).await;
 
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1696,7 +1690,7 @@ async fn test_per_model_system_prompt_template_beats_global(cx: &mut TestAppCont
         .unwrap();
     cx.run_until_parked();
 
-    let mut pending_completions = fake_model.pending_completions();
+    let mut pending_completions = fake.pending_completions();
     assert_eq!(pending_completions.len(), 1);
     let pending_completion = pending_completions.pop().unwrap();
     let MessageContent::Text(system_prompt) = &pending_completion.messages[0].content[0] else {
@@ -1712,10 +1706,7 @@ async fn test_per_model_system_prompt_template_beats_global(cx: &mut TestAppCont
 async fn test_per_model_system_prompt_template_global_fallback_when_unmatched(
     cx: &mut TestAppContext,
 ) {
-    let ThreadTest {
-        model, thread, fs, ..
-    } = setup(cx, TestModel::Fake).await;
-    let fake_model = model.as_fake();
+    let ThreadTest { thread, fs, fake, .. } = setup(cx, TestModel::Fake).await;
 
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1771,7 +1762,7 @@ async fn test_per_model_system_prompt_template_global_fallback_when_unmatched(
         .unwrap();
     cx.run_until_parked();
 
-    let mut pending_completions = fake_model.pending_completions();
+    let mut pending_completions = fake.pending_completions();
     assert_eq!(pending_completions.len(), 1);
     let pending_completion = pending_completions.pop().unwrap();
     let MessageContent::Text(system_prompt) = &pending_completion.messages[0].content[0] else {
@@ -1786,13 +1777,12 @@ async fn test_per_model_system_prompt_template_global_fallback_when_unmatched(
 #[gpui::test]
 async fn test_per_model_custom_instructions(cx: &mut TestAppContext) {
     let ThreadTest {
-        model,
         thread,
         fs,
+        fake,
         project_context,
         ..
     } = setup(cx, TestModel::Fake).await;
-    let fake_model = model.as_fake();
 
     project_context.update(cx, |project_context, _cx| {
         project_context.shell = "test-shell".into()
@@ -1834,7 +1824,7 @@ async fn test_per_model_custom_instructions(cx: &mut TestAppContext) {
         .unwrap();
     cx.run_until_parked();
 
-    let mut pending_completions = fake_model.pending_completions();
+    let mut pending_completions = fake.pending_completions();
     assert_eq!(pending_completions.len(), 1);
     let pending_completion = pending_completions.pop().unwrap();
     let MessageContent::Text(system_prompt) = &pending_completion.messages[0].content[0] else {
@@ -1858,10 +1848,7 @@ async fn test_per_model_custom_instructions(cx: &mut TestAppContext) {
 
 #[gpui::test]
 async fn test_per_model_custom_instructions_appended_to_profile_prompt(cx: &mut TestAppContext) {
-    let ThreadTest {
-        model, thread, fs, ..
-    } = setup(cx, TestModel::Fake).await;
-    let fake_model = model.as_fake();
+    let ThreadTest { thread, fs, fake, .. } = setup(cx, TestModel::Fake).await;
 
     let profile_prompt_path = std::env::temp_dir().join(format!(
         "zed-test-profile-prompt-{}-{}.md",
@@ -1910,7 +1897,7 @@ async fn test_per_model_custom_instructions_appended_to_profile_prompt(cx: &mut 
         .unwrap();
     cx.run_until_parked();
 
-    let mut pending_completions = fake_model.pending_completions();
+    let mut pending_completions = fake.pending_completions();
     assert_eq!(pending_completions.len(), 1);
     let pending_completion = pending_completions.pop().unwrap();
     let MessageContent::Text(system_prompt) = &pending_completion.messages[0].content[0] else {
@@ -1927,13 +1914,12 @@ async fn test_per_model_custom_instructions_appended_to_profile_prompt(cx: &mut 
 #[gpui::test]
 async fn test_templated_profile_prompt_interpolates_variables(cx: &mut TestAppContext) {
     let ThreadTest {
-        model,
         thread,
+        fake,
         project_context,
         fs,
         ..
     } = setup(cx, TestModel::Fake).await;
-    let fake_model = model.as_fake();
 
     project_context.update(cx, |pc, _| {
         pc.os = "custom-os".into();
@@ -1988,7 +1974,7 @@ async fn test_templated_profile_prompt_interpolates_variables(cx: &mut TestAppCo
         .unwrap();
     cx.run_until_parked();
 
-    let mut pending_completions = fake_model.pending_completions();
+    let mut pending_completions = fake.pending_completions();
     assert_eq!(pending_completions.len(), 1);
     let pending_completion = pending_completions.pop().unwrap();
     let MessageContent::Text(system_prompt) = &pending_completion.messages[0].content[0] else {
@@ -2008,10 +1994,7 @@ async fn test_templated_profile_prompt_interpolates_variables(cx: &mut TestAppCo
 
 #[gpui::test]
 async fn test_templated_profile_prompt_includes_worktree_partial(cx: &mut TestAppContext) {
-    let ThreadTest {
-        model, thread, fs, ..
-    } = setup(cx, TestModel::Fake).await;
-    let fake_model = model.as_fake();
+    let ThreadTest { thread, fs, fake, .. } = setup(cx, TestModel::Fake).await;
 
     let worktree_dir = tempfile::tempdir().unwrap();
     let prompts_dir = worktree_dir.path().join(".zed").join("prompts");
@@ -2070,7 +2053,7 @@ async fn test_templated_profile_prompt_includes_worktree_partial(cx: &mut TestAp
         .unwrap();
     cx.run_until_parked();
 
-    let mut pending_completions = fake_model.pending_completions();
+    let mut pending_completions = fake.pending_completions();
     assert_eq!(pending_completions.len(), 1);
     let pending_completion = pending_completions.pop().unwrap();
     let MessageContent::Text(system_prompt) = &pending_completion.messages[0].content[0] else {
@@ -2088,10 +2071,7 @@ async fn test_templated_profile_prompt_includes_worktree_partial(cx: &mut TestAp
 async fn test_templated_profile_prompt_invalid_template_falls_back_to_raw_text(
     cx: &mut TestAppContext,
 ) {
-    let ThreadTest {
-        model, thread, fs, ..
-    } = setup(cx, TestModel::Fake).await;
-    let fake_model = model.as_fake();
+    let ThreadTest { thread, fs, fake, .. } = setup(cx, TestModel::Fake).await;
 
     let raw_prompt = "Raw profile prompt with invalid syntax {{#if unclosed_block}} here";
     let profile_prompt_path = std::env::temp_dir().join(format!(
@@ -2134,7 +2114,7 @@ async fn test_templated_profile_prompt_invalid_template_falls_back_to_raw_text(
         .unwrap();
     cx.run_until_parked();
 
-    let mut pending_completions = fake_model.pending_completions();
+    let mut pending_completions = fake.pending_completions();
     assert_eq!(pending_completions.len(), 1);
     let pending_completion = pending_completions.pop().unwrap();
     let MessageContent::Text(system_prompt) = &pending_completion.messages[0].content[0] else {
@@ -8942,7 +8922,7 @@ async fn test_subagent_thread_model_selection(cx: &mut TestAppContext) {
 
 #[gpui::test]
 async fn test_subagent_with_explicit_profile_uses_profile_tools(cx: &mut TestAppContext) {
-    init_test(cx);
+    let fake = init_test(cx);
 
     cx.update(|cx| insert_profile(cx, "research", &["read_file", "grep"], None));
 
@@ -8953,7 +8933,7 @@ async fn test_subagent_with_explicit_profile_uses_profile_tools(cx: &mut TestApp
     let context_server_store = project.read_with(cx, |project, _| project.context_server_store());
     let context_server_registry =
         cx.new(|cx| ContextServerRegistry::new(context_server_store.clone(), cx));
-    let model = Arc::new(FakeLanguageModel::default());
+    let model = fake.model("fake");
 
     let environment: Rc<dyn crate::ThreadEnvironment> = Rc::new(FakeThreadEnvironment::default());
     let parent_thread = cx.new(|cx| {
@@ -9012,7 +8992,7 @@ async fn test_subagent_with_explicit_profile_uses_profile_tools(cx: &mut TestApp
 async fn test_subagent_with_explicit_profile_keeps_profile_when_parent_switches(
     cx: &mut TestAppContext,
 ) {
-    init_test(cx);
+    let fake = init_test(cx);
 
     cx.update(|cx| insert_profile(cx, "research", &["read_file", "grep"], None));
 
@@ -9023,7 +9003,7 @@ async fn test_subagent_with_explicit_profile_keeps_profile_when_parent_switches(
     let context_server_store = project.read_with(cx, |project, _| project.context_server_store());
     let context_server_registry =
         cx.new(|cx| ContextServerRegistry::new(context_server_store.clone(), cx));
-    let model = Arc::new(FakeLanguageModel::default());
+    let model = fake.model("fake");
 
     let parent_thread = cx.new(|cx| {
         Thread::new(
@@ -9078,26 +9058,19 @@ async fn test_subagent_with_explicit_profile_keeps_profile_when_parent_switches(
 async fn test_subagent_with_explicit_profile_model_not_overridden_by_parent(
     cx: &mut TestAppContext,
 ) {
-    init_test(cx);
+    let fake = init_test(cx);
 
-    let profile_model = Arc::new(FakeLanguageModel::with_id_and_thinking(
-        "fake-corp",
-        "profile-model",
-        "Profile Model",
-        true,
-    ));
-    cx.update(|cx| {
-        LanguageModelRegistry::test(cx);
-
-        let provider = Arc::new(
-            FakeLanguageModelProvider::new(
-                LanguageModelProviderId::from("fake-corp".to_string()),
-                LanguageModelProviderName::from("Fake Corp".to_string()),
-            )
-            .with_models(vec![profile_model.clone()]),
+    let profile_model = cx.update(|cx| {
+        let provider = FakeLanguageModelProvider::new(
+            LanguageModelProviderId::from("fake-corp".to_string()),
+            LanguageModelProviderName::from("Fake Corp".to_string()),
         );
+        let profile_model = provider.update_model("profile-model", |model| {
+            model.name = LanguageModelName::from("Profile Model".to_string());
+            model.supports_thinking = true;
+        });
         LanguageModelRegistry::global(cx).update(cx, |registry, cx| {
-            registry.register_provider(provider, cx);
+            registry.register_provider(Arc::new(provider), cx);
         });
 
         insert_profile(
@@ -9121,7 +9094,7 @@ async fn test_subagent_with_explicit_profile_model_not_overridden_by_parent(
     let context_server_store = project.read_with(cx, |project, _| project.context_server_store());
     let context_server_registry =
         cx.new(|cx| ContextServerRegistry::new(context_server_store.clone(), cx));
-    let parent_model = Arc::new(FakeLanguageModel::default());
+    let parent_model = fake.model("fake");
 
     let parent_thread = cx.new(|cx| {
         Thread::new(
@@ -9252,7 +9225,7 @@ async fn test_max_subagent_depth_prevents_tool_registration(cx: &mut TestAppCont
 
 #[gpui::test]
 async fn test_spawn_agent_gated_by_depth_across_boundaries(cx: &mut TestAppContext) {
-    init_test(cx);
+    let fake = init_test(cx);
 
     let fs = FakeFs::new(cx.executor());
     fs.insert_tree(path!("/test"), json!({})).await;
@@ -9261,7 +9234,7 @@ async fn test_spawn_agent_gated_by_depth_across_boundaries(cx: &mut TestAppConte
     let context_server_store = project.read_with(cx, |project, _| project.context_server_store());
     let context_server_registry =
         cx.new(|cx| ContextServerRegistry::new(context_server_store.clone(), cx));
-    let model = Arc::new(FakeLanguageModel::default());
+    let model = fake.model("fake");
     let environment = Rc::new(cx.update(|cx| {
         FakeThreadEnvironment::default().with_terminal(FakeTerminalHandle::new_never_exits(cx))
     }));
@@ -9342,7 +9315,7 @@ async fn test_spawn_agent_gated_by_depth_across_boundaries(cx: &mut TestAppConte
 async fn test_spawn_agent_absent_when_nesting_disabled_or_profile_lacks_it(
     cx: &mut TestAppContext,
 ) {
-    init_test(cx);
+    let fake = init_test(cx);
 
     let fs = FakeFs::new(cx.executor());
     fs.insert_tree(path!("/test"), json!({})).await;
@@ -9351,7 +9324,7 @@ async fn test_spawn_agent_absent_when_nesting_disabled_or_profile_lacks_it(
     let context_server_store = project.read_with(cx, |project, _| project.context_server_store());
     let context_server_registry =
         cx.new(|cx| ContextServerRegistry::new(context_server_store.clone(), cx));
-    let model = Arc::new(FakeLanguageModel::default());
+    let model = fake.model("fake");
     let environment = Rc::new(cx.update(|cx| {
         FakeThreadEnvironment::default().with_terminal(FakeTerminalHandle::new_never_exits(cx))
     }));
@@ -12156,7 +12129,7 @@ async fn test_mid_turn_model_and_settings_refresh(cx: &mut TestAppContext) {
 
 #[gpui::test]
 async fn test_subagent_task_id_prompt_formatting(cx: &mut TestAppContext) {
-    init_test(cx);
+    let fake = init_test(cx);
     let subagent_profile = cx.update(|cx| enable_default_profile_delegation(cx));
     cx.update(|cx| {
         LanguageModelRegistry::test(cx);
@@ -12184,7 +12157,7 @@ async fn test_subagent_task_id_prompt_formatting(cx: &mut TestAppContext) {
         agent.sessions.get(&session_id).unwrap().thread.clone()
     });
 
-    let model = Arc::new(FakeLanguageModel::default());
+    let model = fake.model("fake");
     thread.update(cx, |thread, cx| {
         thread.set_model(model.clone(), cx);
     });
@@ -12220,8 +12193,8 @@ async fn test_subagent_task_id_prompt_formatting(cx: &mut TestAppContext) {
         thought_signature: None,
     };
 
-    model.send_last_completion_stream_event(LanguageModelCompletionEvent::ToolUse(tool_use));
-    model.end_last_completion_stream();
+    fake.send_last_event(&model, LanguageModelCompletionEvent::ToolUse(tool_use));
+    fake.end_last(&model);
 
     cx.run_until_parked();
 
@@ -12619,7 +12592,7 @@ async fn test_next_returns_serde_error_for_streaming_tools(_cx: &mut TestAppCont
 
 #[gpui::test]
 async fn test_spawn_agent_two_tasks_isolated_worktrees(cx: &mut TestAppContext) {
-    init_test(cx);
+    let fake = init_test(cx);
     always_allow_tools(cx);
     cx.update(|cx| {
         LanguageModelRegistry::test(cx);
@@ -12657,7 +12630,7 @@ async fn test_spawn_agent_two_tasks_isolated_worktrees(cx: &mut TestAppContext) 
     let thread = agent.read_with(cx, |agent, _| {
         agent.sessions.get(&session_id).unwrap().thread.clone()
     });
-    let model = Arc::new(FakeLanguageModel::default());
+    let model = fake.model("fake");
 
     thread.update(cx, |thread, cx| {
         thread.set_model(model.clone(), cx);
@@ -12667,7 +12640,7 @@ async fn test_spawn_agent_two_tasks_isolated_worktrees(cx: &mut TestAppContext) 
     // === First subagent with TASK-1 ===
     let send1 = acp_thread.update(cx, |thread, cx| thread.send_raw("Start task 1", cx));
     cx.run_until_parked();
-    model.send_last_completion_stream_text_chunk("spawning subagent 1");
+    fake.send_last_text(&model, "spawning subagent 1");
     let subagent1_input = SpawnAgentToolInput {
         label: "task 1".to_string(),
         message: "do task 1".to_string(),
@@ -12689,8 +12662,8 @@ async fn test_spawn_agent_two_tasks_isolated_worktrees(cx: &mut TestAppContext) 
         is_input_complete: true,
         thought_signature: None,
     };
-    model.send_last_completion_stream_event(LanguageModelCompletionEvent::ToolUse(tool_use_1));
-    model.end_last_completion_stream();
+    fake.send_last_event(&model, LanguageModelCompletionEvent::ToolUse(tool_use_1));
+    fake.end_last(&model);
     cx.run_until_parked();
 
     let subagent1_session_id = thread.read_with(cx, |thread, cx| {
@@ -12730,18 +12703,17 @@ async fn test_spawn_agent_two_tasks_isolated_worktrees(cx: &mut TestAppContext) 
         is_input_complete: true,
         thought_signature: None,
     };
-    model
-        .send_last_completion_stream_event(LanguageModelCompletionEvent::ToolUse(write_tool_use_1));
-    model.end_last_completion_stream();
+    fake.send_last_event(&model, LanguageModelCompletionEvent::ToolUse(write_tool_use_1));
+    fake.end_last(&model);
     cx.run_until_parked();
 
     // Subagent 1 finishes
-    model.send_last_completion_stream_text_chunk("done with task 1");
-    model.end_last_completion_stream();
+    fake.send_last_text(&model, "done with task 1");
+    fake.end_last(&model);
     cx.run_until_parked();
 
     // Verify parent received isolation_details with branch, sha, changed_files
-    let completion1 = model
+    let completion1 = fake
         .pending_completions()
         .pop()
         .expect("expected parent completion after subagent 1 finish");
@@ -12769,14 +12741,14 @@ async fn test_spawn_agent_two_tasks_isolated_worktrees(cx: &mut TestAppContext) 
     assert!(!head_sha_1.is_empty());
 
     // Parent completes turn 1
-    model.send_last_completion_stream_text_chunk("Parent response 1");
-    model.end_last_completion_stream();
+    fake.send_last_text(&model, "Parent response 1");
+    fake.end_last(&model);
     send1.await.unwrap();
 
     // === Second subagent with TASK-2 ===
     let send2 = acp_thread.update(cx, |thread, cx| thread.send_raw("Start task 2", cx));
     cx.run_until_parked();
-    model.send_last_completion_stream_text_chunk("spawning subagent 2");
+    fake.send_last_text(&model, "spawning subagent 2");
     let subagent2_input = SpawnAgentToolInput {
         label: "task 2".to_string(),
         message: "do task 2".to_string(),
@@ -12798,8 +12770,8 @@ async fn test_spawn_agent_two_tasks_isolated_worktrees(cx: &mut TestAppContext) 
         is_input_complete: true,
         thought_signature: None,
     };
-    model.send_last_completion_stream_event(LanguageModelCompletionEvent::ToolUse(tool_use_2));
-    model.end_last_completion_stream();
+    fake.send_last_event(&model, LanguageModelCompletionEvent::ToolUse(tool_use_2));
+    fake.end_last(&model);
     cx.run_until_parked();
 
     let subagent2_session_id = thread.read_with(cx, |thread, cx| {
@@ -12839,18 +12811,17 @@ async fn test_spawn_agent_two_tasks_isolated_worktrees(cx: &mut TestAppContext) 
         is_input_complete: true,
         thought_signature: None,
     };
-    model
-        .send_last_completion_stream_event(LanguageModelCompletionEvent::ToolUse(write_tool_use_2));
-    model.end_last_completion_stream();
+    fake.send_last_event(&model, LanguageModelCompletionEvent::ToolUse(write_tool_use_2));
+    fake.end_last(&model);
     cx.run_until_parked();
 
     // Subagent 2 finishes
-    model.send_last_completion_stream_text_chunk("done with task 2");
-    model.end_last_completion_stream();
+    fake.send_last_text(&model, "done with task 2");
+    fake.end_last(&model);
     cx.run_until_parked();
 
     // Verify parent received isolation_details with branch, sha, changed_files for task 2
-    let completion2 = model
+    let completion2 = fake
         .pending_completions()
         .pop()
         .expect("expected parent completion after subagent 2 finish");
@@ -12882,8 +12853,8 @@ async fn test_spawn_agent_two_tasks_isolated_worktrees(cx: &mut TestAppContext) 
     assert!(!head_sha_2.is_empty());
 
     // Parent completes turn 2
-    model.send_last_completion_stream_text_chunk("Parent response 2");
-    model.end_last_completion_stream();
+    fake.send_last_text(&model, "Parent response 2");
+    fake.end_last(&model);
     send2.await.unwrap();
 
     // Verify isolation assertions:
@@ -12938,7 +12909,7 @@ async fn test_spawn_agent_two_tasks_isolated_worktrees(cx: &mut TestAppContext) 
 
 #[gpui::test]
 async fn test_spawn_agent_non_git_degrades_isolation(cx: &mut TestAppContext) {
-    init_test(cx);
+    let fake = init_test(cx);
     cx.update(|cx| {
         LanguageModelRegistry::test(cx);
         enable_default_profile_delegation(cx);
@@ -12974,7 +12945,7 @@ async fn test_spawn_agent_non_git_degrades_isolation(cx: &mut TestAppContext) {
     let thread = agent.read_with(cx, |agent, _| {
         agent.sessions.get(&session_id).unwrap().thread.clone()
     });
-    let model = Arc::new(FakeLanguageModel::default());
+    let model = fake.model("fake");
 
     thread.update(cx, |thread, cx| {
         thread.set_model(model.clone(), cx);
@@ -12983,7 +12954,7 @@ async fn test_spawn_agent_non_git_degrades_isolation(cx: &mut TestAppContext) {
 
     let send = acp_thread.update(cx, |thread, cx| thread.send_raw("Start task", cx));
     cx.run_until_parked();
-    model.send_last_completion_stream_text_chunk("spawning subagent");
+    fake.send_last_text(&model, "spawning subagent");
     let subagent_input = SpawnAgentToolInput {
         label: "non-git task".to_string(),
         message: "do something".to_string(),
@@ -13005,8 +12976,8 @@ async fn test_spawn_agent_non_git_degrades_isolation(cx: &mut TestAppContext) {
         is_input_complete: true,
         thought_signature: None,
     };
-    model.send_last_completion_stream_event(LanguageModelCompletionEvent::ToolUse(tool_use));
-    model.end_last_completion_stream();
+    fake.send_last_event(&model, LanguageModelCompletionEvent::ToolUse(tool_use));
+    fake.end_last(&model);
     cx.run_until_parked();
 
     // Subagent should be spawned successfully despite non-git (graceful degradation)
@@ -13031,12 +13002,12 @@ async fn test_spawn_agent_non_git_degrades_isolation(cx: &mut TestAppContext) {
     );
 
     // Subagent responds
-    model.send_last_completion_stream_text_chunk("subagent finished work");
-    model.end_last_completion_stream();
+    fake.send_last_text(&model, "subagent finished work");
+    fake.end_last(&model);
     cx.run_until_parked();
 
     // Verify parent model received the tool result containing the degradation marker
-    let completion = model
+    let completion = fake
         .pending_completions()
         .pop()
         .expect("expected parent completion after subagent finish");
@@ -13058,8 +13029,8 @@ async fn test_spawn_agent_non_git_degrades_isolation(cx: &mut TestAppContext) {
     assert_eq!(parsed["isolation"], "shared:no-git-repository");
 
     // Parent completes turn
-    model.send_last_completion_stream_text_chunk("Parent response");
-    model.end_last_completion_stream();
+    fake.send_last_text(&model, "Parent response");
+    fake.end_last(&model);
     send.await.unwrap();
 }
 

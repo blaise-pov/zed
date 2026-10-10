@@ -479,10 +479,7 @@ impl AgentSettings {
         return None;
     }
 
-    pub fn system_prompt_template_for_model(
-        model: &Arc<dyn LanguageModel>,
-        cx: &App,
-    ) -> Option<String> {
+    pub fn system_prompt_template_for_model(model: &LanguageModel, cx: &App) -> Option<String> {
         let settings = Self::get_global(cx);
         for setting in settings.model_parameters.iter().rev() {
             let Some(template) = &setting.system_prompt_template else {
@@ -503,10 +500,7 @@ impl AgentSettings {
         None
     }
 
-    pub fn custom_instructions_for_model(
-        model: &Arc<dyn LanguageModel>,
-        cx: &App,
-    ) -> Option<String> {
+    pub fn custom_instructions_for_model(model: &LanguageModel, cx: &App) -> Option<String> {
         let settings = Self::get_global(cx);
         for setting in settings.model_parameters.iter().rev() {
             let Some(custom_instructions) = &setting.custom_instructions else {
@@ -3177,28 +3171,26 @@ mod tests {
 
     #[gpui::test]
     fn test_model_parameters_per_model_system_prompt_and_instructions(cx: &mut gpui::App) {
-        use language_model::fake_provider::FakeLanguageModel;
+        use language_model::{LanguageModelId, LanguageModelName, LanguageModelProviderId, LanguageModelProviderName};
 
         let store = SettingsStore::test(cx);
         cx.set_global(store);
         project::DisableAiSettings::register(cx);
         AgentSettings::register(cx);
 
-        let sonnet: Arc<dyn LanguageModel> = Arc::new(FakeLanguageModel::with_id_and_thinking(
-            "anthropic",
-            "claude-3-5-sonnet",
-            "Sonnet",
-            false,
-        ));
-        let opus: Arc<dyn LanguageModel> = Arc::new(FakeLanguageModel::with_id_and_thinking(
-            "anthropic",
-            "claude-3-opus",
-            "Opus",
-            false,
-        ));
-        let gpt4: Arc<dyn LanguageModel> = Arc::new(FakeLanguageModel::with_id_and_thinking(
-            "openai", "gpt-4", "GPT-4", false,
-        ));
+        let model_for = |provider: &str, id: &str, name: &str| {
+            LanguageModel::new(
+                LanguageModelId::from(id.to_string()),
+                LanguageModelName::from(name.to_string()),
+                LanguageModelProviderId::from(provider.to_string()),
+                LanguageModelProviderName::from(provider.to_string()),
+                format!("{provider}/{id}"),
+                1_000_000,
+            )
+        };
+        let sonnet = model_for("anthropic", "claude-3-5-sonnet", "Sonnet");
+        let opus = model_for("anthropic", "claude-3-opus", "Opus");
+        let gpt4 = model_for("openai", "gpt-4", "GPT-4");
 
         // 1. Provider-only match: matches all models from that provider, but not other providers.
         SettingsStore::update_global(cx, |store, cx| {
