@@ -5523,7 +5523,19 @@ impl BackgroundScanner {
                 Ok(Some(metadata)) => metadata,
                 Ok(None) => continue,
                 Err(err) => {
-                    log::error!("error processing {:?}: {err:#}", child_abs_path.display());
+                    let is_sharing_violation = err
+                        .root_cause()
+                        .downcast_ref::<std::io::Error>()
+                        .and_then(|err| err.raw_os_error())
+                        == Some(32);
+                    if is_sharing_violation {
+                        log::debug!(
+                            "skipping locked file during scan {:?}: {err:#}",
+                            child_abs_path.display()
+                        );
+                    } else {
+                        log::error!("error processing {:?}: {err:#}", child_abs_path.display());
+                    }
                     continue;
                 }
             };

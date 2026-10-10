@@ -418,6 +418,11 @@ pub fn ensure_task_worktree_with_policy(
             }
         }
 
+        if let Err(error) = ensure_task_worktree_settings(&file_system, &worktree_path).await {
+            unregister_task_worktree(&task_id);
+            return Err(error);
+        }
+
         let find_task = project.update(cx, |project, cx| {
             project.find_or_create_worktree(&worktree_path, false, cx)
         });
@@ -533,6 +538,58 @@ pub fn ensure_task_worktree_with_policy(
 
         Ok(worktree_path)
     })
+}
+
+async fn ensure_task_worktree_settings(
+    file_system: &Arc<dyn Fs>,
+    worktree_path: &Path,
+) -> Result<()> {
+    let zed_dir = worktree_path.join(".zed");
+    let settings_path = zed_dir.join("settings.json");
+
+    let mut map = if file_system.is_file(&settings_path).await {
+        let content = file_system.load(&settings_path).await?;
+        if content.trim().is_empty() {
+            serde_json::Map::new()
+        } else {
+            let parsed = serde_json_lenient::from_str::<serde_json::Value>(&content)
+                .with_context(|| format!("parsing settings file {settings_path:?}"))?;
+            match parsed {
+                serde_json::Value::Object(map) => map,
+                _ => anyhow::bail!("expected JSON object in {settings_path:?}"),
+            }
+        }
+    } else {
+        serde_json::Map::new()
+    };
+
+    let target_exclusions = ["**/target/**", "**/.git/**"];
+    if let Some(existing_exclusions) = map.get_mut("file_scan_exclusions") {
+        if let serde_json::Value::Array(arr) = existing_exclusions {
+            for exclusion in target_exclusions {
+                if !arr.iter().any(|v| v.as_str() == Some(exclusion)) {
+                    arr.push(serde_json::Value::String(exclusion.to_string()));
+                }
+            }
+        } else {
+            map.insert(
+                "file_scan_exclusions".to_string(),
+                serde_json::json!(target_exclusions),
+            );
+        }
+    } else {
+        map.insert(
+            "file_scan_exclusions".to_string(),
+            serde_json::json!(target_exclusions),
+        );
+    }
+
+    if !file_system.is_dir(&zed_dir).await {
+        file_system.create_dir(&zed_dir).await?;
+    }
+    let serialized = serde_json::to_string_pretty(&serde_json::Value::Object(map))?;
+    file_system.atomic_write(settings_path, serialized).await?;
+    Ok(())
 }
 
 #[derive(Default)]
@@ -6987,5 +7044,47 @@ mod tests {
             task_worktree_title(&task.id),
             Some("Swept task title".to_string())
         );
+    }
+
+    #[gpui::test]
+    async fn test_ensure_task_worktree_settings(cx: &mut TestAppContext) -> Result<()> {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let worktree_path = Path::new("/worktree");
+        fs.create_dir(worktree_path).await?;
+
+        ensure_task_worktree_settings(&(fs.clone() as Arc<dyn Fs>), worktree_path).await?;
+
+        let content = fs.load(&worktree_path.join(".zed/settings.json")).await?;
+        let json: serde_json::Value = serde_json::from_str(&content)?;
+        assert_eq!(
+            json["file_scan_exclusions"],
+            serde_json::json!(["**/target/**", "**/.git/**"])
+        );
+
+        let existing = r#"{
+            // Custom comment
+            "tab_size": 4,
+            "file_scan_exclusions": [
+                "**/node_modules/**",
+            ],
+        }"#;
+        fs.atomic_write(
+            worktree_path.join(".zed/settings.json"),
+            existing.to_string(),
+        )
+        .await?;
+
+        ensure_task_worktree_settings(&(fs.clone() as Arc<dyn Fs>), worktree_path).await?;
+
+        let content = fs.load(&worktree_path.join(".zed/settings.json")).await?;
+        let json: serde_json::Value = serde_json::from_str(&content)?;
+        assert_eq!(json["tab_size"], 4);
+        assert_eq!(
+            json["file_scan_exclusions"],
+            serde_json::json!(["**/node_modules/**", "**/target/**", "**/.git/**"])
+        );
+
+        Ok(())
     }
 }
