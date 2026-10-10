@@ -156,38 +156,24 @@ pub fn submit(mut record: Record) {
         handle.into_inner()
     });
     if let Some(file) = file_guard.as_mut() {
-        struct SizedWriter<'a> {
-            file: &'a mut std::fs::File,
-            written: u64,
-        }
-        impl io::Write for SizedWriter<'_> {
-            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-                self.file.write(buf)?;
-                self.written += buf.len() as u64;
-                Ok(buf.len())
-            }
-
-            fn flush(&mut self) -> io::Result<()> {
-                self.file.flush()
-            }
-        }
-        let file_size_bytes = {
-            let mut writer = SizedWriter { file, written: 0 };
-            _ = writeln!(
-                &mut writer,
-                "{} {} {} {}",
-                chrono::Local::now().format("%Y-%m-%dT%H:%M:%S%:z"),
-                LEVEL_OUTPUT_STRINGS[record.level as usize],
-                SourceFmt {
-                    scope: record.scope,
-                    module_path: record.module_path,
-                    line: record.line,
-                    ansi: false,
-                },
-                record.message
-            );
-            SINK_FILE_SIZE_BYTES.fetch_add(writer.written, Ordering::AcqRel) + writer.written
-        };
+        use std::fmt::Write as _;
+        let mut buffer = String::new();
+        _ = writeln!(
+            &mut buffer,
+            "{} {} {} {}",
+            chrono::Local::now().format("%Y-%m-%dT%H:%M:%S%:z"),
+            LEVEL_OUTPUT_STRINGS[record.level as usize],
+            SourceFmt {
+                scope: record.scope,
+                module_path: record.module_path,
+                line: record.line,
+                ansi: false,
+            },
+            record.message
+        );
+        _ = file.write_all(buffer.as_bytes());
+        let file_size_bytes = SINK_FILE_SIZE_BYTES.fetch_add(buffer.len() as u64, Ordering::AcqRel)
+            + buffer.len() as u64;
         if file_size_bytes > SINK_FILE_SIZE_BYTES_MAX {
             *file_guard = None;
             let file = rotate_log_file(SINK_FILE_PATH.get(), SINK_FILE_PATH_ROTATE.get());
@@ -332,5 +318,45 @@ mod tests {
         assert_eq!(LEVEL_OUTPUT_STRINGS[log::Level::Info as usize], "INFO ");
         assert_eq!(LEVEL_OUTPUT_STRINGS[log::Level::Debug as usize], "DEBUG");
         assert_eq!(LEVEL_OUTPUT_STRINGS[log::Level::Trace as usize], "TRACE");
+    }
+
+    #[test]
+    fn test_file_sink_submit() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let log_file_path = temp_dir.path().join("log.txt");
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_file_path)
+            .unwrap();
+
+        let initial_size = SINK_FILE_SIZE_BYTES.load(Ordering::SeqCst);
+        {
+            let mut file_guard = ENABLED_SINKS_FILE.lock().unwrap();
+            *file_guard = Some(file);
+        }
+
+        let message = format_args!("test log entry");
+        submit(Record {
+            scope: ["test_crate", "sub", "", ""],
+            level: log::Level::Info,
+            message: &message,
+            module_path: Some("test_crate::sub"),
+            line: None,
+        });
+
+        {
+            let mut file_guard = ENABLED_SINKS_FILE.lock().unwrap();
+            *file_guard = None;
+        }
+
+        let contents = std::fs::read_to_string(&log_file_path).unwrap();
+        assert!(contents.contains("INFO "));
+        assert!(contents.contains("[test_crate.sub]"));
+        assert!(contents.ends_with("test log entry\n"));
+        assert_eq!(
+            SINK_FILE_SIZE_BYTES.load(Ordering::SeqCst) - initial_size,
+            contents.len() as u64
+        );
     }
 }
