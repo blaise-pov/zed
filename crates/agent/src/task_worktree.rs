@@ -2,7 +2,9 @@
 use std::collections::HashSet;
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
+#[cfg(not(any(test, feature = "test-support")))]
+use std::sync::LazyLock;
 
 use anyhow::{Context as _, Result};
 use fs::Fs;
@@ -418,9 +420,11 @@ pub fn ensure_task_worktree_with_policy(
             }
         }
 
-        if let Err(error) = ensure_task_worktree_settings(&file_system, &worktree_path).await {
-            unregister_task_worktree(&task_id);
-            return Err(error);
+        if !file_system.is_fake() {
+            if let Err(error) = ensure_task_worktree_settings(&file_system, &worktree_path).await {
+                unregister_task_worktree(&task_id);
+                return Err(error);
+            }
         }
 
         let find_task = project.update(cx, |project, cx| {
@@ -451,9 +455,25 @@ pub fn ensure_task_worktree_with_policy(
         }
 
         cx.update(|cx| {
+            let pool_key = pool_key.clone();
             cx.observe_release(&project, move |_, _cx| {
-                let mut map = PROJECT_TASK_WORKTREES.write();
-                map.remove(&project_id);
+                let removed_tasks: Vec<AgentTaskId> = {
+                    let mut map = PROJECT_TASK_WORKTREES.write();
+                    map.remove(&project_id)
+                        .map(|tasks| tasks.into_keys().collect())
+                        .unwrap_or_default()
+                };
+                let mut reg = REGISTRY.write();
+                for removed_task_id in &removed_tasks {
+                    reg.entries.remove(removed_task_id);
+                    #[cfg(any(test, feature = "test-support"))]
+                    reg.task_files.remove(removed_task_id);
+                }
+                reg.entries
+                    .retain(|_, state| state.pool_key.as_ref() != Some(&pool_key));
+                IN_FLIGHT_CREATIONS.lock().remove(&pool_key);
+                TASK_WORKTREE_WAITING_CREATIONS.lock().remove(&pool_key);
+                NOTIFIED_WAITERS.lock().remove(&pool_key);
             })
             .detach();
         });
@@ -563,7 +583,7 @@ async fn ensure_task_worktree_settings(
         serde_json::Map::new()
     };
 
-    let target_exclusions = ["**/target/**", "**/.git/**"];
+    let target_exclusions = ["**/target", "**/target/**", "**/.git/**"];
     if let Some(existing_exclusions) = map.get_mut("file_scan_exclusions") {
         if let serde_json::Value::Array(arr) = existing_exclusions {
             for exclusion in target_exclusions {
@@ -713,15 +733,52 @@ pub fn worktree_release_safety(task_id: &AgentTaskId) -> WorktreeReleaseSafety {
     )
 }
 
-static REGISTRY: LazyLock<parking_lot::RwLock<TaskWorktreeRegistry>> =
-    LazyLock::new(|| parking_lot::RwLock::new(TaskWorktreeRegistry::default()));
+#[cfg(any(test, feature = "test-support"))]
+struct TestThreadLocal<T: 'static>(fn() -> &'static T);
 
-static PROJECT_TASK_WORKTREES: LazyLock<
-    parking_lot::RwLock<HashMap<gpui::EntityId, HashMap<AgentTaskId, Entity<project::Worktree>>>>,
-> = LazyLock::new(|| parking_lot::RwLock::new(HashMap::default()));
+#[cfg(any(test, feature = "test-support"))]
+impl<T: 'static> std::ops::Deref for TestThreadLocal<T> {
+    type Target = T;
 
-static TASK_LSP_SUPPRESSION: LazyLock<parking_lot::RwLock<HashMap<AgentTaskId, bool>>> =
-    LazyLock::new(|| parking_lot::RwLock::new(HashMap::default()));
+    fn deref(&self) -> &Self::Target {
+        (self.0)()
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+macro_rules! task_worktree_static {
+    ($name:ident: $ty:ty = $init:expr) => {
+        static $name: TestThreadLocal<$ty> = TestThreadLocal(|| {
+            thread_local! {
+                static INSTANCE: &'static $ty = Box::leak(Box::new($init));
+            }
+            INSTANCE.with(|instance| *instance)
+        });
+    };
+}
+
+#[cfg(not(any(test, feature = "test-support")))]
+macro_rules! task_worktree_static {
+    ($name:ident: $ty:ty = $init:expr) => {
+        static $name: LazyLock<$ty> = LazyLock::new(|| $init);
+    };
+}
+
+task_worktree_static!(
+    REGISTRY: parking_lot::RwLock<TaskWorktreeRegistry> =
+        parking_lot::RwLock::new(TaskWorktreeRegistry::default())
+);
+
+task_worktree_static!(
+    PROJECT_TASK_WORKTREES: parking_lot::RwLock<
+        HashMap<gpui::EntityId, HashMap<AgentTaskId, Entity<project::Worktree>>>,
+    > = parking_lot::RwLock::new(HashMap::default())
+);
+
+task_worktree_static!(
+    TASK_LSP_SUPPRESSION: parking_lot::RwLock<HashMap<AgentTaskId, bool>> =
+        parking_lot::RwLock::new(HashMap::default())
+);
 
 pub fn set_task_lsp_suppressed(task_id: &AgentTaskId, suppressed: bool) {
     let mut map = TASK_LSP_SUPPRESSION.write();
@@ -744,15 +801,17 @@ pub fn clear_task_lsp_suppressed(task_id: &AgentTaskId) {
     TASK_LSP_SUPPRESSION.write().remove(task_id);
 }
 
-static GOAL_MERGE_LOCKS: LazyLock<
-    parking_lot::Mutex<HashMap<String, Arc<futures::lock::Mutex<()>>>>,
-> = LazyLock::new(|| parking_lot::Mutex::new(HashMap::default()));
+task_worktree_static!(
+    GOAL_MERGE_LOCKS: parking_lot::Mutex<HashMap<String, Arc<futures::lock::Mutex<()>>>> =
+        parking_lot::Mutex::new(HashMap::default())
+);
 
 pub(crate) fn get_goal_merge_lock(goal_id: &str) -> Arc<futures::lock::Mutex<()>> {
     let mut locks = GOAL_MERGE_LOCKS.lock();
     locks.entry(goal_id.to_string()).or_default().clone()
 }
 
+#[cfg(any(test, feature = "test-support"))]
 pub fn reset_registry_for_tests() {
     let mut reg = REGISTRY.write();
     *reg = TaskWorktreeRegistry::default();
@@ -770,15 +829,21 @@ pub fn reset_registry_for_tests() {
     notified.clear();
 }
 
-static TASK_WORKTREE_WAITING_CREATIONS: LazyLock<
-    parking_lot::Mutex<HashMap<ProjectPoolKey, VecDeque<futures::channel::oneshot::Sender<()>>>>,
-> = LazyLock::new(|| parking_lot::Mutex::new(HashMap::default()));
+task_worktree_static!(
+    TASK_WORKTREE_WAITING_CREATIONS: parking_lot::Mutex<
+        HashMap<ProjectPoolKey, VecDeque<futures::channel::oneshot::Sender<()>>>,
+    > = parking_lot::Mutex::new(HashMap::default())
+);
 
-static IN_FLIGHT_CREATIONS: LazyLock<parking_lot::Mutex<HashMap<ProjectPoolKey, usize>>> =
-    LazyLock::new(|| parking_lot::Mutex::new(HashMap::default()));
+task_worktree_static!(
+    IN_FLIGHT_CREATIONS: parking_lot::Mutex<HashMap<ProjectPoolKey, usize>> =
+        parking_lot::Mutex::new(HashMap::default())
+);
 
-static NOTIFIED_WAITERS: LazyLock<parking_lot::Mutex<HashMap<ProjectPoolKey, usize>>> =
-    LazyLock::new(|| parking_lot::Mutex::new(HashMap::default()));
+task_worktree_static!(
+    NOTIFIED_WAITERS: parking_lot::Mutex<HashMap<ProjectPoolKey, usize>> =
+        parking_lot::Mutex::new(HashMap::default())
+);
 
 fn notify_task_worktree_slot_available_for_pool(pool_key: &ProjectPoolKey) {
     let mut all_waiters = TASK_WORKTREE_WAITING_CREATIONS.lock();
@@ -1229,37 +1294,31 @@ fn finish_slot_and_register_policy(
     } else {
         Some(std::time::Instant::now())
     };
-    let entry = reg
-        .entries
-        .entry(task_id.clone())
-        .or_insert_with(|| TaskWorktreeState {
-            worktree_path: worktree_path.clone(),
-            commit_error: None,
-            cleanup_error: None,
-            is_terminal: false,
-            goal_branch: goal_branch.clone(),
-            base_ref: base_ref.clone(),
-            base_sha: base_sha.clone(),
-            merge_conflict: None,
-            changed_files: Vec::new(),
-            isolation_details: None,
-            checkout_target: checkout_target.clone(),
-            last_session_ended_at: initial_ended_at,
-            pool_key: pool_key.clone(),
-            slot_notified: false,
-            is_cleaning: false,
-        });
-    entry.worktree_path = worktree_path;
-    entry.goal_branch = goal_branch;
-    entry.base_ref = base_ref;
-    entry.base_sha = base_sha;
-    entry.checkout_target = checkout_target;
-    if pool_key.is_some() {
-        entry.pool_key = pool_key;
-    }
-    if entry.last_session_ended_at.is_none() && !has_active {
-        entry.last_session_ended_at = Some(std::time::Instant::now());
-    }
+    let entry = reg.entries.entry(task_id.clone()).or_default();
+    let preserved_pool_key = pool_key.or_else(|| {
+        if entry.worktree_path == worktree_path {
+            entry.pool_key.clone()
+        } else {
+            None
+        }
+    });
+    *entry = TaskWorktreeState {
+        worktree_path,
+        commit_error: None,
+        cleanup_error: None,
+        is_terminal: false,
+        goal_branch,
+        base_ref,
+        base_sha,
+        merge_conflict: None,
+        changed_files: Vec::new(),
+        isolation_details: None,
+        checkout_target,
+        last_session_ended_at: initial_ended_at,
+        pool_key: preserved_pool_key,
+        slot_notified: false,
+        is_cleaning: false,
+    };
 }
 
 pub fn register_task_worktree_policy(
@@ -2982,7 +3041,7 @@ pub fn prepare_goal_graduation_summary(goal_id: &str) -> Result<GoalGraduationSu
     body.push_str(&format!("- Source branch: `{goal_branch}`\n"));
     body.push_str("- Target branch: `main`\n");
     if let Some(sha) = &tip_sha {
-        let short_sha = &sha[..7.min(sha.len())];
+        let short_sha: String = sha.chars().take(7).collect();
         body.push_str(&format!("- Tip SHA: `{short_sha}` ({sha})\n"));
     }
     body.push_str(&format!("- Commits merged: {commits_count}\n"));
@@ -3422,7 +3481,7 @@ mod tests {
     use util::path;
 
     fn init_test(cx: &mut TestAppContext) {
-        // reset_registry_for_tests();
+        reset_registry_for_tests();
         cx.update(|cx| {
             let settings_store = SettingsStore::test(cx);
             cx.set_global(settings_store);
@@ -3433,6 +3492,7 @@ mod tests {
 
     #[test]
     fn test_subagent_session_guard_drop_unregisters() {
+        reset_registry_for_tests();
         let task_id = AgentTaskId::from("TASK-GUARD-TEST");
         assert!(!has_active_subagent_session(&task_id));
 
@@ -3827,7 +3887,7 @@ mod tests {
 
         // Case 3: base_branch matches agent-goal/* -> auto-creates goal branch
         let task3 = AgentTaskSummary {
-            id: AgentTaskId::from("TASK-3"),
+            id: AgentTaskId::from("TASK-ENS-3"),
             parent_id: None,
             goal_id: None,
             title: "Task 3".to_string(),
@@ -3860,7 +3920,7 @@ mod tests {
 
         // Case 4: unknown base_branch -> error
         let task4 = AgentTaskSummary {
-            id: AgentTaskId::from("TASK-4"),
+            id: AgentTaskId::from("TASK-ENS-4"),
             parent_id: None,
             goal_id: None,
             title: "Task 4".to_string(),
@@ -3890,7 +3950,7 @@ mod tests {
 
         // Case 5: task_id without goal_id/base_branch -> previous behavior (from HEAD main)
         let task5 = AgentTaskSummary {
-            id: AgentTaskId::from("TASK-5"),
+            id: AgentTaskId::from("TASK-ENS-5"),
             parent_id: None,
             goal_id: None,
             title: "Task 5".to_string(),
@@ -6768,6 +6828,7 @@ mod tests {
 
     #[test]
     fn test_task_title_recording_and_sanitization() {
+        reset_registry_for_tests();
         let task_1 = AgentTaskId::from("TASK-TITLES-UNIT-1");
         record_task_title(&task_1, "  Add login page\nsecond line");
         assert_eq!(
@@ -7035,10 +7096,11 @@ mod tests {
 
         assert_eq!(task_worktree_title(&task.id), None);
 
-        let _ = cx
+        let swept = cx
             .update(|cx| startup_sweep(project.clone(), Some(std::slice::from_ref(&task)), cx))
             .await
-            .unwrap();
+            .expect("startup_sweep should succeed");
+        assert!(swept.is_empty());
 
         assert_eq!(
             task_worktree_title(&task.id),
@@ -7047,19 +7109,27 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_ensure_task_worktree_settings(cx: &mut TestAppContext) -> Result<()> {
+    async fn test_ensure_task_worktree_settings(cx: &mut TestAppContext) {
         init_test(cx);
         let fs = FakeFs::new(cx.executor());
         let worktree_path = Path::new("/worktree");
-        fs.create_dir(worktree_path).await?;
+        fs.create_dir(worktree_path)
+            .await
+            .expect("create_dir should succeed");
 
-        ensure_task_worktree_settings(&(fs.clone() as Arc<dyn Fs>), worktree_path).await?;
+        ensure_task_worktree_settings(&(fs.clone() as Arc<dyn Fs>), worktree_path)
+            .await
+            .expect("ensure_task_worktree_settings should succeed");
 
-        let content = fs.load(&worktree_path.join(".zed/settings.json")).await?;
-        let json: serde_json::Value = serde_json::from_str(&content)?;
+        let content = fs
+            .load(&worktree_path.join(".zed/settings.json"))
+            .await
+            .expect("load settings.json should succeed");
+        let json: serde_json::Value =
+            serde_json::from_str(&content).expect("settings.json should be valid JSON");
         assert_eq!(
             json["file_scan_exclusions"],
-            serde_json::json!(["**/target/**", "**/.git/**"])
+            serde_json::json!(["**/target", "**/target/**", "**/.git/**"])
         );
 
         let existing = r#"{
@@ -7073,18 +7143,76 @@ mod tests {
             worktree_path.join(".zed/settings.json"),
             existing.to_string(),
         )
-        .await?;
+        .await
+        .expect("atomic_write should succeed");
 
-        ensure_task_worktree_settings(&(fs.clone() as Arc<dyn Fs>), worktree_path).await?;
+        ensure_task_worktree_settings(&(fs.clone() as Arc<dyn Fs>), worktree_path)
+            .await
+            .expect("ensure_task_worktree_settings should succeed");
 
-        let content = fs.load(&worktree_path.join(".zed/settings.json")).await?;
-        let json: serde_json::Value = serde_json::from_str(&content)?;
+        let content = fs
+            .load(&worktree_path.join(".zed/settings.json"))
+            .await
+            .expect("load settings.json should succeed");
+        let json: serde_json::Value =
+            serde_json::from_str(&content).expect("settings.json should be valid JSON");
         assert_eq!(json["tab_size"], 4);
         assert_eq!(
             json["file_scan_exclusions"],
-            serde_json::json!(["**/node_modules/**", "**/target/**", "**/.git/**"])
+            serde_json::json!([
+                "**/node_modules/**",
+                "**/target",
+                "**/target/**",
+                "**/.git/**"
+            ])
+        );
+    }
+
+    #[test]
+    fn test_prepare_goal_graduation_summary_multibyte_utf8_sha() {
+        reset_registry_for_tests();
+        record_goal_tip_sha("GOAL-UTF8", "🦀🦀🦀abc".to_string());
+        let summary = prepare_goal_graduation_summary("GOAL-UTF8")
+            .expect("prepare_goal_graduation_summary should succeed for multibyte UTF-8 SHA");
+        assert!(
+            summary
+                .pr_proposal
+                .body
+                .contains("- Tip SHA: `🦀🦀🦀abc` (🦀🦀🦀abc)")
+        );
+    }
+
+    #[test]
+    fn test_register_task_worktree_policy_clears_stale_overlay_and_reset() {
+        reset_registry_for_tests();
+        let task_id = AgentTaskId::from("TASK-OVERLAY-1");
+        register_task_worktree_policy(
+            &task_id,
+            PathBuf::from("/worktree/first"),
+            Some("agent-goal/GOAL-STALE".to_string()),
+            Some("agent-goal/GOAL-STALE".to_string()),
+            Some("stale-sha".to_string()),
+            Some("agent-goal/GOAL-STALE".to_string()),
+        );
+        record_task_worktree_commit_error(&task_id, "stale error".to_string());
+        record_task_worktree_merge_conflict(&task_id, vec!["conflict.rs".to_string()]);
+        mark_task_terminal(&task_id);
+
+        assert_eq!(
+            task_worktree_goal_branch(&task_id),
+            Some("agent-goal/GOAL-STALE".to_string())
         );
 
-        Ok(())
+        register_task_worktree(&task_id, PathBuf::from("/worktree/second"));
+        assert_eq!(task_worktree_goal_branch(&task_id), None);
+        assert_eq!(task_worktree_base_ref(&task_id), None);
+        assert_eq!(task_worktree_base_sha(&task_id), None);
+        assert_eq!(task_worktree_checkout_target(&task_id), None);
+        assert_eq!(task_worktree_commit_error(&task_id), None);
+        assert_eq!(task_worktree_merge_conflict(&task_id), None);
+        assert!(!is_task_terminal(&task_id));
+
+        reset_registry_for_tests();
+        assert_eq!(task_worktree_path_for_id(&task_id), None);
     }
 }
