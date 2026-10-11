@@ -456,9 +456,33 @@ pub fn resolve_project_path(
     cx: &App,
 ) -> Result<ResolvedProjectPath> {
     let path = path.as_ref();
+    let has_parent_component = path
+        .components()
+        .any(|component| matches!(component, Component::ParentDir))
+        || path
+            .to_str()
+            .is_some_and(|path| path.split(['/', '\\']).any(|component| component == ".."));
+
+    if !path.is_absolute() && has_parent_component {
+        if util::paths::normalize_lexically(path).is_err() {
+            bail!("Path {} is not in the project", path.display());
+        }
+        let escapes_worktree_root = project.visible_worktrees(cx).any(|worktree| {
+            let worktree = worktree.read(cx);
+            path.strip_prefix(worktree.root_name().as_std_path())
+                .is_ok_and(|after_root| util::paths::normalize_lexically(after_root).is_err())
+        });
+        if escapes_worktree_root {
+            bail!("Path {} is not in the project", path.display());
+        }
+    }
+
     let project_path = project
         .find_project_path(path, cx)
         .or_else(|| {
+            if has_parent_component {
+                return None;
+            }
             let parent_path = path.parent()?;
             let parent_project_path = project.find_project_path(parent_path, cx)?;
             let file_name = path.file_name()?.to_str()?;
