@@ -251,7 +251,7 @@ pub(crate) struct FakeThreadEnvironment {
     terminal_output_limits: std::cell::RefCell<Vec<Option<u64>>>,
     terminal_commands: std::cell::RefCell<Vec<String>>,
     subagent_models: std::cell::RefCell<Vec<Option<AgentModelId>>>,
-    registered_tasks: std::cell::RefCell<Vec<(String, String)>>,
+    registered_tasks: std::cell::RefCell<Vec<(String, String, Option<String>)>>,
     failed_tasks: std::cell::RefCell<Vec<(String, String)>>,
     ensure_task_error: std::cell::RefCell<Option<String>>,
     ensure_worktree_calls: std::cell::RefCell<Vec<String>>,
@@ -288,7 +288,7 @@ impl FakeThreadEnvironment {
         self.subagent_models.borrow().clone()
     }
 
-    pub(crate) fn registered_tasks(&self) -> Vec<(String, String)> {
+    pub(crate) fn registered_tasks(&self) -> Vec<(String, String, Option<String>)> {
         self.registered_tasks.borrow().clone()
     }
 
@@ -367,11 +367,14 @@ impl crate::ThreadEnvironment for FakeThreadEnvironment {
         &self,
         task_id: &str,
         title: &str,
+        goal_id: Option<&str>,
         _cx: &mut AsyncApp,
     ) -> Task<Result<()>> {
-        self.registered_tasks
-            .borrow_mut()
-            .push((task_id.to_string(), title.to_string()));
+        self.registered_tasks.borrow_mut().push((
+            task_id.to_string(),
+            title.to_string(),
+            goal_id.map(str::to_string),
+        ));
         if let Some(ref err) = *self.ensure_task_error.borrow() {
             Task::ready(Err(anyhow::anyhow!("{err}")))
         } else {
@@ -7785,10 +7788,10 @@ async fn test_spawn_agent_ensures_task_registration_best_effort(cx: &mut TestApp
     assert!(matches!(result, Ok(SpawnAgentToolOutput::Success { .. })));
     assert_eq!(
         environment.registered_tasks(),
-        vec![("TASK-100".to_string(), "Researching fix".to_string())]
+        vec![("TASK-100".to_string(), "Researching fix".to_string(), None)]
     );
 
-    // 2. Spawning with task_id when registration fails -> best-effort continues and succeeds
+    // 2. Spawning with task_id and goal_id when registration fails -> best-effort continues and succeeds
     environment.set_ensure_task_error(Some("TGS server unavailable".to_string()));
     let (event_stream, _rx) = ToolCallEventStream::test();
     let result = cx
@@ -7798,6 +7801,7 @@ async fn test_spawn_agent_ensures_task_registration_best_effort(cx: &mut TestApp
                     label: "Fixing defect".to_string(),
                     message: "implement changes".to_string(),
                     task_id: Some("TASK-101".to_string()),
+                    goal_id: Some("GOAL-42".to_string()),
                     ..Default::default()
                 }),
                 event_stream,
@@ -7810,8 +7814,12 @@ async fn test_spawn_agent_ensures_task_registration_best_effort(cx: &mut TestApp
     assert_eq!(
         environment.registered_tasks(),
         vec![
-            ("TASK-100".to_string(), "Researching fix".to_string()),
-            ("TASK-101".to_string(), "Fixing defect".to_string()),
+            ("TASK-100".to_string(), "Researching fix".to_string(), None),
+            (
+                "TASK-101".to_string(),
+                "Fixing defect".to_string(),
+                Some("GOAL-42".to_string())
+            ),
         ]
     );
 }
@@ -8106,7 +8114,11 @@ async fn test_spawn_agent_disabled_isolation_preserves_task_linkage_without_work
     let registered = environment.registered_tasks();
     assert_eq!(
         registered,
-        vec![("TASK-RESEARCH-99".to_string(), "research task".to_string())],
+        vec![(
+            "TASK-RESEARCH-99".to_string(),
+            "research task".to_string(),
+            None
+        )],
         "TGS ensure_task registration must occur even without worktree isolation"
     );
 }

@@ -3810,17 +3810,19 @@ impl ThreadEnvironment for NativeThreadEnvironment {
         &self,
         task_id: &str,
         title: &str,
+        goal_id: Option<&str>,
         cx: &mut AsyncApp,
     ) -> Task<Result<()>> {
         let Some(parent_thread_entity) = self.thread.upgrade() else {
             return Task::ready(Err(anyhow!("Parent thread no longer exists")));
         };
-        let (project, task_id_typed, title_string) = cx.update(|cx| {
+        let (project, task_id_typed, title_string, goal_id_string) = cx.update(|cx| {
             let project = parent_thread_entity.read(cx).project().clone();
             (
                 project,
                 crate::AgentTaskId::from(task_id.to_string()),
                 title.to_string(),
+                goal_id.map(|goal_id| goal_id.to_string()),
             )
         });
         cx.spawn(async move |cx| {
@@ -3836,7 +3838,12 @@ impl ThreadEnvironment for NativeThreadEnvironment {
                     context_server_store,
                     server_id,
                 );
-                provider.ensure_task(&task_id_typed, &title_string, cx)
+                provider.ensure_task(
+                    &task_id_typed,
+                    &title_string,
+                    goal_id_string.as_deref(),
+                    cx,
+                )
             });
             task.await
         })

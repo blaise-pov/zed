@@ -525,7 +525,12 @@ impl AgentTool for SpawnAgentTool {
             if let Some(ref task_id) = task_id {
                 if let Err(error) = self
                     .environment
-                    .ensure_task_registered(task_id, &input.label, &mut cx)
+                    .ensure_task_registered(
+                        task_id,
+                        &input.label,
+                        input.goal_id.as_deref(),
+                        &mut cx,
+                    )
                     .await
                 {
                     log::warn!(

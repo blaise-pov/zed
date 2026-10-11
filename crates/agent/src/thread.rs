@@ -952,6 +952,7 @@ pub trait ThreadEnvironment {
         &self,
         _task_id: &str,
         _title: &str,
+        _goal_id: Option<&str>,
         _cx: &mut AsyncApp,
     ) -> Task<Result<()>> {
         Task::ready(Ok(()))

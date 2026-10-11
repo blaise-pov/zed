@@ -103,7 +103,13 @@ impl AgentTaskProvider for McpAgentTaskProvider {
         })
     }
 
-    fn ensure_task(&self, id: &AgentTaskId, title: &str, cx: &mut App) -> Task<Result<()>> {
+    fn ensure_task(
+        &self,
+        id: &AgentTaskId,
+        title: &str,
+        goal_id: Option<&str>,
+        cx: &mut App,
+    ) -> Task<Result<()>> {
         let mut get_arguments = serde_json::Map::new();
         get_arguments.insert(
             "task_id".to_string(),
@@ -126,6 +132,12 @@ impl AgentTaskProvider for McpAgentTaskProvider {
             "idempotency_key".to_string(),
             serde_json::Value::String(id.to_string()),
         );
+        if let Some(goal_id) = goal_id {
+            create_arguments.insert(
+                "goal_id".to_string(),
+                serde_json::Value::String(goal_id.to_string()),
+            );
+        }
 
         let store = self.store.clone();
         let server_id = self.server_id.clone();

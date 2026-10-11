@@ -269,10 +269,11 @@ impl AgentTaskStore {
         &mut self,
         id: &AgentTaskId,
         title: &str,
+        goal_id: Option<&str>,
         cx: &mut Context<Self>,
     ) -> Task<Result<()>> {
         let provider = self.provider.clone();
-        let task = provider.ensure_task(id, title, cx);
+        let task = provider.ensure_task(id, title, goal_id, cx);
         cx.spawn(async move |this, cx| {
             task.await?;
             let refresh_task = this.update(cx, |store, cx| store.refresh(cx))?;
@@ -427,7 +428,7 @@ mod tests {
         archive_calls: Vec<AgentTaskId>,
         unarchive_calls: Vec<AgentTaskId>,
         delete_calls: Vec<AgentTaskId>,
-        ensure_task_calls: Vec<(AgentTaskId, String)>,
+        ensure_task_calls: Vec<(AgentTaskId, String, Option<String>)>,
         set_task_status_calls: Vec<(AgentTaskId, AgentTaskStatus)>,
         set_goal_status_calls: Vec<(String, AgentGoalStatus)>,
         archive_goal_calls: Vec<String>,
@@ -553,12 +554,18 @@ mod tests {
             Task::ready(Ok(()))
         }
 
-        fn ensure_task(&self, id: &AgentTaskId, title: &str, _cx: &mut App) -> Task<Result<()>> {
-            self.calls
-                .lock()
-                .unwrap()
-                .ensure_task_calls
-                .push((id.clone(), title.to_string()));
+        fn ensure_task(
+            &self,
+            id: &AgentTaskId,
+            title: &str,
+            goal_id: Option<&str>,
+            _cx: &mut App,
+        ) -> Task<Result<()>> {
+            self.calls.lock().unwrap().ensure_task_calls.push((
+                id.clone(),
+                title.to_string(),
+                goal_id.map(str::to_string),
+            ));
             if self.should_fail {
                 Task::ready(Err(anyhow::anyhow!("offline")))
             } else {
@@ -723,7 +730,7 @@ mod tests {
         let task_id = AgentTaskId::from("TASK-1");
         let result = store
             .update(cx, |store, cx| {
-                store.ensure_task(&task_id, "Test Title", cx)
+                store.ensure_task(&task_id, "Test Title", Some("GOAL-1"), cx)
             })
             .await;
         assert!(result.is_ok());
@@ -731,7 +738,7 @@ mod tests {
         let counts = calls.lock().unwrap();
         assert_eq!(
             counts.ensure_task_calls,
-            vec![(task_id, "Test Title".to_string())]
+            vec![(task_id, "Test Title".to_string(), Some("GOAL-1".to_string()))]
         );
         assert_eq!(counts.fetch_graph_count, initial_refreshes + 1);
     }
