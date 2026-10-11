@@ -4,12 +4,15 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result};
+use fs::Fs;
 use futures::StreamExt;
+use git::repository::GitRepository;
 use gpui::{App, Context, Entity, Task};
 use parking_lot::Mutex;
 use project::Project;
 use project::git_store::worktrees_directory_for_repo;
 use serde::{Deserialize, Serialize};
+use util::ResultExt as _;
 
 use crate::agent_task::{AgentGoalSummary, AgentTaskId, AgentTaskSummary};
 use crate::task_worktree::{system_git_binary, task_worktree_context, task_worktree_path};
@@ -70,6 +73,76 @@ pub struct TaskGitSnapshot {
 }
 
 pub type DiffCache = Arc<Mutex<HashMap<(String, String), DiffShortStat>>>;
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct RepoCacheKey {
+    pub dot_git: PathBuf,
+    pub fs_ptr: usize,
+}
+
+impl RepoCacheKey {
+    pub fn new(dot_git: &Path, file_system: &Arc<dyn Fs>) -> Self {
+        Self {
+            dot_git: dot_git.to_path_buf(),
+            fs_ptr: Arc::as_ptr(file_system) as *const () as usize,
+        }
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+struct TestThreadLocal<T: 'static>(fn() -> &'static T);
+
+#[cfg(any(test, feature = "test-support"))]
+impl<T: 'static> std::ops::Deref for TestThreadLocal<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        (self.0)()
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+macro_rules! repo_cache_static {
+    ($name:ident: $ty:ty = $init:expr) => {
+        static $name: TestThreadLocal<$ty> = TestThreadLocal(|| {
+            thread_local! {
+                static INSTANCE: &'static $ty = Box::leak(Box::new($init));
+            }
+            INSTANCE.with(|instance| *instance)
+        });
+    };
+}
+
+#[cfg(not(any(test, feature = "test-support")))]
+macro_rules! repo_cache_static {
+    ($name:ident: $ty:ty = $init:expr) => {
+        static $name: std::sync::LazyLock<$ty> = std::sync::LazyLock::new(|| $init);
+    };
+}
+
+repo_cache_static!(
+    REPO_CACHE: Mutex<HashMap<RepoCacheKey, Arc<dyn GitRepository>>> =
+        Mutex::new(HashMap::default())
+);
+
+repo_cache_static!(
+    PROJECT_REPO_KEYS: Mutex<HashMap<gpui::EntityId, RepoCacheKey>> =
+        Mutex::new(HashMap::default())
+);
+
+pub fn get_cached_repo(key: &RepoCacheKey) -> Option<Arc<dyn GitRepository>> {
+    REPO_CACHE.lock().get(key).cloned()
+}
+
+pub fn set_cached_repo(key: RepoCacheKey, repository: Arc<dyn GitRepository>) {
+    REPO_CACHE.lock().insert(key, repository);
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub fn clear_repo_cache() {
+    REPO_CACHE.lock().clear();
+    PROJECT_REPO_KEYS.lock().clear();
+}
 
 #[allow(dead_code)]
 pub const SPEC_DIFF_CACHE_TTL: Duration = Duration::from_secs(30);
@@ -230,10 +303,27 @@ pub fn snapshot_with_cache(
             })?;
 
         let dot_git = anchor_path.join(".git");
-        let git_binary = system_git_binary();
-        let git_repo = file_system
-            .open_repo(&dot_git, git_binary.as_deref())
-            .with_context(|| format!("opening repo at {}", dot_git.display()))?;
+        let cache_key = RepoCacheKey::new(&dot_git, &file_system);
+
+        let previous_key = PROJECT_REPO_KEYS
+            .lock()
+            .insert(project.entity_id(), cache_key.clone());
+        if let Some(previous_key) = previous_key {
+            if previous_key != cache_key {
+                REPO_CACHE.lock().remove(&previous_key);
+            }
+        }
+
+        let git_repo = if let Some(cached_repository) = get_cached_repo(&cache_key) {
+            cached_repository
+        } else {
+            let git_binary = system_git_binary();
+            let repository = file_system
+                .open_repo(&dot_git, git_binary.as_deref())
+                .with_context(|| format!("opening repo at {}", dot_git.display()))?;
+            set_cached_repo(cache_key, repository.clone());
+            repository
+        };
 
         let branches_scan = git_repo.branches().await?;
         let mut goals_map = HashMap::new();
@@ -249,9 +339,14 @@ pub fn snapshot_with_cache(
             let branch_name = branch_name.strip_prefix("origin/").unwrap_or(branch_name);
             if let Some(goal_id) = branch_name.strip_prefix("agent-goal/") {
                 let canonical_branch = format!("agent-goal/{goal_id}");
-                let tip_sha = branch
-                    .most_recent_commit
-                    .map(|commit| commit.sha.to_string());
+                let tip_sha = if let Some(commit) = &branch.most_recent_commit {
+                    Some(commit.sha.to_string())
+                } else {
+                    crate::task_worktree::resolve_ref_to_sha(&git_repo, &canonical_branch)
+                        .await
+                        .log_err()
+                        .flatten()
+                };
                 let entry = existing_goal_branches.entry(goal_id.to_string());
                 match entry {
                     std::collections::hash_map::Entry::Vacant(vacant) => {
@@ -265,9 +360,14 @@ pub fn snapshot_with_cache(
                 }
             } else if let Some(task_id) = branch_name.strip_prefix("agent-task/") {
                 let canonical_branch = format!("agent-task/{task_id}");
-                let tip_sha = branch
-                    .most_recent_commit
-                    .map(|commit| commit.sha.to_string());
+                let tip_sha = if let Some(commit) = &branch.most_recent_commit {
+                    Some(commit.sha.to_string())
+                } else {
+                    crate::task_worktree::resolve_ref_to_sha(&git_repo, &canonical_branch)
+                        .await
+                        .log_err()
+                        .flatten()
+                };
                 let entry = existing_task_branches.entry(task_id.to_string());
                 match entry {
                     std::collections::hash_map::Entry::Vacant(vacant) => {
@@ -425,6 +525,14 @@ impl TaskWorktreeStatus {
         self.last_error.as_deref()
     }
 
+    pub fn cached_repo(&self, cx: &App) -> Option<Arc<dyn GitRepository>> {
+        let (_repository, anchor_path, _path_style, _worktree_setting, file_system) =
+            task_worktree_context(self.project.read(cx), cx).log_err()?;
+        let dot_git = anchor_path.join(".git");
+        let cache_key = RepoCacheKey::new(&dot_git, &file_system);
+        get_cached_repo(&cache_key)
+    }
+
     pub fn refresh_if_needed(
         &mut self,
         tasks: Vec<AgentTaskSummary>,
@@ -540,6 +648,7 @@ mod tests {
     use crate::agent_task::{AgentGoalStatus, AgentTaskStatus};
 
     fn init_test(cx: &mut TestAppContext) {
+        clear_repo_cache();
         cx.update(|cx| {
             let settings_store = SettingsStore::test(cx);
             cx.set_global(settings_store);
@@ -1168,5 +1277,149 @@ mod tests {
             compute_short_stat_for_diff(test_dir, diff_spec, None, Some("head_sha"), None).await;
 
         assert_eq!(result, Some(expected));
+    }
+
+    #[gpui::test]
+    async fn test_snapshot_reuses_cached_git_repository_handle(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/root_cache_reuse"),
+            json!({
+                ".git": {
+                    "HEAD": "ref: refs/heads/main\n"
+                }
+            }),
+        )
+        .await;
+
+        let dot_git = std::path::Path::new(path!("/root_cache_reuse/.git"));
+        fs.with_git_state(dot_git, true, |state| {
+            state.branches.insert("main".into());
+            state
+                .refs
+                .insert("refs/heads/main".into(), "main-sha-100".into());
+            state.refs.insert("HEAD".into(), "main-sha-100".into());
+        })
+        .unwrap();
+
+        let project = Project::test(fs.clone(), [path!("/root_cache_reuse").as_ref()], cx).await;
+        let file_system: Arc<dyn Fs> = fs.clone();
+        let cache_key = RepoCacheKey::new(dot_git, &file_system);
+
+        assert!(get_cached_repo(&cache_key).is_none());
+
+        let snapshot_1 = cx
+            .update(|cx| snapshot(&project, &[], &[], cx))
+            .await
+            .unwrap();
+
+        let first_repo = get_cached_repo(&cache_key)
+            .expect("repository handle should be cached after first snapshot");
+
+        let snapshot_2 = cx
+            .update(|cx| snapshot(&project, &[], &[], cx))
+            .await
+            .unwrap();
+
+        let second_repo = get_cached_repo(&cache_key)
+            .expect("repository handle should be cached after second snapshot");
+
+        assert_eq!(snapshot_1, snapshot_2);
+        assert!(
+            Arc::ptr_eq(&first_repo, &second_repo),
+            "snapshot must reuse the cached repository handle across calls"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_snapshot_invalidates_cached_repository_when_dot_git_changes(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/root_invalidation_1"),
+            json!({
+                ".git": {
+                    "HEAD": "ref: refs/heads/main\n"
+                }
+            }),
+        )
+        .await;
+
+        let dot_git_1 = std::path::Path::new(path!("/root_invalidation_1/.git"));
+        fs.with_git_state(dot_git_1, true, |state| {
+            state.branches.insert("main".into());
+            state
+                .refs
+                .insert("refs/heads/main".into(), "main-sha-100".into());
+            state.refs.insert("HEAD".into(), "main-sha-100".into());
+        })
+        .unwrap();
+
+        fs.insert_tree(
+            path!("/root_invalidation_2"),
+            json!({
+                ".git": {
+                    "HEAD": "ref: refs/heads/main\n"
+                }
+            }),
+        )
+        .await;
+
+        let dot_git_2 = std::path::Path::new(path!("/root_invalidation_2/.git"));
+        fs.with_git_state(dot_git_2, true, |state| {
+            state.branches.insert("main".into());
+            state
+                .refs
+                .insert("refs/heads/main".into(), "main-sha-200".into());
+            state.refs.insert("HEAD".into(), "main-sha-200".into());
+        })
+        .unwrap();
+
+        let project = Project::test(
+            fs.clone(),
+            [
+                path!("/root_invalidation_1").as_ref(),
+                path!("/root_invalidation_2").as_ref(),
+            ],
+            cx,
+        )
+        .await;
+        let file_system: Arc<dyn Fs> = fs.clone();
+        let key_1 = RepoCacheKey::new(dot_git_1, &file_system);
+        let key_2 = RepoCacheKey::new(dot_git_2, &file_system);
+
+        cx.update(|cx| snapshot(&project, &[], &[], cx))
+            .await
+            .unwrap();
+
+        assert!(get_cached_repo(&key_1).is_some());
+        assert!(get_cached_repo(&key_2).is_none());
+
+        let worktree_1 = project.read_with(cx, |project, cx| {
+            project.visible_worktrees(cx).next().unwrap()
+        });
+        let worktree_1_id = worktree_1.read_with(cx, |worktree, _| worktree.id());
+
+        project.update(cx, |project, cx| {
+            project.remove_worktree(worktree_1_id, cx);
+        });
+
+        cx.update(|cx| snapshot(&project, &[], &[], cx))
+            .await
+            .unwrap();
+
+        assert!(
+            get_cached_repo(&key_1).is_none(),
+            "previous repository handle must be invalidated when dot_git changes"
+        );
+        assert!(
+            get_cached_repo(&key_2).is_some(),
+            "new repository handle must be cached under new dot_git key"
+        );
     }
 }
