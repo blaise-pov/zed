@@ -2492,7 +2492,7 @@ pub fn render_goal_markdown(goal: &AgentGoalSummary, goal_git: Option<&GoalGitSt
         doc.push_str(&format!("- **Branch:** `{}`\n", git.branch));
         doc.push_str(&format!("- **Branch Exists:** {}\n", git.branch_exists));
         if let Some(sha) = &git.tip_sha {
-            let short_sha = &sha[..7.min(sha.len())];
+            let short_sha: String = sha.chars().take(7).collect();
             doc.push_str(&format!("- **Tip SHA:** `{short_sha}` ({sha})\n"));
         }
         if let Some(diff) = &git.diff {
@@ -2575,7 +2575,7 @@ pub fn render_task_markdown(
             .and_then(|g| g.tip_sha.as_deref())
             .or_else(|| task_ref.as_ref().and_then(|tr| tr.head_sha.as_deref()));
         if let Some(sha) = tip_sha {
-            let short_sha = &sha[..7.min(sha.len())];
+            let short_sha: String = sha.chars().take(7).collect();
             doc.push_str(&format!("- **Tip SHA:** `{short_sha}` ({sha})\n"));
         }
         if let Some(g) = goal {
