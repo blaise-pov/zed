@@ -156,6 +156,76 @@ impl AgentTaskProvider for McpAgentTaskProvider {
         })
     }
 
+    fn update_task_metadata(
+        &self,
+        id: &AgentTaskId,
+        model: Option<&str>,
+        assignee: Option<&str>,
+        session_id: Option<&str>,
+        cx: &mut App,
+    ) -> Task<Result<()>> {
+        let mut args = serde_json::Map::new();
+        args.insert(
+            "task_id".to_string(),
+            serde_json::Value::String(id.to_string()),
+        );
+        if let Some(m) = model.map(str::trim).filter(|s| !s.is_empty()) {
+            args.insert(
+                "model".to_string(),
+                serde_json::Value::String(m.to_string()),
+            );
+            args.insert(
+                "assigned_model".to_string(),
+                serde_json::Value::String(m.to_string()),
+            );
+        }
+        if let Some(a) = assignee.map(str::trim).filter(|s| !s.is_empty()) {
+            args.insert(
+                "assignee".to_string(),
+                serde_json::Value::String(a.to_string()),
+            );
+        }
+        let has_session_id = if let Some(s) = session_id.map(str::trim).filter(|s| !s.is_empty()) {
+            args.insert(
+                "session_id".to_string(),
+                serde_json::Value::String(s.to_string()),
+            );
+            true
+        } else {
+            false
+        };
+
+        if args.len() <= 1 {
+            return Task::ready(Ok(()));
+        }
+
+        let update_task = self.call_tool("task_update", Some(args.clone()), cx);
+        let store = self.store.clone();
+        let server_id = self.server_id.clone();
+
+        cx.spawn(async move |cx| {
+            match update_task.await {
+                Ok(_) => Ok(()),
+                Err(err) => {
+                    if has_session_id {
+                        args.remove("session_id");
+                        if args.len() <= 1 {
+                            return Ok(());
+                        }
+                        let fallback_task = cx.update(|cx| {
+                            let provider = McpAgentTaskProvider::new(store, server_id);
+                            provider.call_tool("task_update", Some(args), cx)
+                        });
+                        fallback_task.await?;
+                        Ok(())
+                    } else {
+                        Err(err)
+                    }
+                }
+            }
+        })
+    }
+
     fn complete_task(&self, id: &AgentTaskId, cx: &mut App) -> Task<Result<()>> {
         let mut args = serde_json::Map::new();
         args.insert(
@@ -321,10 +391,57 @@ impl AgentTaskProvider for McpAgentTaskProvider {
             args.insert(key.to_string(), serde_json::Value::String(val));
         }
 
+        let is_running = *status == AgentTaskStatus::Running;
+        let task_id_str = id.to_string();
+        let store = self.store.clone();
+        let server_id = self.server_id.clone();
+
         let task = self.call_tool(tool_name, Some(args), cx);
-        cx.spawn(async move |_cx| {
-            task.await?;
-            Ok(())
+        cx.spawn(async move |cx| {
+            match task.await {
+                Ok(_) => Ok(()),
+                Err(first_err) if is_running => {
+                    let mut retry_args = serde_json::Map::new();
+                    retry_args.insert(
+                        "task_id".to_string(),
+                        serde_json::Value::String(task_id_str.clone()),
+                    );
+                    let retry_task = cx.update(|cx| {
+                        let provider = McpAgentTaskProvider::new(store.clone(), server_id.clone());
+                        provider.call_tool("task_retry", Some(retry_args.clone()), cx)
+                    });
+                    if retry_task.await.is_ok() {
+                        let start_again_task = cx.update(|cx| {
+                            let provider =
+                                McpAgentTaskProvider::new(store.clone(), server_id.clone());
+                            provider.call_tool("task_start", Some(retry_args), cx)
+                        });
+                        if start_again_task.await.is_ok() {
+                            return Ok(());
+                        }
+                    }
+
+                    let mut update_args = serde_json::Map::new();
+                    update_args.insert(
+                        "task_id".to_string(),
+                        serde_json::Value::String(task_id_str),
+                    );
+                    update_args.insert(
+                        "status".to_string(),
+                        serde_json::Value::String("running".to_string()),
+                    );
+                    let update_task = cx.update(|cx| {
+                        let provider = McpAgentTaskProvider::new(store, server_id);
+                        provider.call_tool("task_update", Some(update_args), cx)
+                    });
+                    if update_task.await.is_ok() {
+                        Ok(())
+                    } else {
+                        Err(first_err)
+                    }
+                }
+                Err(err) => Err(err),
+            }
         })
     }
 

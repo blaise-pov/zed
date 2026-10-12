@@ -769,6 +769,29 @@ impl AgentTaskPanel {
                         });
                     }
 
+                    if let Some(session_id) = agent::task_worktree::task_session_id_for_id(&task_id)
+                    {
+                        let workspace = workspace.clone();
+                        let task_title = task.as_ref().map(|t| SharedString::from(t.title.clone()));
+                        menu = menu.entry("Open Agent Thread", None, move |window, cx| {
+                            if let Some(workspace) = workspace.upgrade() {
+                                workspace.update(cx, |workspace, cx| {
+                                    if let Some(panel) = workspace.panel::<crate::AgentPanel>(cx) {
+                                        let session_id =
+                                            agent_client_protocol::schema::v1::SessionId::new(
+                                                session_id.clone(),
+                                            );
+                                        let title = task_title.clone();
+                                        panel.update(cx, |panel, cx| {
+                                            panel.open_thread(session_id, None, title, window, cx);
+                                        });
+                                    }
+                                    workspace.focus_panel::<crate::AgentPanel>(window, cx);
+                                });
+                            }
+                        });
+                    }
+
                     if exists_on_disk {
                         if let Some(path) = worktree_path.clone() {
                             let task_id = task_id.clone();
@@ -4390,6 +4413,11 @@ mod tests {
         });
         cx.run_until_parked();
 
+        assert!(
+            cx.debug_bounds("MENU_ITEM-Open Agent Thread").is_none(),
+            "Open Agent Thread should not be present when no session is registered"
+        );
+
         let archive_item = cx
             .debug_bounds("MENU_ITEM-Archive")
             .expect("Archive menu item should be in context menu");
@@ -4399,6 +4427,27 @@ mod tests {
         assert_eq!(
             calls.lock().unwrap().archive_calls,
             vec![AgentTaskId::from("TASK-1")]
+        );
+
+        agent::task_worktree::register_task_session(
+            &AgentTaskId::from("TASK-1"),
+            "session-task-1".to_string(),
+        );
+
+        panel.update_in(cx, |panel, window, cx| {
+            panel.deploy_context_menu(
+                ContextMenuTarget::Task(AgentTaskId::from("TASK-1")),
+                Point::new(px(100.0), px(100.0)),
+                None,
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        assert!(
+            cx.debug_bounds("MENU_ITEM-Open Agent Thread").is_some(),
+            "Open Agent Thread should be present when a session is registered for the task"
         );
     }
 

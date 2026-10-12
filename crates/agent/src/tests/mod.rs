@@ -253,6 +253,9 @@ pub(crate) struct FakeThreadEnvironment {
     subagent_models: std::cell::RefCell<Vec<Option<AgentModelId>>>,
     registered_tasks: std::cell::RefCell<Vec<(String, String, Option<String>)>>,
     failed_tasks: std::cell::RefCell<Vec<(String, String)>>,
+    updated_task_metadata:
+        std::cell::RefCell<Vec<(String, Option<String>, Option<String>, Option<String>)>>,
+    task_status_transitions: std::cell::RefCell<Vec<(String, crate::AgentTaskStatus)>>,
     ensure_task_error: std::cell::RefCell<Option<String>>,
     ensure_worktree_calls: std::cell::RefCell<Vec<String>>,
 }
@@ -294,6 +297,16 @@ impl FakeThreadEnvironment {
 
     pub(crate) fn failed_tasks(&self) -> Vec<(String, String)> {
         self.failed_tasks.borrow().clone()
+    }
+
+    pub(crate) fn updated_task_metadata(
+        &self,
+    ) -> Vec<(String, Option<String>, Option<String>, Option<String>)> {
+        self.updated_task_metadata.borrow().clone()
+    }
+
+    pub(crate) fn task_status_transitions(&self) -> Vec<(String, crate::AgentTaskStatus)> {
+        self.task_status_transitions.borrow().clone()
     }
 
     pub(crate) fn set_ensure_task_error(&self, error: Option<String>) {
@@ -391,6 +404,35 @@ impl crate::ThreadEnvironment for FakeThreadEnvironment {
         self.failed_tasks
             .borrow_mut()
             .push((task_id.to_string(), reason.to_string()));
+        Task::ready(Ok(()))
+    }
+
+    fn update_task_registered(
+        &self,
+        task_id: &str,
+        model: Option<&str>,
+        assignee: Option<&str>,
+        session_id: Option<&str>,
+        _cx: &mut AsyncApp,
+    ) -> Task<Result<()>> {
+        self.updated_task_metadata.borrow_mut().push((
+            task_id.to_string(),
+            model.map(str::to_string),
+            assignee.map(str::to_string),
+            session_id.map(str::to_string),
+        ));
+        Task::ready(Ok(()))
+    }
+
+    fn set_task_status_registered(
+        &self,
+        task_id: &str,
+        status: crate::AgentTaskStatus,
+        _cx: &mut AsyncApp,
+    ) -> Task<Result<()>> {
+        self.task_status_transitions
+            .borrow_mut()
+            .push((task_id.to_string(), status));
         Task::ready(Ok(()))
     }
 }
@@ -1572,7 +1614,9 @@ async fn test_system_prompt_without_tools(cx: &mut TestAppContext) {
 
 #[gpui::test]
 async fn test_per_model_system_prompt_template_matched(cx: &mut TestAppContext) {
-    let ThreadTest { thread, fs, fake, .. } = setup(cx, TestModel::Fake).await;
+    let ThreadTest {
+        thread, fs, fake, ..
+    } = setup(cx, TestModel::Fake).await;
 
     let template_path = std::env::temp_dir().join(format!(
         "zed-test-per-model-matched-{}-{}.hbs",
@@ -1633,7 +1677,9 @@ async fn test_per_model_system_prompt_template_matched(cx: &mut TestAppContext) 
 
 #[gpui::test]
 async fn test_per_model_system_prompt_template_beats_global(cx: &mut TestAppContext) {
-    let ThreadTest { thread, fs, fake, .. } = setup(cx, TestModel::Fake).await;
+    let ThreadTest {
+        thread, fs, fake, ..
+    } = setup(cx, TestModel::Fake).await;
 
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1709,7 +1755,9 @@ async fn test_per_model_system_prompt_template_beats_global(cx: &mut TestAppCont
 async fn test_per_model_system_prompt_template_global_fallback_when_unmatched(
     cx: &mut TestAppContext,
 ) {
-    let ThreadTest { thread, fs, fake, .. } = setup(cx, TestModel::Fake).await;
+    let ThreadTest {
+        thread, fs, fake, ..
+    } = setup(cx, TestModel::Fake).await;
 
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1851,7 +1899,9 @@ async fn test_per_model_custom_instructions(cx: &mut TestAppContext) {
 
 #[gpui::test]
 async fn test_per_model_custom_instructions_appended_to_profile_prompt(cx: &mut TestAppContext) {
-    let ThreadTest { thread, fs, fake, .. } = setup(cx, TestModel::Fake).await;
+    let ThreadTest {
+        thread, fs, fake, ..
+    } = setup(cx, TestModel::Fake).await;
 
     let profile_prompt_path = std::env::temp_dir().join(format!(
         "zed-test-profile-prompt-{}-{}.md",
@@ -1997,7 +2047,9 @@ async fn test_templated_profile_prompt_interpolates_variables(cx: &mut TestAppCo
 
 #[gpui::test]
 async fn test_templated_profile_prompt_includes_worktree_partial(cx: &mut TestAppContext) {
-    let ThreadTest { thread, fs, fake, .. } = setup(cx, TestModel::Fake).await;
+    let ThreadTest {
+        thread, fs, fake, ..
+    } = setup(cx, TestModel::Fake).await;
 
     let worktree_dir = tempfile::tempdir().unwrap();
     let prompts_dir = worktree_dir.path().join(".zed").join("prompts");
@@ -2074,7 +2126,9 @@ async fn test_templated_profile_prompt_includes_worktree_partial(cx: &mut TestAp
 async fn test_templated_profile_prompt_invalid_template_falls_back_to_raw_text(
     cx: &mut TestAppContext,
 ) {
-    let ThreadTest { thread, fs, fake, .. } = setup(cx, TestModel::Fake).await;
+    let ThreadTest {
+        thread, fs, fake, ..
+    } = setup(cx, TestModel::Fake).await;
 
     let raw_prompt = "Raw profile prompt with invalid syntax {{#if unclosed_block}} here";
     let profile_prompt_path = std::env::temp_dir().join(format!(
@@ -7825,6 +7879,69 @@ async fn test_spawn_agent_ensures_task_registration_best_effort(cx: &mut TestApp
 }
 
 #[gpui::test]
+async fn test_spawn_agent_updates_task_metadata_and_status_lifecycle(cx: &mut TestAppContext) {
+    init_test(cx);
+    crate::task_worktree::reset_registry_for_tests();
+    cx.update(|cx| {
+        insert_profile_with_isolation(
+            cx,
+            "agent_engineer",
+            agent_settings::TaskIsolation::Optional,
+        );
+    });
+
+    let environment = Rc::new(FakeThreadEnvironment::default().with_subagent(
+        FakeSubagentHandle::new(
+            acp::SessionId::new("session-xyz-999"),
+            Task::ready("done".to_string()).shared(),
+            None,
+        ),
+    ));
+    #[allow(clippy::arc_with_non_send_sync)]
+    let tool = Arc::new(SpawnAgentTool::new(environment.clone()));
+
+    let (event_stream, _rx) = ToolCallEventStream::test();
+    let result = cx
+        .update(|cx| {
+            tool.run(
+                ToolInput::resolved(SpawnAgentToolInput {
+                    label: "Implement feature".to_string(),
+                    message: "write code".to_string(),
+                    task_id: Some("TASK-META-1".to_string()),
+                    profile: Some(agent_settings::AgentProfileId("agent_engineer".into())),
+                    model: Some("claude-3-7-sonnet".to_string()),
+                    ..Default::default()
+                }),
+                event_stream,
+                cx,
+            )
+        })
+        .await;
+
+    assert!(matches!(result, Ok(SpawnAgentToolOutput::Success { .. })));
+    assert_eq!(
+        environment.updated_task_metadata(),
+        vec![(
+            "TASK-META-1".to_string(),
+            Some("claude-3-7-sonnet".to_string()),
+            Some("agent_engineer".to_string()),
+            Some("session-xyz-999".to_string()),
+        )]
+    );
+    assert_eq!(
+        environment.task_status_transitions(),
+        vec![
+            ("TASK-META-1".to_string(), crate::AgentTaskStatus::Running),
+            ("TASK-META-1".to_string(), crate::AgentTaskStatus::Completed),
+        ]
+    );
+    assert_eq!(
+        crate::task_worktree::task_session_id_for_id(&crate::AgentTaskId::from("TASK-META-1")),
+        Some("session-xyz-999".to_string())
+    );
+}
+
+#[gpui::test]
 async fn test_spawn_agent_differentiated_error_handling(cx: &mut TestAppContext) {
     init_test(cx);
 
@@ -12608,7 +12725,6 @@ async fn test_spawn_agent_two_tasks_isolated_worktrees(cx: &mut TestAppContext) 
     let fake = init_test(cx);
     always_allow_tools(cx);
     cx.update(|cx| {
-        LanguageModelRegistry::test(cx);
         enable_default_profile_delegation(cx);
     });
 
@@ -12647,6 +12763,7 @@ async fn test_spawn_agent_two_tasks_isolated_worktrees(cx: &mut TestAppContext) 
 
     thread.update(cx, |thread, cx| {
         thread.set_model(model.clone(), cx);
+        thread.set_summarization_model(None, cx);
     });
     cx.run_until_parked();
 
@@ -12716,7 +12833,10 @@ async fn test_spawn_agent_two_tasks_isolated_worktrees(cx: &mut TestAppContext) 
         is_input_complete: true,
         thought_signature: None,
     };
-    fake.send_last_event(&model, LanguageModelCompletionEvent::ToolUse(write_tool_use_1));
+    fake.send_last_event(
+        &model,
+        LanguageModelCompletionEvent::ToolUse(write_tool_use_1),
+    );
     fake.end_last(&model);
     cx.run_until_parked();
 
@@ -12824,7 +12944,10 @@ async fn test_spawn_agent_two_tasks_isolated_worktrees(cx: &mut TestAppContext) 
         is_input_complete: true,
         thought_signature: None,
     };
-    fake.send_last_event(&model, LanguageModelCompletionEvent::ToolUse(write_tool_use_2));
+    fake.send_last_event(
+        &model,
+        LanguageModelCompletionEvent::ToolUse(write_tool_use_2),
+    );
     fake.end_last(&model);
     cx.run_until_parked();
 
@@ -12924,7 +13047,6 @@ async fn test_spawn_agent_two_tasks_isolated_worktrees(cx: &mut TestAppContext) 
 async fn test_spawn_agent_non_git_degrades_isolation(cx: &mut TestAppContext) {
     let fake = init_test(cx);
     cx.update(|cx| {
-        LanguageModelRegistry::test(cx);
         enable_default_profile_delegation(cx);
     });
 
@@ -12962,6 +13084,7 @@ async fn test_spawn_agent_non_git_degrades_isolation(cx: &mut TestAppContext) {
 
     thread.update(cx, |thread, cx| {
         thread.set_model(model.clone(), cx);
+        thread.set_summarization_model(None, cx);
     });
     cx.run_until_parked();
 
@@ -13052,7 +13175,6 @@ async fn test_spawn_agent_error_creates_wip_commit(cx: &mut TestAppContext) {
     let fake = init_test(cx);
     always_allow_tools(cx);
     cx.update(|cx| {
-        LanguageModelRegistry::test(cx);
         enable_default_profile_delegation(cx);
         cx.update_flags(true, vec!["subagents".to_string()]);
     });
@@ -13088,6 +13210,7 @@ async fn test_spawn_agent_error_creates_wip_commit(cx: &mut TestAppContext) {
 
     thread.update(cx, |thread, cx| {
         thread.set_model(model.clone(), cx);
+        thread.set_summarization_model(None, cx);
     });
     cx.run_until_parked();
 
@@ -13151,7 +13274,10 @@ async fn test_spawn_agent_error_creates_wip_commit(cx: &mut TestAppContext) {
         is_input_complete: true,
         thought_signature: None,
     };
-    fake.send_last_event(&model, LanguageModelCompletionEvent::ToolUse(write_tool_use));
+    fake.send_last_event(
+        &model,
+        LanguageModelCompletionEvent::ToolUse(write_tool_use),
+    );
     fake.end_last(&model);
     cx.run_until_parked();
 
@@ -13577,7 +13703,10 @@ async fn test_subagent_lsp_rename_denied_outside_task_worktree(cx: &mut TestAppC
         is_input_complete: true,
         thought_signature: None,
     };
-    fake.send_last_event(&model, LanguageModelCompletionEvent::ToolUse(rename_tool_use));
+    fake.send_last_event(
+        &model,
+        LanguageModelCompletionEvent::ToolUse(rename_tool_use),
+    );
     fake.end_last(&model);
     cx.run_until_parked();
 
@@ -13630,7 +13759,6 @@ async fn test_spawn_agent_with_goal_id_and_base_branch(cx: &mut TestAppContext) 
     let fake = init_test(cx);
     always_allow_tools(cx);
     cx.update(|cx| {
-        LanguageModelRegistry::test(cx);
         enable_default_profile_delegation(cx);
         cx.update_flags(true, vec!["subagents".to_string()]);
     });
@@ -13668,6 +13796,7 @@ async fn test_spawn_agent_with_goal_id_and_base_branch(cx: &mut TestAppContext) 
 
     thread.update(cx, |thread, cx| {
         thread.set_model(model.clone(), cx);
+        thread.set_summarization_model(None, cx);
     });
     cx.run_until_parked();
 
@@ -13696,8 +13825,10 @@ async fn test_spawn_agent_with_goal_id_and_base_branch(cx: &mut TestAppContext) 
         is_input_complete: true,
         thought_signature: None,
     };
-    fake
-        .send_last_event(&model, LanguageModelCompletionEvent::ToolUse(tool_use_invalid));
+    fake.send_last_event(
+        &model,
+        LanguageModelCompletionEvent::ToolUse(tool_use_invalid),
+    );
     fake.end_last(&model);
     cx.run_until_parked();
 
@@ -13863,7 +13994,6 @@ async fn test_spawn_agent_with_on_branch_goal_and_exclusivity(cx: &mut TestAppCo
     let fake = init_test(cx);
     always_allow_tools(cx);
     cx.update(|cx| {
-        LanguageModelRegistry::test(cx);
         enable_default_profile_delegation(cx);
         cx.update_flags(true, vec!["subagents".to_string()]);
     });
@@ -13901,6 +14031,7 @@ async fn test_spawn_agent_with_on_branch_goal_and_exclusivity(cx: &mut TestAppCo
 
     thread.update(cx, |thread, cx| {
         thread.set_model(model.clone(), cx);
+        thread.set_summarization_model(None, cx);
     });
     cx.run_until_parked();
 
@@ -14083,6 +14214,7 @@ async fn test_spawn_agent_with_on_branch_goal_and_exclusivity(cx: &mut TestAppCo
     });
     thread2.update(cx, |thread, cx| {
         thread.set_model(model.clone(), cx);
+        thread.set_summarization_model(None, cx);
     });
     cx.run_until_parked();
 

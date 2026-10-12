@@ -624,6 +624,7 @@ struct TaskWorktreeRegistry {
     goal_tip_shas: HashMap<String, String>,
     goal_graduations: HashMap<String, GoalGraduationSummary>,
     task_titles: HashMap<AgentTaskId, String>,
+    task_sessions: HashMap<AgentTaskId, String>,
 }
 
 #[derive(Clone, Debug)]
@@ -667,6 +668,7 @@ struct TaskWorktreeState {
     pool_key: Option<ProjectPoolKey>,
     slot_notified: bool,
     is_cleaning: bool,
+    pub session_id: Option<String>,
 }
 
 impl TaskWorktreeState {
@@ -1294,6 +1296,7 @@ fn finish_slot_and_register_policy(
     } else {
         Some(std::time::Instant::now())
     };
+    let session_from_map = reg.task_sessions.get(task_id).cloned();
     let entry = reg.entries.entry(task_id.clone()).or_default();
     let preserved_pool_key = pool_key.or_else(|| {
         if entry.worktree_path == worktree_path {
@@ -1302,6 +1305,7 @@ fn finish_slot_and_register_policy(
             None
         }
     });
+    let preserved_session_id = entry.session_id.clone().or(session_from_map);
     *entry = TaskWorktreeState {
         worktree_path,
         commit_error: None,
@@ -1318,6 +1322,7 @@ fn finish_slot_and_register_policy(
         pool_key: preserved_pool_key,
         slot_notified: false,
         is_cleaning: false,
+        session_id: preserved_session_id,
     };
 }
 
@@ -1383,11 +1388,14 @@ pub fn claim_branch_or_error(
     } else {
         None
     };
+    let session_from_map = reg.task_sessions.get(task_id).cloned();
     let entry = reg.entries.entry(task_id.clone()).or_default();
+    let preserved_session_id = entry.session_id.clone().or(session_from_map);
     *entry = TaskWorktreeState {
         checkout_target,
         is_terminal: false,
         last_session_ended_at: initial_ended_at,
+        session_id: preserved_session_id,
         ..Default::default()
     };
     Ok(())
@@ -1454,7 +1462,35 @@ pub fn task_worktree_base_sha(task_id: &AgentTaskId) -> Option<String> {
 
 pub fn task_worktree_path_for_id(task_id: &AgentTaskId) -> Option<PathBuf> {
     let reg = REGISTRY.read();
-    reg.entries.get(task_id).map(|e| e.worktree_path.clone())
+    reg.entries
+        .get(task_id)
+        .map(|e| e.worktree_path.clone())
+        .filter(|p| !p.as_os_str().is_empty())
+}
+
+pub fn register_task_session(task_id: &AgentTaskId, session_id: String) {
+    let mut reg = REGISTRY.write();
+    reg.task_sessions
+        .insert(task_id.clone(), session_id.clone());
+    if let Some(entry) = reg.entries.get_mut(task_id) {
+        entry.session_id = Some(session_id);
+    } else {
+        reg.entries.insert(
+            task_id.clone(),
+            TaskWorktreeState {
+                session_id: Some(session_id),
+                ..Default::default()
+            },
+        );
+    }
+}
+
+pub fn task_session_id_for_id(task_id: &AgentTaskId) -> Option<String> {
+    let reg = REGISTRY.read();
+    reg.entries
+        .get(task_id)
+        .and_then(|e| e.session_id.clone())
+        .or_else(|| reg.task_sessions.get(task_id).cloned())
 }
 
 pub fn record_task_worktree_changed_files(task_id: &AgentTaskId, files: Vec<String>) {

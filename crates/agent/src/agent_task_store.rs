@@ -40,7 +40,9 @@ fn merge_items_into_graph(graph: &mut AgentTaskGraph, items: &[AgentUnifiedItem]
             {
                 task.assigned_profile = item_profile;
             }
-            if task.model.is_none() {
+            if (task.model.is_none() || task.model.as_ref().is_some_and(|m| m.is_empty()))
+                && item.model.is_some()
+            {
                 task.model = item.model.clone();
             }
         }
@@ -51,6 +53,9 @@ fn merge_items_into_graph(graph: &mut AgentTaskGraph, items: &[AgentUnifiedItem]
 
     for item in items.iter().filter(|item| item.kind == AgentItemKind::Task) {
         let task_id = AgentTaskId::from(item.id.as_str());
+        if let Some(session_id) = item.resolved_session_id() {
+            crate::task_worktree::register_task_session(&task_id, session_id);
+        }
         if !existing_task_ids.contains(&task_id) {
             existing_task_ids.insert(task_id.clone());
             let item_profile = item
@@ -859,6 +864,8 @@ mod tests {
                 model: Some(SharedString::from("gpt-4o")),
                 parent_id: None,
                 goal_id: None,
+                session_id: None,
+                metadata: None,
             },
             AgentUnifiedItem {
                 kind: AgentItemKind::Goal,
@@ -874,6 +881,8 @@ mod tests {
                 model: None,
                 parent_id: None,
                 goal_id: None,
+                session_id: None,
+                metadata: None,
             },
         ];
 
@@ -929,6 +938,8 @@ mod tests {
             model: None,
             parent_id: None,
             goal_id: None,
+            session_id: None,
+            metadata: None,
         }];
 
         let provider = Arc::new(TestProvider {
@@ -1037,6 +1048,8 @@ mod tests {
                 model: Some(SharedString::from("claude-3-7-sonnet")),
                 parent_id: None,
                 goal_id: None,
+                session_id: None,
+                metadata: None,
             },
             AgentUnifiedItem {
                 kind: AgentItemKind::Task,
@@ -1052,6 +1065,8 @@ mod tests {
                 model: None,
                 parent_id: None,
                 goal_id: None,
+                session_id: None,
+                metadata: None,
             },
         ];
 
@@ -1109,6 +1124,8 @@ mod tests {
                 model: None,
                 parent_id: Some("TASK-PARENT".to_string()),
                 goal_id: Some("GOAL-42".to_string()),
+                session_id: None,
+                metadata: None,
             },
             AgentUnifiedItem {
                 kind: AgentItemKind::Task,
@@ -1124,6 +1141,8 @@ mod tests {
                 model: Some(SharedString::from("claude-3-7-sonnet")),
                 parent_id: Some("TASK-EXISTING".to_string()),
                 goal_id: Some("GOAL-42".to_string()),
+                session_id: None,
+                metadata: None,
             },
         ];
 
@@ -1188,6 +1207,8 @@ mod tests {
                 model: Some(SharedString::from("gpt-4o")),
                 parent_id: Some("TASK-PARENT-1".to_string()),
                 goal_id: Some("GOAL-10".to_string()),
+                session_id: None,
+                metadata: None,
             },
             AgentUnifiedItem {
                 kind: AgentItemKind::Task,
@@ -1203,6 +1224,8 @@ mod tests {
                 model: Some(SharedString::from("claude-3-7-sonnet")),
                 parent_id: Some("TASK-EXISTING".to_string()),
                 goal_id: Some("GOAL-10".to_string()),
+                session_id: None,
+                metadata: None,
             },
         ];
 
@@ -1352,5 +1375,81 @@ mod tests {
         let refresh_task = store.update(cx, |s, cx| s.refresh(cx));
         refresh_task.await.ok();
         assert_eq!(notify_count.load(Ordering::SeqCst), initial_notifies + 1);
+    }
+
+    #[test]
+    fn test_merge_items_registers_session_id_and_syncs_model() {
+        crate::task_worktree::reset_registry_for_tests();
+
+        let mut graph = AgentTaskGraph {
+            tasks: vec![AgentTaskSummary {
+                id: AgentTaskId::from("TASK-SESS-1"),
+                parent_id: None,
+                goal_id: None,
+                title: "Task 1".to_string(),
+                status: AgentTaskStatus::Running,
+                attempt: 1,
+                assignee: None,
+                write_scopes: vec![],
+                created_at: None,
+                assigned_profile: None,
+                model: None,
+            }],
+            goals: vec![],
+        };
+
+        let items = vec![
+            AgentUnifiedItem {
+                kind: AgentItemKind::Task,
+                id: "TASK-SESS-1".to_string(),
+                title: "Task 1".to_string(),
+                status: "running".to_string(),
+                priority: 1,
+                created_at: None,
+                failure_reason: None,
+                progress: None,
+                assignee: None,
+                assigned_profile: None,
+                model: Some(SharedString::from("gemini-3.8-flash-high")),
+                parent_id: None,
+                goal_id: None,
+                session_id: Some("session-top-level-123".to_string()),
+                metadata: None,
+            },
+            AgentUnifiedItem {
+                kind: AgentItemKind::Task,
+                id: "TASK-SESS-2".to_string(),
+                title: "Task 2".to_string(),
+                status: "completed".to_string(),
+                priority: 1,
+                created_at: None,
+                failure_reason: None,
+                progress: None,
+                assignee: None,
+                assigned_profile: None,
+                model: Some(SharedString::from("claude-3-7-sonnet")),
+                parent_id: None,
+                goal_id: None,
+                session_id: None,
+                metadata: Some(serde_json::json!({
+                    "session_id": "session-metadata-456"
+                })),
+            },
+        ];
+
+        merge_items_into_graph(&mut graph, &items);
+
+        assert_eq!(
+            graph.tasks[0].model,
+            Some(SharedString::from("gemini-3.8-flash-high"))
+        );
+        assert_eq!(
+            crate::task_worktree::task_session_id_for_id(&AgentTaskId::from("TASK-SESS-1")),
+            Some("session-top-level-123".to_string())
+        );
+        assert_eq!(
+            crate::task_worktree::task_session_id_for_id(&AgentTaskId::from("TASK-SESS-2")),
+            Some("session-metadata-456".to_string())
+        );
     }
 }

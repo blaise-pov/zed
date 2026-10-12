@@ -451,7 +451,10 @@ impl AgentTool for SpawnAgentTool {
                 (None, None)
             };
 
-            let (subagent, mut session_info) = cx.update(|cx| {
+            let explicit_profile_str = input.profile.as_ref().map(|p| p.0.to_string());
+            let explicit_model_str = input.model.clone();
+
+            let (subagent, mut session_info, resolved_model) = cx.update(|cx| {
                 if let Some(ref path) = worktree_path {
                     if let Some(project) = event_stream.project() {
                         let worktree_id = project.read_with(cx, |project, cx| {
@@ -492,10 +495,16 @@ impl AgentTool for SpawnAgentTool {
                     isolation: isolation.clone(),
                     isolation_details: None,
                 })?;
+                let resolved_model = subagent.model_id(cx).or(explicit_model_str);
+                let session_info = SubagentSessionInfo {
+                    session_id: subagent.id(),
+                    message_start_index: subagent.num_entries(cx),
+                    message_end_index: None,
+                };
                 if let Some(ref task_id) = task_id {
                     subagent.set_task_id(Some(task_id.clone()), cx);
+                    let task_id_typed = crate::AgentTaskId::from(task_id.clone());
                     if let Some(ref worktree_path) = worktree_path {
-                        let task_id_typed = crate::AgentTaskId::from(task_id.clone());
                         if crate::task_worktree::task_worktree_path_for_id(&task_id_typed).is_none() {
                             crate::task_worktree::register_task_worktree(
                                 &task_id_typed,
@@ -503,12 +512,11 @@ impl AgentTool for SpawnAgentTool {
                             );
                         }
                     }
+                    crate::task_worktree::register_task_session(
+                        &task_id_typed,
+                        session_info.session_id.to_string(),
+                    );
                 }
-                let session_info = SubagentSessionInfo {
-                    session_id: subagent.id(),
-                    message_start_index: subagent.num_entries(cx),
-                    message_end_index: None,
-                };
 
                 event_stream.subagent_spawned(subagent.id());
                 event_stream.update_fields_with_meta(
@@ -519,7 +527,7 @@ impl AgentTool for SpawnAgentTool {
                     )])),
                 );
 
-                Ok((subagent, session_info))
+                Ok((subagent, session_info, resolved_model))
             })?;
 
             if let Some(ref task_id) = task_id {
@@ -535,6 +543,31 @@ impl AgentTool for SpawnAgentTool {
                 {
                     log::warn!(
                         "failed to ensure task {task_id} registered in task graph service: {error:#}"
+                    );
+                }
+                let session_id_str = session_info.session_id.to_string();
+                if let Err(error) = self
+                    .environment
+                    .update_task_registered(
+                        task_id,
+                        resolved_model.as_deref(),
+                        explicit_profile_str.as_deref(),
+                        Some(&session_id_str),
+                        &mut cx,
+                    )
+                    .await
+                {
+                    log::warn!(
+                        "failed to update task {task_id} metadata in task graph service: {error:#}"
+                    );
+                }
+                if let Err(error) = self
+                    .environment
+                    .set_task_status_registered(task_id, crate::AgentTaskStatus::Running, &mut cx)
+                    .await
+                {
+                    log::warn!(
+                        "failed to set task {task_id} status to running in task graph service: {error:#}"
                     );
                 }
             }
@@ -615,6 +648,24 @@ impl AgentTool for SpawnAgentTool {
                 } else {
                     None
                 };
+
+            if send_result.is_ok() {
+                if let Some(ref task_id) = task_id {
+                    if let Err(error) = self
+                        .environment
+                        .set_task_status_registered(
+                            task_id,
+                            crate::AgentTaskStatus::Completed,
+                            &mut cx,
+                        )
+                        .await
+                    {
+                        log::warn!(
+                            "failed to set task {task_id} status to completed in task graph service: {error:#}"
+                        );
+                    }
+                }
+            }
 
             // Release active session guard after commit is done to close race window
             drop(session_guard);

@@ -393,6 +393,10 @@ pub struct AgentUnifiedItem {
     pub parent_id: Option<String>,
     #[serde(default)]
     pub goal_id: Option<String>,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub metadata: Option<serde_json::Value>,
 }
 
 impl AgentUnifiedItem {
@@ -402,6 +406,22 @@ impl AgentUnifiedItem {
 
     pub fn goal_status(&self) -> AgentGoalStatus {
         AgentGoalStatus::from_str(&self.status)
+    }
+
+    pub fn resolved_session_id(&self) -> Option<String> {
+        if let Some(ref sid) = self.session_id {
+            let trimmed = sid.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+        self.metadata
+            .as_ref()
+            .and_then(|m| m.get("session_id"))
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
     }
 }
 
@@ -501,6 +521,17 @@ pub trait AgentTaskProvider: 'static + Send + Sync {
         let _ = title;
         let _ = goal_id;
         let _ = cx;
+        Task::ready(Ok(()))
+    }
+    fn update_task_metadata(
+        &self,
+        id: &AgentTaskId,
+        model: Option<&str>,
+        assignee: Option<&str>,
+        session_id: Option<&str>,
+        cx: &mut App,
+    ) -> Task<Result<()>> {
+        let _ = (id, model, assignee, session_id, cx);
         Task::ready(Ok(()))
     }
     fn complete_task(&self, id: &AgentTaskId, cx: &mut App) -> Task<Result<()>>;

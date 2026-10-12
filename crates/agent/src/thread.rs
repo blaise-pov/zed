@@ -881,6 +881,10 @@ pub trait SubagentHandle {
     fn send(&self, message: String, cx: &AsyncApp) -> Task<Result<String>>;
 
     fn set_task_id(&self, _task_id: Option<String>, _cx: &mut App) {}
+
+    fn model_id(&self, _cx: &App) -> Option<String> {
+        None
+    }
 }
 
 pub trait ThreadEnvironment {
@@ -962,6 +966,26 @@ pub trait ThreadEnvironment {
         &self,
         _task_id: &str,
         _reason: &str,
+        _cx: &mut AsyncApp,
+    ) -> Task<Result<()>> {
+        Task::ready(Ok(()))
+    }
+
+    fn update_task_registered(
+        &self,
+        _task_id: &str,
+        _model: Option<&str>,
+        _assignee: Option<&str>,
+        _session_id: Option<&str>,
+        _cx: &mut AsyncApp,
+    ) -> Task<Result<()>> {
+        Task::ready(Ok(()))
+    }
+
+    fn set_task_status_registered(
+        &self,
+        _task_id: &str,
+        _status: crate::AgentTaskStatus,
         _cx: &mut AsyncApp,
     ) -> Task<Result<()>> {
         Task::ready(Ok(()))
@@ -2142,9 +2166,8 @@ impl Thread {
             (None, None) => {
                 Self::resolve_profile_model_with_location(&profile_id, settings_location, cx)
                     .or_else(|| {
-                        LanguageModelRegistry::global(cx).update(cx, |registry, _cx| {
-                            registry.default_model()
-                        })
+                        LanguageModelRegistry::global(cx)
+                            .update(cx, |registry, _cx| registry.default_model())
                     })
                     .map_or(ThreadModel::Unset, ThreadModel::Ready)
             }
@@ -4017,9 +4040,10 @@ impl Thread {
         let rate_limit_policy = LanguageModelRegistry::read_global(cx)
             .provider_for_model(model)
             .ok()
-            .map_or_else(language_model::RateLimitParkingPolicy::default, |provider| {
-                provider.rate_limit_parking_policy(cx)
-            });
+            .map_or_else(
+                language_model::RateLimitParkingPolicy::default,
+                |provider| provider.rate_limit_parking_policy(cx),
+            );
         let Some(strategy) = Self::retry_strategy_for(&error, rate_limit_policy) else {
             return Err(anyhow!(error));
         };
