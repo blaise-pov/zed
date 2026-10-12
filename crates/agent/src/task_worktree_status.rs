@@ -715,6 +715,7 @@ mod tests {
                 created_at: None,
                 assigned_profile: None,
                 model: None,
+                metrics: None,
             },
             AgentTaskSummary {
                 id: AgentTaskId::from("TASK-2"),
@@ -728,6 +729,7 @@ mod tests {
                 created_at: None,
                 assigned_profile: None,
                 model: None,
+                metrics: None,
             },
         ];
 
@@ -740,6 +742,7 @@ mod tests {
                 tasks_total: 2,
                 tasks_done: 0,
                 created_at: None,
+                metrics: None,
             },
             AgentGoalSummary {
                 goal_id: "GOAL-2".to_string(),
@@ -749,6 +752,7 @@ mod tests {
                 tasks_total: 1,
                 tasks_done: 0,
                 created_at: None,
+                metrics: None,
             },
         ];
 
@@ -980,6 +984,7 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
+            metrics: None,
         }];
 
         let goals = vec![AgentGoalSummary {
@@ -990,6 +995,7 @@ mod tests {
             tasks_total: 1,
             tasks_done: 0,
             created_at: None,
+            metrics: None,
         }];
 
         let snapshot = cx
@@ -1144,6 +1150,7 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
+            metrics: None,
         }];
 
         let snap1 = status_entity
@@ -1204,6 +1211,7 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
+            metrics: None,
         }];
         let goals = vec![AgentGoalSummary {
             goal_id: "GOAL-1".to_string(),
@@ -1213,6 +1221,7 @@ mod tests {
             tasks_total: 1,
             tasks_done: 0,
             created_at: None,
+            metrics: None,
         }];
 
         let snap1 = status_entity
@@ -1250,6 +1259,7 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
+            metrics: None,
         });
 
         let snap3 = status_entity

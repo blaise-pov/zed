@@ -200,6 +200,9 @@ pub(crate) struct FakeSubagentHandle {
     send_task: Shared<Task<String>>,
     send_error: Option<String>,
     task_id: Arc<parking_lot::Mutex<Option<String>>>,
+    sent_messages: Arc<parking_lot::Mutex<Vec<String>>>,
+    token_usage: Arc<parking_lot::Mutex<Option<language_model::TokenUsage>>>,
+    send_tokens: Option<language_model::TokenUsage>,
 }
 
 impl FakeSubagentHandle {
@@ -213,11 +216,23 @@ impl FakeSubagentHandle {
             send_task,
             send_error,
             task_id: Arc::new(parking_lot::Mutex::new(None)),
+            sent_messages: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            token_usage: Arc::new(parking_lot::Mutex::new(None)),
+            send_tokens: None,
         }
     }
 
     pub(crate) fn task_id(&self) -> Option<String> {
         self.task_id.lock().clone()
+    }
+
+    pub(crate) fn sent_messages(&self) -> Vec<String> {
+        self.sent_messages.lock().clone()
+    }
+
+    pub(crate) fn with_token_usage(mut self, usage: language_model::TokenUsage) -> Self {
+        self.send_tokens = Some(usage);
+        self
     }
 }
 
@@ -230,7 +245,11 @@ impl SubagentHandle for FakeSubagentHandle {
         0
     }
 
-    fn send(&self, _message: String, cx: &AsyncApp) -> Task<Result<String>> {
+    fn send(&self, message: String, cx: &AsyncApp) -> Task<Result<String>> {
+        self.sent_messages.lock().push(message);
+        if let Some(tokens) = self.send_tokens {
+            *self.token_usage.lock() = Some(tokens);
+        }
         if let Some(ref err) = self.send_error {
             return Task::ready(Err(anyhow::anyhow!("{err}")));
         }
@@ -240,6 +259,10 @@ impl SubagentHandle for FakeSubagentHandle {
 
     fn set_task_id(&self, task_id: Option<String>, _cx: &mut App) {
         *self.task_id.lock() = task_id;
+    }
+
+    fn cumulative_token_usage(&self, _cx: &App) -> Option<language_model::TokenUsage> {
+        *self.token_usage.lock()
     }
 }
 
@@ -258,6 +281,18 @@ pub(crate) struct FakeThreadEnvironment {
     task_status_transitions: std::cell::RefCell<Vec<(String, crate::AgentTaskStatus)>>,
     ensure_task_error: std::cell::RefCell<Option<String>>,
     ensure_worktree_calls: std::cell::RefCell<Vec<String>>,
+    recorded_turn_starts: std::cell::RefCell<Vec<(String, String, Option<String>, Option<String>)>>,
+    recorded_turn_finishes: std::cell::RefCell<
+        Vec<(
+            String,
+            Option<u32>,
+            u64,
+            Option<language_model::TokenUsage>,
+            Option<String>,
+        )>,
+    >,
+    published_artifacts: std::cell::RefCell<Vec<(String, String, String, Option<String>)>>,
+    task_details: std::cell::RefCell<std::collections::HashMap<String, crate::AgentTaskDetail>>,
 }
 
 impl FakeThreadEnvironment {
@@ -317,6 +352,35 @@ impl FakeThreadEnvironment {
         self.ensure_worktree_calls.borrow().clone()
     }
 
+    pub(crate) fn recorded_turn_starts(
+        &self,
+    ) -> Vec<(String, String, Option<String>, Option<String>)> {
+        self.recorded_turn_starts.borrow().clone()
+    }
+
+    pub(crate) fn recorded_turn_finishes(
+        &self,
+    ) -> Vec<(
+        String,
+        Option<u32>,
+        u64,
+        Option<language_model::TokenUsage>,
+        Option<String>,
+    )> {
+        self.recorded_turn_finishes.borrow().clone()
+    }
+
+    pub(crate) fn published_artifacts(&self) -> Vec<(String, String, String, Option<String>)> {
+        self.published_artifacts.borrow().clone()
+    }
+
+    pub(crate) fn with_task_detail(self, task_id: &str, detail: crate::AgentTaskDetail) -> Self {
+        self.task_details
+            .borrow_mut()
+            .insert(task_id.to_string(), detail);
+        self
+    }
+
     pub(crate) fn subagent_handle(&self) -> Option<Rc<FakeSubagentHandle>> {
         self.subagent_handle.clone()
     }
@@ -353,6 +417,20 @@ impl crate::ThreadEnvironment for FakeThreadEnvironment {
         _cx: &mut App,
     ) -> Result<Rc<dyn SubagentHandle>> {
         self.subagent_models.borrow_mut().push(model);
+        Ok(self
+            .subagent_handle
+            .clone()
+            .expect("Subagent handle not available on FakeThreadEnvironment")
+            as Rc<dyn SubagentHandle>)
+    }
+
+    fn resume_subagent(
+        &self,
+        _session_id: acp::SessionId,
+        _profile: Option<agent_settings::AgentProfileId>,
+        _task_worktree: Option<PathBuf>,
+        _cx: &mut App,
+    ) -> Result<Rc<dyn SubagentHandle>> {
         Ok(self
             .subagent_handle
             .clone()
@@ -434,6 +512,72 @@ impl crate::ThreadEnvironment for FakeThreadEnvironment {
             .borrow_mut()
             .push((task_id.to_string(), status));
         Task::ready(Ok(()))
+    }
+
+    fn get_task_registered(
+        &self,
+        task_id: &str,
+        _cx: &mut AsyncApp,
+    ) -> Task<Result<crate::AgentTaskDetail>> {
+        if let Some(detail) = self.task_details.borrow().get(task_id).cloned() {
+            Task::ready(Ok(detail))
+        } else {
+            Task::ready(Err(anyhow::anyhow!("Task not found")))
+        }
+    }
+
+    fn record_turn_start(
+        &self,
+        task_id: &str,
+        prompt: &str,
+        model: Option<&str>,
+        session_id: Option<&str>,
+        _cx: &mut AsyncApp,
+    ) -> Task<Result<Option<u32>>> {
+        self.recorded_turn_starts.borrow_mut().push((
+            task_id.to_string(),
+            prompt.to_string(),
+            model.map(str::to_string),
+            session_id.map(str::to_string),
+        ));
+        let count = self.recorded_turn_starts.borrow().len() as u32;
+        Task::ready(Ok(Some(count)))
+    }
+
+    fn record_turn_finish(
+        &self,
+        task_id: &str,
+        turn_index: Option<u32>,
+        duration_ms: u64,
+        tokens: Option<language_model::TokenUsage>,
+        error: Option<&str>,
+        _cx: &mut AsyncApp,
+    ) -> Task<Result<()>> {
+        self.recorded_turn_finishes.borrow_mut().push((
+            task_id.to_string(),
+            turn_index,
+            duration_ms,
+            tokens,
+            error.map(str::to_string),
+        ));
+        Task::ready(Ok(()))
+    }
+
+    fn publish_artifact(
+        &self,
+        task_id: &str,
+        kind: &str,
+        content: &str,
+        summary: Option<&str>,
+        _cx: &mut AsyncApp,
+    ) -> Task<Result<String>> {
+        self.published_artifacts.borrow_mut().push((
+            task_id.to_string(),
+            kind.to_string(),
+            content.to_string(),
+            summary.map(str::to_string),
+        ));
+        Task::ready(Ok("artifact-1".to_string()))
     }
 }
 
@@ -7942,6 +8086,261 @@ async fn test_spawn_agent_updates_task_metadata_and_status_lifecycle(cx: &mut Te
 }
 
 #[gpui::test]
+async fn test_spawn_agent_turn_recording_and_metrics(cx: &mut TestAppContext) {
+    init_test(cx);
+
+    let token_usage = language_model::TokenUsage {
+        input_tokens: 1500,
+        output_tokens: 300,
+        cache_read_input_tokens: 100,
+        cache_creation_input_tokens: 50,
+    };
+
+    let subagent = FakeSubagentHandle::new(
+        acp::SessionId::new("subagent-turn-1"),
+        Task::ready("turn complete output".to_string()).shared(),
+        None,
+    )
+    .with_token_usage(token_usage);
+
+    let environment = Rc::new(FakeThreadEnvironment::default().with_subagent(subagent));
+    #[allow(clippy::arc_with_non_send_sync)]
+    let tool = Arc::new(SpawnAgentTool::new(environment.clone()));
+    let (event_stream, _rx) = ToolCallEventStream::test();
+
+    let result = cx
+        .update(|cx| {
+            tool.run(
+                ToolInput::resolved(SpawnAgentToolInput {
+                    label: "Run turn".to_string(),
+                    message: "execute command".to_string(),
+                    task_id: Some("TASK-TURN-1".to_string()),
+                    model: Some("gemini-3.8-flash-high".to_string()),
+                    ..Default::default()
+                }),
+                event_stream,
+                cx,
+            )
+        })
+        .await;
+
+    assert!(matches!(result, Ok(SpawnAgentToolOutput::Success { .. })));
+
+    let turn_starts = environment.recorded_turn_starts();
+    assert_eq!(turn_starts.len(), 1);
+    assert_eq!(turn_starts[0].0, "TASK-TURN-1");
+    assert_eq!(turn_starts[0].1, "execute command");
+    assert_eq!(turn_starts[0].2, Some("gemini-3.8-flash-high".to_string()));
+    assert_eq!(turn_starts[0].3, Some("subagent-turn-1".to_string()));
+
+    let turn_finishes = environment.recorded_turn_finishes();
+    assert_eq!(turn_finishes.len(), 1);
+    assert_eq!(turn_finishes[0].0, "TASK-TURN-1");
+    assert_eq!(turn_finishes[0].1, Some(1));
+    assert_eq!(turn_finishes[0].3, Some(token_usage));
+    assert_eq!(turn_finishes[0].4, None);
+}
+
+#[gpui::test]
+async fn test_spawn_agent_contract_injection_turn_one(cx: &mut TestAppContext) {
+    init_test(cx);
+
+    let task_detail = crate::AgentTaskDetail {
+        summary: crate::AgentTaskSummary {
+            id: crate::AgentTaskId::from("TASK-CONTRACT-1"),
+            parent_id: None,
+            goal_id: Some("GOAL-42".to_string()),
+            title: "Implement metrics and turn tracking".to_string(),
+            status: crate::AgentTaskStatus::Ready,
+            attempt: 1,
+            assignee: None,
+            write_scopes: vec!["crates/agent/**".to_string(), "crates/agent_ui/**".to_string()],
+            created_at: None,
+            assigned_profile: None,
+            model: None,
+            metrics: None,
+        },
+        description: "Add metrics tracking to subagent runtime.\n\nStrict constraints:\n- No panic\n- Best effort MCP".to_string(),
+        acceptance_criteria: vec![
+            "AgentTaskMetrics defined".to_string(),
+            "Contract injected on turn 1".to_string(),
+        ],
+        events_tail: vec![],
+    };
+
+    let subagent = FakeSubagentHandle::new(
+        acp::SessionId::new("subagent-contract-1"),
+        Task::ready("done".to_string()).shared(),
+        None,
+    );
+
+    let environment = Rc::new(
+        FakeThreadEnvironment::default()
+            .with_subagent(subagent)
+            .with_task_detail("TASK-CONTRACT-1", task_detail),
+    );
+    let subagent_handle = environment.subagent_handle().unwrap();
+
+    #[allow(clippy::arc_with_non_send_sync)]
+    let tool = Arc::new(SpawnAgentTool::new(environment.clone()));
+    let (event_stream, _rx) = ToolCallEventStream::test();
+
+    let result = cx
+        .update(|cx| {
+            tool.run(
+                ToolInput::resolved(SpawnAgentToolInput {
+                    label: "Initial turn".to_string(),
+                    message: "Please begin your task".to_string(),
+                    task_id: Some("TASK-CONTRACT-1".to_string()),
+                    session_id: None,
+                    ..Default::default()
+                }),
+                event_stream,
+                cx,
+            )
+        })
+        .await;
+
+    assert!(matches!(result, Ok(SpawnAgentToolOutput::Success { .. })));
+
+    let sent = subagent_handle.sent_messages();
+    assert_eq!(sent.len(), 1);
+    let sent_msg = &sent[0];
+    assert!(sent_msg.contains("<task_contract>"));
+    assert!(sent_msg.contains("Task ID: TASK-CONTRACT-1"));
+    assert!(sent_msg.contains("Title: Implement metrics and turn tracking"));
+    assert!(sent_msg.contains("Objective: Add metrics tracking to subagent runtime."));
+    assert!(sent_msg.contains("Acceptance Criteria:"));
+    assert!(sent_msg.contains("- AgentTaskMetrics defined"));
+    assert!(sent_msg.contains("- Contract injected on turn 1"));
+    assert!(sent_msg.contains("Constraints:"));
+    assert!(sent_msg.contains("- No panic"));
+    assert!(sent_msg.contains("- Best effort MCP"));
+    assert!(sent_msg.contains("Write Scopes: crates/agent/**, crates/agent_ui/**"));
+    assert!(sent_msg.contains("</task_contract>"));
+    assert!(sent_msg.contains("Please begin your task"));
+}
+
+#[gpui::test]
+async fn test_spawn_agent_resumed_turn_bypasses_contract_injection(cx: &mut TestAppContext) {
+    init_test(cx);
+
+    let task_detail = crate::AgentTaskDetail {
+        summary: crate::AgentTaskSummary {
+            id: crate::AgentTaskId::from("TASK-RESUME-1"),
+            parent_id: None,
+            goal_id: None,
+            title: "Task Title".to_string(),
+            status: crate::AgentTaskStatus::Running,
+            attempt: 1,
+            assignee: None,
+            write_scopes: vec![],
+            created_at: None,
+            assigned_profile: None,
+            model: None,
+            metrics: None,
+        },
+        description: "Task description".to_string(),
+        acceptance_criteria: vec!["Crit".to_string()],
+        events_tail: vec![],
+    };
+
+    let subagent = FakeSubagentHandle::new(
+        acp::SessionId::new("subagent-resume-1"),
+        Task::ready("resumed turn output".to_string()).shared(),
+        None,
+    );
+
+    let environment = Rc::new(
+        FakeThreadEnvironment::default()
+            .with_subagent(subagent)
+            .with_task_detail("TASK-RESUME-1", task_detail),
+    );
+    let subagent_handle = environment.subagent_handle().unwrap();
+
+    #[allow(clippy::arc_with_non_send_sync)]
+    let tool = Arc::new(SpawnAgentTool::new(environment.clone()));
+    let (event_stream, _rx) = ToolCallEventStream::test();
+
+    let result = cx
+        .update(|cx| {
+            tool.run(
+                ToolInput::resolved(SpawnAgentToolInput {
+                    label: "Resumed turn".to_string(),
+                    message: "follow-up instruction".to_string(),
+                    task_id: Some("TASK-RESUME-1".to_string()),
+                    session_id: Some(acp::SessionId::new("subagent-resume-1")),
+                    ..Default::default()
+                }),
+                event_stream,
+                cx,
+            )
+        })
+        .await;
+
+    assert!(matches!(result, Ok(SpawnAgentToolOutput::Success { .. })));
+
+    let sent = subagent_handle.sent_messages();
+    assert_eq!(sent.len(), 1);
+    let sent_msg = &sent[0];
+    assert!(!sent_msg.contains("<task_contract>"));
+    assert!(sent_msg.contains("follow-up instruction"));
+}
+
+#[gpui::test]
+async fn test_spawn_agent_auto_publishes_execution_report_artifact(cx: &mut TestAppContext) {
+    init_test(cx);
+
+    let token_usage = language_model::TokenUsage {
+        input_tokens: 5000,
+        output_tokens: 800,
+        cache_read_input_tokens: 1200,
+        cache_creation_input_tokens: 0,
+    };
+
+    let subagent = FakeSubagentHandle::new(
+        acp::SessionId::new("subagent-artifact-1"),
+        Task::ready("Lines of output from agent\nLine 2\nLine 3".to_string()).shared(),
+        None,
+    )
+    .with_token_usage(token_usage);
+
+    let environment = Rc::new(FakeThreadEnvironment::default().with_subagent(subagent));
+    #[allow(clippy::arc_with_non_send_sync)]
+    let tool = Arc::new(SpawnAgentTool::new(environment.clone()));
+    let (event_stream, _rx) = ToolCallEventStream::test();
+
+    let result = cx
+        .update(|cx| {
+            tool.run(
+                ToolInput::resolved(SpawnAgentToolInput {
+                    label: "Build feature".to_string(),
+                    message: "do work".to_string(),
+                    task_id: Some("TASK-ARTIFACT-1".to_string()),
+                    ..Default::default()
+                }),
+                event_stream,
+                cx,
+            )
+        })
+        .await;
+
+    assert!(matches!(result, Ok(SpawnAgentToolOutput::Success { .. })));
+
+    let artifacts = environment.published_artifacts();
+    assert_eq!(artifacts.len(), 1);
+    let (task_id, kind, content, summary) = &artifacts[0];
+    assert_eq!(task_id, "TASK-ARTIFACT-1");
+    assert_eq!(kind, "execution_report");
+    assert_eq!(summary, &Some("Execution Report".to_string()));
+    assert!(content.contains("# Execution Report: TASK-ARTIFACT-1"));
+    assert!(content.contains("- **Status:** Completed"));
+    assert!(content.contains("- **Tokens:** 5000 in / 800 out / 1200 cache"));
+    assert!(content.contains("## Agent Output Summary"));
+    assert!(content.contains("Lines of output from agent"));
+}
+
+#[gpui::test]
 async fn test_spawn_agent_differentiated_error_handling(cx: &mut TestAppContext) {
     init_test(cx);
 
@@ -13355,6 +13754,7 @@ async fn test_auto_cleanup_terminal_task_removes_worktree_preserves_branch(
         created_at: None,
         assigned_profile: None,
         model: None,
+        metrics: None,
     };
 
     let worktree_path = cx
@@ -13440,6 +13840,7 @@ async fn test_auto_cleanup_retains_worktree_on_commit_error(cx: &mut TestAppCont
         created_at: None,
         assigned_profile: None,
         model: None,
+        metrics: None,
     };
 
     let worktree_path = cx
@@ -13519,6 +13920,7 @@ async fn test_startup_sweep_cleans_only_terminal_tasks(cx: &mut TestAppContext) 
         created_at: None,
         assigned_profile: None,
         model: None,
+        metrics: None,
     };
     let task2 = AgentTaskSummary {
         id: AgentTaskId::from("TASK-SWEEP-2"),
@@ -13532,6 +13934,7 @@ async fn test_startup_sweep_cleans_only_terminal_tasks(cx: &mut TestAppContext) 
         created_at: None,
         assigned_profile: None,
         model: None,
+        metrics: None,
     };
     let task3 = AgentTaskSummary {
         id: AgentTaskId::from("TASK-SWEEP-3"),
@@ -13545,6 +13948,7 @@ async fn test_startup_sweep_cleans_only_terminal_tasks(cx: &mut TestAppContext) 
         created_at: None,
         assigned_profile: None,
         model: None,
+        metrics: None,
     };
 
     let path1 = cx

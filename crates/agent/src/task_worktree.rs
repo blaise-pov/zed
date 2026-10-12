@@ -3566,6 +3566,7 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
+            metrics: None,
         };
 
         let path1 = cx
@@ -3611,6 +3612,7 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
+            metrics: None,
         };
         let second_task = AgentTaskSummary {
             id: AgentTaskId::from("TASK-DIST-2"),
@@ -3624,6 +3626,7 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
+            metrics: None,
         };
 
         let first_path = cx
@@ -3679,6 +3682,7 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
+            metrics: None,
         };
 
         let initial_visible_count =
@@ -3858,6 +3862,7 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
+            metrics: None,
         };
 
         // Case 1: task with goal_id forks from goal-tip
@@ -3897,6 +3902,7 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
+            metrics: None,
         };
         let path2 = cx
             .update(|cx| {
@@ -3934,6 +3940,7 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
+            metrics: None,
         };
         let path3 = cx
             .update(|cx| {
@@ -3967,6 +3974,7 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
+            metrics: None,
         };
         let result4 = cx
             .update(|cx| {
@@ -3997,6 +4005,7 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
+            metrics: None,
         };
         let path5 = cx
             .update(|cx| ensure_task_worktree(project.clone(), &task5, cx))
@@ -4047,6 +4056,7 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
+            metrics: None,
         };
 
         let worktree_path = cx
@@ -4138,6 +4148,7 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
+            metrics: None,
         };
         let task_b = AgentTaskSummary {
             id: AgentTaskId::from("TASK-NFF-B"),
@@ -4151,6 +4162,7 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
+            metrics: None,
         };
 
         let path_a = cx
@@ -4267,6 +4279,7 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
+            metrics: None,
         };
         let task_c2 = AgentTaskSummary {
             id: AgentTaskId::from("TASK-CONF-2"),
@@ -4280,6 +4293,7 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
+            metrics: None,
         };
 
         let path_c1 = cx
@@ -4411,6 +4425,7 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
+            metrics: None,
         };
 
         let worktree_path = cx
@@ -4502,6 +4517,7 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
+            metrics: None,
         };
 
         let path_a = cx
@@ -4552,6 +4568,7 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
+            metrics: None,
         };
 
         let path_b = cx
@@ -4635,6 +4652,7 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
+            metrics: None,
         };
 
         let path_a = cx
@@ -4686,6 +4704,7 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
+            metrics: None,
         };
 
         let path_reviewer = cx
@@ -4766,6 +4785,7 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
+            metrics: None,
         };
 
         let path_x = cx
@@ -4816,6 +4836,7 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
+            metrics: None,
         };
 
         let path_insp = cx
@@ -4895,6 +4916,7 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
+            metrics: None,
         };
         let task2 = AgentTaskSummary {
             id: AgentTaskId::from("TASK-EXC-2"),
@@ -4908,6 +4930,7 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
+            metrics: None,
         };
 
         // Task 1 checks out shared-branch
@@ -5015,6 +5038,7 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
+            metrics: None,
         };
 
         let task_a = AgentTaskSummary {
@@ -5029,6 +5053,7 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
+            metrics: None,
         };
 
         let task_rec = AgentTaskSummary {
@@ -5043,6 +5068,7 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
+            metrics: None,
         };
 
         // Both Task B and Task A create worktrees branched from the same initial goal state
@@ -5176,6 +5202,7 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
+            metrics: None,
         };
         let task2 = AgentTaskSummary {
             id: AgentTaskId::from("TASK-C-2"),
@@ -5189,6 +5216,7 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
+            metrics: None,
         };
 
         // Task 1 checks out branch-c with an active session guard
@@ -5291,6 +5319,7 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
+            metrics: None,
         };
         let task2 = AgentTaskSummary {
             id: AgentTaskId::from("TASK-D-2"),
@@ -5304,6 +5333,7 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
+            metrics: None,
         };
 
         let path1 = cx
@@ -5388,6 +5418,7 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
+            metrics: None,
         };
 
         // 1. on_branch + base_branch mutually exclusive
@@ -5479,6 +5510,7 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
+            metrics: None,
         };
 
         let path = cx
@@ -5634,6 +5666,7 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
+            metrics: None,
         };
 
         let worktree_path = cx
@@ -6068,6 +6101,7 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
+            metrics: None,
         };
         let task2 = AgentTaskSummary {
             id: AgentTaskId::from("TASK-POOL-2"),
@@ -6081,6 +6115,7 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
+            metrics: None,
         };
         let task3 = AgentTaskSummary {
             id: AgentTaskId::from("TASK-POOL-3"),
@@ -6094,6 +6129,7 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
+            metrics: None,
         };
         let task4 = AgentTaskSummary {
             id: AgentTaskId::from("TASK-POOL-4"),
@@ -6107,6 +6143,7 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
+            metrics: None,
         };
 
         // Task 1 and Task 2 active sessions
@@ -6247,6 +6284,7 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
+            metrics: None,
         };
         let task2 = AgentTaskSummary {
             id: AgentTaskId::from("TASK-LRU-2"),
@@ -6260,6 +6298,7 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
+            metrics: None,
         };
         let task3 = AgentTaskSummary {
             id: AgentTaskId::from("TASK-LRU-3"),
@@ -6273,6 +6312,7 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
+            metrics: None,
         };
 
         // Create Task 1 with guard
@@ -6392,6 +6432,7 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
+            metrics: None,
         };
         let task_dirty = AgentTaskSummary {
             id: AgentTaskId::from("TASK-SAFE-DIRTY"),
@@ -6405,6 +6446,7 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
+            metrics: None,
         };
         let task_new = AgentTaskSummary {
             id: AgentTaskId::from("TASK-SAFE-NEW"),
@@ -6418,6 +6460,7 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
+            metrics: None,
         };
 
         // Task Err is created, guard dropped, but has commit_error
@@ -6543,6 +6586,7 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
+            metrics: None,
         };
         let task2 = AgentTaskSummary {
             id: AgentTaskId::from("TASK-ACT-SAFE-2"),
@@ -6556,6 +6600,7 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
+            metrics: None,
         };
 
         // Task 1 has active session guard
@@ -6649,6 +6694,7 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
+            metrics: None,
         };
         let task2 = AgentTaskSummary {
             id: AgentTaskId::from("TASK-NONTERM-2"),
@@ -6662,6 +6708,7 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
+            metrics: None,
         };
         let task3 = AgentTaskSummary {
             id: AgentTaskId::from("TASK-NONTERM-3"),
@@ -6675,6 +6722,7 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
+            metrics: None,
         };
 
         // Tasks 1 and 2 occupy the entire pool (limit = 2) with active sessions.
@@ -6781,6 +6829,7 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
+            metrics: None,
         };
         let task2 = AgentTaskSummary {
             id: AgentTaskId::from("TASK-SWP-2"),
@@ -6794,6 +6843,7 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
+            metrics: None,
         };
         let task3 = AgentTaskSummary {
             id: AgentTaskId::from("TASK-SWP-3"),
@@ -6807,6 +6857,7 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
+            metrics: None,
         };
 
         let g1 = SubagentSessionGuard::new(task1.id.clone());
@@ -6929,6 +6980,7 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
+            metrics: None,
         };
 
         let worktree_path = cx
@@ -7042,6 +7094,7 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
+            metrics: None,
         };
 
         let worktree_path = cx
@@ -7128,6 +7181,7 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
+            metrics: None,
         };
 
         assert_eq!(task_worktree_title(&task.id), None);

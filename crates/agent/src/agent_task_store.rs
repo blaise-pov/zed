@@ -45,6 +45,9 @@ fn merge_items_into_graph(graph: &mut AgentTaskGraph, items: &[AgentUnifiedItem]
             {
                 task.model = item.model.clone();
             }
+            if item.metrics.is_some() {
+                task.metrics = item.metrics.clone();
+            }
         }
     }
 
@@ -74,6 +77,7 @@ fn merge_items_into_graph(graph: &mut AgentTaskGraph, items: &[AgentUnifiedItem]
                 created_at: item.created_at,
                 assigned_profile: item_profile,
                 model: item.model.clone(),
+                metrics: item.metrics.clone(),
             });
         }
     }
@@ -88,6 +92,9 @@ fn merge_items_into_graph(graph: &mut AgentTaskGraph, items: &[AgentUnifiedItem]
                     goal.tasks_total = progress.total;
                     goal.tasks_done = progress.done;
                 }
+            }
+            if item.metrics.is_some() {
+                goal.metrics = item.metrics.clone();
             }
         }
     }
@@ -106,6 +113,7 @@ fn merge_items_into_graph(graph: &mut AgentTaskGraph, items: &[AgentUnifiedItem]
                 tasks_total,
                 tasks_done,
                 created_at: item.created_at,
+                metrics: item.metrics.clone(),
             });
         }
     }
@@ -476,6 +484,7 @@ mod tests {
                         created_at: None,
                         assigned_profile: None,
                         model: None,
+                        metrics: None,
                     }]
                 } else {
                     self.tasks.clone()
@@ -743,7 +752,11 @@ mod tests {
         let counts = calls.lock().unwrap();
         assert_eq!(
             counts.ensure_task_calls,
-            vec![(task_id, "Test Title".to_string(), Some("GOAL-1".to_string()))]
+            vec![(
+                task_id,
+                "Test Title".to_string(),
+                Some("GOAL-1".to_string())
+            )]
         );
         assert_eq!(counts.fetch_graph_count, initial_refreshes + 1);
     }
@@ -837,6 +850,7 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
+            metrics: None,
         };
 
         let initial_goal = AgentGoalSummary {
@@ -847,6 +861,7 @@ mod tests {
             tasks_total: 0,
             tasks_done: 0,
             created_at: None,
+            metrics: None,
         };
 
         let items = vec![
@@ -866,6 +881,7 @@ mod tests {
                 goal_id: None,
                 session_id: None,
                 metadata: None,
+                metrics: None,
             },
             AgentUnifiedItem {
                 kind: AgentItemKind::Goal,
@@ -883,6 +899,7 @@ mod tests {
                 goal_id: None,
                 session_id: None,
                 metadata: None,
+                metrics: None,
             },
         ];
 
@@ -940,6 +957,7 @@ mod tests {
             goal_id: None,
             session_id: None,
             metadata: None,
+            metrics: None,
         }];
 
         let provider = Arc::new(TestProvider {
@@ -1015,6 +1033,7 @@ mod tests {
                     created_at: None,
                     assigned_profile: None,
                     model: None,
+                    metrics: None,
                 },
                 AgentTaskSummary {
                     id: AgentTaskId::from("TASK-WITH-EXISTING-PROFILE"),
@@ -1028,6 +1047,7 @@ mod tests {
                     created_at: None,
                     assigned_profile: Some(SharedString::from("senior_engineer")),
                     model: None,
+                    metrics: None,
                 },
             ],
             goals: vec![],
@@ -1050,6 +1070,7 @@ mod tests {
                 goal_id: None,
                 session_id: None,
                 metadata: None,
+                metrics: None,
             },
             AgentUnifiedItem {
                 kind: AgentItemKind::Task,
@@ -1067,6 +1088,7 @@ mod tests {
                 goal_id: None,
                 session_id: None,
                 metadata: None,
+                metrics: None,
             },
         ];
 
@@ -1105,6 +1127,7 @@ mod tests {
                 created_at: None,
                 assigned_profile: None,
                 model: None,
+                metrics: None,
             }],
             goals: vec![],
         };
@@ -1126,6 +1149,7 @@ mod tests {
                 goal_id: Some("GOAL-42".to_string()),
                 session_id: None,
                 metadata: None,
+                metrics: None,
             },
             AgentUnifiedItem {
                 kind: AgentItemKind::Task,
@@ -1143,6 +1167,7 @@ mod tests {
                 goal_id: Some("GOAL-42".to_string()),
                 session_id: None,
                 metadata: None,
+                metrics: None,
             },
         ];
 
@@ -1188,6 +1213,7 @@ mod tests {
                 created_at: None,
                 assigned_profile: None,
                 model: None,
+                metrics: None,
             }],
             goals: vec![],
         };
@@ -1209,6 +1235,7 @@ mod tests {
                 goal_id: Some("GOAL-10".to_string()),
                 session_id: None,
                 metadata: None,
+                metrics: None,
             },
             AgentUnifiedItem {
                 kind: AgentItemKind::Task,
@@ -1226,6 +1253,7 @@ mod tests {
                 goal_id: Some("GOAL-10".to_string()),
                 session_id: None,
                 metadata: None,
+                metrics: None,
             },
         ];
 
@@ -1340,6 +1368,7 @@ mod tests {
                 created_at: None,
                 assigned_profile: None,
                 model: None,
+                metrics: None,
             }],
             goals: vec![],
         };
@@ -1394,6 +1423,7 @@ mod tests {
                 created_at: None,
                 assigned_profile: None,
                 model: None,
+                metrics: None,
             }],
             goals: vec![],
         };
@@ -1415,6 +1445,7 @@ mod tests {
                 goal_id: None,
                 session_id: Some("session-top-level-123".to_string()),
                 metadata: None,
+                metrics: None,
             },
             AgentUnifiedItem {
                 kind: AgentItemKind::Task,
@@ -1434,6 +1465,7 @@ mod tests {
                 metadata: Some(serde_json::json!({
                     "session_id": "session-metadata-456"
                 })),
+                metrics: None,
             },
         ];
 
@@ -1451,5 +1483,86 @@ mod tests {
             crate::task_worktree::task_session_id_for_id(&AgentTaskId::from("TASK-SESS-2")),
             Some("session-metadata-456".to_string())
         );
+    }
+
+    #[test]
+    fn test_merge_items_propagates_metrics_to_tasks_and_goals() {
+        use crate::agent_task::AgentTaskMetrics;
+
+        let task_metrics = AgentTaskMetrics {
+            duration_ms: Some(45000),
+            input_tokens: Some(10000),
+            output_tokens: Some(2500),
+            cache_read_tokens: Some(500),
+            cache_creation_tokens: Some(100),
+            total_tokens: Some(13100),
+            cost_usd: Some(0.045),
+            turns_count: Some(2),
+        };
+
+        let mut graph = AgentTaskGraph {
+            tasks: vec![AgentTaskSummary {
+                id: AgentTaskId::from("TASK-1"),
+                parent_id: None,
+                goal_id: Some("GOAL-1".to_string()),
+                title: "Existing Task".to_string(),
+                status: AgentTaskStatus::Running,
+                attempt: 1,
+                assignee: None,
+                write_scopes: vec![],
+                created_at: None,
+                assigned_profile: None,
+                model: None,
+                metrics: None,
+            }],
+            goals: vec![AgentGoalSummary {
+                goal_id: "GOAL-1".to_string(),
+                title: "Existing Goal".to_string(),
+                status: AgentGoalStatus::Running,
+                priority: 1,
+                tasks_total: 1,
+                tasks_done: 0,
+                created_at: None,
+                metrics: None,
+            }],
+        };
+
+        let items = vec![
+            AgentUnifiedItem {
+                kind: AgentItemKind::Task,
+                id: "TASK-1".to_string(),
+                metrics: Some(task_metrics.clone()),
+                ..Default::default()
+            },
+            AgentUnifiedItem {
+                kind: AgentItemKind::Task,
+                id: "TASK-SYNTH".to_string(),
+                title: "Synthesized Task".to_string(),
+                metrics: Some(task_metrics.clone()),
+                ..Default::default()
+            },
+            AgentUnifiedItem {
+                kind: AgentItemKind::Goal,
+                id: "GOAL-1".to_string(),
+                metrics: Some(task_metrics.clone()),
+                ..Default::default()
+            },
+            AgentUnifiedItem {
+                kind: AgentItemKind::Goal,
+                id: "GOAL-SYNTH".to_string(),
+                title: "Synthesized Goal".to_string(),
+                metrics: Some(task_metrics.clone()),
+                ..Default::default()
+            },
+        ];
+
+        merge_items_into_graph(&mut graph, &items);
+
+        // Task 1 got metrics propagated
+        assert_eq!(graph.tasks[0].metrics, Some(task_metrics.clone()));
+        // Synthesized task got metrics
+        assert_eq!(graph.tasks[1].metrics, Some(task_metrics.clone()));
+        // Goal 1 got metrics propagated
+        assert_eq!(graph.goals[0].metrics, Some(task_metrics));
     }
 }

@@ -203,24 +203,22 @@ impl AgentTaskProvider for McpAgentTaskProvider {
         let store = self.store.clone();
         let server_id = self.server_id.clone();
 
-        cx.spawn(async move |cx| {
-            match update_task.await {
-                Ok(_) => Ok(()),
-                Err(err) => {
-                    if has_session_id {
-                        args.remove("session_id");
-                        if args.len() <= 1 {
-                            return Ok(());
-                        }
-                        let fallback_task = cx.update(|cx| {
-                            let provider = McpAgentTaskProvider::new(store, server_id);
-                            provider.call_tool("task_update", Some(args), cx)
-                        });
-                        fallback_task.await?;
-                        Ok(())
-                    } else {
-                        Err(err)
+        cx.spawn(async move |cx| match update_task.await {
+            Ok(_) => Ok(()),
+            Err(err) => {
+                if has_session_id {
+                    args.remove("session_id");
+                    if args.len() <= 1 {
+                        return Ok(());
                     }
+                    let fallback_task = cx.update(|cx| {
+                        let provider = McpAgentTaskProvider::new(store, server_id);
+                        provider.call_tool("task_update", Some(args), cx)
+                    });
+                    fallback_task.await?;
+                    Ok(())
+                } else {
+                    Err(err)
                 }
             }
         })
@@ -341,6 +339,143 @@ impl AgentTaskProvider for McpAgentTaskProvider {
         })
     }
 
+    fn record_turn_start(
+        &self,
+        task_id: &AgentTaskId,
+        prompt: &str,
+        model: Option<&str>,
+        session_id: Option<&str>,
+        cx: &mut App,
+    ) -> Task<Result<Option<u32>>> {
+        let mut args = serde_json::Map::new();
+        args.insert(
+            "task_id".to_string(),
+            serde_json::Value::String(task_id.to_string()),
+        );
+        args.insert(
+            "prompt".to_string(),
+            serde_json::Value::String(prompt.to_string()),
+        );
+        if let Some(m) = model.map(str::trim).filter(|s| !s.is_empty()) {
+            args.insert(
+                "model".to_string(),
+                serde_json::Value::String(m.to_string()),
+            );
+        }
+        if let Some(s) = session_id.map(str::trim).filter(|s| !s.is_empty()) {
+            args.insert(
+                "session_id".to_string(),
+                serde_json::Value::String(s.to_string()),
+            );
+        }
+        let task = self.call_tool("task_turn_start", Some(args), cx);
+        cx.spawn(async move |_cx| {
+            let value = task.await?;
+            let turn_index = if let Some(n) = value.as_u64() {
+                Some(n as u32)
+            } else if let Some(obj) = value.as_object() {
+                obj.get("turn_index")
+                    .or_else(|| obj.get("turn"))
+                    .and_then(|v| v.as_u64())
+                    .map(|n| n as u32)
+            } else {
+                None
+            };
+            Ok(turn_index)
+        })
+    }
+
+    fn record_turn_finish(
+        &self,
+        task_id: &AgentTaskId,
+        turn_index: Option<u32>,
+        duration_ms: u64,
+        tokens: Option<language_model::TokenUsage>,
+        error: Option<&str>,
+        cx: &mut App,
+    ) -> Task<Result<()>> {
+        let mut args = serde_json::Map::new();
+        args.insert(
+            "task_id".to_string(),
+            serde_json::Value::String(task_id.to_string()),
+        );
+        if let Some(turn_index) = turn_index {
+            args.insert(
+                "turn_index".to_string(),
+                serde_json::Value::Number(turn_index.into()),
+            );
+        }
+        args.insert(
+            "duration_ms".to_string(),
+            serde_json::Value::Number(duration_ms.into()),
+        );
+        if let Some(tokens) = tokens {
+            let tokens_obj = serde_json::json!({
+                "input": tokens.input_tokens,
+                "output": tokens.output_tokens,
+                "cache_read": tokens.cache_read_input_tokens,
+                "cache_creation": tokens.cache_creation_input_tokens,
+            });
+            args.insert("tokens".to_string(), tokens_obj);
+        }
+        if let Some(error) = error.map(str::trim).filter(|s| !s.is_empty()) {
+            args.insert(
+                "error".to_string(),
+                serde_json::Value::String(error.to_string()),
+            );
+        }
+        let task = self.call_tool("task_turn_finish", Some(args), cx);
+        cx.spawn(async move |_cx| {
+            task.await?;
+            Ok(())
+        })
+    }
+
+    fn publish_artifact(
+        &self,
+        task_id: &AgentTaskId,
+        kind: &str,
+        content: &str,
+        summary: Option<&str>,
+        cx: &mut App,
+    ) -> Task<Result<String>> {
+        let mut args = serde_json::Map::new();
+        args.insert(
+            "task_id".to_string(),
+            serde_json::Value::String(task_id.to_string()),
+        );
+        args.insert(
+            "kind".to_string(),
+            serde_json::Value::String(kind.to_string()),
+        );
+        args.insert(
+            "content".to_string(),
+            serde_json::Value::String(content.to_string()),
+        );
+        if let Some(summary) = summary.map(str::trim).filter(|s| !s.is_empty()) {
+            args.insert(
+                "summary".to_string(),
+                serde_json::Value::String(summary.to_string()),
+            );
+        }
+        let task = self.call_tool("artifact_publish", Some(args), cx);
+        cx.spawn(async move |_cx| {
+            let value = task.await?;
+            let artifact_id = if let Some(s) = value.as_str() {
+                s.to_string()
+            } else if let Some(obj) = value.as_object() {
+                obj.get("id")
+                    .or_else(|| obj.get("artifact_id"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string()
+            } else {
+                String::new()
+            };
+            Ok(artifact_id)
+        })
+    }
+
     fn fetch_items(&self, cx: &mut App) -> Task<Result<Vec<AgentUnifiedItem>>> {
         let task = self.call_tool("item_list", Some(serde_json::Map::new()), cx);
         cx.spawn(async move |_cx| {
@@ -352,8 +487,19 @@ impl AgentTaskProvider for McpAgentTaskProvider {
                     .unwrap_or(serde_json::Value::Array(Vec::new())),
                 _ => serde_json::Value::Array(Vec::new()),
             };
-            let items: Vec<AgentUnifiedItem> = serde_json::from_value(items_value)
+            let mut items: Vec<AgentUnifiedItem> = serde_json::from_value(items_value)
                 .context("failed to parse Vec<AgentUnifiedItem> from item_list response")?;
+            for item in &mut items {
+                if item.metrics.is_none() {
+                    if let Some(metadata) = &item.metadata {
+                        if let Some(m) = metadata.get("metrics") {
+                            if let Ok(parsed) = serde_json::from_value(m.clone()) {
+                                item.metrics = Some(parsed);
+                            }
+                        }
+                    }
+                }
+            }
             Ok(items)
         })
     }
@@ -397,51 +543,48 @@ impl AgentTaskProvider for McpAgentTaskProvider {
         let server_id = self.server_id.clone();
 
         let task = self.call_tool(tool_name, Some(args), cx);
-        cx.spawn(async move |cx| {
-            match task.await {
-                Ok(_) => Ok(()),
-                Err(first_err) if is_running => {
-                    let mut retry_args = serde_json::Map::new();
-                    retry_args.insert(
-                        "task_id".to_string(),
-                        serde_json::Value::String(task_id_str.clone()),
-                    );
-                    let retry_task = cx.update(|cx| {
+        cx.spawn(async move |cx| match task.await {
+            Ok(_) => Ok(()),
+            Err(first_err) if is_running => {
+                let mut retry_args = serde_json::Map::new();
+                retry_args.insert(
+                    "task_id".to_string(),
+                    serde_json::Value::String(task_id_str.clone()),
+                );
+                let retry_task = cx.update(|cx| {
+                    let provider = McpAgentTaskProvider::new(store.clone(), server_id.clone());
+                    provider.call_tool("task_retry", Some(retry_args.clone()), cx)
+                });
+                if retry_task.await.is_ok() {
+                    let start_again_task = cx.update(|cx| {
                         let provider = McpAgentTaskProvider::new(store.clone(), server_id.clone());
-                        provider.call_tool("task_retry", Some(retry_args.clone()), cx)
+                        provider.call_tool("task_start", Some(retry_args), cx)
                     });
-                    if retry_task.await.is_ok() {
-                        let start_again_task = cx.update(|cx| {
-                            let provider =
-                                McpAgentTaskProvider::new(store.clone(), server_id.clone());
-                            provider.call_tool("task_start", Some(retry_args), cx)
-                        });
-                        if start_again_task.await.is_ok() {
-                            return Ok(());
-                        }
-                    }
-
-                    let mut update_args = serde_json::Map::new();
-                    update_args.insert(
-                        "task_id".to_string(),
-                        serde_json::Value::String(task_id_str),
-                    );
-                    update_args.insert(
-                        "status".to_string(),
-                        serde_json::Value::String("running".to_string()),
-                    );
-                    let update_task = cx.update(|cx| {
-                        let provider = McpAgentTaskProvider::new(store, server_id);
-                        provider.call_tool("task_update", Some(update_args), cx)
-                    });
-                    if update_task.await.is_ok() {
-                        Ok(())
-                    } else {
-                        Err(first_err)
+                    if start_again_task.await.is_ok() {
+                        return Ok(());
                     }
                 }
-                Err(err) => Err(err),
+
+                let mut update_args = serde_json::Map::new();
+                update_args.insert(
+                    "task_id".to_string(),
+                    serde_json::Value::String(task_id_str),
+                );
+                update_args.insert(
+                    "status".to_string(),
+                    serde_json::Value::String("running".to_string()),
+                );
+                let update_task = cx.update(|cx| {
+                    let provider = McpAgentTaskProvider::new(store, server_id);
+                    provider.call_tool("task_update", Some(update_args), cx)
+                });
+                if update_task.await.is_ok() {
+                    Ok(())
+                } else {
+                    Err(first_err)
+                }
             }
+            Err(err) => Err(err),
         })
     }
 

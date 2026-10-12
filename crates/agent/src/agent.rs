@@ -3740,6 +3740,7 @@ impl ThreadEnvironment for NativeThreadEnvironment {
             created_at: None,
             assigned_profile: None,
             model: None,
+            metrics: None,
         };
         cx.update(|cx| {
             crate::task_worktree::ensure_task_worktree_with_policy(
@@ -3963,6 +3964,175 @@ impl ThreadEnvironment for NativeThreadEnvironment {
         })
     }
 
+    fn get_task_registered(
+        &self,
+        task_id: &str,
+        cx: &mut AsyncApp,
+    ) -> Task<Result<crate::AgentTaskDetail>> {
+        let Some(parent_thread_entity) = self.thread.upgrade() else {
+            return Task::ready(Err(anyhow!("Parent thread no longer exists")));
+        };
+        let (project, task_id_typed) = cx.update(|cx| {
+            let project = parent_thread_entity.read(cx).project().clone();
+            (project, crate::AgentTaskId::from(task_id.to_string()))
+        });
+        cx.spawn(async move |cx| {
+            let task = cx.update(|cx| {
+                let context_server_store = project.read(cx).context_server_store();
+                let server_id = context_server::ContextServerId(
+                    agent_settings::AgentSettings::get_for_project(project.read(cx), cx)
+                        .task_graph_server_id
+                        .clone()
+                        .into(),
+                );
+                let provider = crate::mcp_agent_task_provider::McpAgentTaskProvider::new(
+                    context_server_store,
+                    server_id,
+                );
+                provider.get_task(&task_id_typed, cx)
+            });
+            task.await
+        })
+    }
+
+    fn record_turn_start(
+        &self,
+        task_id: &str,
+        prompt: &str,
+        model: Option<&str>,
+        session_id: Option<&str>,
+        cx: &mut AsyncApp,
+    ) -> Task<Result<Option<u32>>> {
+        let Some(parent_thread_entity) = self.thread.upgrade() else {
+            return Task::ready(Err(anyhow!("Parent thread no longer exists")));
+        };
+        let (project, task_id_typed, prompt_string, model_string, session_id_string) = cx.update(|cx| {
+            let project = parent_thread_entity.read(cx).project().clone();
+            (
+                project,
+                crate::AgentTaskId::from(task_id.to_string()),
+                prompt.to_string(),
+                model.map(str::to_string),
+                session_id.map(str::to_string),
+            )
+        });
+        cx.spawn(async move |cx| {
+            let task = cx.update(|cx| {
+                let context_server_store = project.read(cx).context_server_store();
+                let server_id = context_server::ContextServerId(
+                    agent_settings::AgentSettings::get_for_project(project.read(cx), cx)
+                        .task_graph_server_id
+                        .clone()
+                        .into(),
+                );
+                let provider = crate::mcp_agent_task_provider::McpAgentTaskProvider::new(
+                    context_server_store,
+                    server_id,
+                );
+                provider.record_turn_start(
+                    &task_id_typed,
+                    &prompt_string,
+                    model_string.as_deref(),
+                    session_id_string.as_deref(),
+                    cx,
+                )
+            });
+            task.await
+        })
+    }
+
+    fn record_turn_finish(
+        &self,
+        task_id: &str,
+        turn_index: Option<u32>,
+        duration_ms: u64,
+        tokens: Option<language_model::TokenUsage>,
+        error: Option<&str>,
+        cx: &mut AsyncApp,
+    ) -> Task<Result<()>> {
+        let Some(parent_thread_entity) = self.thread.upgrade() else {
+            return Task::ready(Err(anyhow!("Parent thread no longer exists")));
+        };
+        let (project, task_id_typed, error_string) = cx.update(|cx| {
+            let project = parent_thread_entity.read(cx).project().clone();
+            (
+                project,
+                crate::AgentTaskId::from(task_id.to_string()),
+                error.map(str::to_string),
+            )
+        });
+        cx.spawn(async move |cx| {
+            let task = cx.update(|cx| {
+                let context_server_store = project.read(cx).context_server_store();
+                let server_id = context_server::ContextServerId(
+                    agent_settings::AgentSettings::get_for_project(project.read(cx), cx)
+                        .task_graph_server_id
+                        .clone()
+                        .into(),
+                );
+                let provider = crate::mcp_agent_task_provider::McpAgentTaskProvider::new(
+                    context_server_store,
+                    server_id,
+                );
+                provider.record_turn_finish(
+                    &task_id_typed,
+                    turn_index,
+                    duration_ms,
+                    tokens,
+                    error_string.as_deref(),
+                    cx,
+                )
+            });
+            task.await
+        })
+    }
+
+    fn publish_artifact(
+        &self,
+        task_id: &str,
+        kind: &str,
+        content: &str,
+        summary: Option<&str>,
+        cx: &mut AsyncApp,
+    ) -> Task<Result<String>> {
+        let Some(parent_thread_entity) = self.thread.upgrade() else {
+            return Task::ready(Err(anyhow!("Parent thread no longer exists")));
+        };
+        let (project, task_id_typed, kind_string, content_string, summary_string) = cx.update(|cx| {
+            let project = parent_thread_entity.read(cx).project().clone();
+            (
+                project,
+                crate::AgentTaskId::from(task_id.to_string()),
+                kind.to_string(),
+                content.to_string(),
+                summary.map(str::to_string),
+            )
+        });
+        cx.spawn(async move |cx| {
+            let task = cx.update(|cx| {
+                let context_server_store = project.read(cx).context_server_store();
+                let server_id = context_server::ContextServerId(
+                    agent_settings::AgentSettings::get_for_project(project.read(cx), cx)
+                        .task_graph_server_id
+                        .clone()
+                        .into(),
+                );
+                let provider = crate::mcp_agent_task_provider::McpAgentTaskProvider::new(
+                    context_server_store,
+                    server_id,
+                );
+                provider.publish_artifact(
+                    &task_id_typed,
+                    &kind_string,
+                    &content_string,
+                    summary_string.as_deref(),
+                    cx,
+                )
+            });
+            task.await
+        })
+    }
+
     fn create_sibling_thread(
         &self,
         request: SiblingThreadRequest,
@@ -4040,6 +4210,10 @@ impl SubagentHandle for NativeSubagentHandle {
             .read(cx)
             .model()
             .map(|model| model.id().0.to_string())
+    }
+
+    fn cumulative_token_usage(&self, cx: &App) -> Option<language_model::TokenUsage> {
+        Some(self.subagent_thread.read(cx).cumulative_token_usage())
     }
 
     fn send(&self, message: String, cx: &AsyncApp) -> Task<Result<String>> {

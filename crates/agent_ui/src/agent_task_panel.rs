@@ -29,8 +29,8 @@ use std::sync::Arc;
 
 use agent::{
     AgentGoalStatus, AgentGoalSummary, AgentTaskArtifact, AgentTaskDetail, AgentTaskEvent,
-    AgentTaskEventKind, AgentTaskId, AgentTaskStatus, AgentTaskStore, AgentTaskSummary,
-    DiffShortStat, GoalGitState, OrphanWorktree, TaskWorktreeStatus,
+    AgentTaskEventKind, AgentTaskId, AgentTaskMetrics, AgentTaskStatus, AgentTaskStore,
+    AgentTaskSummary, DiffShortStat, GoalGitState, OrphanWorktree, TaskWorktreeStatus,
 };
 use agent_settings::AgentSettings;
 use editor::Editor;
@@ -44,8 +44,8 @@ use multi_buffer::MultiBuffer;
 use project::{Project, git_store::Repository};
 use settings::{Settings, SettingsStore};
 use ui::{
-    Color, CommonAnimationExt, ContextMenu, Icon, IconButton, IconName, IconPosition, IconSize,
-    Label, LabelSize, PopoverMenu, Tooltip, prelude::*,
+    Color, CommonAnimationExt, ContextMenu, ContextMenuEntry, Icon, IconButton, IconName,
+    IconPosition, IconSize, Label, LabelSize, PopoverMenu, Tooltip, prelude::*,
 };
 use util::ResultExt;
 use workspace::Workspace;
@@ -1554,14 +1554,19 @@ impl AgentTaskPanel {
                         } else {
                             div().w_4().h_4().flex_shrink_0().into_any_element()
                         })
-                        .child(
-                            Label::new(goal_status_label(&goal_status))
+                        .child({
+                            let goal_label = if goal_id.starts_with("GOAL-") {
+                                goal_id
+                            } else {
+                                format!("GOAL-{goal_id}")
+                            };
+                            Label::new(goal_label)
                                 .size(LabelSize::Small)
-                                .color(goal_status_text_color(&goal_status)),
-                        )
+                                .color(Color::Muted)
+                        })
                         .child(dot_separator())
                         .child(
-                            Label::new(format!("{tasks_done} / {tasks_total} tasks"))
+                            Label::new(format!("{tasks_done} / {tasks_total}"))
                                 .size(LabelSize::Small)
                                 .color(if tasks_done == tasks_total && tasks_total > 0 {
                                     Color::Success
@@ -1577,17 +1582,19 @@ impl AgentTaskPanel {
                                 .size(LabelSize::Small)
                                 .color(priority_color(priority))
                         })
-                        .child(dot_separator())
-                        .child({
-                            let goal_label = if goal_id.starts_with("GOAL-") {
-                                goal_id
-                            } else {
-                                format!("GOAL-{goal_id}")
-                            };
-                            Label::new(goal_label)
-                                .size(LabelSize::Small)
-                                .color(Color::Muted)
-                        })
+                        .when_some(
+                            group.goal_summary.as_ref().and_then(|g| g.metrics.as_ref()),
+                            |mut this, metrics| {
+                                for item in format_metrics_items(Some(metrics)) {
+                                    this = this.child(dot_separator()).child(
+                                        Label::new(item.text)
+                                            .size(LabelSize::Small)
+                                            .color(item.color),
+                                    );
+                                }
+                                this
+                            },
+                        )
                         .when_some(cleanup_summary, |this, (text, color)| {
                             this.child(dot_separator())
                                 .child(Label::new(text).size(LabelSize::Small).color(color))
@@ -1921,9 +1928,15 @@ impl AgentTaskPanel {
                         |this| this.child(div().w_4().h_4().flex_shrink_0()),
                     )
                     .child(
-                        Label::new(status_label(&task.status))
-                            .size(LabelSize::Small)
-                            .color(task_status_text_color(&task.status)),
+                        Label::new({
+                            if task.id.starts_with("TASK-") {
+                                task.id.to_string()
+                            } else {
+                                format!("TASK-{}", task.id)
+                            }
+                        })
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
                     )
                     .child(dot_separator())
                     .child({
@@ -1951,18 +1964,16 @@ impl AgentTaskPanel {
                             )
                         },
                     )
-                    .child(dot_separator())
-                    .child(
-                        Label::new({
-                            if task.id.starts_with("TASK-") {
-                                task.id.to_string()
-                            } else {
-                                format!("TASK-{}", task.id)
-                            }
-                        })
-                        .size(LabelSize::Small)
-                        .color(Color::Muted),
-                    ),
+                    .when_some(task.metrics.as_ref(), |mut this, metrics| {
+                        for item in format_metrics_items(Some(metrics)) {
+                            this = this.child(dot_separator()).child(
+                                Label::new(item.text)
+                                    .size(LabelSize::Small)
+                                    .color(item.color),
+                            );
+                        }
+                        this
+                    }),
             )
             .into_any_element()
     }
@@ -1970,6 +1981,90 @@ impl AgentTaskPanel {
 
 fn dot_separator() -> impl IntoElement {
     Label::new("·").size(LabelSize::Small).color(Color::Muted)
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct FormattedMetricItem {
+    pub text: String,
+    pub color: Color,
+}
+
+pub fn format_duration_ms(ms: u64) -> String {
+    let s = ms / 1000;
+    if ms < 60_000 {
+        format!("🕐{s}s")
+    } else {
+        let m = s / 60;
+        let rem_s = s % 60;
+        format!("🕐{m}m {rem_s}s")
+    }
+}
+
+pub fn format_compact_tokens(n: u64) -> String {
+    if n >= 1000 {
+        let k = n as f64 / 1000.0;
+        if ((k * 10.0).round() as u64).is_multiple_of(10) {
+            format!("{:.0}k", k)
+        } else {
+            format!("{:.1}k", k)
+        }
+    } else {
+        n.to_string()
+    }
+}
+
+pub fn format_turns(turns_count: u32) -> String {
+    format!("{turns_count}↻")
+}
+
+pub fn format_cost(cost_usd: f64) -> String {
+    format!("${cost_usd:.2}")
+}
+
+pub fn format_metrics_items(metrics: Option<&AgentTaskMetrics>) -> Vec<FormattedMetricItem> {
+    let Some(metrics) = metrics else {
+        return Vec::new();
+    };
+    let mut items = Vec::new();
+
+    if let Some(ms) = metrics.duration_ms {
+        items.push(FormattedMetricItem {
+            text: format_duration_ms(ms),
+            color: Color::Muted,
+        });
+    }
+
+    if metrics.input_tokens.is_some()
+        || metrics.output_tokens.is_some()
+        || metrics.cache_read_tokens.is_some()
+        || metrics.cache_creation_tokens.is_some()
+    {
+        let in_tok = format_compact_tokens(metrics.input_tokens.unwrap_or(0));
+        let out_tok = format_compact_tokens(metrics.output_tokens.unwrap_or(0));
+        let cache_tok = format_compact_tokens(
+            metrics.cache_read_tokens.unwrap_or(0) + metrics.cache_creation_tokens.unwrap_or(0),
+        );
+        items.push(FormattedMetricItem {
+            text: format!("{in_tok}/{out_tok}/{cache_tok}"),
+            color: Color::Muted,
+        });
+    }
+
+    if let Some(turns) = metrics.turns_count {
+        items.push(FormattedMetricItem {
+            text: format_turns(turns),
+            color: Color::Muted,
+        });
+    }
+
+    if let Some(cost) = metrics.cost_usd {
+        items.push(FormattedMetricItem {
+            text: format_cost(cost),
+            color: Color::Success,
+        });
+    }
+
+    items
 }
 
 impl Focusable for AgentTaskPanel {
@@ -2188,27 +2283,51 @@ impl Render for AgentTaskPanel {
                                                     let is_selected =
                                                         current_categories.contains(&category);
                                                     let view = view.clone();
-                                                    menu = menu.toggleable_entry(
-                                                        category.label(),
-                                                        is_selected,
-                                                        IconPosition::Start,
-                                                        None,
-                                                        move |_window, cx| {
-                                                            view.update(cx, |this, cx| {
-                                                                if this
-                                                                    .category_filters
-                                                                    .contains(&category)
-                                                                {
-                                                                    this.category_filters
-                                                                        .remove(&category);
-                                                                } else {
-                                                                    this.category_filters
-                                                                        .insert(category);
-                                                                }
-                                                                cx.notify();
-                                                            })
-                                                            .log_err();
-                                                        },
+                                                    let (icon, color) = match category {
+                                                        FilterCategory::Ready => {
+                                                            (IconName::Check, Color::Muted)
+                                                        }
+                                                        FilterCategory::Running => {
+                                                            (IconName::PlayFilled, Color::Accent)
+                                                        }
+                                                        FilterCategory::Blocked => {
+                                                            (IconName::Stop, Color::Warning)
+                                                        }
+                                                        FilterCategory::Failed => {
+                                                            (IconName::Close, Color::Error)
+                                                        }
+                                                        FilterCategory::Done => {
+                                                            (IconName::Check, Color::Success)
+                                                        }
+                                                        FilterCategory::Cancelled => {
+                                                            (IconName::Close, Color::Muted)
+                                                        }
+                                                        FilterCategory::Archived => {
+                                                            (IconName::Archive, Color::Muted)
+                                                        }
+                                                    };
+                                                    menu = menu.item(
+                                                        ContextMenuEntry::new(category.label())
+                                                            .icon(icon)
+                                                            .icon_color(color)
+                                                            .icon_position(IconPosition::Start)
+                                                            .toggle(IconPosition::End, is_selected)
+                                                            .handler(move |_window, cx| {
+                                                                view.update(cx, |this, cx| {
+                                                                    if this
+                                                                        .category_filters
+                                                                        .contains(&category)
+                                                                    {
+                                                                        this.category_filters
+                                                                            .remove(&category);
+                                                                    } else {
+                                                                        this.category_filters
+                                                                            .insert(category);
+                                                                    }
+                                                                    cx.notify();
+                                                                })
+                                                                .log_err();
+                                                            }),
                                                     );
                                                 }
 
@@ -2219,12 +2338,17 @@ impl Render for AgentTaskPanel {
                                                             current_others.contains(&other_status);
                                                         let view = view.clone();
                                                         let filter_status = other_status.clone();
-                                                        menu = menu.toggleable_entry(
-                                                            status_label(&other_status),
-                                                            is_selected,
-                                                            IconPosition::Start,
-                                                            None,
-                                                            move |_window, cx| {
+                                                        let icon = status_icon(&other_status);
+                                                        let color = status_color(&other_status);
+                                                        menu = menu.item(
+                                                            ContextMenuEntry::new(status_label(
+                                                                &other_status,
+                                                            ))
+                                                            .icon(icon)
+                                                            .icon_color(color)
+                                                            .icon_position(IconPosition::Start)
+                                                            .toggle(IconPosition::End, is_selected)
+                                                            .handler(move |_window, cx| {
                                                                 view.update(cx, |this, cx| {
                                                                     if this
                                                                         .other_status_filters
@@ -2242,7 +2366,7 @@ impl Render for AgentTaskPanel {
                                                                     cx.notify();
                                                                 })
                                                                 .log_err();
-                                                            },
+                                                            }),
                                                         );
                                                     }
                                                 }
@@ -2370,44 +2494,6 @@ pub fn render_goal_status_icon(status: &AgentGoalStatus) -> impl IntoElement {
     }
 }
 
-pub fn goal_status_label(status: &AgentGoalStatus) -> &str {
-    match status {
-        AgentGoalStatus::Running => "Running",
-        AgentGoalStatus::Blocked => "Blocked",
-        AgentGoalStatus::Failed => "Failed",
-        AgentGoalStatus::Completed => "Completed",
-        AgentGoalStatus::Cancelled => "Cancelled",
-        AgentGoalStatus::Archived => "Archived",
-        AgentGoalStatus::Other(name) => name.as_ref(),
-    }
-}
-
-pub fn goal_status_text_color(status: &AgentGoalStatus) -> Color {
-    match status {
-        AgentGoalStatus::Running => Color::Accent,
-        AgentGoalStatus::Completed => Color::Success,
-        AgentGoalStatus::Failed => Color::Error,
-        AgentGoalStatus::Blocked => Color::Warning,
-        AgentGoalStatus::Cancelled | AgentGoalStatus::Archived | AgentGoalStatus::Other(_) => {
-            Color::Muted
-        }
-    }
-}
-
-pub fn task_status_text_color(status: &AgentTaskStatus) -> Color {
-    match status {
-        AgentTaskStatus::Ready | AgentTaskStatus::Running | AgentTaskStatus::Review => {
-            Color::Accent
-        }
-        AgentTaskStatus::Completed => Color::Success,
-        AgentTaskStatus::Blocked | AgentTaskStatus::Stale => Color::Warning,
-        AgentTaskStatus::Failed => Color::Error,
-        AgentTaskStatus::Cancelled | AgentTaskStatus::Archived | AgentTaskStatus::Other(_) => {
-            Color::Muted
-        }
-    }
-}
-
 pub fn priority_color(priority: i64) -> Color {
     match priority {
         0 | 1 => Color::Error,
@@ -2510,6 +2596,10 @@ pub fn render_goal_markdown(goal: &AgentGoalSummary, goal_git: Option<&GoalGitSt
         doc.push_str(&format!("- **Created At:** {}\n", created_at));
     }
 
+    if let Some(metrics) = &goal.metrics {
+        render_metrics_markdown(&mut doc, metrics);
+    }
+
     if let Some(git) = goal_git {
         doc.push_str("\n## Git\n\n");
         doc.push_str(&format!("- **Branch:** `{}`\n", git.branch));
@@ -2542,11 +2632,26 @@ pub fn render_task_markdown(
         status_label(&detail.summary.status)
     ));
     doc.push_str(&format!("- **Task ID:** {}\n", detail.summary.id));
+    if let Some(profile) = detail
+        .summary
+        .assigned_profile
+        .as_deref()
+        .filter(|s| !s.is_empty())
+    {
+        doc.push_str(&format!("- **Profile:** {}\n", profile));
+    }
+    if let Some(model) = detail.summary.model.as_deref().filter(|s| !s.is_empty()) {
+        doc.push_str(&format!("- **Model:** {}\n", model));
+    }
     if let Some(assignee) = &detail.summary.assignee {
         doc.push_str(&format!("- **Assignee:** {}\n", assignee));
     }
     if detail.summary.attempt > 1 {
         doc.push_str(&format!("- **Attempt:** {}\n", detail.summary.attempt));
+    }
+
+    if let Some(metrics) = &detail.summary.metrics {
+        render_metrics_markdown(&mut doc, metrics);
     }
 
     doc.push_str("\n## Description\n\n");
@@ -2630,9 +2735,41 @@ pub fn render_task_markdown(
     doc
 }
 
+pub fn render_metrics_markdown(doc: &mut String, metrics: &AgentTaskMetrics) {
+    doc.push_str("\n## Metrics\n\n");
+    if let Some(ms) = metrics.duration_ms {
+        let duration_s = ms / 1000;
+        doc.push_str(&format!("- **Duration:** {duration_s}s\n"));
+    }
+    let in_tok = metrics.input_tokens.unwrap_or(0);
+    let out_tok = metrics.output_tokens.unwrap_or(0);
+    let cache_tok =
+        metrics.cache_read_tokens.unwrap_or(0) + metrics.cache_creation_tokens.unwrap_or(0);
+    if metrics.input_tokens.is_some()
+        || metrics.output_tokens.is_some()
+        || metrics.cache_read_tokens.is_some()
+        || metrics.cache_creation_tokens.is_some()
+    {
+        doc.push_str(&format!(
+            "- **Tokens:** {in_tok} in / {out_tok} out / {cache_tok} cache\n"
+        ));
+    }
+    if let Some(turns) = metrics.turns_count {
+        doc.push_str(&format!("- **Turns:** {turns}\n"));
+    }
+    if let Some(cost) = metrics.cost_usd {
+        doc.push_str(&format!("- **Cost:** ${cost:.2}\n"));
+    }
+}
+
 #[allow(dead_code)]
 pub fn format_task_meta_line(task: &AgentTaskSummary, _diff: Option<&DiffShortStat>) -> String {
-    let mut parts = vec![status_label(&task.status).to_string()];
+    let task_seg = if task.id.starts_with("TASK-") {
+        task.id.to_string()
+    } else {
+        format!("TASK-{}", task.id)
+    };
+    let mut parts = vec![task_seg];
     let profile = task
         .assigned_profile
         .as_deref()
@@ -2643,12 +2780,9 @@ pub fn format_task_meta_line(task: &AgentTaskSummary, _diff: Option<&DiffShortSt
     if let Some(model) = task.model.as_ref().filter(|m| !m.is_empty()) {
         parts.push(model.to_string());
     }
-    let task_seg = if task.id.starts_with("TASK-") {
-        task.id.to_string()
-    } else {
-        format!("TASK-{}", task.id)
-    };
-    parts.push(task_seg);
+    for item in format_metrics_items(task.metrics.as_ref()) {
+        parts.push(item.text);
+    }
 
     parts.join(" · ")
 }
@@ -2656,10 +2790,11 @@ pub fn format_task_meta_line(task: &AgentTaskSummary, _diff: Option<&DiffShortSt
 #[allow(dead_code)]
 pub fn format_goal_meta_line(
     goal_id: &str,
-    status: &AgentGoalStatus,
+    _status: &AgentGoalStatus,
     priority: i64,
     tasks_done: u64,
     tasks_total: u64,
+    metrics: Option<&AgentTaskMetrics>,
     _diff: Option<&DiffShortStat>,
 ) -> String {
     let goal_seg = if goal_id.starts_with("GOAL-") {
@@ -2667,12 +2802,14 @@ pub fn format_goal_meta_line(
     } else {
         format!("GOAL-{goal_id}")
     };
-    let parts = [
-        goal_status_label(status).to_string(),
-        format!("{tasks_done} / {tasks_total} tasks"),
-        format!("P{priority}"),
+    let mut parts = vec![
         goal_seg,
+        format!("{tasks_done} / {tasks_total}"),
+        format!("P{priority}"),
     ];
+    for item in format_metrics_items(metrics) {
+        parts.push(item.text);
+    }
     parts.join(" · ")
 }
 
@@ -3151,6 +3288,7 @@ mod tests {
                         tasks_total: 1,
                         tasks_done: 0,
                         created_at: Some(100),
+                        metrics: None,
                     },
                     AgentGoalSummary {
                         goal_id: "GOAL-2".to_string(),
@@ -3160,6 +3298,7 @@ mod tests {
                         tasks_total: 0,
                         tasks_done: 0,
                         created_at: Some(200),
+                        metrics: None,
                     },
                 ],
                 tasks: vec![
@@ -3175,6 +3314,7 @@ mod tests {
                         created_at: Some(150),
                         assigned_profile: Some("agent_engineer".into()),
                         model: Some("glm-5.3".into()),
+                        metrics: None,
                     },
                     AgentTaskSummary {
                         id: AgentTaskId::from("TASK-2"),
@@ -3188,6 +3328,7 @@ mod tests {
                         created_at: Some(250),
                         assigned_profile: None,
                         model: None,
+                        metrics: None,
                     },
                 ],
                 events: vec![],
@@ -3234,6 +3375,7 @@ mod tests {
                     created_at: None,
                     assigned_profile: None,
                     model: None,
+                    metrics: None,
                 });
             Task::ready(Ok(AgentTaskDetail {
                 summary: task,
@@ -3476,6 +3618,7 @@ mod tests {
             created_at: Some(10),
             assigned_profile: None,
             model: None,
+            metrics: None,
         };
         let child_failed = AgentTaskSummary {
             id: AgentTaskId::from("TASK-FAILED-CHILD"),
@@ -3489,6 +3632,7 @@ mod tests {
             created_at: Some(20),
             assigned_profile: None,
             model: None,
+            metrics: None,
         };
         let standalone_ready = AgentTaskSummary {
             id: AgentTaskId::from("TASK-READY"),
@@ -3502,6 +3646,7 @@ mod tests {
             created_at: Some(30),
             assigned_profile: None,
             model: None,
+            metrics: None,
         };
 
         let tasks = vec![root_completed, child_failed, standalone_ready];
@@ -3633,6 +3778,7 @@ mod tests {
             tasks_total: 2,
             tasks_done: 0,
             created_at: Some(100),
+            metrics: None,
         };
         let goal_2 = AgentGoalSummary {
             goal_id: "GOAL-2".to_string(),
@@ -3642,6 +3788,7 @@ mod tests {
             tasks_total: 2,
             tasks_done: 0,
             created_at: Some(200),
+            metrics: None,
         };
 
         let task_1a = AgentTaskSummary {
@@ -3656,6 +3803,7 @@ mod tests {
             created_at: Some(110),
             assigned_profile: None,
             model: None,
+            metrics: None,
         };
         let task_1b = AgentTaskSummary {
             id: AgentTaskId::from("TASK-1B"),
@@ -3669,6 +3817,7 @@ mod tests {
             created_at: Some(120),
             assigned_profile: None,
             model: None,
+            metrics: None,
         };
         let task_2_parent = AgentTaskSummary {
             id: AgentTaskId::from("TASK-2P"),
@@ -3682,6 +3831,7 @@ mod tests {
             created_at: Some(210),
             assigned_profile: None,
             model: None,
+            metrics: None,
         };
         let task_2_child = AgentTaskSummary {
             id: AgentTaskId::from("TASK-2C"),
@@ -3695,6 +3845,7 @@ mod tests {
             created_at: Some(220),
             assigned_profile: None,
             model: None,
+            metrics: None,
         };
 
         let goals = vec![goal_1, goal_2];
@@ -3753,6 +3904,7 @@ mod tests {
             created_at: Some(1000),
             assigned_profile: None,
             model: None,
+            metrics: None,
         };
         let task_b = AgentTaskSummary {
             id: AgentTaskId::from("TASK-B"),
@@ -3766,6 +3918,7 @@ mod tests {
             created_at: Some(3000),
             assigned_profile: None,
             model: None,
+            metrics: None,
         };
         let task_b_child_1 = AgentTaskSummary {
             id: AgentTaskId::from("TASK-B-CHILD-1"),
@@ -3779,6 +3932,7 @@ mod tests {
             created_at: Some(3500),
             assigned_profile: None,
             model: None,
+            metrics: None,
         };
         let task_b_grandchild = AgentTaskSummary {
             id: AgentTaskId::from("TASK-B-GRANDCHILD"),
@@ -3792,6 +3946,7 @@ mod tests {
             created_at: Some(3400),
             assigned_profile: None,
             model: None,
+            metrics: None,
         };
         let task_b_child_2 = AgentTaskSummary {
             id: AgentTaskId::from("TASK-B-CHILD-2"),
@@ -3805,6 +3960,7 @@ mod tests {
             created_at: Some(3100),
             assigned_profile: None,
             model: None,
+            metrics: None,
         };
         let task_c = AgentTaskSummary {
             id: AgentTaskId::from("TASK-C"),
@@ -3818,6 +3974,7 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
+            metrics: None,
         };
         let task_no_events = AgentTaskSummary {
             id: AgentTaskId::from("TASK-NO-EVENTS"),
@@ -3831,6 +3988,7 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
+            metrics: None,
         };
         let tasks = vec![
             task_a,
@@ -3882,6 +4040,7 @@ mod tests {
                 created_at: Some(100),
                 assigned_profile: Some("agent_engineer".into()),
                 model: Some("glm-5.3".into()),
+                metrics: None,
             },
             description: "Detailed description of the rework.".to_string(),
             acceptance_criteria: vec![
@@ -3917,6 +4076,8 @@ mod tests {
         assert!(md.contains("# Rework Task Panel"));
         assert!(md.contains("- **Status:** Running"));
         assert!(md.contains("- **Task ID:** TASK-35"));
+        assert!(md.contains("- **Profile:** agent_engineer"));
+        assert!(md.contains("- **Model:** glm-5.3"));
         assert!(md.contains("- **Assignee:** ui_engineer"));
         assert!(md.contains("- **Attempt:** 2"));
         assert!(md.contains("## Description\n\nDetailed description of the rework."));
@@ -3952,6 +4113,7 @@ mod tests {
             tasks_total: 2,
             tasks_done: 1,
             created_at: Some(12345),
+            metrics: None,
         };
         let goal_git = GoalGitState {
             branch: "agent-goal/GOAL-UI-1".to_string(),
@@ -4094,6 +4256,7 @@ mod tests {
             created_at: None,
             assigned_profile: Some("agent_engineer".into()),
             model: Some("claude-3-7-sonnet".into()),
+            metrics: None,
         };
         let diff = DiffShortStat {
             files: 2,
@@ -4101,14 +4264,18 @@ mod tests {
             removed: 3,
         };
         let meta = format_task_meta_line(&task_full, Some(&diff));
-        assert_eq!(
-            meta,
-            "Running · agent_engineer · claude-3-7-sonnet · TASK-1"
-        );
+        assert_eq!(meta, "TASK-1 · agent_engineer · claude-3-7-sonnet");
 
-        let goal_meta =
-            format_goal_meta_line("GOAL-1", &AgentGoalStatus::Running, 2, 1, 3, Some(&diff));
-        assert_eq!(goal_meta, "Running · 1 / 3 tasks · P2 · GOAL-1");
+        let goal_meta = format_goal_meta_line(
+            "GOAL-1",
+            &AgentGoalStatus::Running,
+            2,
+            1,
+            3,
+            None,
+            Some(&diff),
+        );
+        assert_eq!(goal_meta, "GOAL-1 · 1 / 3 · P2");
 
         let single_diff = DiffShortStat {
             files: 1,
@@ -4122,18 +4289,48 @@ mod tests {
                 1,
                 0,
                 1,
+                None,
                 Some(&single_diff)
             ),
-            "Running · 0 / 1 tasks · P1 · GOAL-1"
+            "GOAL-1 · 0 / 1 · P1"
         );
 
         assert_eq!(
             format_task_meta_line(&task_full, None),
-            "Running · agent_engineer · claude-3-7-sonnet · TASK-1"
+            "TASK-1 · agent_engineer · claude-3-7-sonnet"
         );
         assert_eq!(
-            format_goal_meta_line("GOAL-1", &AgentGoalStatus::Completed, 1, 2, 2, None),
-            "Completed · 2 / 2 tasks · P1 · GOAL-1"
+            format_goal_meta_line("GOAL-1", &AgentGoalStatus::Completed, 1, 2, 2, None, None),
+            "GOAL-1 · 2 / 2 · P1"
+        );
+
+        let sample_metrics = AgentTaskMetrics {
+            duration_ms: Some(14_000),
+            input_tokens: Some(5100),
+            output_tokens: Some(1300),
+            cache_read_tokens: Some(15100),
+            cache_creation_tokens: None,
+            total_tokens: Some(21500),
+            cost_usd: Some(0.04),
+            turns_count: Some(1),
+        };
+        let mut task_with_metrics = task_full;
+        task_with_metrics.metrics = Some(sample_metrics.clone());
+        assert_eq!(
+            format_task_meta_line(&task_with_metrics, None),
+            "TASK-1 · agent_engineer · claude-3-7-sonnet · 🕐14s · 5.1k/1.3k/15.1k · 1↻ · $0.04"
+        );
+        assert_eq!(
+            format_goal_meta_line(
+                "GOAL-10",
+                &AgentGoalStatus::Running,
+                1,
+                3,
+                3,
+                Some(&sample_metrics),
+                None
+            ),
+            "GOAL-10 · 3 / 3 · P1 · 🕐14s · 5.1k/1.3k/15.1k · 1↻ · $0.04"
         );
     }
 
@@ -4151,10 +4348,11 @@ mod tests {
             created_at: None,
             assigned_profile: Some("code_mechanic".into()),
             model: Some("gemini-2.5-pro".into()),
+            metrics: None,
         };
         assert_eq!(
             format_task_meta_line(&task_no_goal, None),
-            "Ready · code_mechanic · gemini-2.5-pro · TASK-2"
+            "TASK-2 · code_mechanic · gemini-2.5-pro"
         );
 
         let task_assignee_fallback = AgentTaskSummary {
@@ -4169,10 +4367,11 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
+            metrics: None,
         };
         assert_eq!(
             format_task_meta_line(&task_assignee_fallback, None),
-            "Ready · backend_profile · TASK-3"
+            "TASK-3 · backend_profile"
         );
 
         let task_no_profile = AgentTaskSummary {
@@ -4187,10 +4386,11 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
+            metrics: None,
         };
         assert_eq!(
             format_task_meta_line(&task_no_profile, None),
-            "Ready · no profile · TASK-4"
+            "TASK-4 · no profile"
         );
 
         let task_both = AgentTaskSummary {
@@ -4205,10 +4405,11 @@ mod tests {
             created_at: None,
             assigned_profile: Some("primary_profile".into()),
             model: None,
+            metrics: None,
         };
         assert_eq!(
             format_task_meta_line(&task_both, None),
-            "Ready · primary_profile · TASK-5"
+            "TASK-5 · primary_profile"
         );
     }
 
@@ -4230,6 +4431,7 @@ mod tests {
             created_at: Some(10),
             assigned_profile: None,
             model: None,
+            metrics: None,
         };
         let task_child = AgentTaskSummary {
             id: AgentTaskId::from("TASK-CHILD"),
@@ -4243,6 +4445,7 @@ mod tests {
             created_at: Some(20),
             assigned_profile: None,
             model: None,
+            metrics: None,
         };
 
         let provider = Arc::new(TestProvider {
@@ -4616,6 +4819,7 @@ mod tests {
                 tasks_total: 1,
                 tasks_done: 0,
                 created_at: Some(10),
+                metrics: None,
             }],
             tasks: vec![AgentTaskSummary {
                 id: AgentTaskId::from("TASK-1"),
@@ -4629,6 +4833,7 @@ mod tests {
                 created_at: Some(10),
                 assigned_profile: None,
                 model: None,
+                metrics: None,
             }],
             ..Default::default()
         });
@@ -4687,6 +4892,7 @@ mod tests {
                 tasks_total: 1,
                 tasks_done: 1,
                 created_at: Some(10),
+                metrics: None,
             }],
             tasks: vec![AgentTaskSummary {
                 id: AgentTaskId::from("TASK-1"),
@@ -4700,6 +4906,7 @@ mod tests {
                 created_at: Some(10),
                 assigned_profile: None,
                 model: None,
+                metrics: None,
             }],
             ..Default::default()
         });
@@ -4773,6 +4980,7 @@ mod tests {
                 created_at: Some(10),
                 assigned_profile: None,
                 model: None,
+                metrics: None,
             }],
             ..Default::default()
         });
@@ -4906,6 +5114,7 @@ mod tests {
             tasks_total: 2,
             tasks_done: 0,
             created_at: Some(10),
+            metrics: None,
         };
         let goal_git = GoalGitState {
             branch: format!("agent-goal/{goal_id}"),
@@ -4927,6 +5136,7 @@ mod tests {
                 created_at: Some(10),
                 assigned_profile: None,
                 model: None,
+                metrics: None,
             },
             description: "Task description".to_string(),
             acceptance_criteria: vec![],
@@ -4978,6 +5188,7 @@ mod tests {
                 created_at: Some(10),
                 assigned_profile: None,
                 model: None,
+                metrics: None,
             },
             AgentTaskSummary {
                 id: AgentTaskId::from("TASK-CHILD-1"),
@@ -4991,6 +5202,7 @@ mod tests {
                 created_at: Some(20),
                 assigned_profile: None,
                 model: None,
+                metrics: None,
             },
             AgentTaskSummary {
                 id: AgentTaskId::from("TASK-GRANDCHILD-1"),
@@ -5004,6 +5216,7 @@ mod tests {
                 created_at: Some(30),
                 assigned_profile: None,
                 model: None,
+                metrics: None,
             },
             AgentTaskSummary {
                 id: AgentTaskId::from("TASK-CHILD-2"),
@@ -5017,6 +5230,7 @@ mod tests {
                 created_at: Some(40),
                 assigned_profile: None,
                 model: None,
+                metrics: None,
             },
             AgentTaskSummary {
                 id: AgentTaskId::from("TASK-ROOT-2"),
@@ -5030,6 +5244,7 @@ mod tests {
                 created_at: Some(50),
                 assigned_profile: None,
                 model: None,
+                metrics: None,
             },
             AgentTaskSummary {
                 id: AgentTaskId::from("TASK-CHILD-3"),
@@ -5043,6 +5258,7 @@ mod tests {
                 created_at: Some(60),
                 assigned_profile: None,
                 model: None,
+                metrics: None,
             },
         ];
 
@@ -5109,67 +5325,6 @@ mod tests {
 
     #[test]
     fn test_status_and_priority_colors_and_labels() {
-        assert_eq!(goal_status_label(&AgentGoalStatus::Running), "Running");
-        assert_eq!(goal_status_label(&AgentGoalStatus::Completed), "Completed");
-        assert_eq!(goal_status_label(&AgentGoalStatus::Failed), "Failed");
-        assert_eq!(goal_status_label(&AgentGoalStatus::Blocked), "Blocked");
-        assert_eq!(goal_status_label(&AgentGoalStatus::Cancelled), "Cancelled");
-        assert_eq!(goal_status_label(&AgentGoalStatus::Archived), "Archived");
-
-        assert_eq!(
-            goal_status_text_color(&AgentGoalStatus::Running),
-            Color::Accent
-        );
-        assert_eq!(
-            goal_status_text_color(&AgentGoalStatus::Completed),
-            Color::Success
-        );
-        assert_eq!(
-            goal_status_text_color(&AgentGoalStatus::Failed),
-            Color::Error
-        );
-        assert_eq!(
-            goal_status_text_color(&AgentGoalStatus::Blocked),
-            Color::Warning
-        );
-        assert_eq!(
-            goal_status_text_color(&AgentGoalStatus::Cancelled),
-            Color::Muted
-        );
-        assert_eq!(
-            goal_status_text_color(&AgentGoalStatus::Archived),
-            Color::Muted
-        );
-
-        assert_eq!(
-            task_status_text_color(&AgentTaskStatus::Ready),
-            Color::Accent
-        );
-        assert_eq!(
-            task_status_text_color(&AgentTaskStatus::Running),
-            Color::Accent
-        );
-        assert_eq!(
-            task_status_text_color(&AgentTaskStatus::Completed),
-            Color::Success
-        );
-        assert_eq!(
-            task_status_text_color(&AgentTaskStatus::Blocked),
-            Color::Warning
-        );
-        assert_eq!(
-            task_status_text_color(&AgentTaskStatus::Failed),
-            Color::Error
-        );
-        assert_eq!(
-            task_status_text_color(&AgentTaskStatus::Cancelled),
-            Color::Muted
-        );
-        assert_eq!(
-            task_status_text_color(&AgentTaskStatus::Archived),
-            Color::Muted
-        );
-
         assert_eq!(priority_color(0), Color::Error);
         assert_eq!(priority_color(1), Color::Error);
         assert_eq!(priority_color(2), Color::Warning);
@@ -5195,6 +5350,7 @@ mod tests {
             created_at: Some(10),
             assigned_profile: None,
             model: None,
+            metrics: None,
         };
         let task_child = AgentTaskSummary {
             id: AgentTaskId::from("TASK-C1"),
@@ -5208,6 +5364,7 @@ mod tests {
             created_at: Some(20),
             assigned_profile: None,
             model: None,
+            metrics: None,
         };
 
         let provider = Arc::new(TestProvider {
@@ -5265,5 +5422,63 @@ mod tests {
         });
         // Child is now collapsed
         assert!(cx.debug_bounds("task-node-TASK-C1").is_none());
+    }
+
+    #[test]
+    fn test_markdown_preview_metrics() {
+        let sample_metrics = AgentTaskMetrics {
+            duration_ms: Some(14_000),
+            input_tokens: Some(5100),
+            output_tokens: Some(1300),
+            cache_read_tokens: Some(15000),
+            cache_creation_tokens: Some(100),
+            total_tokens: Some(21500),
+            cost_usd: Some(0.04),
+            turns_count: Some(1),
+        };
+        let goal = AgentGoalSummary {
+            goal_id: "GOAL-10".to_string(),
+            title: "Goal 10".to_string(),
+            status: AgentGoalStatus::Completed,
+            priority: 1,
+            tasks_total: 3,
+            tasks_done: 3,
+            created_at: Some(10),
+            metrics: Some(sample_metrics.clone()),
+        };
+        let goal_md = render_goal_markdown(&goal, None);
+        assert!(goal_md.contains("## Metrics"));
+        assert!(goal_md.contains("- **Duration:** 14s"));
+        assert!(goal_md.contains("- **Tokens:** 5100 in / 1300 out / 15100 cache"));
+        assert!(goal_md.contains("- **Turns:** 1"));
+        assert!(goal_md.contains("- **Cost:** $0.04"));
+
+        let detail = AgentTaskDetail {
+            summary: AgentTaskSummary {
+                id: AgentTaskId::from("TASK-1"),
+                parent_id: None,
+                goal_id: Some("GOAL-10".to_string()),
+                title: "Task 1".to_string(),
+                status: AgentTaskStatus::Completed,
+                attempt: 1,
+                assignee: None,
+                write_scopes: vec![],
+                created_at: Some(10),
+                assigned_profile: Some("agent_engineer".into()),
+                model: Some("glm-5.3".into()),
+                metrics: Some(sample_metrics),
+            },
+            description: "Desc".to_string(),
+            acceptance_criteria: vec![],
+            events_tail: vec![],
+        };
+        let task_md = render_task_markdown(&detail, &[], Some(&goal), None);
+        assert!(task_md.contains("- **Profile:** agent_engineer"));
+        assert!(task_md.contains("- **Model:** glm-5.3"));
+        assert!(task_md.contains("## Metrics"));
+        assert!(task_md.contains("- **Duration:** 14s"));
+        assert!(task_md.contains("- **Tokens:** 5100 in / 1300 out / 15100 cache"));
+        assert!(task_md.contains("- **Turns:** 1"));
+        assert!(task_md.contains("- **Cost:** $0.04"));
     }
 }

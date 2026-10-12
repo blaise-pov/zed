@@ -270,6 +270,26 @@ where
     deserializer.deserialize_any(CreatedAtVisitor)
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct AgentTaskMetrics {
+    #[serde(default)]
+    pub duration_ms: Option<u64>,
+    #[serde(default)]
+    pub input_tokens: Option<u64>,
+    #[serde(default)]
+    pub output_tokens: Option<u64>,
+    #[serde(default)]
+    pub cache_read_tokens: Option<u64>,
+    #[serde(default)]
+    pub cache_creation_tokens: Option<u64>,
+    #[serde(default)]
+    pub total_tokens: Option<u64>,
+    #[serde(default)]
+    pub cost_usd: Option<f64>,
+    #[serde(default, alias = "turns")]
+    pub turns_count: Option<u32>,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AgentTaskSummary {
     pub id: AgentTaskId,
@@ -287,6 +307,27 @@ pub struct AgentTaskSummary {
     pub assigned_profile: Option<SharedString>,
     #[serde(default)]
     pub model: Option<SharedString>,
+    #[serde(default)]
+    pub metrics: Option<AgentTaskMetrics>,
+}
+
+impl Default for AgentTaskSummary {
+    fn default() -> Self {
+        Self {
+            id: AgentTaskId::from(""),
+            parent_id: None,
+            goal_id: None,
+            title: String::new(),
+            status: AgentTaskStatus::Ready,
+            attempt: 0,
+            assignee: None,
+            write_scopes: Vec::new(),
+            created_at: None,
+            assigned_profile: None,
+            model: None,
+            metrics: None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -299,6 +340,23 @@ pub struct AgentGoalSummary {
     pub tasks_done: u64,
     #[serde(default, deserialize_with = "deserialize_created_at")]
     pub created_at: Option<u64>,
+    #[serde(default)]
+    pub metrics: Option<AgentTaskMetrics>,
+}
+
+impl Default for AgentGoalSummary {
+    fn default() -> Self {
+        Self {
+            goal_id: String::new(),
+            title: String::new(),
+            status: AgentGoalStatus::Running,
+            priority: 0,
+            tasks_total: 0,
+            tasks_done: 0,
+            created_at: None,
+            metrics: None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -397,6 +455,31 @@ pub struct AgentUnifiedItem {
     pub session_id: Option<String>,
     #[serde(default)]
     pub metadata: Option<serde_json::Value>,
+    #[serde(default)]
+    pub metrics: Option<AgentTaskMetrics>,
+}
+
+impl Default for AgentUnifiedItem {
+    fn default() -> Self {
+        Self {
+            kind: AgentItemKind::Task,
+            id: String::new(),
+            title: String::new(),
+            status: String::new(),
+            priority: 0,
+            created_at: None,
+            failure_reason: None,
+            progress: None,
+            assignee: None,
+            assigned_profile: None,
+            model: None,
+            parent_id: None,
+            goal_id: None,
+            session_id: None,
+            metadata: None,
+            metrics: None,
+        }
+    }
 }
 
 impl AgentUnifiedItem {
@@ -546,6 +629,40 @@ pub trait AgentTaskProvider: 'static + Send + Sync {
         cx: &mut App,
     ) -> Task<Result<Vec<AgentTaskArtifact>>>;
     fn get_artifact(&self, artifact_id: &str, cx: &mut App) -> Task<Result<AgentTaskArtifact>>;
+    fn record_turn_start(
+        &self,
+        task_id: &AgentTaskId,
+        prompt: &str,
+        model: Option<&str>,
+        session_id: Option<&str>,
+        cx: &mut App,
+    ) -> Task<Result<Option<u32>>> {
+        let _ = (task_id, prompt, model, session_id, cx);
+        Task::ready(Ok(None))
+    }
+    fn record_turn_finish(
+        &self,
+        task_id: &AgentTaskId,
+        turn_index: Option<u32>,
+        duration_ms: u64,
+        tokens: Option<language_model::TokenUsage>,
+        error: Option<&str>,
+        cx: &mut App,
+    ) -> Task<Result<()>> {
+        let _ = (task_id, turn_index, duration_ms, tokens, error, cx);
+        Task::ready(Ok(()))
+    }
+    fn publish_artifact(
+        &self,
+        task_id: &AgentTaskId,
+        kind: &str,
+        content: &str,
+        summary: Option<&str>,
+        cx: &mut App,
+    ) -> Task<Result<String>> {
+        let _ = (task_id, kind, content, summary, cx);
+        Task::ready(Ok(String::new()))
+    }
     fn fetch_items(&self, cx: &mut App) -> Task<Result<Vec<AgentUnifiedItem>>> {
         let _ = cx;
         Task::ready(Err(anyhow::anyhow!("item_list not supported")))
@@ -992,6 +1109,7 @@ mod tests {
                 tasks_total: 2,
                 tasks_done: 1,
                 created_at: None,
+                metrics: None,
             }
         );
 
@@ -999,5 +1117,54 @@ mod tests {
         let serialized = serde_json::to_string(&graph_new).unwrap();
         let deserialized: AgentTaskGraph = serde_json::from_str(&serialized).unwrap();
         assert_eq!(deserialized, graph_new);
+    }
+
+    #[test]
+    fn test_task_metrics_deserialization() {
+        let json_data = json!({
+            "duration_ms": 12500,
+            "input_tokens": 1500,
+            "output_tokens": 250,
+            "cache_read_tokens": 300,
+            "cache_creation_tokens": 50,
+            "total_tokens": 2100,
+            "cost_usd": 0.015,
+            "turns_count": 3
+        });
+        let metrics: AgentTaskMetrics = serde_json::from_value(json_data).unwrap();
+        assert_eq!(metrics.duration_ms, Some(12500));
+        assert_eq!(metrics.input_tokens, Some(1500));
+        assert_eq!(metrics.output_tokens, Some(250));
+        assert_eq!(metrics.cache_read_tokens, Some(300));
+        assert_eq!(metrics.cache_creation_tokens, Some(50));
+        assert_eq!(metrics.total_tokens, Some(2100));
+        assert_eq!(metrics.cost_usd, Some(0.015));
+        assert_eq!(metrics.turns_count, Some(3));
+
+        // Alias "turns" -> turns_count
+        let json_alias = json!({
+            "turns": 5
+        });
+        let metrics_alias: AgentTaskMetrics = serde_json::from_value(json_alias).unwrap();
+        assert_eq!(metrics_alias.turns_count, Some(5));
+
+        // Unified item with metrics
+        let item_json = json!({
+            "kind": "task",
+            "id": "TASK-METRICS",
+            "title": "Task with metrics",
+            "status": "completed",
+            "metrics": {
+                "duration_ms": 5000,
+                "input_tokens": 100,
+                "output_tokens": 20
+            }
+        });
+        let item: AgentUnifiedItem = serde_json::from_value(item_json).unwrap();
+        assert!(item.metrics.is_some());
+        let m = item.metrics.unwrap();
+        assert_eq!(m.duration_ms, Some(5000));
+        assert_eq!(m.input_tokens, Some(100));
+        assert_eq!(m.output_tokens, Some(20));
     }
 }

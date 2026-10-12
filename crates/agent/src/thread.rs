@@ -885,6 +885,10 @@ pub trait SubagentHandle {
     fn model_id(&self, _cx: &App) -> Option<String> {
         None
     }
+
+    fn cumulative_token_usage(&self, _cx: &App) -> Option<language_model::TokenUsage> {
+        None
+    }
 }
 
 pub trait ThreadEnvironment {
@@ -989,6 +993,48 @@ pub trait ThreadEnvironment {
         _cx: &mut AsyncApp,
     ) -> Task<Result<()>> {
         Task::ready(Ok(()))
+    }
+
+    fn get_task_registered(
+        &self,
+        _task_id: &str,
+        _cx: &mut AsyncApp,
+    ) -> Task<Result<crate::AgentTaskDetail>> {
+        Task::ready(Err(anyhow::anyhow!("get_task_registered not supported")))
+    }
+
+    fn record_turn_start(
+        &self,
+        _task_id: &str,
+        _prompt: &str,
+        _model: Option<&str>,
+        _session_id: Option<&str>,
+        _cx: &mut AsyncApp,
+    ) -> Task<Result<Option<u32>>> {
+        Task::ready(Ok(None))
+    }
+
+    fn record_turn_finish(
+        &self,
+        _task_id: &str,
+        _turn_index: Option<u32>,
+        _duration_ms: u64,
+        _tokens: Option<language_model::TokenUsage>,
+        _error: Option<&str>,
+        _cx: &mut AsyncApp,
+    ) -> Task<Result<()>> {
+        Task::ready(Ok(()))
+    }
+
+    fn publish_artifact(
+        &self,
+        _task_id: &str,
+        _kind: &str,
+        _content: &str,
+        _summary: Option<&str>,
+        _cx: &mut AsyncApp,
+    ) -> Task<Result<String>> {
+        Task::ready(Ok(String::new()))
     }
 
     /// Creates an independent sibling thread visible in the agent sidebar.

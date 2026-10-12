@@ -453,6 +453,7 @@ impl AgentTool for SpawnAgentTool {
 
             let explicit_profile_str = input.profile.as_ref().map(|p| p.0.to_string());
             let explicit_model_str = input.model.clone();
+            let is_initial_turn = input.session_id.is_none();
 
             let (subagent, mut session_info, resolved_model) = cx.update(|cx| {
                 if let Some(ref path) = worktree_path {
@@ -472,7 +473,7 @@ impl AgentTool for SpawnAgentTool {
                         }
                     }
                 }
-                let subagent = if let Some(session_id) = input.session_id {
+                let subagent = if let Some(session_id) = input.session_id.clone() {
                     self.environment.resume_subagent(
                         session_id,
                         input.profile.clone(),
@@ -572,17 +573,107 @@ impl AgentTool for SpawnAgentTool {
                 }
             }
 
+            let session_id_str = session_info.session_id.to_string();
+            let mut task_title = input.label.clone();
+            let mut contract_block = None;
+
+            if let Some(ref task_id) = task_id {
+                if is_initial_turn {
+                    match self.environment.get_task_registered(task_id, &mut cx).await {
+                        Ok(detail) => {
+                            task_title = detail.summary.title.clone();
+                            contract_block = build_task_contract(task_id, &detail);
+                        }
+                        Err(error) => {
+                            log::warn!(
+                                "failed to get task {task_id} detail for contract injection: {error:#}"
+                            );
+                        }
+                    }
+                }
+            }
+
+            let turn_index = if let Some(ref task_id) = task_id {
+                match self
+                    .environment
+                    .record_turn_start(
+                        task_id,
+                        &input.message,
+                        resolved_model.as_deref(),
+                        Some(&session_id_str),
+                        &mut cx,
+                    )
+                    .await
+                {
+                    Ok(idx) => idx,
+                    Err(error) => {
+                        log::warn!(
+                            "failed to record turn start for task {task_id}: {error:#}"
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
+            let start_instant = std::time::Instant::now();
+            let start_tokens = cx.update(|cx| subagent.cumulative_token_usage(cx));
+
             let send_result = {
                 let message = match input.task_id.as_deref() {
-                    Some(task_id) => format!(
-                        "{message}\n\nTask reference: {task_id}. Fetch the details of this task \
-                         yourself via the task-management tools available to you.",
-                        message = input.message
-                    ),
+                    Some(task_id) => {
+                        if let Some(ref contract) = contract_block {
+                            format!("{contract}\n\n{message}", message = input.message)
+                        } else {
+                            format!(
+                                "{message}\n\nTask reference: {task_id}. Fetch the details of this task \
+                                 yourself via the task-management tools available to you.",
+                                message = input.message
+                            )
+                        }
+                    }
                     None => input.message.clone(),
                 };
                 subagent.send(message, cx).await
             };
+
+            let duration_ms = start_instant.elapsed().as_millis() as u64;
+            let end_tokens = cx.update(|cx| subagent.cumulative_token_usage(cx));
+            let delta_tokens = match (start_tokens, end_tokens) {
+                (Some(start), Some(end)) => Some(language_model::TokenUsage {
+                    input_tokens: end.input_tokens.saturating_sub(start.input_tokens),
+                    output_tokens: end.output_tokens.saturating_sub(start.output_tokens),
+                    cache_creation_input_tokens: end
+                        .cache_creation_input_tokens
+                        .saturating_sub(start.cache_creation_input_tokens),
+                    cache_read_input_tokens: end
+                        .cache_read_input_tokens
+                        .saturating_sub(start.cache_read_input_tokens),
+                }),
+                (None, Some(end)) => Some(end),
+                _ => None,
+            };
+
+            let turn_error_str = send_result.as_ref().err().map(|e| e.to_string());
+            if let Some(ref task_id) = task_id {
+                if let Err(error) = self
+                    .environment
+                    .record_turn_finish(
+                        task_id,
+                        turn_index,
+                        duration_ms,
+                        delta_tokens,
+                        turn_error_str.as_deref(),
+                        &mut cx,
+                    )
+                    .await
+                {
+                    log::warn!(
+                        "failed to record turn finish for task {task_id}: {error:#}"
+                    );
+                }
+            }
 
             let status = if send_result.is_ok() {
                 "completed"
@@ -651,7 +742,7 @@ impl AgentTool for SpawnAgentTool {
 
             if send_result.is_ok() {
                 if let Some(ref task_id) = task_id {
-                    if let Err(error) = self
+                    match self
                         .environment
                         .set_task_status_registered(
                             task_id,
@@ -660,9 +751,63 @@ impl AgentTool for SpawnAgentTool {
                         )
                         .await
                     {
-                        log::warn!(
-                            "failed to set task {task_id} status to completed in task graph service: {error:#}"
-                        );
+                        Ok(()) => {
+                            let branch_str = isolation_details
+                                .as_ref()
+                                .map(|d| d.branch.as_str())
+                                .unwrap_or("main");
+                            let commit_sha_str = isolation_details
+                                .as_ref()
+                                .and_then(|d| d.head_sha.as_deref())
+                                .unwrap_or("HEAD");
+                            let duration_secs = duration_ms / 1000;
+                            let tokens = delta_tokens.or(end_tokens).unwrap_or_default();
+                            let output_summary = send_result
+                                .as_ref()
+                                .map(|out| {
+                                    out.lines()
+                                        .take(20)
+                                        .collect::<Vec<_>>()
+                                        .join("\n")
+                                })
+                                .unwrap_or_default();
+
+                            let report = format!(
+                                "# Execution Report: {task_id} - {title}\n\n\
+                                 - **Status:** Completed\n\
+                                 - **Branch:** {branch_str}\n\
+                                 - **Commit SHA:** {commit_sha_str}\n\
+                                 - **Duration:** {duration_secs}s\n\
+                                 - **Tokens:** {in_tok} in / {out_tok} out / {cache_tok} cache\n\n\
+                                 ## Agent Output Summary\n\
+                                 {output_summary}\n",
+                                title = task_title,
+                                in_tok = tokens.input_tokens,
+                                out_tok = tokens.output_tokens,
+                                cache_tok = tokens.cache_read_input_tokens,
+                            );
+
+                            if let Err(err) = self
+                                .environment
+                                .publish_artifact(
+                                    task_id,
+                                    "execution_report",
+                                    &report,
+                                    Some("Execution Report"),
+                                    &mut cx,
+                                )
+                                .await
+                            {
+                                log::warn!(
+                                    "failed to publish execution report for task {task_id}: {err:#}"
+                                );
+                            }
+                        }
+                        Err(error) => {
+                            log::warn!(
+                                "failed to set task {task_id} status to completed in task graph service: {error:#}"
+                            );
+                        }
                     }
                 }
             }
@@ -759,6 +904,100 @@ impl AgentTool for SpawnAgentTool {
     }
 }
 
+fn find_ascii_case_insensitive(haystack: &str, needle: &str) -> Option<(usize, usize)> {
+    let needle_bytes = needle.as_bytes();
+    if needle_bytes.is_empty() || haystack.len() < needle_bytes.len() {
+        return None;
+    }
+    haystack
+        .as_bytes()
+        .windows(needle_bytes.len())
+        .position(|window| window.eq_ignore_ascii_case(needle_bytes))
+        .map(|pos| (pos, pos + needle_bytes.len()))
+}
+
+fn extract_contract_parts(desc: &str) -> (String, Vec<String>) {
+    let marker_pos = find_ascii_case_insensitive(desc, "strict constraints:")
+        .or_else(|| find_ascii_case_insensitive(desc, "constraints:"));
+
+    if let Some((start_pos, content_pos)) = marker_pos {
+        let objective = desc[..start_pos].trim().to_string();
+        let remainder = &desc[content_pos..];
+        let mut constraints = Vec::new();
+        for line in remainder.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if trimmed.starts_with('#')
+                || (trimmed.ends_with(':')
+                    && !trimmed.starts_with('-')
+                    && !trimmed.starts_with('*'))
+            {
+                break;
+            }
+            if let Some(item) = trimmed
+                .strip_prefix("- ")
+                .or_else(|| trimmed.strip_prefix("* "))
+            {
+                constraints.push(item.trim().to_string());
+            } else if let Some(dot_pos) = trimmed.find(". ") {
+                if trimmed[..dot_pos].chars().all(|c| c.is_ascii_digit()) {
+                    constraints.push(trimmed[dot_pos + 2..].trim().to_string());
+                }
+            } else {
+                constraints.push(trimmed.to_string());
+            }
+        }
+        (objective, constraints)
+    } else {
+        (desc.trim().to_string(), Vec::new())
+    }
+}
+
+fn build_task_contract(task_id: &str, detail: &crate::AgentTaskDetail) -> Option<String> {
+    let has_description = !detail.description.trim().is_empty();
+    let has_criteria = !detail.acceptance_criteria.is_empty();
+    if !has_description && !has_criteria {
+        return None;
+    }
+
+    let (objective_part, constraints) = extract_contract_parts(&detail.description);
+    let objective = if !objective_part.is_empty() {
+        objective_part
+    } else if has_description {
+        detail.description.trim().to_string()
+    } else {
+        detail.summary.title.clone()
+    };
+
+    let mut contract = String::new();
+    contract.push_str("<task_contract>\n");
+    contract.push_str(&format!("Task ID: {}\n", task_id));
+    contract.push_str(&format!("Title: {}\n", detail.summary.title));
+    contract.push_str(&format!("Objective: {}\n", objective));
+
+    if has_criteria {
+        contract.push_str("Acceptance Criteria:\n");
+        for criterion in &detail.acceptance_criteria {
+            contract.push_str(&format!("- {}\n", criterion));
+        }
+    }
+
+    if !constraints.is_empty() {
+        contract.push_str("Constraints:\n");
+        for constraint in &constraints {
+            contract.push_str(&format!("- {}\n", constraint));
+        }
+    }
+
+    let write_scopes = detail.summary.write_scopes.join(", ");
+    contract.push_str(&format!("Write Scopes: {}\n", write_scopes));
+    contract.push_str("</task_contract>");
+
+    Some(contract)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -817,6 +1056,20 @@ mod tests {
         assert!(
             error.starts_with("Unknown profile 'nonexistent'."),
             "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn extract_contract_parts_handles_case_folding_unicode_safely() {
+        let desc = "İstanbul İı objective.
+Strict Constraints:
+- Keep İ intact
+1. No panics";
+        let (objective, constraints) = extract_contract_parts(desc);
+        assert_eq!(objective, "İstanbul İı objective.");
+        assert_eq!(
+            constraints,
+            vec!["Keep İ intact".to_string(), "No panics".to_string()]
         );
     }
 }
