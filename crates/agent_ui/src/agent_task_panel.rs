@@ -1585,12 +1585,8 @@ impl AgentTaskPanel {
                         .when_some(
                             group.goal_summary.as_ref().and_then(|g| g.metrics.as_ref()),
                             |mut this, metrics| {
-                                for item in format_metrics_items(Some(metrics)) {
-                                    this = this.child(dot_separator()).child(
-                                        Label::new(item.text)
-                                            .size(LabelSize::Small)
-                                            .color(item.color),
-                                    );
+                                for element in render_metrics_elements(Some(metrics)) {
+                                    this = this.child(dot_separator()).child(element);
                                 }
                                 this
                             },
@@ -1965,12 +1961,8 @@ impl AgentTaskPanel {
                         },
                     )
                     .when_some(task.metrics.as_ref(), |mut this, metrics| {
-                        for item in format_metrics_items(Some(metrics)) {
-                            this = this.child(dot_separator()).child(
-                                Label::new(item.text)
-                                    .size(LabelSize::Small)
-                                    .color(item.color),
-                            );
+                        for element in render_metrics_elements(Some(metrics)) {
+                            this = this.child(dot_separator()).child(element);
                         }
                         this
                     }),
@@ -1992,11 +1984,11 @@ pub struct FormattedMetricItem {
 pub fn format_duration_ms(ms: u64) -> String {
     let s = ms / 1000;
     if ms < 60_000 {
-        format!("🕐{s}s")
+        format!("{s}s")
     } else {
         let m = s / 60;
         let rem_s = s % 60;
-        format!("🕐{m}m {rem_s}s")
+        format!("{m}m {rem_s}s")
     }
 }
 
@@ -2014,11 +2006,87 @@ pub fn format_compact_tokens(n: u64) -> String {
 }
 
 pub fn format_turns(turns_count: u32) -> String {
-    format!("{turns_count}↻")
+    format!("{turns_count}")
 }
 
 pub fn format_cost(cost_usd: f64) -> String {
     format!("${cost_usd:.2}")
+}
+
+pub fn render_metrics_elements(metrics: Option<&AgentTaskMetrics>) -> Vec<gpui::AnyElement> {
+    let Some(metrics) = metrics else {
+        return Vec::new();
+    };
+    let mut elements = Vec::new();
+
+    if let Some(ms) = metrics.duration_ms {
+        elements.push(
+            h_flex()
+                .items_center()
+                .gap_0p5()
+                .child(
+                    Icon::new(IconName::Clock)
+                        .size(IconSize::Small)
+                        .color(Color::Muted),
+                )
+                .child(
+                    Label::new(format_duration_ms(ms))
+                        .size(IconSize::Small)
+                        .color(Color::Muted),
+                )
+                .into_any_element(),
+        );
+    }
+
+    if metrics.input_tokens.is_some()
+        || metrics.output_tokens.is_some()
+        || metrics.cache_read_tokens.is_some()
+        || metrics.cache_creation_tokens.is_some()
+    {
+        let in_tok = format_compact_tokens(metrics.input_tokens.unwrap_or(0));
+        let out_tok = format_compact_tokens(metrics.output_tokens.unwrap_or(0));
+        let cache_tok = format_compact_tokens(
+            metrics.cache_read_tokens.unwrap_or(0) + metrics.cache_creation_tokens.unwrap_or(0),
+        );
+        let tokens_str = format!("{in_tok}/{out_tok}/{cache_tok}");
+        elements.push(
+            Label::new(tokens_str)
+                .size(LabelSize::Small)
+                .color(Color::Muted)
+                .into_any_element(),
+        );
+    }
+
+    if let Some(turns) = metrics.turns_count {
+        elements.push(
+            h_flex()
+                .items_center()
+                .gap_0p5()
+                .child(
+                    Icon::new(IconName::RotateCw)
+                        .size(IconSize::Small)
+                        .color(Color::Muted),
+                )
+                .child(
+                    Label::new(format!("{turns}"))
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                )
+                .into_any_element(),
+        );
+    }
+
+    if let Some(cost) = metrics.cost_usd {
+        let cost_str = format_cost(cost);
+        elements.push(
+            Label::new(cost_str)
+                .size(LabelSize::Small)
+                .color(Color::Success)
+                .into_any_element(),
+        );
+    }
+
+    elements
 }
 
 pub fn format_metrics_items(metrics: Option<&AgentTaskMetrics>) -> Vec<FormattedMetricItem> {
@@ -4318,7 +4386,7 @@ mod tests {
         task_with_metrics.metrics = Some(sample_metrics.clone());
         assert_eq!(
             format_task_meta_line(&task_with_metrics, None),
-            "TASK-1 · agent_engineer · claude-3-7-sonnet · 🕐14s · 5.1k/1.3k/15.1k · 1↻ · $0.04"
+            "TASK-1 · agent_engineer · claude-3-7-sonnet · 14s · 5.1k/1.3k/15.1k · 1 · $0.04"
         );
         assert_eq!(
             format_goal_meta_line(
@@ -4330,7 +4398,7 @@ mod tests {
                 Some(&sample_metrics),
                 None
             ),
-            "GOAL-10 · 3 / 3 · P1 · 🕐14s · 5.1k/1.3k/15.1k · 1↻ · $0.04"
+            "GOAL-10 · 3 / 3 · P1 · 14s · 5.1k/1.3k/15.1k · 1 · $0.04"
         );
     }
 
