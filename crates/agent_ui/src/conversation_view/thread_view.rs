@@ -11419,13 +11419,12 @@ impl ThreadView {
                 _ => false,
             });
 
-        let model_name = thread_view
-            .and_then(|view| view.read(cx).as_native_thread(cx))
-            .and_then(|thread| {
-                let thread = thread.read(cx);
-                let model = thread.model()?;
-                Some(model.name().0)
-            });
+        let native_thread = thread_view.and_then(|view| view.read(cx).as_native_thread(cx));
+        let model_name = native_thread.as_ref().and_then(|thread| {
+            let thread = thread.read(cx);
+            let model = thread.model()?;
+            Some(model.name().0)
+        });
         let thread_title = thread
             .as_ref()
             .and_then(|t| t.read(cx).title())
@@ -11558,25 +11557,30 @@ impl ThreadView {
                     .truncate(),
             );
 
+        let has_worktree = tool_call
+            .raw_output
+            .as_ref()
+            .and_then(|output| output.get("isolation"))
+            .and_then(|v| v.as_str())
+            .map_or(false, |iso| {
+                iso.starts_with("worktree:") || iso.starts_with("checkout:")
+            })
+            || task_id.as_ref().map_or(false, |id| {
+                agent::task_worktree::task_worktree_path_for_id(&agent::AgentTaskId::from(
+                    id.as_str(),
+                ))
+                .is_some()
+            });
+
+        let duration = thread
+            .as_ref()
+            .and_then(|thread| thread.read(cx).activity_duration());
+
+        let token_usage = native_thread
+            .as_ref()
+            .map(|thread| thread.read(cx).cumulative_token_usage());
+
         let mut metadata_segments: Vec<AnyElement> = Vec::new();
-
-        metadata_segments.push(
-            Label::new(profile_label.clone())
-                .size(LabelSize::Custom(self.tool_name_font_size()))
-                .color(Color::Muted)
-                .flex_none()
-                .into_any_element(),
-        );
-
-        if let Some(model_name) = model_name {
-            metadata_segments.push(
-                Label::new(model_name)
-                    .size(LabelSize::Custom(self.tool_name_font_size()))
-                    .color(Color::Muted)
-                    .flex_none()
-                    .into_any_element(),
-            );
-        }
 
         if let Some(goal_id) = goal_id {
             metadata_segments.push(
@@ -11596,6 +11600,92 @@ impl ThreadView {
                     .flex_none()
                     .into_any_element(),
             );
+        }
+
+        metadata_segments.push(
+            Label::new(profile_label.clone())
+                .size(LabelSize::Custom(self.tool_name_font_size()))
+                .color(Color::Muted)
+                .flex_none()
+                .into_any_element(),
+        );
+
+        if let Some(model_name) = model_name {
+            metadata_segments.push(
+                Label::new(model_name)
+                    .size(LabelSize::Custom(self.tool_name_font_size()))
+                    .color(Color::Muted)
+                    .flex_none()
+                    .into_any_element(),
+            );
+        }
+
+        if has_worktree {
+            metadata_segments.push(
+                h_flex()
+                    .flex_none()
+                    .gap_0p5()
+                    .items_center()
+                    .child(
+                        Icon::new(IconName::GitWorktree)
+                            .size(IconSize::Custom(self.tool_name_font_size()))
+                            .color(Color::Muted),
+                    )
+                    .child(
+                        Label::new("worktree")
+                            .size(LabelSize::Custom(self.tool_name_font_size()))
+                            .color(Color::Muted)
+                            .flex_none(),
+                    )
+                    .into_any_element(),
+            );
+        }
+
+        if let Some(duration) = duration {
+            let secs = duration.as_secs();
+            let duration_text = if secs < 60 {
+                format!("{secs}s")
+            } else {
+                format!("{}m {}s", secs / 60, secs % 60)
+            };
+            metadata_segments.push(
+                h_flex()
+                    .flex_none()
+                    .gap_0p5()
+                    .items_center()
+                    .child(
+                        Icon::new(IconName::Clock)
+                            .size(IconSize::Custom(self.tool_name_font_size()))
+                            .color(Color::Muted),
+                    )
+                    .child(
+                        Label::new(duration_text)
+                            .size(LabelSize::Custom(self.tool_name_font_size()))
+                            .color(Color::Muted)
+                            .flex_none(),
+                    )
+                    .into_any_element(),
+            );
+        }
+
+        if let Some(usage) = token_usage {
+            let out = usage.output_tokens;
+            let in_tokens = usage.input_tokens;
+            let cached = usage.cache_read_input_tokens + usage.cache_creation_input_tokens;
+            if out > 0 || in_tokens > 0 || cached > 0 {
+                metadata_segments.push(
+                    Label::new(format!(
+                        "{}/{}/{}",
+                        crate::humanize_token_count(out),
+                        crate::humanize_token_count(in_tokens),
+                        crate::humanize_token_count(cached),
+                    ))
+                    .size(LabelSize::Custom(self.tool_name_font_size()))
+                    .color(Color::Muted)
+                    .flex_none()
+                    .into_any_element(),
+                );
+            }
         }
 
         if files_changed > 0 {
