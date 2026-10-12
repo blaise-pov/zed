@@ -2031,7 +2031,7 @@ pub fn render_metrics_elements(metrics: Option<&AgentTaskMetrics>) -> Vec<gpui::
                 )
                 .child(
                     Label::new(format_duration_ms(ms))
-                        .size(IconSize::Small)
+                        .size(LabelSize::Small)
                         .color(Color::Muted),
                 )
                 .into_any_element(),
