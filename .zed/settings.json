@@ -65,6 +65,11 @@
   "ensure_final_newline_on_save": true,
   "file_scan_exclusions": ["...", "crates/agent/src/tools/evals/fixtures"],
   "read_only_files": ["**/.rustup/**", "**/.cargo/registry/**", "**/.cargo/git/**", "target/**/*.rs", "**/*.lock"],
+  "git": {
+    "inline_blame": {
+      "enabled": false
+    }
+  },
   "context_servers": {
     "skills-hub": {
       "command": "npx",
