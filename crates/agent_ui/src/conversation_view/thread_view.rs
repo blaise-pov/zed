@@ -11557,24 +11557,43 @@ impl ThreadView {
                     .truncate(),
             );
 
-        let has_worktree = tool_call
-            .raw_output
+        let worktree_name = native_thread
             .as_ref()
-            .and_then(|output| output.get("isolation"))
-            .and_then(|v| v.as_str())
-            .map_or(false, |iso| {
-                iso.starts_with("worktree:") || iso.starts_with("checkout:")
+            .and_then(|nt| nt.read(cx).worktree_root_path(cx))
+            .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+            .or_else(|| {
+                task_id.as_ref().and_then(|id| {
+                    agent::task_worktree::task_worktree_path_for_id(&agent::AgentTaskId::from(
+                        id.as_str(),
+                    ))
+                    .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+                })
             })
-            || task_id.as_ref().map_or(false, |id| {
-                agent::task_worktree::task_worktree_path_for_id(&agent::AgentTaskId::from(
-                    id.as_str(),
-                ))
-                .is_some()
+            .or_else(|| {
+                tool_call
+                    .raw_output
+                    .as_ref()
+                    .and_then(|output| output.get("isolation"))
+                    .and_then(|v| v.as_str())
+                    .and_then(|iso| {
+                        iso.strip_prefix("worktree:")
+                            .or_else(|| iso.strip_prefix("checkout:"))
+                            .map(|remainder| remainder.to_string())
+                    })
+                    .filter(|s| !s.is_empty())
             });
 
-        let duration = thread
+        let formatted_duration = thread
             .as_ref()
-            .and_then(|thread| thread.read(cx).activity_duration());
+            .and_then(|thread| thread.read(cx).activity_duration())
+            .map(|duration| {
+                let secs = duration.as_secs();
+                if secs < 60 {
+                    format!("{secs}s")
+                } else {
+                    format!("{}m {}s", secs / 60, secs % 60)
+                }
+            });
 
         let token_usage = native_thread
             .as_ref()
@@ -11620,49 +11639,24 @@ impl ThreadView {
             );
         }
 
-        if has_worktree {
+        if let Some(worktree_name) = worktree_name {
             metadata_segments.push(
                 h_flex()
                     .flex_none()
                     .gap_0p5()
                     .items_center()
+                    .max_w_32()
+                    .overflow_hidden()
                     .child(
                         Icon::new(IconName::GitWorktree)
                             .size(IconSize::Custom(self.tool_name_font_size()))
                             .color(Color::Muted),
                     )
                     .child(
-                        Label::new("worktree")
+                        Label::new(worktree_name)
                             .size(LabelSize::Custom(self.tool_name_font_size()))
                             .color(Color::Muted)
-                            .flex_none(),
-                    )
-                    .into_any_element(),
-            );
-        }
-
-        if let Some(duration) = duration {
-            let secs = duration.as_secs();
-            let duration_text = if secs < 60 {
-                format!("{secs}s")
-            } else {
-                format!("{}m {}s", secs / 60, secs % 60)
-            };
-            metadata_segments.push(
-                h_flex()
-                    .flex_none()
-                    .gap_0p5()
-                    .items_center()
-                    .child(
-                        Icon::new(IconName::Clock)
-                            .size(IconSize::Custom(self.tool_name_font_size()))
-                            .color(Color::Muted),
-                    )
-                    .child(
-                        Label::new(duration_text)
-                            .size(LabelSize::Custom(self.tool_name_font_size()))
-                            .color(Color::Muted)
-                            .flex_none(),
+                            .truncate(),
                     )
                     .into_any_element(),
             );
@@ -11740,6 +11734,7 @@ impl ThreadView {
                     .px_1()
                     .py_1()
                     .w_full()
+                    .gap_1p5()
                     .items_center()
                     .justify_between()
                     .when(!has_no_title_or_canceled, |this| {
@@ -11805,6 +11800,24 @@ impl ThreadView {
                                     }))
                             }),
                     )
+                    .when_some(formatted_duration, |this, duration_str| {
+                        this.child(
+                            h_flex()
+                                .flex_none()
+                                .gap_0p5()
+                                .items_center()
+                                .child(
+                                    Icon::new(IconName::Clock)
+                                        .size(IconSize::Custom(self.tool_name_font_size()))
+                                        .color(Color::Muted),
+                                )
+                                .child(
+                                    Label::new(duration_str)
+                                        .size(LabelSize::Custom(self.tool_name_font_size()))
+                                        .color(Color::Muted),
+                                ),
+                        )
+                    })
                     .when(is_running && subagent_session_id.is_some(), |buttons| {
                         buttons.child(
                             IconButton::new(format!("stop-subagent-{}", entry_ix), IconName::Stop)
