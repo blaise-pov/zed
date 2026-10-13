@@ -498,8 +498,11 @@ Task Graph Service — это локальный Go-демон с базой д�
 
 #### Пример использования в диалоге с агентом
 Оркестратор может декомпозировать фичу:
-1. Создает задачу: `task_create(title="Реализовать API роутер", assigned_profile="editor_engineer", write_scopes=["crates/editor/**"])`.
-2. Назначает зависимость: `task_add_dependency(task_id="TASK-2", depends_on_task_id="TASK-1")`.
+1. Создает независимые задачи (параллельными вызовами):
+   - `task_create(title="Реализовать API роутер", assigned_profile="editor_engineer", write_scopes=["crates/editor/**"])` → получает `TASK-1`.
+   - `task_create(title="Подготовить моки сервиса", assigned_profile="editor_engineer", write_scopes=["crates/editor/**"])` → получает `TASK-2`.
+2. Создает зависимую задачу, сразу связывая её через `depends_on`:
+   - `task_create(title="Интеграционные тесты", assigned_profile="editor_engineer", depends_on=["TASK-1", "TASK-2"], write_scopes=["crates/editor/**"])` → получает `TASK-3` (вызов `task_add_dependency` не требуется; он используется только для динамических изменений уже существующего графа).
 3. Исполнитель берет задачу: `task_start(task_id="TASK-1")`.
 4. Публикует отчет: `artifact_publish(task_id="TASK-1", kind="code_review", content="...")`.
 5. Завершает задачу: `task_complete(task_id="TASK-1", result="Готово")`.
