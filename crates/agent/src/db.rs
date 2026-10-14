@@ -396,7 +396,7 @@ impl Column for DataType {
 
 static ACTIVE_DATABASE: RwLock<Option<Arc<ThreadsDatabase>>> = RwLock::new(None);
 
-pub(crate) struct ThreadsDatabase {
+pub struct ThreadsDatabase {
     executor: BackgroundExecutor,
     connection: Arc<Mutex<Connection>>,
     /// In production, saves take real time (serialization, zstd, disk I/O) while

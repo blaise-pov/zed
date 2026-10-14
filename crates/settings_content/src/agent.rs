@@ -319,6 +319,10 @@ pub struct AgentSettingsContent {
     ///
     /// Default: true
     pub button: Option<bool>,
+    /// Whether to show the agent task panel button in the status bar.
+    ///
+    /// Default: true
+    pub task_button: Option<bool>,
     /// Where to dock the agent panel.
     ///
     /// Default: left (Agentic layout), right (Classic layout)
@@ -340,6 +344,11 @@ pub struct AgentSettingsContent {
     ///
     /// Default: true
     pub flexible: Option<bool>,
+    /// Whether the agent task panel should use flexible (proportional) sizing when docked to the
+    /// left or right.
+    ///
+    /// Default: false
+    pub task_flexible: Option<bool>,
     /// The deprecated version of `threads_sidebar.position`.
     ///
     /// Don't use this field.
@@ -583,6 +592,10 @@ impl AgentSettingsContent {
 
     pub fn set_flexible_size(&mut self, flexible: bool) {
         self.flexible = Some(flexible);
+    }
+
+    pub fn set_task_flexible_size(&mut self, flexible: bool) {
+        self.task_flexible = Some(flexible);
     }
 
     pub fn set_model(&mut self, language_model: LanguageModelSelection) {

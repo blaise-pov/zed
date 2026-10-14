@@ -387,10 +387,12 @@ impl TerminalWatchdogSettings {
 pub struct AgentSettings {
     pub enabled: bool,
     pub button: bool,
+    pub task_button: bool,
     pub dock: DockPosition,
     pub task_dock: DockPosition,
     pub task_graph_server_id: String,
     pub flexible: bool,
+    pub task_flexible: bool,
     pub max_idle_retained_threads: usize,
     pub threads_sidebar: ThreadsSidebarSettings,
     pub default_width: Pixels,
@@ -1183,6 +1185,7 @@ impl Settings for AgentSettings {
         Self {
             enabled: agent.enabled.unwrap(),
             button: agent.button.unwrap(),
+            task_button: agent.task_button.unwrap_or(true),
             dock: agent.dock.unwrap(),
             task_dock: agent.task_dock.unwrap_or(DockPosition::Left),
             task_graph_server_id: agent
@@ -1209,6 +1212,7 @@ impl Settings for AgentSettings {
                 None
             },
             flexible: agent.flexible.unwrap(),
+            task_flexible: agent.task_flexible.unwrap_or(false),
             default_model: Some(expand_model_selection(agent.default_model.unwrap())),
             subagent_model: agent.subagent_model.map(expand_model_selection),
             inline_assistant_model: agent.inline_assistant_model.map(expand_model_selection),
