@@ -8088,7 +8088,10 @@ async fn test_spawn_agent_turn_recording_and_metrics(cx: &mut TestAppContext) {
     assert_eq!(record.model.as_deref(), Some("gemini-3.8-flash-high"));
     assert_eq!(record.session_id.as_deref(), Some("subagent-turn-1"));
     assert_eq!(record.error, None);
-    assert_eq!(record.output_summary.as_deref(), Some("turn complete output"));
+    assert_eq!(
+        record.output_summary.as_deref(),
+        Some("turn complete output")
+    );
 }
 
 #[gpui::test]
@@ -8238,7 +8241,6 @@ async fn test_spawn_agent_resumed_turn_bypasses_contract_injection(cx: &mut Test
     assert!(!sent_msg.contains("<task_contract>"));
     assert!(sent_msg.contains("follow-up instruction"));
 }
-
 
 #[gpui::test]
 async fn test_spawn_agent_differentiated_error_handling(cx: &mut TestAppContext) {
@@ -9191,6 +9193,215 @@ async fn test_subagent_tool_resume_session(cx: &mut TestAppContext) {
 
         "}
     );
+}
+
+#[gpui::test]
+async fn test_subagent_tool_resume_session_after_restart(cx: &mut TestAppContext) {
+    let fake = init_test(cx);
+    let subagent_profile = cx.update(|cx| enable_default_profile_delegation(cx));
+    cx.update(|cx| {
+        cx.update_flags(true, vec!["subagents".to_string()]);
+    });
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(
+        "/",
+        json!({
+            "a": {
+                "b.md": "Lorem"
+            }
+        }),
+    )
+    .await;
+    let project = Project::test(fs.clone(), [path!("/a").as_ref()], cx).await;
+    let thread_store = cx.new(|cx| ThreadStore::new(cx));
+    let agent =
+        cx.update(|cx| NativeAgent::new(thread_store.clone(), Templates::new(), fs.clone(), cx));
+    let connection = Rc::new(NativeAgentConnection(agent.clone()));
+
+    let acp_thread = cx
+        .update(|cx| {
+            connection
+                .clone()
+                .new_session(project.clone(), PathList::new(&[Path::new("")]), cx)
+        })
+        .await
+        .unwrap();
+
+    let parent_session_id = acp_thread.read_with(cx, |thread, _| thread.session_id().clone());
+    let thread = agent.read_with(cx, |agent, _| {
+        agent
+            .sessions
+            .get(&parent_session_id)
+            .unwrap()
+            .thread
+            .clone()
+    });
+    let model = fake.model("thread");
+    thread.update(cx, |thread, cx| {
+        thread.set_model(model.clone(), cx);
+    });
+    cx.run_until_parked();
+
+    // === First turn: spawn subagent ===
+    let send = acp_thread.update(cx, |thread, cx| thread.send_raw("Start", cx));
+    cx.run_until_parked();
+    let request = fake.pending_completions_for(&model).pop().unwrap();
+    fake.send_text(&model, &request, "spawning subagent");
+
+    let subagent_tool_input = SpawnAgentToolInput {
+        label: "first task".to_string(),
+        message: "do the first task".to_string(),
+        session_id: None,
+        task_id: Some("TASK-99".to_string()),
+        profile: Some(subagent_profile.clone()),
+        goal_id: None,
+        base_branch: None,
+        on_branch: None,
+        model: None,
+    };
+    let subagent_tool_use = LanguageModelToolUse {
+        id: "subagent_1".into(),
+        name: SpawnAgentTool::NAME.into(),
+        raw_input: serde_json::to_string(&subagent_tool_input).unwrap(),
+        input: language_model::LanguageModelToolUseInput::Json(
+            serde_json::to_value(&subagent_tool_input).unwrap(),
+        ),
+        is_input_complete: true,
+        thought_signature: None,
+    };
+    fake.send_event(
+        &model,
+        &request,
+        LanguageModelCompletionEvent::ToolUse(subagent_tool_use),
+    );
+    fake.end_stream(&model, &request);
+
+    cx.run_until_parked();
+
+    let subagent_session_id = thread.read_with(cx, |thread, cx| {
+        thread
+            .running_subagent_ids(cx)
+            .into_iter()
+            .next()
+            .expect("subagent should be running")
+    });
+
+    let subagent_thread = agent.read_with(cx, |agent, _| {
+        agent
+            .sessions
+            .get(&subagent_session_id)
+            .unwrap()
+            .thread
+            .clone()
+    });
+    assert_eq!(
+        subagent_thread.read_with(cx, |t, _| t.task_id().map(ToString::to_string)),
+        Some("TASK-99".to_string())
+    );
+
+    // Subagent responds
+    let request = fake.pending_completions_for(&model).pop().unwrap();
+    fake.send_text(&model, &request, "first task response");
+    fake.end_stream(&model, &request);
+
+    cx.run_until_parked();
+
+    // Parent completes first turn
+    let request = fake.pending_completions_for(&model).pop().unwrap();
+    fake.send_text(&model, &request, "First response");
+    fake.end_stream(&model, &request);
+
+    send.await.unwrap();
+    cx.run_until_parked();
+
+    // Ensure subagent thread is saved to database
+    agent.update(cx, |agent, cx| {
+        agent.save_thread(subagent_thread.clone(), cx);
+    });
+    cx.run_until_parked();
+
+    // Simulate restart: evict subagent session from in-memory agent.sessions
+    cx.update(|cx| {
+        agent.update(cx, |agent, _cx| {
+            agent.sessions.remove(&subagent_session_id);
+            if let Some(parent_session) = agent.sessions.get_mut(&parent_session_id) {
+                parent_session.subagents.clear();
+            }
+        });
+    });
+    assert!(!agent.read_with(cx, |agent, _| {
+        agent.sessions.contains_key(&subagent_session_id)
+    }));
+
+    // === Second turn: resume subagent with session_id after restart ===
+    let send2 = acp_thread.update(cx, |thread, cx| thread.send_raw("Follow up", cx));
+    cx.run_until_parked();
+    let request = fake.pending_completions_for(&model).pop().unwrap();
+    fake.send_text(&model, &request, "resuming subagent");
+    let resume_tool_input = SpawnAgentToolInput {
+        label: "follow-up task".to_string(),
+        message: "do the follow-up task".to_string(),
+        session_id: Some(subagent_session_id.clone()),
+        task_id: None,
+        profile: Some(subagent_profile.clone()),
+        goal_id: None,
+        base_branch: None,
+        on_branch: None,
+        model: None,
+    };
+    let resume_tool_use = LanguageModelToolUse {
+        id: "subagent_2".into(),
+        name: SpawnAgentTool::NAME.into(),
+        raw_input: serde_json::to_string(&resume_tool_input).unwrap(),
+        input: language_model::LanguageModelToolUseInput::Json(
+            serde_json::to_value(&resume_tool_input).unwrap(),
+        ),
+        is_input_complete: true,
+        thought_signature: None,
+    };
+    fake.send_event(
+        &model,
+        &request,
+        LanguageModelCompletionEvent::ToolUse(resume_tool_use),
+    );
+    fake.end_stream(&model, &request);
+
+    cx.run_until_parked();
+
+    // Verify subagent session was reloaded into agent.sessions and is running
+    thread.read_with(cx, |thread, cx| {
+        let running = thread.running_subagent_ids(cx);
+        assert_eq!(running.len(), 1, "subagent should be running after reload");
+        assert_eq!(running[0], subagent_session_id, "should be same session");
+    });
+    agent.read_with(cx, |agent, cx| {
+        assert!(agent.sessions.contains_key(&subagent_session_id));
+        let session = &agent.sessions[&subagent_session_id];
+        assert_eq!(session.thread.read(cx).task_id(), Some("TASK-99"));
+    });
+
+    // Subagent responds to follow-up
+    let request = fake.pending_completions_for(&model).pop().unwrap();
+    fake.send_text(&model, &request, "follow-up task response");
+    fake.end_stream(&model, &request);
+
+    cx.run_until_parked();
+
+    // Parent completes second turn
+    let request = fake.pending_completions_for(&model).pop().unwrap();
+    fake.send_text(&model, &request, "Second response");
+    fake.end_stream(&model, &request);
+
+    send2.await.unwrap();
+
+    // Verify subagent is no longer running
+    thread.read_with(cx, |thread, cx| {
+        assert!(
+            thread.running_subagent_ids(cx).is_empty(),
+            "subagent should not be running after resume completion"
+        );
+    });
 }
 
 #[gpui::test]
@@ -12617,12 +12828,10 @@ async fn test_mid_turn_model_and_settings_refresh(cx: &mut TestAppContext) {
 
 #[gpui::test]
 async fn test_subagent_task_id_prompt_formatting(cx: &mut TestAppContext) {
-    init_test(cx);
+    let fake = init_test(cx);
     let subagent_profile = cx.update(|cx| enable_default_profile_delegation(cx));
-    let fake = cx.update(|cx| {
-        let fake = LanguageModelRegistry::test(cx);
+    cx.update(|cx| {
         cx.update_flags(true, vec!["subagents".to_string()]);
-        fake
     });
 
     let fs = FakeFs::new(cx.executor());
@@ -12649,6 +12858,7 @@ async fn test_subagent_task_id_prompt_formatting(cx: &mut TestAppContext) {
     let model = fake.model("fake");
     thread.update(cx, |thread, cx| {
         thread.set_model(model.clone(), cx);
+        thread.set_summarization_model(None, cx);
     });
 
     let _events = thread
@@ -13984,7 +14194,6 @@ async fn test_subagent_lsp_rename_denied_outside_task_worktree(cx: &mut TestAppC
     let fake = init_test(cx);
     always_allow_tools(cx);
     cx.update(|cx| {
-        LanguageModelRegistry::test(cx);
         enable_default_profile_delegation(cx);
         cx.update_flags(true, vec!["subagents".to_string()]);
     });
@@ -14020,6 +14229,7 @@ async fn test_subagent_lsp_rename_denied_outside_task_worktree(cx: &mut TestAppC
 
     thread.update(cx, |thread, cx| {
         thread.set_model(model.clone(), cx);
+        thread.set_summarization_model(None, cx);
     });
     cx.run_until_parked();
 

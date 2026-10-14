@@ -804,11 +804,9 @@ impl AgentMessage {
                     );
                 }
                 AgentMessageContent::ToolUse(tool_use) => {
-                    if self.tool_results.contains_key(&tool_use.id) {
-                        assistant_message
-                            .content
-                            .push(language_model::MessageContent::ToolUse(tool_use.clone()));
-                    }
+                    assistant_message
+                        .content
+                        .push(language_model::MessageContent::ToolUse(tool_use.clone()));
                 }
             };
         }
@@ -820,7 +818,27 @@ impl AgentMessage {
             reasoning_details: None,
         };
 
-        for tool_result in self.tool_results.values() {
+        let mut tool_results = self.tool_results.clone();
+        for chunk in &self.content {
+            if let AgentMessageContent::ToolUse(tool_use) = chunk {
+                if !tool_results.contains_key(&tool_use.id) {
+                    tool_results.insert(
+                        tool_use.id.clone(),
+                        LanguageModelToolResult {
+                            tool_use_id: tool_use.id.clone(),
+                            tool_name: tool_use.name.clone(),
+                            is_error: true,
+                            content: vec![LanguageModelToolResultContent::Text(
+                                "Tool execution interrupted by application shutdown".into(),
+                            )],
+                            output: None,
+                        },
+                    );
+                }
+            }
+        }
+
+        for tool_result in tool_results.values() {
             let mut tool_result = tool_result.clone();
             // Surprisingly, the API fails if we return an empty string here.
             // It thinks we are sending a tool use without a tool result.
@@ -936,6 +954,14 @@ pub trait ThreadEnvironment {
 
     fn subagent_task_id(&self, _session_id: &acp::SessionId, _cx: &App) -> Option<String> {
         None
+    }
+
+    fn ensure_subagent_loaded(
+        &self,
+        _session_id: &acp::SessionId,
+        _cx: &mut AsyncApp,
+    ) -> Task<Result<()>> {
+        Task::ready(Ok(()))
     }
 
     fn commit_subagent_worktree(
@@ -1509,6 +1535,7 @@ pub(crate) struct StreamingSaveKey {
     thinking_effort: Option<String>,
     sandboxed_terminal_temp_dir: Option<PathBuf>,
     sandbox_grants: crate::db::DbSandboxGrants,
+    task_id: Option<String>,
 }
 
 pub struct Thread {
@@ -2221,6 +2248,42 @@ impl Thread {
                 .unwrap_or(agent_settings::Delegation::default().max_depth)
         };
 
+        let mut messages = Vec::with_capacity(db_thread.messages.len());
+        for message in db_thread.messages {
+            match message.as_ref() {
+                Message::Agent(agent_message) => {
+                    let mut agent_message = agent_message.clone();
+                    let mut changed = false;
+                    for content in &agent_message.content {
+                        if let AgentMessageContent::ToolUse(tool_use) = content {
+                            if !agent_message.tool_results.contains_key(&tool_use.id) {
+                                agent_message.tool_results.insert(
+                                    tool_use.id.clone(),
+                                    LanguageModelToolResult {
+                                        tool_use_id: tool_use.id.clone(),
+                                        tool_name: tool_use.name.clone(),
+                                        is_error: true,
+                                        content: vec![LanguageModelToolResultContent::Text(
+                                            "Tool execution interrupted by application shutdown"
+                                                .into(),
+                                        )],
+                                        output: None,
+                                    },
+                                );
+                                changed = true;
+                            }
+                        }
+                    }
+                    if changed {
+                        messages.push(Arc::new(Message::Agent(agent_message)));
+                    } else {
+                        messages.push(message);
+                    }
+                }
+                _ => messages.push(message),
+            }
+        }
+
         Self {
             id,
             prompt_id: PromptId::new(),
@@ -2233,7 +2296,7 @@ impl Thread {
             title_generation_error: None,
             pending_summary_generation: None,
             summary: db_thread.detailed_summary,
-            messages: db_thread.messages,
+            messages,
             user_store: project.read(cx).user_store(),
             running_turn: None,
             end_turn_at_next_boundary: false,
@@ -2274,7 +2337,7 @@ impl Thread {
             ))),
             delegation_budget,
             task_worktree: None,
-            task_id: None,
+            task_id: db_thread.task_id,
             is_canceling: false,
             was_canceled: false,
         }
@@ -2378,6 +2441,7 @@ impl Thread {
             }),
             sandboxed_terminal_temp_dir: self.sandboxed_terminal_temp_dir.clone(),
             sandbox_grants: self.sandbox_grants.borrow().to_db(),
+            task_id: self.task_id.clone(),
         };
 
         cx.background_spawn(async move {
@@ -2403,6 +2467,7 @@ impl Thread {
             thinking_effort: self.thinking_effort.clone(),
             sandboxed_terminal_temp_dir: self.sandboxed_terminal_temp_dir.clone(),
             sandbox_grants: self.sandbox_grants.borrow().to_db(),
+            task_id: self.task_id.clone(),
         }
     }
 
@@ -8570,6 +8635,147 @@ mod tests {
             text.as_str(),
             "The previous conversation was compacted. Use this summary as context:\n\nOlder context"
         );
+    }
+
+    #[gpui::test]
+    async fn test_from_db_synthesizes_tool_results_and_restores_task_id(cx: &mut TestAppContext) {
+        let (existing_thread, _, _) = setup_thread_for_test(cx).await;
+        let (project, project_context, context_server_registry, templates) = existing_thread
+            .read_with(cx, |t, _| {
+                (
+                    t.project().clone(),
+                    t.project_context().clone(),
+                    t.context_server_registry.clone(),
+                    t.templates.clone(),
+                )
+            });
+
+        let tool_use = LanguageModelToolUse {
+            id: LanguageModelToolUseId::from("call_1"),
+            name: "spawn_agent".into(),
+            input: language_model::LanguageModelToolUseInput::Json(
+                json!({"label": "Worker", "message": "Do work"}),
+            ),
+            raw_input: "{\"label\":\"Worker\",\"message\":\"Do work\"}".into(),
+            is_input_complete: true,
+            thought_signature: None,
+        };
+
+        let agent_message = AgentMessage {
+            content: vec![
+                AgentMessageContent::Text("Starting subagent...".into()),
+                AgentMessageContent::ToolUse(tool_use.clone()),
+            ],
+            tool_results: IndexMap::default(),
+            reasoning_details: None,
+        };
+
+        let db_thread = DbThread {
+            title: "Test Thread".into(),
+            messages: vec![Arc::new(Message::Agent(agent_message))],
+            updated_at: Utc::now(),
+            detailed_summary: None,
+            initial_project_snapshot: None,
+            cumulative_token_usage: Default::default(),
+            request_token_usage: Default::default(),
+            model: None,
+            profile: None,
+            subagent_context: None,
+            speed: None,
+            thinking_enabled: false,
+            thinking_effort: None,
+            draft_prompt: None,
+            ui_scroll_position: None,
+            sandboxed_terminal_temp_dir: None,
+            sandbox_grants: Default::default(),
+            task_id: Some("TASK-11".to_string()),
+        };
+
+        let session_id = acp::SessionId::new(Arc::<str>::from("session-test-from-db"));
+        let thread = cx.update(|cx| {
+            cx.new(|cx| {
+                Thread::from_db(
+                    session_id,
+                    db_thread,
+                    project,
+                    project_context,
+                    context_server_registry,
+                    templates,
+                    cx,
+                )
+            })
+        });
+
+        thread.read_with(cx, |t, _| {
+            assert_eq!(t.task_id(), Some("TASK-11"));
+            assert_eq!(t.messages.len(), 1);
+            let Message::Agent(msg) = t.messages[0].as_ref() else {
+                panic!("expected AgentMessage");
+            };
+            assert!(msg.tool_results.contains_key(&tool_use.id));
+            let result = &msg.tool_results[&tool_use.id];
+            assert!(result.is_error);
+            assert_eq!(
+                result.content,
+                vec![LanguageModelToolResultContent::Text(
+                    "Tool execution interrupted by application shutdown".into()
+                )]
+            );
+
+            // Verify to_request preserves ToolUse and includes the tool result
+            let requests = msg.to_request();
+            assert_eq!(requests.len(), 2);
+            assert_eq!(requests[0].role, Role::Assistant);
+            assert!(requests[0].content.iter().any(|c| match c {
+                language_model::MessageContent::ToolUse(u) => u.id == tool_use.id,
+                _ => false,
+            }));
+            assert_eq!(requests[1].role, Role::User);
+            assert!(requests[1].content.iter().any(|c| match c {
+                language_model::MessageContent::ToolResult(r) => r.tool_use_id == tool_use.id,
+                _ => false,
+            }));
+        });
+    }
+
+    #[test]
+    fn test_agent_message_to_request_defense_in_depth_synthesizes_missing_tool_result() {
+        let tool_use = LanguageModelToolUse {
+            id: LanguageModelToolUseId::from("call_orphan"),
+            name: "spawn_agent".into(),
+            input: language_model::LanguageModelToolUseInput::Json(
+                json!({"label": "Worker", "message": "Do work"}),
+            ),
+            raw_input: "{\"label\":\"Worker\",\"message\":\"Do work\"}".into(),
+            is_input_complete: true,
+            thought_signature: None,
+        };
+
+        let agent_message = AgentMessage {
+            content: vec![AgentMessageContent::ToolUse(tool_use.clone())],
+            tool_results: IndexMap::default(),
+            reasoning_details: None,
+        };
+
+        let requests = agent_message.to_request();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].role, Role::Assistant);
+        assert!(requests[0].content.iter().any(|c| match c {
+            language_model::MessageContent::ToolUse(u) => u.id == tool_use.id,
+            _ => false,
+        }));
+        assert_eq!(requests[1].role, Role::User);
+        assert!(requests[1].content.iter().any(|c| match c {
+            language_model::MessageContent::ToolResult(r) => {
+                r.tool_use_id == tool_use.id
+                    && r.is_error
+                    && r.content
+                        == vec![LanguageModelToolResultContent::Text(
+                            "Tool execution interrupted by application shutdown".into(),
+                        )]
+            }
+            _ => false,
+        }));
     }
 
     #[test]

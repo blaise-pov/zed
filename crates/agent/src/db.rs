@@ -10,7 +10,7 @@ use futures::{FutureExt, future::Shared};
 use gpui::{BackgroundExecutor, Global, Task};
 use indoc::indoc;
 use language_model::Speed;
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use sqlez::{
     bindable::{Bind, Column},
@@ -87,6 +87,8 @@ pub struct DbThread {
     /// [`crate::sandboxing::ThreadSandboxGrants`].
     #[serde(default)]
     pub sandbox_grants: DbSandboxGrants,
+    #[serde(default)]
+    pub task_id: Option<String>,
 }
 
 /// Serialized form of the sandbox permissions the user granted "for the rest of
@@ -170,6 +172,7 @@ impl SharedThread {
             ui_scroll_position: None,
             sandboxed_terminal_temp_dir: None,
             sandbox_grants: DbSandboxGrants::default(),
+            task_id: None,
         }
     }
 
@@ -356,6 +359,7 @@ impl DbThread {
             ui_scroll_position: None,
             sandboxed_terminal_temp_dir: None,
             sandbox_grants: DbSandboxGrants::default(),
+            task_id: None,
         })
     }
 }
@@ -390,6 +394,8 @@ impl Column for DataType {
     }
 }
 
+static ACTIVE_DATABASE: RwLock<Option<Arc<ThreadsDatabase>>> = RwLock::new(None);
+
 pub(crate) struct ThreadsDatabase {
     executor: BackgroundExecutor,
     connection: Arc<Mutex<Connection>>,
@@ -403,30 +409,71 @@ pub(crate) struct ThreadsDatabase {
     save_count: std::sync::atomic::AtomicUsize,
 }
 
-struct GlobalThreadsDatabase(Shared<Task<Result<Arc<ThreadsDatabase>, Arc<anyhow::Error>>>>);
+impl Clone for ThreadsDatabase {
+    fn clone(&self) -> Self {
+        Self {
+            executor: self.executor.clone(),
+            connection: self.connection.clone(),
+            #[cfg(test)]
+            write_gate: Mutex::new(self.write_gate.lock().clone()),
+            #[cfg(test)]
+            save_count: std::sync::atomic::AtomicUsize::new(
+                self.save_count.load(std::sync::atomic::Ordering::SeqCst),
+            ),
+        }
+    }
+}
+
+struct GlobalThreadsDatabase {
+    task: Shared<Task<Result<Arc<ThreadsDatabase>, Arc<anyhow::Error>>>>,
+    database: Arc<Mutex<Option<Arc<ThreadsDatabase>>>>,
+}
 
 impl Global for GlobalThreadsDatabase {}
 
 impl ThreadsDatabase {
     pub fn connect(cx: &mut App) -> Shared<Task<Result<Arc<ThreadsDatabase>, Arc<anyhow::Error>>>> {
         if cx.has_global::<GlobalThreadsDatabase>() {
-            return cx.global::<GlobalThreadsDatabase>().0.clone();
+            return cx.global::<GlobalThreadsDatabase>().task.clone();
         }
         let executor = cx.background_executor().clone();
+        let database = Arc::new(Mutex::new(None));
         let task = executor
             .spawn({
                 let executor = executor.clone();
+                let database = database.clone();
                 async move {
                     match ThreadsDatabase::new(executor) {
-                        Ok(db) => Ok(Arc::new(db)),
+                        Ok(db) => {
+                            let db = Arc::new(db);
+                            *database.lock() = Some(db.clone());
+                            Ok(db)
+                        }
                         Err(err) => Err(Arc::new(err)),
                     }
                 }
             })
             .shared();
 
-        cx.set_global(GlobalThreadsDatabase(task.clone()));
+        cx.set_global(GlobalThreadsDatabase {
+            task: task.clone(),
+            database,
+        });
         task
+    }
+
+    pub fn from_cx(cx: &App) -> Option<Arc<ThreadsDatabase>> {
+        if cx.has_global::<GlobalThreadsDatabase>() {
+            let global = cx.global::<GlobalThreadsDatabase>();
+            if let Some(db) = global.database.lock().clone() {
+                return Some(db);
+            }
+            if let Some(Ok(db)) = global.task.clone().now_or_never() {
+                *global.database.lock() = Some(db.clone());
+                return Some(db);
+            }
+        }
+        Self::active()
     }
 
     pub fn new(executor: BackgroundExecutor) -> Result<Self> {
@@ -496,7 +543,13 @@ impl ThreadsDatabase {
             save_count: Default::default(),
         };
 
+        *ACTIVE_DATABASE.write() = Some(Arc::new(db.clone()));
+
         Ok(db)
+    }
+
+    pub fn active() -> Option<Arc<ThreadsDatabase>> {
+        ACTIVE_DATABASE.read().clone()
     }
 
     fn save_thread_sync(
@@ -620,19 +673,29 @@ impl ThreadsDatabase {
     pub fn load_thread(&self, id: acp::SessionId) -> Task<Result<Option<DbThread>>> {
         let connection = self.connection.clone();
 
-        self.executor.spawn(async move {
-            let connection = connection.lock();
-            let mut select = connection.select_bound::<Arc<str>, (DataType, Vec<u8>)>(indoc! {"
-                SELECT data_type, data FROM threads WHERE id = ? LIMIT 1
-            "})?;
+        self.executor
+            .spawn(async move { Self::load_thread_from_connection(&connection, &id) })
+    }
 
-            let rows = select(id.0)?;
-            if let Some((data_type, data)) = rows.into_iter().next() {
-                Ok(Some(Self::deserialize_thread(data_type, data)?))
-            } else {
-                Ok(None)
-            }
-        })
+    pub fn load_thread_sync(&self, id: &acp::SessionId) -> Result<Option<DbThread>> {
+        Self::load_thread_from_connection(&self.connection, id)
+    }
+
+    fn load_thread_from_connection(
+        connection: &Arc<Mutex<Connection>>,
+        id: &acp::SessionId,
+    ) -> Result<Option<DbThread>> {
+        let connection = connection.lock();
+        let mut select = connection.select_bound::<Arc<str>, (DataType, Vec<u8>)>(indoc! {"
+            SELECT data_type, data FROM threads WHERE id = ? LIMIT 1
+        "})?;
+
+        let rows = select(id.0.clone())?;
+        if let Some((data_type, data)) = rows.into_iter().next() {
+            Ok(Some(Self::deserialize_thread(data_type, data)?))
+        } else {
+            Ok(None)
+        }
     }
 
     pub fn save_thread(
@@ -839,6 +902,7 @@ mod tests {
             ui_scroll_position: None,
             sandboxed_terminal_temp_dir: None,
             sandbox_grants: DbSandboxGrants::default(),
+            task_id: None,
         }
     }
 
@@ -1337,5 +1401,49 @@ mod tests {
             .expect("scroll_position should be restored");
         assert_eq!(scroll.item_ix, 42);
         assert!((scroll.offset_in_item - 13.5).abs() < f32::EPSILON);
+    }
+
+    #[gpui::test]
+    async fn test_task_id_roundtrips_through_save_load(cx: &mut TestAppContext) {
+        let database = ThreadsDatabase::new(cx.executor()).unwrap();
+
+        let thread_id = session_id("task-thread");
+        let mut thread = make_thread(
+            "Task Associated Thread",
+            Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap(),
+        );
+        thread.task_id = Some("TASK-11".to_string());
+
+        database
+            .save_thread(thread_id.clone(), thread, PathList::default())
+            .await
+            .unwrap();
+
+        let loaded = database
+            .load_thread(thread_id.clone())
+            .await
+            .unwrap()
+            .expect("thread should exist");
+
+        assert_eq!(loaded.task_id.as_deref(), Some("TASK-11"));
+
+        // Also test synchronous loading via load_thread_sync
+        let loaded_sync = database
+            .load_thread_sync(&thread_id)
+            .unwrap()
+            .expect("thread should exist sync");
+        assert_eq!(loaded_sync.task_id.as_deref(), Some("TASK-11"));
+    }
+
+    #[test]
+    fn test_task_id_defaults_to_none_when_deserializing_legacy_json() {
+        let json = r#"{
+            "title": "Legacy Thread",
+            "messages": [],
+            "updated_at": "2024-01-01T00:00:00Z"
+        }"#;
+
+        let thread: DbThread = serde_json::from_str(json).unwrap();
+        assert_eq!(thread.task_id, None);
     }
 }

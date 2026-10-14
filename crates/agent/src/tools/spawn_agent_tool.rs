@@ -308,6 +308,18 @@ impl AgentTool for SpawnAgentTool {
                 });
             }
 
+            if let Some(ref session_id) = input.session_id {
+                if let Err(err) = self.environment.ensure_subagent_loaded(session_id, &mut cx).await {
+                    return Err(SpawnAgentToolOutput::Error {
+                        session_id: input.session_id.clone(),
+                        error: format!("Failed to load subagent session: {err}"),
+                        session_info: None,
+                        isolation: None,
+                        isolation_details: None,
+                    });
+                }
+            }
+
             let task_id = if raw_task_id.is_some() {
                 raw_task_id
             } else if let Some(session_id) = &input.session_id {
