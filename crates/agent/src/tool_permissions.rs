@@ -694,10 +694,12 @@ mod tests {
         AgentSettings {
             enabled: true,
             button: true,
+            task_button: true,
             dock: DockPosition::Right,
             task_dock: DockPosition::Left,
             task_graph_server_id: DEFAULT_TASK_GRAPH_SERVER_ID.to_string(),
             flexible: true,
+            task_flexible: false,
             default_width: px(300.),
             default_height: px(600.),
             max_content_width: Some(px(850.)),
