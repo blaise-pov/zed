@@ -5639,7 +5639,7 @@ impl Thread {
             .or_else(|| self.model().cloned())
     }
 
-    fn build_compaction_request(
+    pub(crate) fn build_compaction_request(
         &self,
         insertion_ix: usize,
         model: &LanguageModel,
@@ -5660,6 +5660,8 @@ impl Thread {
             cache: false,
             reasoning_details: None,
         });
+
+        bound_compaction_request_messages(&mut request.messages, model);
 
         request
     }
@@ -6119,6 +6121,187 @@ fn retained_user_request_messages_before(
 
     retained_messages.reverse();
     retained_messages
+}
+
+pub const COMPACTION_TRUNCATION_MARKER: &str = "\n\n[Content truncated for compaction]";
+
+pub(crate) fn request_message_byte_len(message: &LanguageModelRequestMessage) -> usize {
+    message
+        .content
+        .iter()
+        .map(|content| match content {
+            MessageContent::Text(text) => text.len(),
+            MessageContent::Thinking { text, .. } => text.len(),
+            MessageContent::RedactedThinking(text) => text.len(),
+            MessageContent::Image(image) => image.len(),
+            MessageContent::ToolUse(tool_use) => tool_use.name.len() + tool_use.raw_input.len(),
+            MessageContent::ToolResult(tool_result) => tool_result
+                .content
+                .iter()
+                .map(|part| match part {
+                    LanguageModelToolResultContent::Text(text) => text.len(),
+                    LanguageModelToolResultContent::Image(image) => image.len(),
+                })
+                .sum(),
+            MessageContent::Compaction(compacted) => match compacted {
+                language_model::CompactedContext::Summary { content, .. } => content.len(),
+                language_model::CompactedContext::ProviderState(state) => state.payload().len(),
+            },
+        })
+        .sum()
+}
+
+fn truncate_text_with_compaction_marker(text: &mut String, max_bytes: usize) {
+    if text.len() <= max_bytes {
+        return;
+    }
+    let target = max_bytes.saturating_sub(COMPACTION_TRUNCATION_MARKER.len());
+    let cutoff = text.floor_char_boundary(target.min(text.len()));
+    *text = format!("{}{}", &text[..cutoff], COMPACTION_TRUNCATION_MARKER);
+}
+
+pub(crate) fn bound_compaction_request_messages(
+    messages: &mut Vec<LanguageModelRequestMessage>,
+    model: &LanguageModel,
+) {
+    if messages.is_empty() {
+        return;
+    }
+
+    let max_tokens = model.max_token_count();
+    if max_tokens == 0 {
+        return;
+    }
+
+    let output_headroom = model
+        .max_output_tokens()
+        .unwrap_or(2048)
+        .min(max_tokens / 5);
+    let input_token_budget = max_tokens.saturating_sub(output_headroom).max(1);
+
+    // Using the heuristic that 1 token is about 4 bytes:
+    let context_byte_budget = (input_token_budget as usize).saturating_mul(4);
+
+    let total_bytes: usize = messages.iter().map(request_message_byte_len).sum();
+    if total_bytes <= context_byte_budget {
+        return;
+    }
+
+    // Phase 1: Truncate oversized individual message contents or tool results exceeding the per-item budget.
+    let per_item_budget = (context_byte_budget / 2).max(256);
+    for message in messages.iter_mut() {
+        for content in &mut message.content {
+            match content {
+                MessageContent::Text(text) => {
+                    if text.len() > per_item_budget {
+                        truncate_text_with_compaction_marker(text, per_item_budget);
+                    }
+                }
+                MessageContent::ToolResult(tool_result) => {
+                    for part in &mut tool_result.content {
+                        if let LanguageModelToolResultContent::Text(text) = part {
+                            if text.len() > per_item_budget {
+                                let mut truncated = text.to_string();
+                                truncate_text_with_compaction_marker(
+                                    &mut truncated,
+                                    per_item_budget,
+                                );
+                                *text = Arc::from(truncated);
+                            }
+                        }
+                    }
+                    if let Some(serde_json::Value::String(s)) = &tool_result.output {
+                        if s.len() > per_item_budget {
+                            tool_result.output = None;
+                        }
+                    }
+                }
+                MessageContent::Thinking { text, .. } => {
+                    if text.len() > per_item_budget {
+                        truncate_text_with_compaction_marker(text, per_item_budget);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let total_bytes: usize = messages.iter().map(request_message_byte_len).sum();
+    if total_bytes <= context_byte_budget {
+        return;
+    }
+
+    // Phase 2: Prune middle messages while retaining the earliest prompt/instructions
+    // and the most recent turns.
+    if messages.len() <= 3 {
+        if messages.len() >= 2 {
+            let fixed_overhead = request_message_byte_len(&messages[0])
+                + messages.last().map(request_message_byte_len).unwrap_or(0);
+            let available = context_byte_budget.saturating_sub(fixed_overhead);
+            if let Some(first_user) = messages.get_mut(1) {
+                for content in &mut first_user.content {
+                    if let MessageContent::Text(text) = content {
+                        truncate_text_with_compaction_marker(text, available);
+                    }
+                }
+            }
+        }
+        return;
+    }
+
+    let fixed_bytes = request_message_byte_len(&messages[0])
+        + request_message_byte_len(&messages[1])
+        + request_message_byte_len(messages.last().unwrap());
+    let budget_for_recent = context_byte_budget.saturating_sub(fixed_bytes);
+
+    let middle = &messages[2..messages.len() - 1];
+
+    // Find safe turn start boundaries in middle that do not start with a tool result.
+    let mut turn_starts = Vec::new();
+    for (ix, msg) in middle.iter().enumerate() {
+        let has_tool_result = msg
+            .content
+            .iter()
+            .any(|c| matches!(c, MessageContent::ToolResult(_)));
+        if !has_tool_result {
+            turn_starts.push(ix);
+        }
+    }
+
+    let mut chosen_start_ix = middle.len();
+    for &start_ix in &turn_starts {
+        let recent_bytes: usize = middle[start_ix..]
+            .iter()
+            .map(request_message_byte_len)
+            .sum();
+        if recent_bytes <= budget_for_recent {
+            chosen_start_ix = start_ix;
+            break;
+        }
+    }
+
+    let mut bounded_messages = Vec::with_capacity(3 + (middle.len() - chosen_start_ix));
+    bounded_messages.push(messages[0].clone());
+    bounded_messages.push(messages[1].clone());
+    if chosen_start_ix < middle.len() {
+        bounded_messages.extend_from_slice(&middle[chosen_start_ix..]);
+    }
+    bounded_messages.push(messages.last().cloned().unwrap());
+    *messages = bounded_messages;
+
+    // Final safety bound: ensure total size fits context_byte_budget
+    let total_bytes: usize = messages.iter().map(request_message_byte_len).sum();
+    if total_bytes > context_byte_budget && messages.len() >= 2 {
+        let others_len = total_bytes.saturating_sub(request_message_byte_len(&messages[1]));
+        let available = context_byte_budget.saturating_sub(others_len);
+        if let Some(first_user) = messages.get_mut(1) {
+            for content in &mut first_user.content {
+                if let MessageContent::Text(text) = content {
+                    truncate_text_with_compaction_marker(text, available);
+                }
+            }
+        }
+    }
 }
 
 pub fn build_thread_title_request(
@@ -9986,6 +10169,140 @@ mod tests {
                 MessageContent::Image(image),
             ]
         );
+    }
+
+    #[gpui::test]
+    async fn test_compaction_request_truncates_oversized_tool_results(cx: &mut TestAppContext) {
+        let (thread, _event_stream, fake) = setup_thread_for_test(cx).await;
+        let model = fake.update_model("fake", |model| {
+            model.max_token_count = 5000;
+            model.max_input_tokens = 5000;
+            model.max_output_tokens = Some(200);
+        });
+
+        let tool_use = LanguageModelToolUse {
+            id: LanguageModelToolUseId::from("tool-fetch"),
+            name: Arc::from("fetch"),
+            raw_input: "{}".to_string(),
+            input: language_model::LanguageModelToolUseInput::Json(json!({})),
+            is_input_complete: true,
+            thought_signature: None,
+        };
+        let large_tool_result_content = "X".repeat(20_000);
+        let tool_result = LanguageModelToolResult {
+            tool_use_id: tool_use.id.clone(),
+            tool_name: tool_use.name.clone(),
+            is_error: false,
+            content: vec![LanguageModelToolResultContent::Text(Arc::from(
+                large_tool_result_content,
+            ))],
+            output: None,
+        };
+        let mut tool_results = collections::IndexMap::default();
+        tool_results.insert(tool_use.id.clone(), tool_result);
+
+        let user_id = ClientUserMessageId::new();
+        cx.update(|cx| {
+            thread.update(cx, |thread, cx| {
+                thread.set_model(model.clone(), cx);
+                thread
+                    .messages
+                    .push(user_text_message(user_id, "please fetch page"));
+                thread.messages.push(Arc::new(Message::Agent(AgentMessage {
+                    content: vec![AgentMessageContent::ToolUse(tool_use)],
+                    tool_results,
+                    ..Default::default()
+                })));
+
+                let req = thread.build_compaction_request(thread.messages.len(), &model, cx);
+                let total_bytes: usize = req.messages.iter().map(request_message_byte_len).sum();
+                assert!(
+                    total_bytes <= (model.max_token_count() as usize) * 4,
+                    "compaction request total bytes {total_bytes} exceeds model capacity"
+                );
+
+                let has_truncated = req.messages.iter().any(|m| {
+                    m.content.iter().any(|c| match c {
+                        MessageContent::ToolResult(tr) => tr.content.iter().any(|p| match p {
+                            LanguageModelToolResultContent::Text(t) => {
+                                t.contains("[Content truncated for compaction]")
+                            }
+                            _ => false,
+                        }),
+                        _ => false,
+                    })
+                });
+                assert!(
+                    has_truncated,
+                    "expected oversized tool result to be truncated"
+                );
+            });
+        });
+    }
+
+    #[gpui::test]
+    async fn test_compaction_request_prunes_middle_messages(cx: &mut TestAppContext) {
+        let (thread, _event_stream, fake) = setup_thread_for_test(cx).await;
+        let model = fake.update_model("fake", |model| {
+            model.max_token_count = 1000;
+            model.max_input_tokens = 1000;
+            model.max_output_tokens = Some(200);
+        });
+
+        cx.update(|cx| {
+            thread.update(cx, |thread, cx| {
+                thread.set_model(model.clone(), cx);
+                thread.messages.push(user_text_message(
+                    ClientUserMessageId::new(),
+                    "earliest user prompt",
+                ));
+                thread
+                    .messages
+                    .push(agent_text_message("earliest assistant reply"));
+
+                for i in 1..=5 {
+                    let text = format!("middle user turn {i}: {}", "M".repeat(700));
+                    thread
+                        .messages
+                        .push(user_text_message(ClientUserMessageId::new(), &text));
+                    thread
+                        .messages
+                        .push(agent_text_message(&format!("middle assistant turn {i}")));
+                }
+
+                thread.messages.push(user_text_message(
+                    ClientUserMessageId::new(),
+                    "most recent user turn",
+                ));
+                thread
+                    .messages
+                    .push(agent_text_message("most recent assistant reply"));
+
+                let req = thread.build_compaction_request(thread.messages.len(), &model, cx);
+                let total_bytes: usize = req.messages.iter().map(request_message_byte_len).sum();
+                assert!(
+                    total_bytes <= (model.max_token_count() as usize) * 4,
+                    "compaction request total bytes {total_bytes} exceeds model capacity"
+                );
+
+                let texts = request_texts_after_system(&req.messages);
+                assert!(
+                    texts.iter().any(|t| t.contains("earliest user prompt")),
+                    "earliest prompt must be preserved"
+                );
+                assert!(
+                    texts.iter().any(|t| t.contains("most recent user turn")),
+                    "most recent turn must be preserved"
+                );
+                assert!(
+                    texts.last().unwrap() == COMPACTION_PROMPT,
+                    "final message must be compaction prompt"
+                );
+
+                let has_middle_1 = texts.iter().any(|t| t.contains("middle user turn 1"));
+                assert!(!has_middle_1, "middle turns should have been pruned");
+            });
+        });
     }
 
     fn setup_parent_with_subagents(

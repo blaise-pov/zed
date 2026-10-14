@@ -1123,6 +1123,7 @@ mod tests {
             terminal_watchdog: Default::default(),
             task_worktree_limit: agent_settings::DEFAULT_TASK_WORKTREE_LIMIT,
             task_worktree_language_servers: agent_settings::DEFAULT_TASK_WORKTREE_LANGUAGE_SERVERS,
+            fetch_max_bytes: agent_settings::DEFAULT_FETCH_MAX_BYTES,
         };
 
         cx.update(|cx| {

@@ -11761,6 +11761,65 @@ async fn test_fetch_tool_follows_same_host_redirect(cx: &mut TestAppContext) {
     );
 }
 
+#[gpui::test]
+async fn test_fetch_tool_truncates_output_exceeding_fetch_max_bytes(cx: &mut TestAppContext) {
+    init_test(cx);
+
+    cx.update(|cx| {
+        let mut settings = agent_settings::AgentSettings::get_global(cx).clone();
+        settings.tool_permissions.tools.insert(
+            FetchTool::NAME.into(),
+            agent_settings::ToolRules {
+                default: Some(settings::ToolPermissionMode::Allow),
+                always_allow: vec![
+                    agent_settings::CompiledRegex::new(r"example\.com", false).unwrap(),
+                ],
+                always_deny: vec![],
+                always_confirm: vec![],
+                write_scopes: None,
+                invalid_patterns: vec![],
+            },
+        );
+        settings
+            .sandbox_permissions
+            .network_hosts
+            .push("example.com".into());
+        settings.fetch_max_bytes = 50;
+        agent_settings::AgentSettings::override_global(settings, cx);
+    });
+
+    let large_body = "A".repeat(200);
+    let body_clone = large_body.clone();
+    let http_client = gpui::http_client::FakeHttpClient::create(move |_| {
+        let body = body_clone.clone();
+        async move {
+            Ok(gpui::http_client::Response::builder()
+                .status(200)
+                .header("content-type", "text/plain")
+                .body(body.into())
+                .unwrap())
+        }
+    });
+
+    #[allow(clippy::arc_with_non_send_sync)]
+    let tool = Arc::new(crate::FetchTool::new(http_client));
+    let (event_stream, _rx) = crate::ToolCallEventStream::test();
+
+    let input: crate::FetchToolInput =
+        serde_json::from_value(json!({"url": "https://example.com/large"})).unwrap();
+
+    let task = cx.update(|cx| tool.run(ToolInput::resolved(input), event_stream, cx));
+    let output = task.await.expect("fetch should succeed");
+
+    assert_eq!(
+        output,
+        format!(
+            "{}\n\n[Output truncated: fetch exceeded limit of 50 bytes]",
+            "A".repeat(50)
+        )
+    );
+}
+
 /// Approving one pending tool call with "Always for <tool>" auto-resolves
 /// sibling pending authorizations for the same tool in the same turn.
 #[gpui::test]

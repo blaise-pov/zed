@@ -302,6 +302,9 @@ pub const MIN_TASK_WORKTREE_LIMIT: usize = 1;
 /// Default setting for whether language servers should start in task worktrees.
 pub const DEFAULT_TASK_WORKTREE_LANGUAGE_SERVERS: bool = true;
 
+/// Default maximum bytes returned by the fetch tool before output is truncated (100 KB).
+pub const DEFAULT_FETCH_MAX_BYTES: usize = 100 * 1024;
+
 /// Clamps a configured `task_worktree_limit`.
 ///
 /// A value of 0 is invalid and will be clamped to the minimum of 1.
@@ -447,6 +450,10 @@ pub struct AgentSettings {
     ///
     /// Default: true
     pub task_worktree_language_servers: bool,
+    /// Maximum bytes returned by the fetch tool before output is truncated.
+    ///
+    /// Default: 102400 (100 KB)
+    pub fetch_max_bytes: usize,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1273,6 +1280,7 @@ impl Settings for AgentSettings {
             task_worktree_language_servers: agent
                 .task_worktree_language_servers
                 .unwrap_or(DEFAULT_TASK_WORKTREE_LANGUAGE_SERVERS),
+            fetch_max_bytes: agent.fetch_max_bytes.unwrap_or(DEFAULT_FETCH_MAX_BYTES),
         }
     }
 }
@@ -1486,6 +1494,18 @@ mod tests {
     fn watchdog_from_json(value: serde_json::Value) -> anyhow::Result<TerminalWatchdogSettings> {
         let content: TerminalWatchdogSettingsContent = serde_json::from_value(value)?;
         Ok(TerminalWatchdogSettings::from_content(Some(&content)))
+    }
+
+    #[test]
+    fn test_fetch_max_bytes_default_and_parsing() {
+        assert_eq!(DEFAULT_FETCH_MAX_BYTES, 102400);
+
+        let omitted: settings::AgentSettingsContent = serde_json::from_str(r#"{}"#).unwrap();
+        assert_eq!(omitted.fetch_max_bytes, None);
+
+        let custom: settings::AgentSettingsContent =
+            serde_json::from_str(r#"{"fetch_max_bytes": 50000}"#).unwrap();
+        assert_eq!(custom.fetch_max_bytes, Some(50000));
     }
 
     #[test]
@@ -3171,7 +3191,9 @@ mod tests {
 
     #[gpui::test]
     fn test_model_parameters_per_model_system_prompt_and_instructions(cx: &mut gpui::App) {
-        use language_model::{LanguageModelId, LanguageModelName, LanguageModelProviderId, LanguageModelProviderName};
+        use language_model::{
+            LanguageModelId, LanguageModelName, LanguageModelProviderId, LanguageModelProviderName,
+        };
 
         let store = SettingsStore::test(cx);
         cx.set_global(store);

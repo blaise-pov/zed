@@ -542,6 +542,10 @@ pub struct AgentSettingsContent {
     ///
     /// Default: true
     pub task_worktree_language_servers: Option<bool>,
+    /// Maximum bytes returned by the fetch tool before output is truncated.
+    ///
+    /// Default: 102400 (100 KB)
+    pub fetch_max_bytes: Option<usize>,
 }
 
 impl AgentSettingsContent {
