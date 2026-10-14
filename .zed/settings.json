@@ -540,30 +540,11 @@
           "taskgraph": {
             "tools": {
               "goal_create": true,
-              "goal_get": true,
               "goal_update": true,
-              "goal_tasks": true,
-              "goal_list": true,
               "task_create": true,
-              "task_get": true,
               "task_update": true,
-              "task_list": true,
-              "task_children": true,
-              "task_start": true,
-              "task_complete": true,
-              "task_fail": true,
-              "task_cancel": true,
-              "task_retry": true,
-              "task_add_dependency": true,
-              "task_remove_dependency": true,
-              "task_dependencies": true,
-              "task_dependents": true,
-              "task_ready": true,
               "task_graph": true,
-              "artifact_publish": true,
-              "artifact_get": true,
-              "artifact_list": true,
-              "events_list": true
+              "task_get": true
             }
           }
         },
@@ -632,76 +613,19 @@
             "mcp:taskgraph:goal_create": {
               "default": "allow"
             },
-            "mcp:taskgraph:goal_get": {
-              "default": "allow"
-            },
             "mcp:taskgraph:goal_update": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:goal_tasks": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:goal_list": {
               "default": "allow"
             },
             "mcp:taskgraph:task_create": {
               "default": "allow"
             },
-            "mcp:taskgraph:task_get": {
-              "default": "allow"
-            },
             "mcp:taskgraph:task_update": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_list": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_children": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_start": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_complete": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_fail": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_cancel": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_retry": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_add_dependency": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_remove_dependency": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_dependencies": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_dependents": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_ready": {
               "default": "allow"
             },
             "mcp:taskgraph:task_graph": {
               "default": "allow"
             },
-            "mcp:taskgraph:artifact_publish": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:artifact_get": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:artifact_list": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:events_list": {
+            "mcp:taskgraph:task_get": {
               "default": "allow"
             }
           }
@@ -742,14 +666,6 @@
           "agent-bus": {
             "tools": {
               "send_feedback": true
-            }
-          },
-          "taskgraph": {
-            "tools": {
-              "task_get": true,
-              "task_start": true,
-              "task_complete": true,
-              "task_fail": true
             }
           }
         },
@@ -834,18 +750,6 @@
             },
             "mcp:skills-hub:get_skill_detail": {
               "default": "allow"
-            },
-            "mcp:taskgraph:task_get": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_start": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_complete": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_fail": {
-              "default": "allow"
             }
           }
         }
@@ -866,14 +770,6 @@
           "agent-bus": {
             "tools": {
               "send_feedback": true
-            }
-          },
-          "taskgraph": {
-            "tools": {
-              "task_get": true,
-              "task_start": true,
-              "task_complete": true,
-              "task_fail": true
             }
           }
         },
@@ -903,18 +799,6 @@
               "default": "allow"
             },
             "mcp:agent-bus:send_feedback": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_get": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_start": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_complete": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_fail": {
               "default": "allow"
             }
           }
@@ -956,14 +840,6 @@
               "read_feedback": true,
               "resolve_feedback": true,
               "send_feedback": true
-            }
-          },
-          "taskgraph": {
-            "tools": {
-              "task_get": true,
-              "task_start": true,
-              "task_complete": true,
-              "task_fail": true
             }
           }
         },
@@ -1046,18 +922,6 @@
             },
             "mcp:skills-hub:get_skill_detail": {
               "default": "allow"
-            },
-            "mcp:taskgraph:task_get": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_start": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_complete": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_fail": {
-              "default": "allow"
             }
           }
         }
@@ -1094,15 +958,7 @@
               "get_server_details": true
             }
           },
-          "agent-bus": true,
-          "taskgraph": {
-            "tools": {
-              "task_get": true,
-              "task_start": true,
-              "task_complete": true,
-              "task_fail": true
-            }
-          }
+          "agent-bus": true
         },
         "tool_permissions": {
           "default": "deny",
@@ -1163,18 +1019,6 @@
             },
             "mcp:skills-hub:get_skill_detail": {
               "default": "allow"
-            },
-            "mcp:taskgraph:task_get": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_start": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_complete": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_fail": {
-              "default": "allow"
             }
           }
         }
@@ -1212,17 +1056,6 @@
           "agent-bus": {
             "tools": {
               "send_feedback": true
-            }
-          },
-          "taskgraph": {
-            "tools": {
-              "task_get": true,
-              "task_start": true,
-              "task_complete": true,
-              "task_fail": true,
-              "artifact_publish": true,
-              "artifact_get": true,
-              "artifact_list": true
             }
           }
         },
@@ -1288,27 +1121,6 @@
               "default": "allow"
             },
             "mcp:agent-bus:send_feedback": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_get": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_start": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_complete": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_fail": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:artifact_publish": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:artifact_get": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:artifact_list": {
               "default": "allow"
             }
           }
@@ -1349,17 +1161,6 @@
             "tools": {
               "send_feedback": true
             }
-          },
-          "taskgraph": {
-            "tools": {
-              "task_get": true,
-              "task_start": true,
-              "task_complete": true,
-              "task_fail": true,
-              "artifact_publish": true,
-              "artifact_get": true,
-              "artifact_list": true
-            }
           }
         },
         "tool_permissions": {
@@ -1416,27 +1217,6 @@
               "default": "allow"
             },
             "mcp:agent-bus:send_feedback": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_get": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_start": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_complete": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_fail": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:artifact_publish": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:artifact_get": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:artifact_list": {
               "default": "allow"
             }
           }
@@ -1478,17 +1258,6 @@
             "tools": {
               "send_feedback": true
             }
-          },
-          "taskgraph": {
-            "tools": {
-              "task_get": true,
-              "task_start": true,
-              "task_complete": true,
-              "task_fail": true,
-              "artifact_publish": true,
-              "artifact_get": true,
-              "artifact_list": true
-            }
           }
         },
         "tool_permissions": {
@@ -1543,27 +1312,6 @@
               "default": "allow"
             },
             "mcp:agent-bus:send_feedback": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_get": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_start": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_complete": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_fail": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:artifact_publish": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:artifact_get": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:artifact_list": {
               "default": "allow"
             }
           }
@@ -1601,17 +1349,6 @@
             "tools": {
               "send_feedback": true
             }
-          },
-          "taskgraph": {
-            "tools": {
-              "task_get": true,
-              "task_start": true,
-              "task_complete": true,
-              "task_fail": true,
-              "artifact_publish": true,
-              "artifact_get": true,
-              "artifact_list": true
-            }
           }
         },
         "tool_permissions": {
@@ -1661,27 +1398,6 @@
             },
             "mcp:agent-bus:send_feedback": {
               "default": "allow"
-            },
-            "mcp:taskgraph:task_get": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_start": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_complete": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_fail": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:artifact_publish": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:artifact_get": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:artifact_list": {
-              "default": "allow"
             }
           }
         }
@@ -1714,17 +1430,7 @@
           },
           "taskgraph": {
             "tools": {
-              "goal_get": true,
-              "goal_tasks": true,
-              "goal_list": true,
               "task_get": true,
-              "task_list": true,
-              "task_children": true,
-              "task_start": true,
-              "task_complete": true,
-              "task_fail": true,
-              "task_dependencies": true,
-              "task_dependents": true,
               "task_graph": true,
               "artifact_get": true,
               "artifact_list": true
@@ -1752,37 +1458,7 @@
             "mcp:agent-bus:send_feedback": {
               "default": "allow"
             },
-            "mcp:taskgraph:goal_get": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:goal_tasks": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:goal_list": {
-              "default": "allow"
-            },
             "mcp:taskgraph:task_get": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_list": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_children": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_start": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_complete": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_fail": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_dependencies": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_dependents": {
               "default": "allow"
             },
             "mcp:taskgraph:task_graph": {
@@ -1819,14 +1495,6 @@
             "tools": {
               "send_feedback": true
             }
-          },
-          "taskgraph": {
-            "tools": {
-              "task_get": true,
-              "task_start": true,
-              "task_complete": true,
-              "task_fail": true
-            }
           }
         },
         "tool_permissions": {
@@ -1854,18 +1522,6 @@
             },
             "mcp:agent-bus:send_feedback": {
               "default": "allow"
-            },
-            "mcp:taskgraph:task_get": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_start": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_complete": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_fail": {
-              "default": "allow"
             }
           }
         }
@@ -1892,16 +1548,6 @@
           "agent-bus": {
             "tools": {
               "send_feedback": true
-            }
-          },
-          "taskgraph": {
-            "tools": {
-              "goal_get": true,
-              "goal_tasks": true,
-              "task_get": true,
-              "task_start": true,
-              "task_complete": true,
-              "task_fail": true
             }
           }
         },
@@ -1939,24 +1585,6 @@
             },
             "mcp:agent-bus:send_feedback": {
               "default": "allow"
-            },
-            "mcp:taskgraph:goal_get": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:goal_tasks": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_get": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_start": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_complete": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_fail": {
-              "default": "allow"
             }
           }
         }
@@ -1986,14 +1614,6 @@
           "agent-bus": {
             "tools": {
               "send_feedback": true
-            }
-          },
-          "taskgraph": {
-            "tools": {
-              "task_get": true,
-              "task_start": true,
-              "task_complete": true,
-              "task_fail": true
             }
           }
         },
@@ -2075,18 +1695,6 @@
             },
             "mcp:agent-bus:send_feedback": {
               "default": "allow"
-            },
-            "mcp:taskgraph:task_get": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_start": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_complete": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_fail": {
-              "default": "allow"
             }
           }
         }
@@ -2117,14 +1725,6 @@
           "agent-bus": {
             "tools": {
               "send_feedback": true
-            }
-          },
-          "taskgraph": {
-            "tools": {
-              "task_get": true,
-              "task_start": true,
-              "task_complete": true,
-              "task_fail": true
             }
           }
         },
@@ -2186,18 +1786,6 @@
             },
             "mcp:agent-bus:send_feedback": {
               "default": "allow"
-            },
-            "mcp:taskgraph:task_get": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_start": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_complete": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_fail": {
-              "default": "allow"
             }
           }
         }
@@ -2221,14 +1809,6 @@
             "tools": {
               "send_feedback": true
             }
-          },
-          "taskgraph": {
-            "tools": {
-              "task_get": true,
-              "task_start": true,
-              "task_complete": true,
-              "task_fail": true
-            }
           }
         },
         "delegation": {
@@ -2247,18 +1827,6 @@
               "default": "allow"
             },
             "mcp:agent-bus:send_feedback": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_get": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_start": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_complete": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_fail": {
               "default": "allow"
             }
           }
@@ -2291,14 +1859,6 @@
           "agent-bus": {
             "tools": {
               "send_feedback": true
-            }
-          },
-          "taskgraph": {
-            "tools": {
-              "task_get": true,
-              "task_start": true,
-              "task_complete": true,
-              "task_fail": true
             }
           }
         },
@@ -2350,18 +1910,6 @@
             },
             "mcp:agent-bus:send_feedback": {
               "default": "allow"
-            },
-            "mcp:taskgraph:task_get": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_start": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_complete": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_fail": {
-              "default": "allow"
             }
           }
         }
@@ -2391,10 +1939,6 @@
           },
           "taskgraph": {
             "tools": {
-              "task_get": true,
-              "task_start": true,
-              "task_complete": true,
-              "task_fail": true,
               "artifact_publish": true,
               "artifact_get": true,
               "artifact_list": true
@@ -2423,18 +1967,6 @@
               "default": "allow"
             },
             "mcp:agent-bus:send_feedback": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_get": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_start": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_complete": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_fail": {
               "default": "allow"
             },
             "mcp:taskgraph:artifact_publish": {
@@ -2496,10 +2028,6 @@
           },
           "taskgraph": {
             "tools": {
-              "task_get": true,
-              "task_start": true,
-              "task_complete": true,
-              "task_fail": true,
               "artifact_publish": true,
               "artifact_get": true,
               "artifact_list": true
@@ -2582,18 +2110,6 @@
               "default": "allow"
             },
             "mcp:agent-bus:send_feedback": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_get": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_start": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_complete": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_fail": {
               "default": "allow"
             },
             "mcp:taskgraph:artifact_publish": {
