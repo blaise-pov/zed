@@ -574,14 +574,12 @@ impl AgentTool for SpawnAgentTool {
             }
 
             let session_id_str = session_info.session_id.to_string();
-            let mut task_title = input.label.clone();
             let mut contract_block = None;
 
             if let Some(ref task_id) = task_id {
                 if is_initial_turn {
                     match self.environment.get_task_registered(task_id, &mut cx).await {
                         Ok(detail) => {
-                            task_title = detail.summary.title.clone();
                             contract_block = build_task_contract(task_id, &detail);
                         }
                         Err(error) => {
@@ -593,47 +591,16 @@ impl AgentTool for SpawnAgentTool {
                 }
             }
 
-            let turn_index = if let Some(ref task_id) = task_id {
-                match self
-                    .environment
-                    .record_turn_start(
-                        task_id,
-                        &input.message,
-                        resolved_model.as_deref(),
-                        Some(&session_id_str),
-                        &mut cx,
-                    )
-                    .await
-                {
-                    Ok(idx) => idx,
-                    Err(error) => {
-                        log::warn!(
-                            "failed to record turn start for task {task_id}: {error:#}"
-                        );
-                        None
-                    }
-                }
-            } else {
-                None
-            };
-
             let start_instant = std::time::Instant::now();
             let start_tokens = cx.update(|cx| subagent.cumulative_token_usage(cx));
 
             let send_result = {
-                let message = match input.task_id.as_deref() {
-                    Some(task_id) => {
-                        if let Some(ref contract) = contract_block {
-                            format!("{contract}\n\n{message}", message = input.message)
-                        } else {
-                            format!(
-                                "{message}\n\nTask reference: {task_id}. Fetch the details of this task \
-                                 yourself via the task-management tools available to you.",
-                                message = input.message
-                            )
-                        }
-                    }
-                    None => input.message.clone(),
+                let message = if let Some(ref contract) = contract_block {
+                    format!("{contract}
+
+{message}", message = input.message)
+                } else {
+                    input.message.clone()
                 };
                 subagent.send(message, cx).await
             };
@@ -656,24 +623,6 @@ impl AgentTool for SpawnAgentTool {
             };
 
             let turn_error_str = send_result.as_ref().err().map(|e| e.to_string());
-            if let Some(ref task_id) = task_id {
-                if let Err(error) = self
-                    .environment
-                    .record_turn_finish(
-                        task_id,
-                        turn_index,
-                        duration_ms,
-                        delta_tokens,
-                        turn_error_str.as_deref(),
-                        &mut cx,
-                    )
-                    .await
-                {
-                    log::warn!(
-                        "failed to record turn finish for task {task_id}: {error:#}"
-                    );
-                }
-            }
 
             let status = if send_result.is_ok() {
                 "completed"
@@ -740,9 +689,33 @@ impl AgentTool for SpawnAgentTool {
                     None
                 };
 
+            if let Some(ref task_id) = task_id {
+                let branch_str = isolation_details.as_ref().map(|d| d.branch.as_str());
+                let commit_sha_str = isolation_details.as_ref().and_then(|d| d.head_sha.as_deref());
+                let output_summary = send_result
+                    .as_ref()
+                    .ok()
+                    .map(|out| out.lines().take(20).collect::<Vec<_>>().join("
+"))
+                    .map(SharedString::from);
+                let record = crate::AgentTurnRecord {
+                    duration_ms,
+                    tokens: delta_tokens.or(end_tokens),
+                    model: resolved_model.map(SharedString::from),
+                    session_id: Some(session_id_str.into()),
+                    error: turn_error_str.map(SharedString::from),
+                    branch: branch_str.map(SharedString::from),
+                    commit_sha: commit_sha_str.map(SharedString::from),
+                    output_summary,
+                };
+                if let Err(err) = self.environment.record_turn(task_id, record, &mut cx).await {
+                    log::warn!("failed to record turn for task {task_id}: {err:#}");
+                }
+            }
+
             if send_result.is_ok() {
                 if let Some(ref task_id) = task_id {
-                    match self
+                    if let Err(error) = self
                         .environment
                         .set_task_status_registered(
                             task_id,
@@ -751,67 +724,12 @@ impl AgentTool for SpawnAgentTool {
                         )
                         .await
                     {
-                        Ok(()) => {
-                            let branch_str = isolation_details
-                                .as_ref()
-                                .map(|d| d.branch.as_str())
-                                .unwrap_or("main");
-                            let commit_sha_str = isolation_details
-                                .as_ref()
-                                .and_then(|d| d.head_sha.as_deref())
-                                .unwrap_or("HEAD");
-                            let duration_secs = duration_ms / 1000;
-                            let tokens = delta_tokens.or(end_tokens).unwrap_or_default();
-                            let output_summary = send_result
-                                .as_ref()
-                                .map(|out| {
-                                    out.lines()
-                                        .take(20)
-                                        .collect::<Vec<_>>()
-                                        .join("\n")
-                                })
-                                .unwrap_or_default();
-
-                            let report = format!(
-                                "# Execution Report: {task_id} - {title}\n\n\
-                                 - **Status:** Completed\n\
-                                 - **Branch:** {branch_str}\n\
-                                 - **Commit SHA:** {commit_sha_str}\n\
-                                 - **Duration:** {duration_secs}s\n\
-                                 - **Tokens:** {in_tok} in / {out_tok} out / {cache_tok} cache\n\n\
-                                 ## Agent Output Summary\n\
-                                 {output_summary}\n",
-                                title = task_title,
-                                in_tok = tokens.input_tokens,
-                                out_tok = tokens.output_tokens,
-                                cache_tok = tokens.cache_read_input_tokens,
-                            );
-
-                            if let Err(err) = self
-                                .environment
-                                .publish_artifact(
-                                    task_id,
-                                    "execution_report",
-                                    &report,
-                                    Some("Execution Report"),
-                                    &mut cx,
-                                )
-                                .await
-                            {
-                                log::warn!(
-                                    "failed to publish execution report for task {task_id}: {err:#}"
-                                );
-                            }
-                        }
-                        Err(error) => {
-                            log::warn!(
-                                "failed to set task {task_id} status to completed in task graph service: {error:#}"
-                            );
-                        }
+                        log::warn!(
+                            "failed to set task {task_id} status to completed in task graph service: {error:#}"
+                        );
                     }
                 }
             }
-
             // Release active session guard after commit is done to close race window
             drop(session_guard);
 

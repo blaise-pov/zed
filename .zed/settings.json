@@ -1,70 +1,89 @@
 {
   "languages": {
     "Docker Compose": {
-      "tab_size": 2,
+      "tab_size": 2
     },
     "Markdown": {
       "tab_size": 2,
-      "formatter": "prettier",
+      "formatter": "prettier"
     },
     "TOML": {
       "formatter": "prettier",
-      "format_on_save": "off",
+      "format_on_save": "off"
     },
     "YAML": {
       "tab_size": 2,
-      "formatter": "prettier",
+      "formatter": "prettier"
     },
     "JSON": {
       "tab_size": 2,
       "preferred_line_length": 120,
-      "formatter": "prettier",
+      "formatter": "prettier"
     },
     "JSONC": {
       "tab_size": 2,
       "preferred_line_length": 120,
-      "formatter": "prettier",
+      "formatter": "prettier"
     },
     "JavaScript": {
       "tab_size": 2,
-      "formatter": "prettier",
+      "formatter": "prettier"
     },
     "TypeScript": {
       "tab_size": 2,
-      "formatter": "prettier",
+      "formatter": "prettier"
     },
     "CSS": {
       "tab_size": 2,
-      "formatter": "prettier",
+      "formatter": "prettier"
     },
     "Rust": {
       "tasks": {
         "variables": {
-          "RUST_DEFAULT_PACKAGE_RUN": "zed",
-        },
-      },
-    },
+          "RUST_DEFAULT_PACKAGE_RUN": "zed"
+        }
+      }
+    }
   },
   "lsp": {
     "rust-analyzer": {
       "initialization_options": {
         "procMacro": {
-          "processes": 4,
-        },
-      },
-    },
+          "processes": 4
+        }
+      }
+    }
   },
   "file_types": {
-    "Dockerfile": ["Dockerfile*[!dockerignore]"],
-    "JSONC": ["**/assets/**/*.json", "renovate.json"],
-    "Git Ignore": ["dockerignore"],
+    "Dockerfile": [
+      "Dockerfile*[!dockerignore]"
+    ],
+    "JSONC": [
+      "**/assets/**/*.json",
+      "renovate.json"
+    ],
+    "Git Ignore": [
+      "dockerignore"
+    ]
   },
   "hard_tabs": false,
   "formatter": "auto",
   "remove_trailing_whitespace_on_save": true,
   "ensure_final_newline_on_save": true,
-  "file_scan_exclusions": ["...", "crates/agent/src/tools/evals/fixtures"],
-  "read_only_files": ["**/.rustup/**", "**/.cargo/registry/**", "**/.cargo/git/**", "target/**/*.rs", "**/*.lock"],
+  "file_scan_exclusions": [
+    "...",
+    "crates/agent/src/tools/evals/fixtures",
+    "**/target",
+    "**/target/**",
+    "**/.git/**"
+  ],
+  "read_only_files": [
+    "**/.rustup/**",
+    "**/.cargo/registry/**",
+    "**/.cargo/git/**",
+    "target/**/*.rs",
+    "**/*.lock"
+  ],
   "git": {
     "inline_blame": {
       "enabled": false
@@ -87,25 +106,51 @@
     },
     "github": {
       "command": "github-mcp-server",
-      "args": ["stdio"],
+      "args": [
+        "stdio"
+      ],
       "env": {
         "GITHUB_PERSONAL_ACCESS_TOKEN": "${GITHUB_PERSONAL_ACCESS_TOKEN}",
         "GITHUB_TOOLSETS": "repos,issues,pull_requests",
         "GITHUB_READ_ONLY": "1"
       },
       "platforms": {
-        "darwin-arm64": { "command": ".zed/mcp/github/bin/github-mcp-server-darwin-arm64" },
-        "darwin-amd64": { "command": ".zed/mcp/github/bin/github-mcp-server-darwin-amd64" },
-        "darwin-x64": { "command": ".zed/mcp/github/bin/github-mcp-server-darwin-amd64" },
-        "linux-arm64": { "command": ".zed/mcp/github/bin/github-mcp-server-linux-arm64" },
-        "linux-amd64": { "command": ".zed/mcp/github/bin/github-mcp-server-linux-amd64" },
-        "linux-x64": { "command": ".zed/mcp/github/bin/github-mcp-server-linux-amd64" },
-        "windows-arm64": { "command": ".zed/mcp/github/bin/github-mcp-server-windows-arm64.exe" },
-        "windows-amd64": { "command": ".zed/mcp/github/bin/github-mcp-server-windows-amd64.exe" },
-        "windows-x64": { "command": ".zed/mcp/github/bin/github-mcp-server-windows-amd64.exe" },
-        "macos": { "command": ".zed/mcp/github/bin/github-mcp-server-darwin-arm64" },
-        "linux": { "command": ".zed/mcp/github/bin/github-mcp-server-linux-amd64" },
-        "windows": { "command": ".zed/mcp/github/bin/github-mcp-server-windows-amd64.exe" }
+        "darwin-arm64": {
+          "command": ".zed/mcp/github/bin/github-mcp-server-darwin-arm64"
+        },
+        "darwin-amd64": {
+          "command": ".zed/mcp/github/bin/github-mcp-server-darwin-amd64"
+        },
+        "darwin-x64": {
+          "command": ".zed/mcp/github/bin/github-mcp-server-darwin-amd64"
+        },
+        "linux-arm64": {
+          "command": ".zed/mcp/github/bin/github-mcp-server-linux-arm64"
+        },
+        "linux-amd64": {
+          "command": ".zed/mcp/github/bin/github-mcp-server-linux-amd64"
+        },
+        "linux-x64": {
+          "command": ".zed/mcp/github/bin/github-mcp-server-linux-amd64"
+        },
+        "windows-arm64": {
+          "command": ".zed/mcp/github/bin/github-mcp-server-windows-arm64.exe"
+        },
+        "windows-amd64": {
+          "command": ".zed/mcp/github/bin/github-mcp-server-windows-amd64.exe"
+        },
+        "windows-x64": {
+          "command": ".zed/mcp/github/bin/github-mcp-server-windows-amd64.exe"
+        },
+        "macos": {
+          "command": ".zed/mcp/github/bin/github-mcp-server-darwin-arm64"
+        },
+        "linux": {
+          "command": ".zed/mcp/github/bin/github-mcp-server-linux-amd64"
+        },
+        "windows": {
+          "command": ".zed/mcp/github/bin/github-mcp-server-windows-amd64.exe"
+        }
       }
     },
     "agent-bus": {
@@ -125,18 +170,42 @@
         "AGENT_BUS_PROJECT_ID": "zed"
       },
       "platforms": {
-        "darwin-arm64": { "command": ".zed/mcp/agent-bus/bin/agent-bus-darwin-arm64" },
-        "darwin-amd64": { "command": ".zed/mcp/agent-bus/bin/agent-bus-darwin-amd64" },
-        "darwin-x64": { "command": ".zed/mcp/agent-bus/bin/agent-bus-darwin-amd64" },
-        "linux-arm64": { "command": ".zed/mcp/agent-bus/bin/agent-bus-linux-arm64" },
-        "linux-amd64": { "command": ".zed/mcp/agent-bus/bin/agent-bus-linux-amd64" },
-        "linux-x64": { "command": ".zed/mcp/agent-bus/bin/agent-bus-linux-amd64" },
-        "windows-arm64": { "command": ".zed/mcp/agent-bus/bin/agent-bus-windows-arm64.exe" },
-        "windows-amd64": { "command": ".zed/mcp/agent-bus/bin/agent-bus-windows-amd64.exe" },
-        "windows-x64": { "command": ".zed/mcp/agent-bus/bin/agent-bus-windows-amd64.exe" },
-        "macos": { "command": ".zed/mcp/agent-bus/bin/agent-bus-darwin-arm64" },
-        "linux": { "command": ".zed/mcp/agent-bus/bin/agent-bus-linux-amd64" },
-        "windows": { "command": ".zed/mcp/agent-bus/bin/agent-bus-windows-amd64.exe" }
+        "darwin-arm64": {
+          "command": ".zed/mcp/agent-bus/bin/agent-bus-darwin-arm64"
+        },
+        "darwin-amd64": {
+          "command": ".zed/mcp/agent-bus/bin/agent-bus-darwin-amd64"
+        },
+        "darwin-x64": {
+          "command": ".zed/mcp/agent-bus/bin/agent-bus-darwin-amd64"
+        },
+        "linux-arm64": {
+          "command": ".zed/mcp/agent-bus/bin/agent-bus-linux-arm64"
+        },
+        "linux-amd64": {
+          "command": ".zed/mcp/agent-bus/bin/agent-bus-linux-amd64"
+        },
+        "linux-x64": {
+          "command": ".zed/mcp/agent-bus/bin/agent-bus-linux-amd64"
+        },
+        "windows-arm64": {
+          "command": ".zed/mcp/agent-bus/bin/agent-bus-windows-arm64.exe"
+        },
+        "windows-amd64": {
+          "command": ".zed/mcp/agent-bus/bin/agent-bus-windows-amd64.exe"
+        },
+        "windows-x64": {
+          "command": ".zed/mcp/agent-bus/bin/agent-bus-windows-amd64.exe"
+        },
+        "macos": {
+          "command": ".zed/mcp/agent-bus/bin/agent-bus-darwin-arm64"
+        },
+        "linux": {
+          "command": ".zed/mcp/agent-bus/bin/agent-bus-linux-amd64"
+        },
+        "windows": {
+          "command": ".zed/mcp/agent-bus/bin/agent-bus-windows-amd64.exe"
+        }
       }
     },
     "taskgraph": {
@@ -149,18 +218,42 @@
         "TGS_LOG_FILE": ".zed/mcp/taskgraph/taskgraph.log"
       },
       "platforms": {
-        "darwin-arm64": { "command": ".zed/mcp/taskgraph/bin/taskgraph-darwin-arm64" },
-        "darwin-amd64": { "command": ".zed/mcp/taskgraph/bin/taskgraph-darwin-amd64" },
-        "darwin-x64": { "command": ".zed/mcp/taskgraph/bin/taskgraph-darwin-amd64" },
-        "linux-arm64": { "command": ".zed/mcp/taskgraph/bin/taskgraph-linux-arm64" },
-        "linux-amd64": { "command": ".zed/mcp/taskgraph/bin/taskgraph-linux-amd64" },
-        "linux-x64": { "command": ".zed/mcp/taskgraph/bin/taskgraph-linux-amd64" },
-        "windows-arm64": { "command": ".zed/mcp/taskgraph/bin/taskgraph-windows-arm64.exe" },
-        "windows-amd64": { "command": ".zed/mcp/taskgraph/bin/taskgraph-windows-amd64.exe" },
-        "windows-x64": { "command": ".zed/mcp/taskgraph/bin/taskgraph-windows-amd64.exe" },
-        "macos": { "command": ".zed/mcp/taskgraph/bin/taskgraph-darwin-arm64" },
-        "linux": { "command": ".zed/mcp/taskgraph/bin/taskgraph-linux-amd64" },
-        "windows": { "command": ".zed/mcp/taskgraph/bin/taskgraph-windows-amd64.exe" }
+        "darwin-arm64": {
+          "command": ".zed/mcp/taskgraph/bin/taskgraph-darwin-arm64"
+        },
+        "darwin-amd64": {
+          "command": ".zed/mcp/taskgraph/bin/taskgraph-darwin-amd64"
+        },
+        "darwin-x64": {
+          "command": ".zed/mcp/taskgraph/bin/taskgraph-darwin-amd64"
+        },
+        "linux-arm64": {
+          "command": ".zed/mcp/taskgraph/bin/taskgraph-linux-arm64"
+        },
+        "linux-amd64": {
+          "command": ".zed/mcp/taskgraph/bin/taskgraph-linux-amd64"
+        },
+        "linux-x64": {
+          "command": ".zed/mcp/taskgraph/bin/taskgraph-linux-amd64"
+        },
+        "windows-arm64": {
+          "command": ".zed/mcp/taskgraph/bin/taskgraph-windows-arm64.exe"
+        },
+        "windows-amd64": {
+          "command": ".zed/mcp/taskgraph/bin/taskgraph-windows-amd64.exe"
+        },
+        "windows-x64": {
+          "command": ".zed/mcp/taskgraph/bin/taskgraph-windows-amd64.exe"
+        },
+        "macos": {
+          "command": ".zed/mcp/taskgraph/bin/taskgraph-darwin-arm64"
+        },
+        "linux": {
+          "command": ".zed/mcp/taskgraph/bin/taskgraph-linux-amd64"
+        },
+        "windows": {
+          "command": ".zed/mcp/taskgraph/bin/taskgraph-windows-amd64.exe"
+        }
       }
     }
   },
@@ -1112,7 +1205,9 @@
           ],
           "max_depth": 1
         },
-        "skills": ["gpui-test"],
+        "skills": [
+          "gpui-test"
+        ],
         "context_servers": {
           "agent-bus": {
             "tools": {

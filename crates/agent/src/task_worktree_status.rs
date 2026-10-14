@@ -715,6 +715,7 @@ mod tests {
                 created_at: None,
                 assigned_profile: None,
                 model: None,
+                session_id: None,
                 metrics: None,
             },
             AgentTaskSummary {
@@ -729,6 +730,7 @@ mod tests {
                 created_at: None,
                 assigned_profile: None,
                 model: None,
+                session_id: None,
                 metrics: None,
             },
         ];
@@ -984,6 +986,7 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
+            session_id: None,
             metrics: None,
         }];
 
@@ -1150,6 +1153,7 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
+            session_id: None,
             metrics: None,
         }];
 
@@ -1211,6 +1215,7 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
+            session_id: None,
             metrics: None,
         }];
         let goals = vec![AgentGoalSummary {
@@ -1259,6 +1264,7 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
+            session_id: None,
             metrics: None,
         });
 

@@ -1003,27 +1003,13 @@ pub trait ThreadEnvironment {
         Task::ready(Err(anyhow::anyhow!("get_task_registered not supported")))
     }
 
-    fn record_turn_start(
+    fn record_turn(
         &self,
         _task_id: &str,
-        _prompt: &str,
-        _model: Option<&str>,
-        _session_id: Option<&str>,
+        _record: crate::AgentTurnRecord,
         _cx: &mut AsyncApp,
-    ) -> Task<Result<Option<u32>>> {
-        Task::ready(Ok(None))
-    }
-
-    fn record_turn_finish(
-        &self,
-        _task_id: &str,
-        _turn_index: Option<u32>,
-        _duration_ms: u64,
-        _tokens: Option<language_model::TokenUsage>,
-        _error: Option<&str>,
-        _cx: &mut AsyncApp,
-    ) -> Task<Result<()>> {
-        Task::ready(Ok(()))
+    ) -> Task<Result<u32>> {
+        Task::ready(Ok(0))
     }
 
     fn publish_artifact(

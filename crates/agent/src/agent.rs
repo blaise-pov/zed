@@ -3740,6 +3740,7 @@ impl ThreadEnvironment for NativeThreadEnvironment {
             created_at: None,
             assigned_profile: None,
             model: None,
+            session_id: None,
             metrics: None,
         };
         cx.update(|cx| {
@@ -3995,26 +3996,18 @@ impl ThreadEnvironment for NativeThreadEnvironment {
         })
     }
 
-    fn record_turn_start(
+    fn record_turn(
         &self,
         task_id: &str,
-        prompt: &str,
-        model: Option<&str>,
-        session_id: Option<&str>,
+        record: crate::AgentTurnRecord,
         cx: &mut AsyncApp,
-    ) -> Task<Result<Option<u32>>> {
+    ) -> Task<Result<u32>> {
         let Some(parent_thread_entity) = self.thread.upgrade() else {
             return Task::ready(Err(anyhow!("Parent thread no longer exists")));
         };
-        let (project, task_id_typed, prompt_string, model_string, session_id_string) = cx.update(|cx| {
+        let (project, task_id_typed) = cx.update(|cx| {
             let project = parent_thread_entity.read(cx).project().clone();
-            (
-                project,
-                crate::AgentTaskId::from(task_id.to_string()),
-                prompt.to_string(),
-                model.map(str::to_string),
-                session_id.map(str::to_string),
-            )
+            (project, crate::AgentTaskId::from(task_id.to_string()))
         });
         cx.spawn(async move |cx| {
             let task = cx.update(|cx| {
@@ -4029,59 +4022,7 @@ impl ThreadEnvironment for NativeThreadEnvironment {
                     context_server_store,
                     server_id,
                 );
-                provider.record_turn_start(
-                    &task_id_typed,
-                    &prompt_string,
-                    model_string.as_deref(),
-                    session_id_string.as_deref(),
-                    cx,
-                )
-            });
-            task.await
-        })
-    }
-
-    fn record_turn_finish(
-        &self,
-        task_id: &str,
-        turn_index: Option<u32>,
-        duration_ms: u64,
-        tokens: Option<language_model::TokenUsage>,
-        error: Option<&str>,
-        cx: &mut AsyncApp,
-    ) -> Task<Result<()>> {
-        let Some(parent_thread_entity) = self.thread.upgrade() else {
-            return Task::ready(Err(anyhow!("Parent thread no longer exists")));
-        };
-        let (project, task_id_typed, error_string) = cx.update(|cx| {
-            let project = parent_thread_entity.read(cx).project().clone();
-            (
-                project,
-                crate::AgentTaskId::from(task_id.to_string()),
-                error.map(str::to_string),
-            )
-        });
-        cx.spawn(async move |cx| {
-            let task = cx.update(|cx| {
-                let context_server_store = project.read(cx).context_server_store();
-                let server_id = context_server::ContextServerId(
-                    agent_settings::AgentSettings::get_for_project(project.read(cx), cx)
-                        .task_graph_server_id
-                        .clone()
-                        .into(),
-                );
-                let provider = crate::mcp_agent_task_provider::McpAgentTaskProvider::new(
-                    context_server_store,
-                    server_id,
-                );
-                provider.record_turn_finish(
-                    &task_id_typed,
-                    turn_index,
-                    duration_ms,
-                    tokens,
-                    error_string.as_deref(),
-                    cx,
-                )
+                provider.record_turn(&task_id_typed, record, cx)
             });
             task.await
         })

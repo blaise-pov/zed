@@ -3566,6 +3566,7 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
+            session_id: None,
             metrics: None,
         };
 
@@ -3612,6 +3613,7 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
+            session_id: None,
             metrics: None,
         };
         let second_task = AgentTaskSummary {
@@ -3626,6 +3628,7 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
+            session_id: None,
             metrics: None,
         };
 
@@ -3682,6 +3685,7 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
+            session_id: None,
             metrics: None,
         };
 
@@ -3862,6 +3866,7 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
+            session_id: None,
             metrics: None,
         };
 
@@ -3902,6 +3907,7 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
+            session_id: None,
             metrics: None,
         };
         let path2 = cx
@@ -3940,6 +3946,7 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
+            session_id: None,
             metrics: None,
         };
         let path3 = cx
@@ -3974,6 +3981,7 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
+            session_id: None,
             metrics: None,
         };
         let result4 = cx
@@ -4005,6 +4013,7 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
+            session_id: None,
             metrics: None,
         };
         let path5 = cx
@@ -4056,6 +4065,7 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
+            session_id: None,
             metrics: None,
         };
 
@@ -4148,6 +4158,7 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
+            session_id: None,
             metrics: None,
         };
         let task_b = AgentTaskSummary {
@@ -4162,6 +4173,7 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
+            session_id: None,
             metrics: None,
         };
 
@@ -4279,6 +4291,7 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
+            session_id: None,
             metrics: None,
         };
         let task_c2 = AgentTaskSummary {
@@ -4293,6 +4306,7 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
+            session_id: None,
             metrics: None,
         };
 
@@ -4425,6 +4439,7 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
+            session_id: None,
             metrics: None,
         };
 
@@ -4517,6 +4532,7 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
+            session_id: None,
             metrics: None,
         };
 
@@ -4568,6 +4584,7 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
+            session_id: None,
             metrics: None,
         };
 
@@ -4652,6 +4669,7 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
+            session_id: None,
             metrics: None,
         };
 
@@ -4704,6 +4722,7 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
+            session_id: None,
             metrics: None,
         };
 
@@ -4785,6 +4804,7 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
+            session_id: None,
             metrics: None,
         };
 
@@ -4836,6 +4856,7 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
+            session_id: None,
             metrics: None,
         };
 
@@ -4916,6 +4937,7 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
+            session_id: None,
             metrics: None,
         };
         let task2 = AgentTaskSummary {
@@ -4930,6 +4952,7 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
+            session_id: None,
             metrics: None,
         };
 
@@ -5038,6 +5061,7 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
+            session_id: None,
             metrics: None,
         };
 
@@ -5053,6 +5077,7 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
+            session_id: None,
             metrics: None,
         };
 
@@ -5068,6 +5093,7 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
+            session_id: None,
             metrics: None,
         };
 
@@ -5202,6 +5228,7 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
+            session_id: None,
             metrics: None,
         };
         let task2 = AgentTaskSummary {
@@ -5216,6 +5243,7 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
+            session_id: None,
             metrics: None,
         };
 
@@ -5319,6 +5347,7 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
+            session_id: None,
             metrics: None,
         };
         let task2 = AgentTaskSummary {
@@ -5333,6 +5362,7 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
+            session_id: None,
             metrics: None,
         };
 
@@ -5418,6 +5448,7 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
+            session_id: None,
             metrics: None,
         };
 
@@ -5510,6 +5541,7 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
+            session_id: None,
             metrics: None,
         };
 
@@ -5666,6 +5698,7 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
+            session_id: None,
             metrics: None,
         };
 
@@ -6101,6 +6134,7 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
+            session_id: None,
             metrics: None,
         };
         let task2 = AgentTaskSummary {
@@ -6115,6 +6149,7 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
+            session_id: None,
             metrics: None,
         };
         let task3 = AgentTaskSummary {
@@ -6129,6 +6164,7 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
+            session_id: None,
             metrics: None,
         };
         let task4 = AgentTaskSummary {
@@ -6143,6 +6179,7 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
+            session_id: None,
             metrics: None,
         };
 
@@ -6284,6 +6321,7 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
+            session_id: None,
             metrics: None,
         };
         let task2 = AgentTaskSummary {
@@ -6298,6 +6336,7 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
+            session_id: None,
             metrics: None,
         };
         let task3 = AgentTaskSummary {
@@ -6312,6 +6351,7 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
+            session_id: None,
             metrics: None,
         };
 
@@ -6432,6 +6472,7 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
+            session_id: None,
             metrics: None,
         };
         let task_dirty = AgentTaskSummary {
@@ -6446,6 +6487,7 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
+            session_id: None,
             metrics: None,
         };
         let task_new = AgentTaskSummary {
@@ -6460,6 +6502,7 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
+            session_id: None,
             metrics: None,
         };
 
@@ -6586,6 +6629,7 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
+            session_id: None,
             metrics: None,
         };
         let task2 = AgentTaskSummary {
@@ -6600,6 +6644,7 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
+            session_id: None,
             metrics: None,
         };
 
@@ -6694,6 +6739,7 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
+            session_id: None,
             metrics: None,
         };
         let task2 = AgentTaskSummary {
@@ -6708,6 +6754,7 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
+            session_id: None,
             metrics: None,
         };
         let task3 = AgentTaskSummary {
@@ -6722,6 +6769,7 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
+            session_id: None,
             metrics: None,
         };
 
@@ -6829,6 +6877,7 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
+            session_id: None,
             metrics: None,
         };
         let task2 = AgentTaskSummary {
@@ -6843,6 +6892,7 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
+            session_id: None,
             metrics: None,
         };
         let task3 = AgentTaskSummary {
@@ -6857,6 +6907,7 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
+            session_id: None,
             metrics: None,
         };
 
@@ -6980,6 +7031,7 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
+            session_id: None,
             metrics: None,
         };
 
@@ -7094,6 +7146,7 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
+            session_id: None,
             metrics: None,
         };
 
@@ -7181,6 +7234,7 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
+            session_id: None,
             metrics: None,
         };
 

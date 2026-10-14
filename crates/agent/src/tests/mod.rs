@@ -281,16 +281,7 @@ pub(crate) struct FakeThreadEnvironment {
     task_status_transitions: std::cell::RefCell<Vec<(String, crate::AgentTaskStatus)>>,
     ensure_task_error: std::cell::RefCell<Option<String>>,
     ensure_worktree_calls: std::cell::RefCell<Vec<String>>,
-    recorded_turn_starts: std::cell::RefCell<Vec<(String, String, Option<String>, Option<String>)>>,
-    recorded_turn_finishes: std::cell::RefCell<
-        Vec<(
-            String,
-            Option<u32>,
-            u64,
-            Option<language_model::TokenUsage>,
-            Option<String>,
-        )>,
-    >,
+    recorded_turns: std::cell::RefCell<Vec<(String, crate::AgentTurnRecord)>>,
     published_artifacts: std::cell::RefCell<Vec<(String, String, String, Option<String>)>>,
     task_details: std::cell::RefCell<std::collections::HashMap<String, crate::AgentTaskDetail>>,
 }
@@ -352,24 +343,11 @@ impl FakeThreadEnvironment {
         self.ensure_worktree_calls.borrow().clone()
     }
 
-    pub(crate) fn recorded_turn_starts(
-        &self,
-    ) -> Vec<(String, String, Option<String>, Option<String>)> {
-        self.recorded_turn_starts.borrow().clone()
+    pub(crate) fn recorded_turns(&self) -> Vec<(String, crate::AgentTurnRecord)> {
+        self.recorded_turns.borrow().clone()
     }
 
-    pub(crate) fn recorded_turn_finishes(
-        &self,
-    ) -> Vec<(
-        String,
-        Option<u32>,
-        u64,
-        Option<language_model::TokenUsage>,
-        Option<String>,
-    )> {
-        self.recorded_turn_finishes.borrow().clone()
-    }
-
+    #[allow(dead_code)]
     pub(crate) fn published_artifacts(&self) -> Vec<(String, String, String, Option<String>)> {
         self.published_artifacts.borrow().clone()
     }
@@ -526,41 +504,17 @@ impl crate::ThreadEnvironment for FakeThreadEnvironment {
         }
     }
 
-    fn record_turn_start(
+    fn record_turn(
         &self,
         task_id: &str,
-        prompt: &str,
-        model: Option<&str>,
-        session_id: Option<&str>,
+        record: crate::AgentTurnRecord,
         _cx: &mut AsyncApp,
-    ) -> Task<Result<Option<u32>>> {
-        self.recorded_turn_starts.borrow_mut().push((
-            task_id.to_string(),
-            prompt.to_string(),
-            model.map(str::to_string),
-            session_id.map(str::to_string),
-        ));
-        let count = self.recorded_turn_starts.borrow().len() as u32;
-        Task::ready(Ok(Some(count)))
-    }
-
-    fn record_turn_finish(
-        &self,
-        task_id: &str,
-        turn_index: Option<u32>,
-        duration_ms: u64,
-        tokens: Option<language_model::TokenUsage>,
-        error: Option<&str>,
-        _cx: &mut AsyncApp,
-    ) -> Task<Result<()>> {
-        self.recorded_turn_finishes.borrow_mut().push((
-            task_id.to_string(),
-            turn_index,
-            duration_ms,
-            tokens,
-            error.map(str::to_string),
-        ));
-        Task::ready(Ok(()))
+    ) -> Task<Result<u32>> {
+        self.recorded_turns
+            .borrow_mut()
+            .push((task_id.to_string(), record));
+        let count = self.recorded_turns.borrow().len() as u32;
+        Task::ready(Ok(count))
     }
 
     fn publish_artifact(
@@ -8126,19 +8080,15 @@ async fn test_spawn_agent_turn_recording_and_metrics(cx: &mut TestAppContext) {
 
     assert!(matches!(result, Ok(SpawnAgentToolOutput::Success { .. })));
 
-    let turn_starts = environment.recorded_turn_starts();
-    assert_eq!(turn_starts.len(), 1);
-    assert_eq!(turn_starts[0].0, "TASK-TURN-1");
-    assert_eq!(turn_starts[0].1, "execute command");
-    assert_eq!(turn_starts[0].2, Some("gemini-3.8-flash-high".to_string()));
-    assert_eq!(turn_starts[0].3, Some("subagent-turn-1".to_string()));
-
-    let turn_finishes = environment.recorded_turn_finishes();
-    assert_eq!(turn_finishes.len(), 1);
-    assert_eq!(turn_finishes[0].0, "TASK-TURN-1");
-    assert_eq!(turn_finishes[0].1, Some(1));
-    assert_eq!(turn_finishes[0].3, Some(token_usage));
-    assert_eq!(turn_finishes[0].4, None);
+    let turns = environment.recorded_turns();
+    assert_eq!(turns.len(), 1);
+    assert_eq!(turns[0].0, "TASK-TURN-1");
+    let record = &turns[0].1;
+    assert_eq!(record.tokens, Some(token_usage));
+    assert_eq!(record.model.as_deref(), Some("gemini-3.8-flash-high"));
+    assert_eq!(record.session_id.as_deref(), Some("subagent-turn-1"));
+    assert_eq!(record.error, None);
+    assert_eq!(record.output_summary.as_deref(), Some("turn complete output"));
 }
 
 #[gpui::test]
@@ -8158,6 +8108,7 @@ async fn test_spawn_agent_contract_injection_turn_one(cx: &mut TestAppContext) {
             created_at: None,
             assigned_profile: None,
             model: None,
+            session_id: None,
             metrics: None,
         },
         description: "Add metrics tracking to subagent runtime.\n\nStrict constraints:\n- No panic\n- Best effort MCP".to_string(),
@@ -8238,6 +8189,7 @@ async fn test_spawn_agent_resumed_turn_bypasses_contract_injection(cx: &mut Test
             created_at: None,
             assigned_profile: None,
             model: None,
+            session_id: None,
             metrics: None,
         },
         description: "Task description".to_string(),
@@ -8287,58 +8239,6 @@ async fn test_spawn_agent_resumed_turn_bypasses_contract_injection(cx: &mut Test
     assert!(sent_msg.contains("follow-up instruction"));
 }
 
-#[gpui::test]
-async fn test_spawn_agent_auto_publishes_execution_report_artifact(cx: &mut TestAppContext) {
-    init_test(cx);
-
-    let token_usage = language_model::TokenUsage {
-        input_tokens: 5000,
-        output_tokens: 800,
-        cache_read_input_tokens: 1200,
-        cache_creation_input_tokens: 0,
-    };
-
-    let subagent = FakeSubagentHandle::new(
-        acp::SessionId::new("subagent-artifact-1"),
-        Task::ready("Lines of output from agent\nLine 2\nLine 3".to_string()).shared(),
-        None,
-    )
-    .with_token_usage(token_usage);
-
-    let environment = Rc::new(FakeThreadEnvironment::default().with_subagent(subagent));
-    #[allow(clippy::arc_with_non_send_sync)]
-    let tool = Arc::new(SpawnAgentTool::new(environment.clone()));
-    let (event_stream, _rx) = ToolCallEventStream::test();
-
-    let result = cx
-        .update(|cx| {
-            tool.run(
-                ToolInput::resolved(SpawnAgentToolInput {
-                    label: "Build feature".to_string(),
-                    message: "do work".to_string(),
-                    task_id: Some("TASK-ARTIFACT-1".to_string()),
-                    ..Default::default()
-                }),
-                event_stream,
-                cx,
-            )
-        })
-        .await;
-
-    assert!(matches!(result, Ok(SpawnAgentToolOutput::Success { .. })));
-
-    let artifacts = environment.published_artifacts();
-    assert_eq!(artifacts.len(), 1);
-    let (task_id, kind, content, summary) = &artifacts[0];
-    assert_eq!(task_id, "TASK-ARTIFACT-1");
-    assert_eq!(kind, "execution_report");
-    assert_eq!(summary, &Some("Execution Report".to_string()));
-    assert!(content.contains("# Execution Report: TASK-ARTIFACT-1"));
-    assert!(content.contains("- **Status:** Completed"));
-    assert!(content.contains("- **Tokens:** 5000 in / 800 out / 1200 cache"));
-    assert!(content.contains("## Agent Output Summary"));
-    assert!(content.contains("Lines of output from agent"));
-}
 
 #[gpui::test]
 async fn test_spawn_agent_differentiated_error_handling(cx: &mut TestAppContext) {
@@ -12717,11 +12617,12 @@ async fn test_mid_turn_model_and_settings_refresh(cx: &mut TestAppContext) {
 
 #[gpui::test]
 async fn test_subagent_task_id_prompt_formatting(cx: &mut TestAppContext) {
-    let fake = init_test(cx);
+    init_test(cx);
     let subagent_profile = cx.update(|cx| enable_default_profile_delegation(cx));
-    cx.update(|cx| {
-        LanguageModelRegistry::test(cx);
+    let fake = cx.update(|cx| {
+        let fake = LanguageModelRegistry::test(cx);
         cx.update_flags(true, vec!["subagents".to_string()]);
+        fake
     });
 
     let fs = FakeFs::new(cx.executor());
@@ -12814,8 +12715,7 @@ async fn test_subagent_task_id_prompt_formatting(cx: &mut TestAppContext) {
                 _ => None,
             })
             .expect("text content should exist");
-        assert!(text.contains("Implement persistence layer"));
-        assert!(text.contains("Task reference: TASK-42"));
+        assert_eq!(text, "Implement persistence layer");
     });
 }
 
@@ -13813,6 +13713,7 @@ async fn test_auto_cleanup_terminal_task_removes_worktree_preserves_branch(
         created_at: None,
         assigned_profile: None,
         model: None,
+        session_id: None,
         metrics: None,
     };
 
@@ -13899,6 +13800,7 @@ async fn test_auto_cleanup_retains_worktree_on_commit_error(cx: &mut TestAppCont
         created_at: None,
         assigned_profile: None,
         model: None,
+        session_id: None,
         metrics: None,
     };
 
@@ -13979,6 +13881,7 @@ async fn test_startup_sweep_cleans_only_terminal_tasks(cx: &mut TestAppContext) 
         created_at: None,
         assigned_profile: None,
         model: None,
+        session_id: None,
         metrics: None,
     };
     let task2 = AgentTaskSummary {
@@ -13993,6 +13896,7 @@ async fn test_startup_sweep_cleans_only_terminal_tasks(cx: &mut TestAppContext) 
         created_at: None,
         assigned_profile: None,
         model: None,
+        session_id: None,
         metrics: None,
     };
     let task3 = AgentTaskSummary {
@@ -14007,6 +13911,7 @@ async fn test_startup_sweep_cleans_only_terminal_tasks(cx: &mut TestAppContext) 
         created_at: None,
         assigned_profile: None,
         model: None,
+        session_id: None,
         metrics: None,
     };
 

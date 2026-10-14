@@ -5,7 +5,7 @@ use project::context_server_store::ContextServerStore;
 
 use crate::agent_task::{
     AgentGoalStatus, AgentTaskArtifact, AgentTaskDetail, AgentTaskEvent, AgentTaskGraph,
-    AgentTaskId, AgentTaskProvider, AgentTaskStatus, AgentUnifiedItem,
+    AgentTaskId, AgentTaskProvider, AgentTaskStatus, AgentTurnRecord,
 };
 
 pub struct McpAgentTaskProvider {
@@ -128,10 +128,6 @@ impl AgentTaskProvider for McpAgentTaskProvider {
             "task_id".to_string(),
             serde_json::Value::String(id.to_string()),
         );
-        create_arguments.insert(
-            "idempotency_key".to_string(),
-            serde_json::Value::String(id.to_string()),
-        );
         if let Some(goal_id) = goal_id {
             create_arguments.insert(
                 "goal_id".to_string(),
@@ -230,7 +226,11 @@ impl AgentTaskProvider for McpAgentTaskProvider {
             "task_id".to_string(),
             serde_json::Value::String(id.to_string()),
         );
-        let task = self.call_tool("task_complete", Some(args), cx);
+        args.insert(
+            "status".to_string(),
+            serde_json::Value::String("completed".to_string()),
+        );
+        let task = self.call_tool("task_update", Some(args), cx);
         cx.spawn(async move |_cx| {
             task.await?;
             Ok(())
@@ -244,10 +244,14 @@ impl AgentTaskProvider for McpAgentTaskProvider {
             serde_json::Value::String(id.to_string()),
         );
         args.insert(
-            "reason".to_string(),
+            "status".to_string(),
+            serde_json::Value::String("failed".to_string()),
+        );
+        args.insert(
+            "error".to_string(),
             serde_json::Value::String(reason.to_string()),
         );
-        let task = self.call_tool("task_fail", Some(args), cx);
+        let task = self.call_tool("task_update", Some(args), cx);
         cx.spawn(async move |_cx| {
             task.await?;
             Ok(())
@@ -260,7 +264,11 @@ impl AgentTaskProvider for McpAgentTaskProvider {
             "task_id".to_string(),
             serde_json::Value::String(id.to_string()),
         );
-        let task = self.call_tool("task_archive", Some(args), cx);
+        args.insert(
+            "status".to_string(),
+            serde_json::Value::String("archived".to_string()),
+        );
+        let task = self.call_tool("task_update", Some(args), cx);
         cx.spawn(async move |_cx| {
             task.await?;
             Ok(())
@@ -273,7 +281,11 @@ impl AgentTaskProvider for McpAgentTaskProvider {
             "task_id".to_string(),
             serde_json::Value::String(id.to_string()),
         );
-        let task = self.call_tool("task_unarchive", Some(args), cx);
+        args.insert(
+            "status".to_string(),
+            serde_json::Value::String("ready".to_string()),
+        );
+        let task = self.call_tool("task_update", Some(args), cx);
         cx.spawn(async move |_cx| {
             task.await?;
             Ok(())
@@ -339,77 +351,22 @@ impl AgentTaskProvider for McpAgentTaskProvider {
         })
     }
 
-    fn record_turn_start(
+    fn record_turn(
         &self,
         task_id: &AgentTaskId,
-        prompt: &str,
-        model: Option<&str>,
-        session_id: Option<&str>,
+        record: AgentTurnRecord,
         cx: &mut App,
-    ) -> Task<Result<Option<u32>>> {
+    ) -> Task<Result<u32>> {
         let mut args = serde_json::Map::new();
         args.insert(
             "task_id".to_string(),
             serde_json::Value::String(task_id.to_string()),
         );
-        args.insert(
-            "prompt".to_string(),
-            serde_json::Value::String(prompt.to_string()),
-        );
-        if let Some(m) = model.map(str::trim).filter(|s| !s.is_empty()) {
-            args.insert(
-                "model".to_string(),
-                serde_json::Value::String(m.to_string()),
-            );
-        }
-        if let Some(s) = session_id.map(str::trim).filter(|s| !s.is_empty()) {
-            args.insert(
-                "session_id".to_string(),
-                serde_json::Value::String(s.to_string()),
-            );
-        }
-        let task = self.call_tool("task_turn_start", Some(args), cx);
-        cx.spawn(async move |_cx| {
-            let value = task.await?;
-            let turn_index = if let Some(n) = value.as_u64() {
-                Some(n as u32)
-            } else if let Some(obj) = value.as_object() {
-                obj.get("turn_index")
-                    .or_else(|| obj.get("turn"))
-                    .and_then(|v| v.as_u64())
-                    .map(|n| n as u32)
-            } else {
-                None
-            };
-            Ok(turn_index)
-        })
-    }
-
-    fn record_turn_finish(
-        &self,
-        task_id: &AgentTaskId,
-        turn_index: Option<u32>,
-        duration_ms: u64,
-        tokens: Option<language_model::TokenUsage>,
-        error: Option<&str>,
-        cx: &mut App,
-    ) -> Task<Result<()>> {
-        let mut args = serde_json::Map::new();
-        args.insert(
-            "task_id".to_string(),
-            serde_json::Value::String(task_id.to_string()),
-        );
-        if let Some(turn_index) = turn_index {
-            args.insert(
-                "turn_index".to_string(),
-                serde_json::Value::Number(turn_index.into()),
-            );
-        }
         args.insert(
             "duration_ms".to_string(),
-            serde_json::Value::Number(duration_ms.into()),
+            serde_json::Value::Number(record.duration_ms.into()),
         );
-        if let Some(tokens) = tokens {
+        if let Some(tokens) = record.tokens {
             let tokens_obj = serde_json::json!({
                 "input": tokens.input_tokens,
                 "output": tokens.output_tokens,
@@ -418,16 +375,87 @@ impl AgentTaskProvider for McpAgentTaskProvider {
             });
             args.insert("tokens".to_string(), tokens_obj);
         }
-        if let Some(error) = error.map(str::trim).filter(|s| !s.is_empty()) {
+        if let Some(model) = record
+            .model
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            args.insert(
+                "model".to_string(),
+                serde_json::Value::String(model.to_string()),
+            );
+        }
+        if let Some(session_id) = record
+            .session_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            args.insert(
+                "session_id".to_string(),
+                serde_json::Value::String(session_id.to_string()),
+            );
+        }
+        if let Some(error) = record
+            .error
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
             args.insert(
                 "error".to_string(),
                 serde_json::Value::String(error.to_string()),
             );
         }
-        let task = self.call_tool("task_turn_finish", Some(args), cx);
+        if let Some(branch) = record
+            .branch
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            args.insert(
+                "branch".to_string(),
+                serde_json::Value::String(branch.to_string()),
+            );
+        }
+        if let Some(commit_sha) = record
+            .commit_sha
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            args.insert(
+                "commit_sha".to_string(),
+                serde_json::Value::String(commit_sha.to_string()),
+            );
+        }
+        if let Some(output_summary) = record
+            .output_summary
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            args.insert(
+                "output_summary".to_string(),
+                serde_json::Value::String(output_summary.to_string()),
+            );
+        }
+        let task = self.call_tool("task_record_turn", Some(args), cx);
         cx.spawn(async move |_cx| {
-            task.await?;
-            Ok(())
+            let value = task.await?;
+            let turn_index = if let Some(n) = value.as_u64() {
+                n as u32
+            } else if let Some(obj) = value.as_object() {
+                obj.get("turn_index")
+                    .or_else(|| obj.get("turn"))
+                    .and_then(|v| v.as_u64())
+                    .map(|n| n as u32)
+                    .unwrap_or(0)
+            } else {
+                0
+            };
+            Ok(turn_index)
         })
     }
 
@@ -476,115 +504,25 @@ impl AgentTaskProvider for McpAgentTaskProvider {
         })
     }
 
-    fn fetch_items(&self, cx: &mut App) -> Task<Result<Vec<AgentUnifiedItem>>> {
-        let task = self.call_tool("item_list", Some(serde_json::Map::new()), cx);
-        cx.spawn(async move |_cx| {
-            let value = task.await?;
-            let items_value = match value {
-                serde_json::Value::Array(_) => value,
-                serde_json::Value::Object(mut map) => map
-                    .remove("items")
-                    .unwrap_or(serde_json::Value::Array(Vec::new())),
-                _ => serde_json::Value::Array(Vec::new()),
-            };
-            let mut items: Vec<AgentUnifiedItem> = serde_json::from_value(items_value)
-                .context("failed to parse Vec<AgentUnifiedItem> from item_list response")?;
-            for item in &mut items {
-                if item.metrics.is_none() {
-                    if let Some(metadata) = &item.metadata {
-                        if let Some(m) = metadata.get("metrics") {
-                            if let Ok(parsed) = serde_json::from_value(m.clone()) {
-                                item.metrics = Some(parsed);
-                            }
-                        }
-                    }
-                }
-            }
-            Ok(items)
-        })
-    }
-
     fn set_task_status(
         &self,
         id: &AgentTaskId,
         status: &AgentTaskStatus,
         cx: &mut App,
     ) -> Task<Result<()>> {
-        let (tool_name, extra_args) = match status {
-            AgentTaskStatus::Ready => ("task_retry", None),
-            AgentTaskStatus::Running => ("task_start", None),
-            AgentTaskStatus::Completed => ("task_complete", None),
-            AgentTaskStatus::Failed => (
-                "task_fail",
-                Some(("reason", "marked failed from Agent Task Panel".to_string())),
-            ),
-            AgentTaskStatus::Cancelled => ("task_cancel", None),
-            AgentTaskStatus::Archived => ("task_archive", None),
-            other => {
-                return Task::ready(Err(anyhow::anyhow!(
-                    "cannot set task status {:?} via MCP",
-                    other
-                )));
-            }
-        };
-
         let mut args = serde_json::Map::new();
         args.insert(
             "task_id".to_string(),
             serde_json::Value::String(id.to_string()),
         );
-        if let Some((key, val)) = extra_args {
-            args.insert(key.to_string(), serde_json::Value::String(val));
-        }
-
-        let is_running = *status == AgentTaskStatus::Running;
-        let task_id_str = id.to_string();
-        let store = self.store.clone();
-        let server_id = self.server_id.clone();
-
-        let task = self.call_tool(tool_name, Some(args), cx);
-        cx.spawn(async move |cx| match task.await {
-            Ok(_) => Ok(()),
-            Err(first_err) if is_running => {
-                let mut retry_args = serde_json::Map::new();
-                retry_args.insert(
-                    "task_id".to_string(),
-                    serde_json::Value::String(task_id_str.clone()),
-                );
-                let retry_task = cx.update(|cx| {
-                    let provider = McpAgentTaskProvider::new(store.clone(), server_id.clone());
-                    provider.call_tool("task_retry", Some(retry_args.clone()), cx)
-                });
-                if retry_task.await.is_ok() {
-                    let start_again_task = cx.update(|cx| {
-                        let provider = McpAgentTaskProvider::new(store.clone(), server_id.clone());
-                        provider.call_tool("task_start", Some(retry_args), cx)
-                    });
-                    if start_again_task.await.is_ok() {
-                        return Ok(());
-                    }
-                }
-
-                let mut update_args = serde_json::Map::new();
-                update_args.insert(
-                    "task_id".to_string(),
-                    serde_json::Value::String(task_id_str),
-                );
-                update_args.insert(
-                    "status".to_string(),
-                    serde_json::Value::String("running".to_string()),
-                );
-                let update_task = cx.update(|cx| {
-                    let provider = McpAgentTaskProvider::new(store, server_id);
-                    provider.call_tool("task_update", Some(update_args), cx)
-                });
-                if update_task.await.is_ok() {
-                    Ok(())
-                } else {
-                    Err(first_err)
-                }
-            }
-            Err(err) => Err(err),
+        args.insert(
+            "status".to_string(),
+            serde_json::Value::String(status.as_str().to_string()),
+        );
+        let task = self.call_tool("task_update", Some(args), cx);
+        cx.spawn(async move |_cx| {
+            task.await?;
+            Ok(())
         })
     }
 
@@ -616,7 +554,11 @@ impl AgentTaskProvider for McpAgentTaskProvider {
             "goal_id".to_string(),
             serde_json::Value::String(goal_id.to_string()),
         );
-        let task = self.call_tool("goal_archive", Some(args), cx);
+        args.insert(
+            "status".to_string(),
+            serde_json::Value::String("archived".to_string()),
+        );
+        let task = self.call_tool("goal_update", Some(args), cx);
         cx.spawn(async move |_cx| {
             task.await?;
             Ok(())
@@ -629,7 +571,11 @@ impl AgentTaskProvider for McpAgentTaskProvider {
             "goal_id".to_string(),
             serde_json::Value::String(goal_id.to_string()),
         );
-        let task = self.call_tool("goal_unarchive", Some(args), cx);
+        args.insert(
+            "status".to_string(),
+            serde_json::Value::String("running".to_string()),
+        );
+        let task = self.call_tool("goal_update", Some(args), cx);
         cx.spawn(async move |_cx| {
             task.await?;
             Ok(())
