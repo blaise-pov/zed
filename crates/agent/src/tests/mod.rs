@@ -13049,6 +13049,93 @@ async fn test_mcp_agent_task_provider_fetch_graph(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+async fn test_mcp_agent_task_provider_update_task_and_goal_title(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/", json!({})).await;
+    let project = Project::test(fs.clone(), [path!("/").as_ref()], cx).await;
+    let context_server_store = project.read_with(cx, |p, _| p.context_server_store());
+
+    let mut tool_calls = setup_context_server(
+        DEFAULT_TASK_GRAPH_SERVER_ID,
+        vec![
+            context_server::types::Tool {
+                name: "task_update".into(),
+                title: None,
+                description: None,
+                input_schema: serde_json::Value::Object(Default::default()),
+                output_schema: None,
+                annotations: None,
+            },
+            context_server::types::Tool {
+                name: "goal_update".into(),
+                title: None,
+                description: None,
+                input_schema: serde_json::Value::Object(Default::default()),
+                output_schema: None,
+                annotations: None,
+            },
+        ],
+        &context_server_store,
+        cx,
+    );
+
+    let provider = McpAgentTaskProvider::new(
+        context_server_store,
+        ContextServerId(DEFAULT_TASK_GRAPH_SERVER_ID.into()),
+    );
+
+    let update_task = cx.update(|cx| {
+        provider.update_task_title(&AgentTaskId::from("TASK-42"), "Updated Task Title", cx)
+    });
+
+    let (params, tx) = tool_calls.next().await.expect("expected task_update call");
+    assert_eq!(params.name, "task_update");
+    let args = params.arguments.expect("expected arguments");
+    assert_eq!(
+        args.get("task_id").and_then(|v| v.as_str()),
+        Some("TASK-42")
+    );
+    assert_eq!(
+        args.get("title").and_then(|v| v.as_str()),
+        Some("Updated Task Title")
+    );
+
+    tx.send(context_server::types::CallToolResponse {
+        content: vec![],
+        is_error: None,
+        meta: None,
+        structured_content: None,
+    })
+    .unwrap();
+    update_task.await.expect("update_task_title should succeed");
+
+    let update_goal =
+        cx.update(|cx| provider.update_goal_title("GOAL-99", "Updated Goal Title", cx));
+
+    let (params, tx) = tool_calls.next().await.expect("expected goal_update call");
+    assert_eq!(params.name, "goal_update");
+    let args = params.arguments.expect("expected arguments");
+    assert_eq!(
+        args.get("goal_id").and_then(|v| v.as_str()),
+        Some("GOAL-99")
+    );
+    assert_eq!(
+        args.get("title").and_then(|v| v.as_str()),
+        Some("Updated Goal Title")
+    );
+
+    tx.send(context_server::types::CallToolResponse {
+        content: vec![],
+        is_error: None,
+        meta: None,
+        structured_content: None,
+    })
+    .unwrap();
+    update_goal.await.expect("update_goal_title should succeed");
+}
+
+#[gpui::test]
 async fn test_mcp_agent_task_provider_missing_server(cx: &mut TestAppContext) {
     init_test(cx);
     let fs = FakeFs::new(cx.executor());

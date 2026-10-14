@@ -515,6 +515,14 @@ pub trait AgentTaskProvider: 'static + Send + Sync {
         let _ = (task_id, kind, content, summary, cx);
         Task::ready(Ok(String::new()))
     }
+    fn update_task_title(&self, id: &AgentTaskId, title: &str, cx: &mut App) -> Task<Result<()>> {
+        let _ = (id, title, cx);
+        Task::ready(Err(anyhow::anyhow!("update_task_title not supported")))
+    }
+    fn update_goal_title(&self, goal_id: &str, title: &str, cx: &mut App) -> Task<Result<()>> {
+        let _ = (goal_id, title, cx);
+        Task::ready(Err(anyhow::anyhow!("update_goal_title not supported")))
+    }
     fn set_task_status(
         &self,
         id: &AgentTaskId,
@@ -867,5 +875,79 @@ mod tests {
         assert_eq!(m.duration_ms, Some(5000));
         assert_eq!(m.input_tokens, Some(100));
         assert_eq!(m.output_tokens, Some(20));
+    }
+
+    #[gpui::test]
+    async fn test_default_agent_task_provider_update_title_unsupported(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        struct DefaultProvider;
+        impl AgentTaskProvider for DefaultProvider {
+            fn server_id(&self) -> ContextServerId {
+                ContextServerId("dummy".into())
+            }
+            fn fetch_graph(&self, _cx: &mut App) -> Task<Result<AgentTaskGraph>> {
+                Task::ready(Err(anyhow::anyhow!("not implemented")))
+            }
+            fn get_task(&self, _id: &AgentTaskId, _cx: &mut App) -> Task<Result<AgentTaskDetail>> {
+                Task::ready(Err(anyhow::anyhow!("not implemented")))
+            }
+            fn complete_task(&self, _id: &AgentTaskId, _cx: &mut App) -> Task<Result<()>> {
+                Task::ready(Err(anyhow::anyhow!("not implemented")))
+            }
+            fn fail_task(
+                &self,
+                _id: &AgentTaskId,
+                _reason: &str,
+                _cx: &mut App,
+            ) -> Task<Result<()>> {
+                Task::ready(Err(anyhow::anyhow!("not implemented")))
+            }
+            fn archive_task(&self, _id: &AgentTaskId, _cx: &mut App) -> Task<Result<()>> {
+                Task::ready(Err(anyhow::anyhow!("not implemented")))
+            }
+            fn unarchive_task(&self, _id: &AgentTaskId, _cx: &mut App) -> Task<Result<()>> {
+                Task::ready(Err(anyhow::anyhow!("not implemented")))
+            }
+            fn delete_task(&self, _id: &AgentTaskId, _cx: &mut App) -> Task<Result<()>> {
+                Task::ready(Err(anyhow::anyhow!("not implemented")))
+            }
+            fn list_events(&self, _limit: u32, _cx: &mut App) -> Task<Result<Vec<AgentTaskEvent>>> {
+                Task::ready(Err(anyhow::anyhow!("not implemented")))
+            }
+            fn list_artifacts(
+                &self,
+                _task_id: &AgentTaskId,
+                _cx: &mut App,
+            ) -> Task<Result<Vec<AgentTaskArtifact>>> {
+                Task::ready(Err(anyhow::anyhow!("not implemented")))
+            }
+            fn get_artifact(
+                &self,
+                _artifact_id: &str,
+                _cx: &mut App,
+            ) -> Task<Result<AgentTaskArtifact>> {
+                Task::ready(Err(anyhow::anyhow!("not implemented")))
+            }
+        }
+
+        let provider = DefaultProvider;
+        let task_res = cx
+            .update(|cx| {
+                provider.update_task_title(&AgentTaskId::from("TASK-1"), "New Title", cx)
+            })
+            .await;
+        assert_eq!(
+            task_res.unwrap_err().to_string(),
+            "update_task_title not supported"
+        );
+
+        let goal_res = cx
+            .update(|cx| provider.update_goal_title("GOAL-1", "New Title", cx))
+            .await;
+        assert_eq!(
+            goal_res.unwrap_err().to_string(),
+            "update_goal_title not supported"
+        );
     }
 }

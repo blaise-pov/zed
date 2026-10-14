@@ -594,4 +594,38 @@ impl AgentTaskProvider for McpAgentTaskProvider {
             Ok(())
         })
     }
+
+    fn update_task_title(&self, id: &AgentTaskId, title: &str, cx: &mut App) -> Task<Result<()>> {
+        let mut args = serde_json::Map::new();
+        args.insert(
+            "task_id".to_string(),
+            serde_json::Value::String(id.to_string()),
+        );
+        args.insert(
+            "title".to_string(),
+            serde_json::Value::String(title.to_string()),
+        );
+        let task = self.call_tool("task_update", Some(args), cx);
+        cx.spawn(async move |_cx| {
+            task.await?;
+            Ok(())
+        })
+    }
+
+    fn update_goal_title(&self, goal_id: &str, title: &str, cx: &mut App) -> Task<Result<()>> {
+        let mut args = serde_json::Map::new();
+        args.insert(
+            "goal_id".to_string(),
+            serde_json::Value::String(goal_id.to_string()),
+        );
+        args.insert(
+            "title".to_string(),
+            serde_json::Value::String(title.to_string()),
+        );
+        let task = self.call_tool("goal_update", Some(args), cx);
+        cx.spawn(async move |_cx| {
+            task.await?;
+            Ok(())
+        })
+    }
 }

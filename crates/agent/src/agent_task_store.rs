@@ -299,6 +299,38 @@ impl AgentTaskStore {
         })
     }
 
+    pub fn update_task_title(
+        &mut self,
+        id: &AgentTaskId,
+        title: &str,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
+        let provider = self.provider.clone();
+        let task = provider.update_task_title(id, title, cx);
+        cx.spawn(async move |this, cx| {
+            task.await?;
+            let refresh_task = this.update(cx, |store, cx| store.refresh(cx))?;
+            refresh_task.await?;
+            Ok(())
+        })
+    }
+
+    pub fn update_goal_title(
+        &mut self,
+        goal_id: &str,
+        title: &str,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
+        let provider = self.provider.clone();
+        let task = provider.update_goal_title(goal_id, title, cx);
+        cx.spawn(async move |this, cx| {
+            task.await?;
+            let refresh_task = this.update(cx, |store, cx| store.refresh(cx))?;
+            refresh_task.await?;
+            Ok(())
+        })
+    }
+
     pub fn get_task_detail(&self, id: &AgentTaskId, cx: &mut App) -> Task<Result<AgentTaskDetail>> {
         self.provider.get_task(id, cx)
     }
@@ -336,6 +368,8 @@ mod tests {
         archive_goal_calls: Vec<String>,
         unarchive_goal_calls: Vec<String>,
         delete_goal_calls: Vec<String>,
+        update_task_title_calls: Vec<(AgentTaskId, String)>,
+        update_goal_title_calls: Vec<(String, String)>,
         fetch_graph_count: usize,
     }
 
@@ -435,6 +469,34 @@ mod tests {
                 .unwrap()
                 .delete_goal_calls
                 .push(goal_id.to_string());
+            Task::ready(Ok(()))
+        }
+
+        fn update_task_title(
+            &self,
+            id: &AgentTaskId,
+            title: &str,
+            _cx: &mut App,
+        ) -> Task<Result<()>> {
+            self.calls
+                .lock()
+                .unwrap()
+                .update_task_title_calls
+                .push((id.clone(), title.to_string()));
+            Task::ready(Ok(()))
+        }
+
+        fn update_goal_title(
+            &self,
+            goal_id: &str,
+            title: &str,
+            _cx: &mut App,
+        ) -> Task<Result<()>> {
+            self.calls
+                .lock()
+                .unwrap()
+                .update_goal_title_calls
+                .push((goal_id.to_string(), title.to_string()));
             Task::ready(Ok(()))
         }
 
@@ -709,6 +771,59 @@ mod tests {
         assert_eq!(counts.unarchive_goal_calls, vec!["GOAL-1".to_string()]);
         assert_eq!(counts.delete_goal_calls, vec!["GOAL-1".to_string()]);
         assert_eq!(counts.fetch_graph_count, initial_refreshes + 4);
+    }
+
+    #[gpui::test]
+    async fn test_agent_task_store_update_task_title(cx: &mut TestAppContext) {
+        let calls = Arc::new(Mutex::new(CallCounts::default()));
+        let provider = Arc::new(TestProvider {
+            calls: calls.clone(),
+            ..Default::default()
+        });
+        let store = cx.update(|cx| cx.new(|cx| AgentTaskStore::new(provider, cx)));
+        cx.run_until_parked();
+
+        let initial_refreshes = calls.lock().unwrap().fetch_graph_count;
+        let task_id = AgentTaskId::from("TASK-1");
+        let result = store
+            .update(cx, |store, cx| {
+                store.update_task_title(&task_id, "New Task Title", cx)
+            })
+            .await;
+        assert!(result.is_ok());
+
+        let counts = calls.lock().unwrap();
+        assert_eq!(
+            counts.update_task_title_calls,
+            vec![(task_id, "New Task Title".to_string())]
+        );
+        assert_eq!(counts.fetch_graph_count, initial_refreshes + 1);
+    }
+
+    #[gpui::test]
+    async fn test_agent_task_store_update_goal_title(cx: &mut TestAppContext) {
+        let calls = Arc::new(Mutex::new(CallCounts::default()));
+        let provider = Arc::new(TestProvider {
+            calls: calls.clone(),
+            ..Default::default()
+        });
+        let store = cx.update(|cx| cx.new(|cx| AgentTaskStore::new(provider, cx)));
+        cx.run_until_parked();
+
+        let initial_refreshes = calls.lock().unwrap().fetch_graph_count;
+        let result = store
+            .update(cx, |store, cx| {
+                store.update_goal_title("GOAL-1", "New Goal Title", cx)
+            })
+            .await;
+        assert!(result.is_ok());
+
+        let counts = calls.lock().unwrap();
+        assert_eq!(
+            counts.update_goal_title_calls,
+            vec![("GOAL-1".to_string(), "New Goal Title".to_string())]
+        );
+        assert_eq!(counts.fetch_graph_count, initial_refreshes + 1);
     }
 
     #[test]
