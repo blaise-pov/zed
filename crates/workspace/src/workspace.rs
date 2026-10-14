@@ -4760,33 +4760,54 @@ impl Workspace {
     ) -> Option<Arc<dyn PanelHandle>> {
         let mut result_panel = None;
         let mut serialize = false;
-        for dock in self.all_docks() {
-            if let Some(panel_index) = dock.read(cx).panel_index_for_type::<T>() {
-                let mut focus_center = false;
-                let panel = dock.update(cx, |dock, cx| {
-                    dock.activate_panel(panel_index, window, cx);
+        let target_dock = [
+            self.left_dock.clone(),
+            self.bottom_dock.clone(),
+            self.right_dock.clone(),
+        ]
+        .into_iter()
+        .find_map(|dock| {
+            let dock_read = dock.read(cx);
+            let position = dock_read.position();
+            dock_read
+                .panel_index_for_type::<T>()
+                .map(|panel_index| (dock, position, panel_index))
+        });
 
-                    let panel = dock.active_panel().cloned();
-                    if let Some(panel) = panel.as_ref() {
-                        if should_focus(&**panel, window, cx) {
-                            dock.set_open(true, window, cx);
-                            panel.activation_focus_handle(cx).focus(window, cx);
-                        } else {
-                            focus_center = true;
-                        }
+        if let Some((dock, dock_position, panel_index)) = target_dock {
+            self.dismiss_zoomed_items_to_reveal(Some(dock_position), window, cx);
+
+            let mut focus_center = false;
+            let panel = dock.update(cx, |dock, cx| {
+                dock.activate_panel(panel_index, window, cx);
+
+                let panel = dock.active_panel().cloned();
+                if let Some(panel) = panel.as_ref() {
+                    if should_focus(&**panel, window, cx) {
+                        dock.set_open(true, window, cx);
+                        panel.activation_focus_handle(cx).focus(window, cx);
+                    } else {
+                        focus_center = true;
                     }
-                    panel
-                });
-
-                if focus_center {
-                    self.active_pane
-                        .update(cx, |pane, cx| window.focus(&pane.focus_handle(cx), cx))
                 }
+                panel
+            });
 
-                result_panel = panel;
-                serialize = true;
-                break;
+            if focus_center {
+                self.dismiss_zoomed_items_to_reveal(None, window, cx);
+                self.active_pane
+                    .update(cx, |pane, cx| window.focus(&pane.focus_handle(cx), cx));
+            } else if self.zoomed_position == Some(dock_position) {
+                if let Some(panel) = panel.as_ref().filter(|panel| panel.is_zoomed(window, cx)) {
+                    self.zoomed = Some(panel.to_any().downgrade());
+                    cx.emit(Event::ZoomChanged);
+                } else {
+                    self.dismiss_zoomed_items_to_reveal(None, window, cx);
+                }
             }
+
+            result_panel = panel;
+            serialize = true;
         }
 
         if serialize {
@@ -20184,6 +20205,266 @@ mod tests {
             assert!(!first_panel.read(cx).zoomed);
             assert!(second_panel.read(cx).zoomed);
         });
+    }
+
+
+    #[gpui::test]
+    async fn test_panel_focus_switch_preserves_zoom_in_same_dock(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+
+        let first_panel = workspace.update_in(cx, |workspace, window, cx| {
+            let panel = cx.new(|cx| TestPanel::new(DockPosition::Bottom, 100, cx));
+            workspace.add_panel(panel.clone(), window, cx);
+            workspace.toggle_panel_focus::<TestPanel>(window, cx);
+            panel
+        });
+
+        let second_panel = workspace.update_in(cx, |workspace, window, cx| {
+            let panel = cx.new(|cx| SecondTestPanel {
+                focus_handle: cx.focus_handle(),
+                zoomed: false,
+            });
+            workspace.add_panel(panel.clone(), window, cx);
+            panel
+        });
+
+        first_panel.update(cx, |_, cx| cx.emit(PanelEvent::ZoomIn));
+        cx.executor().run_until_parked();
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            assert!(workspace.bottom_dock().read(cx).is_open());
+            assert_eq!(workspace.zoomed_position, Some(DockPosition::Bottom));
+            assert!(first_panel.read(cx).zoomed);
+            assert!(first_panel.read(cx).focus_handle(cx).contains_focused(window, cx));
+        });
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.toggle_panel_focus::<SecondTestPanel>(window, cx);
+        });
+        cx.executor().run_until_parked();
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            let dock = workspace.bottom_dock().read(cx);
+            assert!(dock.is_open());
+            assert_eq!(workspace.zoomed_position, Some(DockPosition::Bottom));
+            assert_eq!(
+                dock.active_panel().map(|p| p.panel_id()),
+                Some(second_panel.entity_id())
+            );
+            assert!(!first_panel.read(cx).zoomed);
+            assert!(second_panel.read(cx).zoomed);
+            assert_eq!(
+                workspace.zoomed_item().and_then(|item| item.upgrade()).map(|v| v.entity_id()),
+                Some(second_panel.entity_id())
+            );
+            assert!(second_panel.read(cx).focus_handle(cx).contains_focused(window, cx));
+        });
+    }
+
+    #[gpui::test]
+    async fn test_panel_focus_switch_dismisses_zoom_for_non_zoomable_panel(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+
+        let first_panel = workspace.update_in(cx, |workspace, window, cx| {
+            let panel = cx.new(|cx| TestPanel::new(DockPosition::Bottom, 100, cx));
+            workspace.add_panel(panel.clone(), window, cx);
+            workspace.toggle_panel_focus::<TestPanel>(window, cx);
+            panel
+        });
+
+        let non_zoomable_panel = workspace.update_in(cx, |workspace, window, cx| {
+            let panel = cx.new(|cx| NonZoomableTestPanel {
+                focus_handle: cx.focus_handle(),
+            });
+            workspace.add_panel(panel.clone(), window, cx);
+            panel
+        });
+
+        first_panel.update(cx, |_, cx| cx.emit(PanelEvent::ZoomIn));
+        cx.executor().run_until_parked();
+
+        workspace.update_in(cx, |workspace, _window, cx| {
+            assert_eq!(workspace.zoomed_position, Some(DockPosition::Bottom));
+            assert!(first_panel.read(cx).zoomed);
+        });
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.toggle_panel_focus::<NonZoomableTestPanel>(window, cx);
+        });
+        cx.executor().run_until_parked();
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            let dock = workspace.bottom_dock().read(cx);
+            assert!(dock.is_open());
+            assert_eq!(workspace.zoomed_position, None);
+            assert!(workspace.zoomed_item().is_none());
+            assert_eq!(
+                dock.active_panel().map(|p| p.panel_id()),
+                Some(non_zoomable_panel.entity_id())
+            );
+            assert!(!first_panel.read(cx).zoomed);
+            assert!(non_zoomable_panel.read(cx).focus_handle(cx).contains_focused(window, cx));
+        });
+    }
+
+    #[gpui::test]
+    async fn test_panel_focus_switch_to_different_dock_dismisses_zoom(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+
+        let left_panel = workspace.update_in(cx, |workspace, window, cx| {
+            let panel = cx.new(|cx| TestPanel::new(DockPosition::Left, 100, cx));
+            workspace.add_panel(panel.clone(), window, cx);
+            workspace.toggle_panel_focus::<TestPanel>(window, cx);
+            panel
+        });
+
+        let bottom_panel = workspace.update_in(cx, |workspace, window, cx| {
+            let panel = cx.new(|cx| SecondTestPanel {
+                focus_handle: cx.focus_handle(),
+                zoomed: false,
+            });
+            workspace.add_panel(panel.clone(), window, cx);
+            panel
+        });
+
+        left_panel.update(cx, |_, cx| cx.emit(PanelEvent::ZoomIn));
+        cx.executor().run_until_parked();
+
+        workspace.update_in(cx, |workspace, _window, cx| {
+            assert!(workspace.left_dock().read(cx).is_open());
+            assert_eq!(workspace.zoomed_position, Some(DockPosition::Left));
+            assert!(left_panel.read(cx).zoomed);
+        });
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.toggle_panel_focus::<SecondTestPanel>(window, cx);
+        });
+        cx.executor().run_until_parked();
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            assert!(!workspace.left_dock().read(cx).is_open());
+            assert!(workspace.bottom_dock().read(cx).is_open());
+            assert_eq!(workspace.zoomed_position, None);
+            assert!(workspace.zoomed_item().is_none());
+            assert!(!bottom_panel.read(cx).zoomed);
+            assert!(bottom_panel.read(cx).focus_handle(cx).contains_focused(window, cx));
+        });
+    }
+
+    #[gpui::test]
+    async fn test_toggle_off_zoomed_panel_dismisses_zoom(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+
+        let panel = workspace.update_in(cx, |workspace, window, cx| {
+            let panel = cx.new(|cx| TestPanel::new(DockPosition::Bottom, 100, cx));
+            workspace.add_panel(panel.clone(), window, cx);
+            workspace.toggle_panel_focus::<TestPanel>(window, cx);
+            panel
+        });
+
+        panel.update(cx, |_, cx| cx.emit(PanelEvent::ZoomIn));
+        cx.executor().run_until_parked();
+
+        workspace.update_in(cx, |workspace, _window, cx| {
+            assert!(workspace.bottom_dock().read(cx).is_open());
+            assert_eq!(workspace.zoomed_position, Some(DockPosition::Bottom));
+            assert!(panel.read(cx).zoomed);
+        });
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.toggle_panel_focus::<TestPanel>(window, cx);
+        });
+        cx.executor().run_until_parked();
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            assert_eq!(workspace.zoomed_position, None);
+            assert!(workspace.zoomed_item().is_none());
+            assert!(workspace.active_pane.read(cx).focus_handle(cx).contains_focused(window, cx));
+        });
+    }
+
+    struct NonZoomableTestPanel {
+        focus_handle: FocusHandle,
+    }
+
+    impl EventEmitter<PanelEvent> for NonZoomableTestPanel {}
+
+    impl Focusable for NonZoomableTestPanel {
+        fn focus_handle(&self, _cx: &App) -> FocusHandle {
+            self.focus_handle.clone()
+        }
+    }
+
+    impl Render for NonZoomableTestPanel {
+        fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .id("non-zoomable-test-panel")
+                .track_focus(&self.focus_handle(cx))
+        }
+    }
+
+    impl Panel for NonZoomableTestPanel {
+        fn persistent_name() -> &'static str {
+            "NonZoomableTestPanel"
+        }
+
+        fn panel_key() -> &'static str {
+            "NonZoomableTestPanel"
+        }
+
+        fn position(&self, _: &Window, _: &App) -> DockPosition {
+            DockPosition::Bottom
+        }
+
+        fn position_is_valid(&self, _: DockPosition) -> bool {
+            true
+        }
+
+        fn set_position(&mut self, _: DockPosition, _: &mut Window, _: &mut Context<Self>) {}
+
+        fn default_size(&self, _: &Window, _: &App) -> Pixels {
+            px(300.)
+        }
+
+        fn icon(&self, _: &Window, _: &App) -> Option<ui::IconName> {
+            None
+        }
+
+        fn icon_tooltip(&self, _: &Window, _: &App) -> Option<&'static str> {
+            None
+        }
+
+        fn toggle_action(&self) -> Box<dyn Action> {
+            crate::dock::test::ToggleTestPanel.boxed_clone()
+        }
+
+        fn activation_priority(&self) -> u32 {
+            300
+        }
     }
 
     struct SecondTestPanel {

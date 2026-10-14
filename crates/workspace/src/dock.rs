@@ -949,13 +949,24 @@ impl Dock {
         cx: &mut Context<Self>,
     ) {
         if Some(panel_ix) != self.active_panel_index {
+            let was_zoomed = self.zoom_layer_open
+                && self
+                    .active_panel_entry()
+                    .map_or(false, |entry| entry.panel.is_zoomed(window, cx));
             if let Some(active_panel) = self.active_panel_entry() {
                 active_panel.panel.set_active(false, window, cx);
+                if was_zoomed {
+                    active_panel.panel.set_zoomed(false, window, cx);
+                }
             }
 
             self.active_panel_index = Some(panel_ix);
             if let Some(active_panel) = self.active_panel_entry() {
                 active_panel.panel.set_active(true, window, cx);
+                if was_zoomed {
+                    active_panel.panel.set_zoomed(true, window, cx);
+                    self.zoom_layer_open = active_panel.panel.is_zoomed(window, cx);
+                }
             }
 
             cx.notify();
