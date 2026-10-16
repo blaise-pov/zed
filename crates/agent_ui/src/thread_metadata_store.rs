@@ -1124,14 +1124,6 @@ impl ThreadMetadataStore {
         })
     }
 
-    pub fn get_all_archived_branch_names(
-        &self,
-        cx: &App,
-    ) -> Task<anyhow::Result<HashMap<ThreadId, HashMap<PathBuf, String>>>> {
-        let db = self.db.clone();
-        cx.background_spawn(async move { db.get_all_archived_branch_names() })
-    }
-
     fn update_archived(&mut self, thread_id: ThreadId, archived: bool, cx: &mut Context<Self>) {
         if let Some(thread) = self.threads.get(&thread_id) {
             self.save_internal(ThreadMetadata {
@@ -1711,27 +1703,6 @@ impl ThreadMetadataDb {
             "SELECT COUNT(*) FROM thread_archived_worktrees WHERE archived_worktree_id = ?1",
         )?(archived_worktree_id)
         .map(|count| count.unwrap_or(0) > 0)
-    }
-
-    pub fn get_all_archived_branch_names(
-        &self,
-    ) -> anyhow::Result<HashMap<ThreadId, HashMap<PathBuf, String>>> {
-        let rows = self.select::<(ThreadId, String, String)>(
-            "SELECT t.thread_id, a.worktree_path, a.branch_name \
-             FROM thread_archived_worktrees t \
-             JOIN archived_git_worktrees a ON a.id = t.archived_worktree_id \
-             WHERE a.branch_name IS NOT NULL \
-             ORDER BY a.id ASC",
-        )?()?;
-
-        let mut result: HashMap<ThreadId, HashMap<PathBuf, String>> = HashMap::default();
-        for (thread_id, worktree_path, branch_name) in rows {
-            result
-                .entry(thread_id)
-                .or_default()
-                .insert(PathBuf::from(worktree_path), branch_name);
-        }
-        Ok(result)
     }
 }
 
