@@ -745,6 +745,7 @@ mod tests {
                 tasks_done: 0,
                 created_at: None,
                 metrics: None,
+                session_id: None,
             },
             AgentGoalSummary {
                 goal_id: "GOAL-2".to_string(),
@@ -755,6 +756,7 @@ mod tests {
                 tasks_done: 0,
                 created_at: None,
                 metrics: None,
+                session_id: None,
             },
         ];
 
@@ -999,6 +1001,7 @@ mod tests {
             tasks_done: 0,
             created_at: None,
             metrics: None,
+            session_id: None,
         }];
 
         let snapshot = cx
@@ -1227,6 +1230,7 @@ mod tests {
             tasks_done: 0,
             created_at: None,
             metrics: None,
+            session_id: None,
         }];
 
         let snap1 = status_entity

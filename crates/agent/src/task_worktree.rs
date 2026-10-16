@@ -5,9 +5,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 #[cfg(not(any(test, feature = "test-support")))]
 use std::sync::LazyLock;
+use std::time::Duration;
 
 use anyhow::{Context as _, Result};
 use fs::Fs;
+use futures::FutureExt as _;
 use git::repository::{AskPassDelegate, CommitOptions, CreateWorktreeTarget, RepoPath};
 use gpui::{App, AsyncApp, Entity, Task};
 use project::{
@@ -883,6 +885,7 @@ pub fn notify_task_worktree_slot_available() {
     }
 }
 
+#[derive(Debug)]
 pub struct TaskWorktreeSlotGuard {
     pool_key: ProjectPoolKey,
     active: bool,
@@ -960,6 +963,138 @@ impl Drop for NotifiedWaiterGuard {
     }
 }
 
+const MAX_REMOVAL_ATTEMPTS: usize = 5;
+const INITIAL_REMOVAL_BACKOFF: Duration = Duration::from_millis(50);
+const MAX_REMOVAL_BACKOFF: Duration = Duration::from_millis(800);
+const DEFAULT_SLOT_TIMEOUT: Duration = Duration::from_secs(45);
+
+fn is_sharing_violation(error: &anyhow::Error) -> bool {
+    for cause in error.chain() {
+        if let Some(io_error) = cause.downcast_ref::<std::io::Error>() {
+            if io_error.raw_os_error() == Some(32) {
+                return true;
+            }
+        }
+    }
+    let message = format!("{error:#}").to_lowercase();
+    message.contains("sharing violation")
+}
+
+fn removal_backoff_duration(attempt: usize) -> Duration {
+    let mut backoff = INITIAL_REMOVAL_BACKOFF;
+    for _ in 0..attempt {
+        backoff = (backoff * 2).min(MAX_REMOVAL_BACKOFF);
+    }
+    backoff
+}
+
+async fn remove_worktree_from_git_and_fs(
+    repository: &Entity<Repository>,
+    file_system: &Arc<dyn Fs>,
+    worktree_path: &Path,
+    force: bool,
+    description: &str,
+    cx: &mut AsyncApp,
+) -> Result<()> {
+    let mut git_remove_result = Ok(());
+    for attempt in 0..MAX_REMOVAL_ATTEMPTS {
+        let remove_task = repository.update(cx, |repository, _| {
+            repository.remove_worktree(worktree_path.to_path_buf(), force)
+        });
+        let result = match remove_task.await {
+            Ok(inner_result) => inner_result,
+            Err(canceled) => Err(anyhow::anyhow!("remove_worktree task canceled: {canceled}")),
+        };
+
+        match result {
+            Ok(()) => {
+                git_remove_result = Ok(());
+                break;
+            }
+            Err(error) => {
+                let is_sharing = is_sharing_violation(&error);
+                git_remove_result = Err(error);
+                if attempt + 1 < MAX_REMOVAL_ATTEMPTS && is_sharing {
+                    let backoff = removal_backoff_duration(attempt);
+                    cx.background_executor().timer(backoff).await;
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+
+    let directory_still_exists = file_system.is_dir(worktree_path).await;
+    if let Err(git_error) = git_remove_result {
+        log::warn!(
+            "git remove_worktree for {description} at {} failed: {git_error:#}; attempting fallback filesystem removal",
+            worktree_path.display()
+        );
+        if directory_still_exists {
+            for attempt in 0..MAX_REMOVAL_ATTEMPTS {
+                let remove_result = file_system
+                    .remove_dir(
+                        worktree_path,
+                        fs::RemoveOptions {
+                            recursive: true,
+                            ignore_if_not_exists: true,
+                        },
+                    )
+                    .await;
+                match remove_result {
+                    Ok(()) => break,
+                    Err(file_system_error) => {
+                        let is_sharing = is_sharing_violation(&file_system_error);
+                        if attempt + 1 < MAX_REMOVAL_ATTEMPTS && is_sharing {
+                            let backoff = removal_backoff_duration(attempt);
+                            cx.background_executor().timer(backoff).await;
+                        } else {
+                            return Err(file_system_error).with_context(|| {
+                                format!(
+                                    "failed to remove {description} directory at {}: git remove failed ({:#}) and filesystem removal failed",
+                                    worktree_path.display(),
+                                    git_error
+                                )
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    } else if directory_still_exists {
+        for attempt in 0..MAX_REMOVAL_ATTEMPTS {
+            let remove_result = file_system
+                .remove_dir(
+                    worktree_path,
+                    fs::RemoveOptions {
+                        recursive: true,
+                        ignore_if_not_exists: true,
+                    },
+                )
+                .await;
+            match remove_result {
+                Ok(()) => break,
+                Err(file_system_error) => {
+                    let is_sharing = is_sharing_violation(&file_system_error);
+                    if attempt + 1 < MAX_REMOVAL_ATTEMPTS && is_sharing {
+                        let backoff = removal_backoff_duration(attempt);
+                        cx.background_executor().timer(backoff).await;
+                    } else {
+                        return Err(file_system_error).with_context(|| {
+                            format!(
+                                "failed to remove {description} directory at {}",
+                                worktree_path.display()
+                            )
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
 async fn release_stale_task_worktree(
     project: &Entity<Project>,
     repository: &Entity<Repository>,
@@ -980,87 +1115,35 @@ async fn release_stale_task_worktree(
         }
     }
 
-    if !stale_path.as_os_str().is_empty() && file_system.is_dir(stale_path).await {
-        let dot_git = stale_path.join(".git");
-        let has_git = file_system.is_file(&dot_git).await || file_system.is_dir(&dot_git).await;
-        if has_git {
-            let salvage_details = commit_task_worktree(
-                file_system.clone(),
-                stale_path.to_path_buf(),
-                stale_task_id.to_string(),
-                false,
-                cx,
-            )
-            .await;
+    if !stale_path.as_os_str().is_empty() {
+        if file_system.is_dir(stale_path).await {
+            let dot_git = stale_path.join(".git");
+            let has_git = file_system.is_file(&dot_git).await || file_system.is_dir(&dot_git).await;
+            if has_git {
+                let salvage_details = commit_task_worktree(
+                    file_system.clone(),
+                    stale_path.to_path_buf(),
+                    stale_task_id.to_string(),
+                    false,
+                    cx,
+                )
+                .await;
 
-            match salvage_details {
-                Ok(details) => {
-                    if let Some(err) = details.commit_error {
+                match salvage_details {
+                    Ok(details) => {
+                        if let Some(err) = details.commit_error {
+                            anyhow::bail!(
+                                "failed to salvage uncommitted changes from stale worktree for task {stale_task_id} {reason}: {err}; inspect or resolve that worktree manually"
+                            );
+                        }
+                    }
+                    Err(err) => {
                         anyhow::bail!(
                             "failed to salvage uncommitted changes from stale worktree for task {stale_task_id} {reason}: {err}; inspect or resolve that worktree manually"
                         );
                     }
                 }
-                Err(err) => {
-                    anyhow::bail!(
-                        "failed to salvage uncommitted changes from stale worktree for task {stale_task_id} {reason}: {err}; inspect or resolve that worktree manually"
-                    );
-                }
             }
-        }
-
-        let remove_task = repository.update(cx, |repository, _| {
-            repository.remove_worktree(stale_path.to_path_buf(), true)
-        });
-        let git_remove_result = match remove_task.await {
-            Ok(inner_result) => inner_result,
-            Err(canceled) => Err(anyhow::anyhow!("remove_worktree task canceled: {canceled}")),
-        };
-
-        let directory_still_exists = file_system.is_dir(stale_path).await;
-        if let Err(git_error) = git_remove_result {
-            log::warn!(
-                "git remove_worktree for stale worktree at {} failed: {git_error:#}; attempting fallback filesystem removal",
-                stale_path.display()
-            );
-            if directory_still_exists {
-                file_system
-                    .remove_dir(
-                        stale_path,
-                        fs::RemoveOptions {
-                            recursive: true,
-                            ignore_if_not_exists: true,
-                        },
-                    )
-                    .await
-                    .with_context(|| {
-                        format!(
-                            "failed to remove stale worktree directory at {}: git remove failed ({:#}) and filesystem removal failed",
-                            stale_path.display(),
-                            git_error
-                        )
-                    })?;
-            }
-        } else if directory_still_exists {
-            file_system
-                .remove_dir(
-                    stale_path,
-                    fs::RemoveOptions {
-                        recursive: true,
-                        ignore_if_not_exists: true,
-                    },
-                )
-                .await
-                .with_context(|| {
-                    format!(
-                        "failed to remove stale worktree directory at {}",
-                        stale_path.display()
-                    )
-                })?;
-        }
-
-        if !file_system.is_fake() {
-            prune_git_worktrees(anchor_path).await;
         }
 
         let stale_worktree_id = project.read_with(cx, |project, cx| {
@@ -1080,6 +1163,22 @@ async fn release_stale_task_worktree(
             project.update(cx, |project, cx| {
                 project.remove_worktree(id, cx);
             });
+        }
+
+        if file_system.is_dir(stale_path).await {
+            remove_worktree_from_git_and_fs(
+                repository,
+                file_system,
+                stale_path,
+                true,
+                "stale worktree",
+                cx,
+            )
+            .await?;
+
+            if !file_system.is_fake() {
+                prune_git_worktrees(anchor_path).await;
+            }
         }
     }
 
@@ -1134,6 +1233,20 @@ async fn acquire_task_worktree_slot(
                 })
                 .collect()
         };
+
+        let holder_info: Vec<(AgentTaskId, &'static str)> = entries
+            .iter()
+            .filter(|(id, _, _, _)| id != current_task_id)
+            .map(|(id, _, safety, _)| {
+                let reason = match safety {
+                    WorktreeReleaseSafety::ActiveSession => "active session",
+                    WorktreeReleaseSafety::CommitError => "commit error",
+                    WorktreeReleaseSafety::MergeConflict => "merge conflict",
+                    WorktreeReleaseSafety::Safe => "other",
+                };
+                (id.clone(), reason)
+            })
+            .collect();
 
         let mut confirmed_existing_ids = collections::HashSet::default();
         let mut candidates = Vec::new();
@@ -1258,7 +1371,39 @@ async fn acquire_task_worktree_slot(
         }
         is_retry = true;
 
-        let _ = receiver.await;
+        let mut receiver = receiver.fuse();
+        let mut timer = cx.background_executor().timer(DEFAULT_SLOT_TIMEOUT).fuse();
+
+        let slot_available = futures::select! {
+            _ = receiver => true,
+            _ = timer => false,
+        };
+
+        if !slot_available {
+            let mut all_waiters = TASK_WORKTREE_WAITING_CREATIONS.lock();
+            if let Some(waiters) = all_waiters.get_mut(&pool_key) {
+                waiters.retain(|sender| !sender.is_canceled());
+                if waiters.is_empty() {
+                    all_waiters.remove(&pool_key);
+                }
+            }
+
+            let mut holder_descriptions: Vec<String> = holder_info
+                .iter()
+                .map(|(id, reason)| format!("{id} ({reason})"))
+                .collect();
+            holder_descriptions.sort();
+            let holders_summary = if holder_descriptions.is_empty() {
+                "none".to_string()
+            } else {
+                holder_descriptions.join(", ")
+            };
+
+            anyhow::bail!(
+                "timed out waiting for task worktree slot after 45s (pool limit: {limit}, holders: [{holders_summary}]); consider increasing `task_worktree_limit` setting"
+            );
+        }
+
         notified_guard = Some(NotifiedWaiterGuard::new(pool_key.clone()));
     }
 }
@@ -1821,57 +1966,6 @@ fn remove_task_worktree_internal(
         let worktree_path =
             task_worktree_path(&anchor_path, &worktree_setting, path_style, &task_id)?;
 
-        if file_system.is_dir(&worktree_path).await {
-            let remove_task = repository.update(cx, |repository, _| {
-                repository.remove_worktree(worktree_path.clone(), force)
-            });
-            let git_remove_result = match remove_task.await {
-                Ok(inner) => inner,
-                Err(canceled) => Err(anyhow::anyhow!("remove_worktree task canceled: {canceled}")),
-            };
-            let directory_still_exists = file_system.is_dir(&worktree_path).await;
-            if let Err(git_error) = git_remove_result {
-                log::warn!(
-                    "git remove_worktree for task worktree at {} failed: {git_error:#}; attempting fallback filesystem removal",
-                    worktree_path.display()
-                );
-                if directory_still_exists {
-                    file_system
-                        .remove_dir(
-                            &worktree_path,
-                            fs::RemoveOptions {
-                                recursive: true,
-                                ignore_if_not_exists: true,
-                            },
-                        )
-                        .await
-                        .with_context(|| {
-                            format!(
-                                "failed to remove task worktree directory at {}: git remove failed ({:#}) and filesystem removal failed",
-                                worktree_path.display(),
-                                git_error
-                            )
-                        })?;
-                }
-            } else if directory_still_exists {
-                file_system
-                    .remove_dir(
-                        &worktree_path,
-                        fs::RemoveOptions {
-                            recursive: true,
-                            ignore_if_not_exists: true,
-                        },
-                    )
-                    .await
-                    .with_context(|| {
-                        format!(
-                            "failed to remove task worktree directory at {}",
-                            worktree_path.display()
-                        )
-                    })?;
-            }
-        }
-
         let worktree_id = project.read_with(cx, |project, cx| {
             project
                 .worktrees(cx)
@@ -1891,6 +1985,18 @@ fn remove_task_worktree_internal(
             project.update(cx, |project, cx| {
                 project.remove_worktree(id, cx);
             });
+        }
+
+        if file_system.is_dir(&worktree_path).await {
+            remove_worktree_from_git_and_fs(
+                &repository,
+                &file_system,
+                &worktree_path,
+                force,
+                "task worktree",
+                cx,
+            )
+            .await?;
         }
 
         Ok(())
@@ -3509,7 +3615,7 @@ mod tests {
     use crate::AgentTaskStatus;
     use context_server::{ContextServer, ContextServerCommand, ContextServerId};
     use fs::FakeFs;
-    use futures::{FutureExt as _, StreamExt as _, channel::mpsc};
+    use futures::{StreamExt as _, channel::mpsc};
     use gpui::{BorrowAppContext, TestAppContext};
     use project::project_settings::ProjectSettings;
     use serde_json::json;
@@ -7358,5 +7464,426 @@ mod tests {
 
         reset_registry_for_tests();
         assert_eq!(task_worktree_path_for_id(&task_id), None);
+    }
+
+    #[gpui::test]
+    async fn test_release_stale_task_worktree_detaches_project_before_removal(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            "/root",
+            json!({
+                ".git": {}
+            }),
+        )
+        .await;
+
+        let project = Project::test(fs.clone(), ["/root".as_ref()], cx).await;
+        let task = AgentTaskSummary {
+            id: AgentTaskId::from("TASK-ORDER-1"),
+            parent_id: None,
+            goal_id: None,
+            title: "Order assertion task".to_string(),
+            status: AgentTaskStatus::Ready,
+            attempt: 1,
+            assignee: None,
+            write_scopes: vec!["src/".to_string()],
+            created_at: None,
+            assigned_profile: None,
+            model: None,
+            session_id: None,
+            metrics: None,
+        };
+
+        let path = cx
+            .update(|cx| ensure_task_worktree(project.clone(), &task, cx))
+            .await
+            .expect("ensure worktree should succeed");
+
+        let has_worktree_before = project.read_with(cx, |project, cx| {
+            project
+                .worktrees(cx)
+                .any(|worktree| worktree.read(cx).abs_path().as_ref() == path)
+        });
+        assert!(
+            has_worktree_before,
+            "worktree must be in project before release"
+        );
+
+        fs.set_remove_dir_error(&path, "permanent removal failure".to_string());
+
+        let (repository, anchor_path, _, _, _) = project
+            .update(cx, |project, cx| task_worktree_context(project, cx))
+            .unwrap();
+
+        let fs_trait: Arc<dyn Fs> = fs.clone();
+        let result = release_stale_task_worktree(
+            &project,
+            &repository,
+            &fs_trait,
+            &anchor_path,
+            &task.id,
+            &path,
+            "for order testing",
+            &mut cx.to_async(),
+        )
+        .await;
+
+        assert!(result.is_err(), "removal should fail due to injected error");
+
+        let has_worktree_after = project.read_with(cx, |project, cx| {
+            project
+                .worktrees(cx)
+                .any(|worktree| worktree.read(cx).abs_path().as_ref() == path)
+        });
+        assert!(
+            !has_worktree_after,
+            "project worktree must be detached before git/fs removal"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_remove_task_worktree_internal_detaches_project_before_removal(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            "/root",
+            json!({
+                ".git": {}
+            }),
+        )
+        .await;
+
+        let project = Project::test(fs.clone(), ["/root".as_ref()], cx).await;
+        let task = AgentTaskSummary {
+            id: AgentTaskId::from("TASK-ORDER-2"),
+            parent_id: None,
+            goal_id: None,
+            title: "Internal removal order assertion task".to_string(),
+            status: AgentTaskStatus::Ready,
+            attempt: 1,
+            assignee: None,
+            write_scopes: vec!["src/".to_string()],
+            created_at: None,
+            assigned_profile: None,
+            model: None,
+            session_id: None,
+            metrics: None,
+        };
+
+        let path = cx
+            .update(|cx| ensure_task_worktree(project.clone(), &task, cx))
+            .await
+            .expect("ensure worktree should succeed");
+
+        fs.set_remove_dir_error(&path, "fatal removal error".to_string());
+
+        let remove_task =
+            cx.update(|cx| remove_task_worktree_internal(project.clone(), &task.id, false, cx));
+        let result = remove_task.await;
+        assert!(result.is_err());
+
+        let has_worktree = project.read_with(cx, |project, cx| {
+            project
+                .worktrees(cx)
+                .any(|worktree| worktree.read(cx).abs_path().as_ref() == path)
+        });
+        assert!(
+            !has_worktree,
+            "worktree must be detached from project before removal failure"
+        );
+    }
+
+    #[test]
+    fn test_is_sharing_violation_helper() {
+        let os_sharing_error = anyhow::Error::new(std::io::Error::from_raw_os_error(32));
+        assert!(is_sharing_violation(&os_sharing_error));
+
+        let string_sharing_error =
+            anyhow::anyhow!("The process cannot access the file: sharing violation");
+        assert!(is_sharing_violation(&string_sharing_error));
+
+        let uppercase_sharing_error = anyhow::anyhow!("ERROR: SHARING VIOLATION DETECTED");
+        assert!(is_sharing_violation(&uppercase_sharing_error));
+
+        let unrelated_io_error = anyhow::Error::new(std::io::Error::from_raw_os_error(5));
+        assert!(!is_sharing_violation(&unrelated_io_error));
+
+        let unrelated_string_error = anyhow::anyhow!("file not found");
+        assert!(!is_sharing_violation(&unrelated_string_error));
+    }
+
+    #[test]
+    fn test_removal_backoff_schedule() {
+        assert_eq!(removal_backoff_duration(0), Duration::from_millis(50));
+        assert_eq!(removal_backoff_duration(1), Duration::from_millis(100));
+        assert_eq!(removal_backoff_duration(2), Duration::from_millis(200));
+        assert_eq!(removal_backoff_duration(3), Duration::from_millis(400));
+        assert_eq!(removal_backoff_duration(4), Duration::from_millis(800));
+        assert_eq!(removal_backoff_duration(5), Duration::from_millis(800));
+    }
+
+    #[gpui::test]
+    async fn test_removal_retry_fake_fs_sharing_violation_succeeds(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            "/root",
+            json!({
+                ".git": {}
+            }),
+        )
+        .await;
+
+        let project = Project::test(fs.clone(), ["/root".as_ref()], cx).await;
+        let task = AgentTaskSummary {
+            id: AgentTaskId::from("TASK-RETRY-SUCCESS"),
+            parent_id: None,
+            goal_id: None,
+            title: "Retry success task".to_string(),
+            status: AgentTaskStatus::Ready,
+            attempt: 1,
+            assignee: None,
+            write_scopes: vec!["src/".to_string()],
+            created_at: None,
+            assigned_profile: None,
+            model: None,
+            session_id: None,
+            metrics: None,
+        };
+
+        let path = cx
+            .update(|cx| ensure_task_worktree(project.clone(), &task, cx))
+            .await
+            .expect("ensure worktree should succeed");
+
+        fs.set_remove_dir_error(&path, "sharing violation: file locked".to_string());
+
+        let (repository, anchor_path, _, _, _) = project
+            .update(cx, |project, cx| task_worktree_context(project, cx))
+            .unwrap();
+
+        // Spawn background task to clear error after two failed attempts (50ms + 100ms backoff)
+        let fs_clone = fs.clone();
+        let path_clone = path.clone();
+        let background_executor = cx.background_executor.clone();
+        cx.background_executor
+            .spawn(async move {
+                background_executor.timer(Duration::from_millis(120)).await;
+                fs_clone.clear_remove_dir_error(&path_clone);
+            })
+            .detach();
+
+        let fs_trait: Arc<dyn Fs> = fs.clone();
+        let mut remove_task = cx.spawn({
+            let project = project.clone();
+            let task_id = task.id.clone();
+            let path = path.clone();
+            |mut cx| async move {
+                release_stale_task_worktree(
+                    &project,
+                    &repository,
+                    &fs_trait,
+                    &anchor_path,
+                    &task_id,
+                    &path,
+                    "testing retry",
+                    &mut cx,
+                )
+                .await
+            }
+        });
+
+        // Run until attempt 0 fails and waits 50ms
+        cx.run_until_parked();
+        // Advance 50ms: attempt 1 runs, fails, and waits 100ms
+        cx.executor().advance_clock(Duration::from_millis(50));
+        cx.run_until_parked();
+        // Advance 70ms (total 120ms): background task clears error
+        cx.executor().advance_clock(Duration::from_millis(70));
+        cx.run_until_parked();
+        // Advance 30ms (total 150ms): attempt 2 runs with error cleared, succeeds
+        cx.executor().advance_clock(Duration::from_millis(30));
+        cx.run_until_parked();
+
+        let result = (&mut remove_task)
+            .now_or_never()
+            .expect("removal should have completed after sharing violation cleared");
+        assert!(result.is_ok());
+        assert!(!fs.is_dir(&path).await);
+    }
+
+    #[gpui::test]
+    async fn test_removal_retry_exhaustion_records_cleanup_error(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            "/root",
+            json!({
+                ".git": {}
+            }),
+        )
+        .await;
+
+        let project = Project::test(fs.clone(), ["/root".as_ref()], cx).await;
+        let task = AgentTaskSummary {
+            id: AgentTaskId::from("TASK-RETRY-FAIL"),
+            parent_id: None,
+            goal_id: None,
+            title: "Retry exhaustion task".to_string(),
+            status: AgentTaskStatus::Ready,
+            attempt: 1,
+            assignee: None,
+            write_scopes: vec!["src/".to_string()],
+            created_at: None,
+            assigned_profile: None,
+            model: None,
+            session_id: None,
+            metrics: None,
+        };
+
+        let path = cx
+            .update(|cx| ensure_task_worktree(project.clone(), &task, cx))
+            .await
+            .expect("ensure worktree should succeed");
+
+        fs.set_remove_dir_error(&path, "sharing violation: locked file".to_string());
+
+        let mut cleanup_task = cx.spawn({
+            let project = project.clone();
+            let task_id = task.id.clone();
+            |cx| async move {
+                cx.update(|cx| auto_cleanup_task_worktree(project, &task_id, cx))
+                    .await
+            }
+        });
+
+        cx.run_until_parked();
+        // Advance past all backoffs (50 + 100 + 200 + 400 = 750ms for git, then again for fs fallback)
+        cx.executor().advance_clock(Duration::from_secs(5));
+        cx.run_until_parked();
+
+        let result = (&mut cleanup_task)
+            .now_or_never()
+            .expect("cleanup should complete after retries exhaust");
+        assert!(result.is_err());
+
+        let cleanup_error = task_worktree_cleanup_error(&task.id);
+        assert!(
+            cleanup_error.is_some(),
+            "cleanup error must be recorded after final failure"
+        );
+        let error_message = cleanup_error.unwrap().to_lowercase();
+        assert!(error_message.contains("sharing violation"));
+    }
+
+    #[gpui::test]
+    async fn test_acquire_slot_timeout_lists_holders(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            "/root",
+            json!({
+                ".git": {}
+            }),
+        )
+        .await;
+
+        let project = Project::test(fs.clone(), ["/root".as_ref()], cx).await;
+
+        cx.update(|cx| {
+            cx.update_global(|store: &mut settings::SettingsStore, cx| {
+                store
+                    .set_user_settings(r#"{ "agent": { "task_worktree_limit": 3 } }"#, cx)
+                    .unwrap();
+            });
+        });
+
+        for index in 1..=3 {
+            let task = AgentTaskSummary {
+                id: AgentTaskId::from(format!("TASK-HOLDER-{index}")),
+                parent_id: None,
+                goal_id: None,
+                title: format!("Holder task {index}"),
+                status: AgentTaskStatus::Ready,
+                attempt: 1,
+                assignee: None,
+                write_scopes: vec!["src/".to_string()],
+                created_at: None,
+                assigned_profile: None,
+                model: None,
+                session_id: None,
+                metrics: None,
+            };
+            cx.update(|cx| ensure_task_worktree(project.clone(), &task, cx))
+                .await
+                .expect("ensure holder worktree should succeed");
+            record_task_worktree_commit_error(&task.id, "uncommitted changes".to_string());
+        }
+
+        let task4 = AgentTaskSummary {
+            id: AgentTaskId::from("TASK-WAIT-4"),
+            parent_id: None,
+            goal_id: None,
+            title: "Waiting task 4".to_string(),
+            status: AgentTaskStatus::Ready,
+            attempt: 1,
+            assignee: None,
+            write_scopes: vec!["src/".to_string()],
+            created_at: None,
+            assigned_profile: None,
+            model: None,
+            session_id: None,
+            metrics: None,
+        };
+
+        let mut acquire_task = cx.spawn({
+            let project = project.clone();
+            |cx| async move {
+                cx.update(|cx| ensure_task_worktree(project, &task4, cx))
+                    .await
+            }
+        });
+
+        cx.run_until_parked();
+        assert!(
+            (&mut acquire_task).now_or_never().is_none(),
+            "slot acquisition must be waiting in queue"
+        );
+
+        cx.executor().advance_clock(Duration::from_secs(45));
+        cx.run_until_parked();
+
+        let result = (&mut acquire_task)
+            .now_or_never()
+            .expect("slot acquisition should fail with timeout");
+        assert!(
+            result.is_err(),
+            "acquisition must return an error on timeout"
+        );
+
+        let error_message = result.unwrap_err().to_string();
+        assert!(
+            error_message.contains("pool limit: 3"),
+            "error message must include pool limit, got: {error_message}"
+        );
+        assert!(
+            error_message.contains("task_worktree_limit"),
+            "error message must include task_worktree_limit setting name, got: {error_message}"
+        );
+        assert!(
+            error_message.contains("TASK-HOLDER-1")
+                && error_message.contains("TASK-HOLDER-2")
+                && error_message.contains("TASK-HOLDER-3"),
+            "error message must list holder task ids, got: {error_message}"
+        );
+        assert!(
+            error_message.contains("commit error"),
+            "error message must list hold reason 'commit error', got: {error_message}"
+        );
     }
 }

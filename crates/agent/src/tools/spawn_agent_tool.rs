@@ -8,6 +8,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use std::rc::Rc;
 use std::sync::Arc;
 
+use crate::agent_task::AgentDiffShortstat;
 use crate::task_worktree::SubagentIsolationDetails;
 use crate::{AgentTool, ThreadEnvironment, ToolCallEventStream, ToolInput};
 use acp_thread::AgentModelId;
@@ -707,9 +708,19 @@ impl AgentTool for SpawnAgentTool {
                 let output_summary = send_result
                     .as_ref()
                     .ok()
-                    .map(|out| out.lines().take(20).collect::<Vec<_>>().join("
-"))
+                    .map(|out| out.lines().take(20).collect::<Vec<_>>().join("\n"))
                     .map(SharedString::from);
+                let diff = {
+                    let task_id_typed = crate::AgentTaskId::from(task_id.clone());
+                    let base_sha = crate::task_worktree::task_worktree_base_sha(&task_id_typed);
+                    let worktree_path =
+                        crate::task_worktree::task_worktree_path_for_id(&task_id_typed);
+                    if let (Some(base_sha), Some(worktree_path)) = (base_sha, worktree_path) {
+                        compute_turn_diff(&base_sha, &worktree_path).await
+                    } else {
+                        None
+                    }
+                };
                 let record = crate::AgentTurnRecord {
                     duration_ms,
                     tokens: delta_tokens.or(end_tokens),
@@ -719,6 +730,7 @@ impl AgentTool for SpawnAgentTool {
                     branch: branch_str.map(SharedString::from),
                     commit_sha: commit_sha_str.map(SharedString::from),
                     output_summary,
+                    diff,
                 };
                 if let Err(err) = self.environment.record_turn(task_id, record, &mut cx).await {
                     log::warn!("failed to record turn for task {task_id}: {err:#}");
@@ -727,7 +739,7 @@ impl AgentTool for SpawnAgentTool {
 
             if send_result.is_ok() {
                 if let Some(ref task_id) = task_id {
-                    if let Err(error) = self
+                    match self
                         .environment
                         .set_task_status_registered(
                             task_id,
@@ -736,9 +748,15 @@ impl AgentTool for SpawnAgentTool {
                         )
                         .await
                     {
-                        log::warn!(
-                            "failed to set task {task_id} status to completed in task graph service: {error:#}"
-                        );
+                        Ok(()) => {
+                            let task_id_typed = crate::AgentTaskId::from(task_id.clone());
+                            crate::task_worktree::mark_task_terminal(&task_id_typed);
+                        }
+                        Err(error) => {
+                            log::warn!(
+                                "failed to set task {task_id} status to completed in task graph service: {error:#}"
+                            );
+                        }
                     }
                 }
             }
@@ -747,8 +765,7 @@ impl AgentTool for SpawnAgentTool {
 
             if let Some(ref task_id) = task_id {
                 let task_id_typed = crate::AgentTaskId::from(task_id.clone());
-                if crate::task_worktree::is_task_terminal(&task_id_typed)
-                    && crate::task_worktree::task_worktree_commit_error(&task_id_typed).is_none()
+                if crate::task_worktree::task_worktree_commit_error(&task_id_typed).is_none()
                     && crate::task_worktree::task_worktree_merge_conflict(&task_id_typed).is_none()
                 {
                     if let Err(err) = self
@@ -928,6 +945,76 @@ fn build_task_contract(task_id: &str, detail: &crate::AgentTaskDetail) -> Option
     Some(contract)
 }
 
+pub(crate) fn parse_git_shortstat(output: &str) -> Option<AgentDiffShortstat> {
+    for line in output.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+
+        let mut files_changed: Option<u64> = None;
+        let mut insertions: u64 = 0;
+        let mut deletions: u64 = 0;
+        let mut valid = true;
+
+        for part in line.split(',') {
+            let part = part.trim();
+            let mut tokens = part.split_whitespace();
+            let Some(number_str) = tokens.next() else {
+                valid = false;
+                break;
+            };
+            let Ok(number) = number_str.parse::<u64>() else {
+                valid = false;
+                break;
+            };
+            let Some(label) = tokens.next() else {
+                valid = false;
+                break;
+            };
+
+            if label.starts_with("file") {
+                files_changed = Some(number);
+            } else if label.starts_with("insertion") {
+                insertions = number;
+            } else if label.starts_with("deletion") {
+                deletions = number;
+            } else {
+                valid = false;
+                break;
+            }
+        }
+
+        if valid {
+            if let Some(files_changed) = files_changed {
+                return Some(AgentDiffShortstat {
+                    files_changed,
+                    insertions,
+                    deletions,
+                });
+            }
+        }
+    }
+
+    None
+}
+
+async fn compute_turn_diff(
+    base_sha: &str,
+    worktree_path: &std::path::Path,
+) -> Option<AgentDiffShortstat> {
+    let git_binary = crate::task_worktree::system_git_binary()?;
+    let mut command = util::command::new_command(git_binary);
+    command.args(["diff", "--shortstat", base_sha]);
+    command.current_dir(worktree_path);
+    let output = command.output().await.ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    parse_git_shortstat(&stdout)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1001,5 +1088,147 @@ Strict Constraints:
             constraints,
             vec!["Keep İ intact".to_string(), "No panics".to_string()]
         );
+    }
+
+    #[test]
+    fn test_parse_git_shortstat() {
+        let full = " 3 files changed, 10 insertions(+), 5 deletions(-)";
+        let result = parse_git_shortstat(full).unwrap();
+        assert_eq!(
+            result,
+            AgentDiffShortstat {
+                files_changed: 3,
+                insertions: 10,
+                deletions: 5,
+            }
+        );
+
+        let missing_deletions = " 1 file changed, 2 insertions(+)";
+        let result = parse_git_shortstat(missing_deletions).unwrap();
+        assert_eq!(
+            result,
+            AgentDiffShortstat {
+                files_changed: 1,
+                insertions: 2,
+                deletions: 0,
+            }
+        );
+
+        let missing_insertions = " 2 files changed, 4 deletions(-)";
+        let result = parse_git_shortstat(missing_insertions).unwrap();
+        assert_eq!(
+            result,
+            AgentDiffShortstat {
+                files_changed: 2,
+                insertions: 0,
+                deletions: 4,
+            }
+        );
+
+        let files_only = " 1 file changed";
+        let result = parse_git_shortstat(files_only).unwrap();
+        assert_eq!(
+            result,
+            AgentDiffShortstat {
+                files_changed: 1,
+                insertions: 0,
+                deletions: 0,
+            }
+        );
+
+        assert_eq!(parse_git_shortstat(""), None);
+        assert_eq!(parse_git_shortstat("   \n\t  "), None);
+        assert_eq!(parse_git_shortstat("not a valid shortstat"), None);
+        assert_eq!(parse_git_shortstat("fatal: bad revision 'HEAD'"), None);
+        assert_eq!(parse_git_shortstat("something, else, here"), None);
+    }
+
+    #[gpui::test]
+    async fn test_compute_turn_diff_real_git(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        let Some(git_binary) = crate::task_worktree::system_git_binary() else {
+            return;
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path();
+
+        let init_status = util::command::new_command(&git_binary)
+            .args(["init"])
+            .current_dir(path)
+            .output()
+            .await
+            .unwrap();
+        assert!(init_status.status.success());
+
+        util::command::new_command(&git_binary)
+            .args(["config", "user.email", "test@test.com"])
+            .current_dir(path)
+            .output()
+            .await
+            .unwrap();
+        util::command::new_command(&git_binary)
+            .args(["config", "user.name", "Test"])
+            .current_dir(path)
+            .output()
+            .await
+            .unwrap();
+
+        std::fs::write(path.join("file1.txt"), "hello\n").unwrap();
+        util::command::new_command(&git_binary)
+            .args(["add", "."])
+            .current_dir(path)
+            .output()
+            .await
+            .unwrap();
+        util::command::new_command(&git_binary)
+            .args(["commit", "-m", "initial"])
+            .current_dir(path)
+            .output()
+            .await
+            .unwrap();
+
+        let base_sha_output = util::command::new_command(&git_binary)
+            .args(["rev-parse", "HEAD"])
+            .current_dir(path)
+            .output()
+            .await
+            .unwrap();
+        let base_sha = String::from_utf8_lossy(&base_sha_output.stdout)
+            .trim()
+            .to_string();
+
+        let diff_none = compute_turn_diff(&base_sha, path).await;
+        assert_eq!(diff_none, None);
+
+        std::fs::write(path.join("file1.txt"), "hello\nworld\nagain\n").unwrap();
+        std::fs::write(path.join("file2.txt"), "new file\n").unwrap();
+        util::command::new_command(&git_binary)
+            .args(["add", "."])
+            .current_dir(path)
+            .output()
+            .await
+            .unwrap();
+        util::command::new_command(&git_binary)
+            .args(["commit", "-m", "second"])
+            .current_dir(path)
+            .output()
+            .await
+            .unwrap();
+
+        let diff_some = compute_turn_diff(&base_sha, path).await;
+        assert_eq!(
+            diff_some,
+            Some(AgentDiffShortstat {
+                files_changed: 2,
+                insertions: 3,
+                deletions: 0,
+            })
+        );
+
+        let bad_sha = compute_turn_diff("nonexistent_sha", path).await;
+        assert_eq!(bad_sha, None);
+
+        let bad_path = compute_turn_diff(&base_sha, std::path::Path::new("/nonexistent")).await;
+        assert_eq!(bad_path, None);
     }
 }

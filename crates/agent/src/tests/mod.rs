@@ -283,6 +283,7 @@ pub(crate) struct FakeThreadEnvironment {
     ensure_worktree_calls: std::cell::RefCell<Vec<String>>,
     recorded_turns: std::cell::RefCell<Vec<(String, crate::AgentTurnRecord)>>,
     published_artifacts: std::cell::RefCell<Vec<(String, String, String, Option<String>)>>,
+    cleanup_subagent_worktree_calls: std::cell::RefCell<Vec<String>>,
     task_details: std::cell::RefCell<std::collections::HashMap<String, crate::AgentTaskDetail>>,
 }
 
@@ -345,6 +346,10 @@ impl FakeThreadEnvironment {
 
     pub(crate) fn recorded_turns(&self) -> Vec<(String, crate::AgentTurnRecord)> {
         self.recorded_turns.borrow().clone()
+    }
+
+    pub(crate) fn cleanup_subagent_worktree_calls(&self) -> Vec<String> {
+        self.cleanup_subagent_worktree_calls.borrow().clone()
     }
 
     #[allow(dead_code)]
@@ -532,6 +537,17 @@ impl crate::ThreadEnvironment for FakeThreadEnvironment {
             summary.map(str::to_string),
         ));
         Task::ready(Ok("artifact-1".to_string()))
+    }
+
+    fn auto_cleanup_subagent_worktree(
+        &self,
+        task_id: &str,
+        _cx: &mut AsyncApp,
+    ) -> Task<Result<bool>> {
+        self.cleanup_subagent_worktree_calls
+            .borrow_mut()
+            .push(task_id.to_string());
+        Task::ready(Ok(true))
     }
 }
 
@@ -7832,6 +7848,199 @@ async fn test_spawn_agent_one_session_per_task(cx: &mut TestAppContext) {
     match &result {
         Ok(SpawnAgentToolOutput::Success { .. }) => {}
         other => panic!("expected success, got: {other:?}"),
+    }
+}
+
+#[gpui::test]
+async fn test_spawn_agent_session_end_cleanup_flow(cx: &mut TestAppContext) {
+    init_test(cx);
+    crate::task_worktree::reset_registry_for_tests();
+
+    let environment = Rc::new(FakeThreadEnvironment::default().with_subagent(
+        FakeSubagentHandle::new(
+            acp::SessionId::new("subagent-cleanup"),
+            Task::ready("done".to_string()).shared(),
+            None,
+        ),
+    ));
+    #[allow(clippy::arc_with_non_send_sync)]
+    let tool = Arc::new(SpawnAgentTool::new(environment.clone()));
+
+    // Case 1: Session ends WITHOUT any terminal tool call.
+    // Cleanup must be invoked (is_task_terminal gate is removed),
+    // and mark_task_terminal is called because set_task_status_registered(Completed) succeeded.
+    let task_id_1 = "TASK-CLEANUP-SUCCESS".to_string();
+    let task_id_typed_1 = AgentTaskId::from(task_id_1.clone());
+    assert!(!crate::task_worktree::is_task_terminal(&task_id_typed_1));
+
+    let (event_stream, _rx) = ToolCallEventStream::test();
+    let result = cx
+        .update(|cx| {
+            tool.clone().run(
+                ToolInput::resolved(SpawnAgentToolInput {
+                    label: "task 1".to_string(),
+                    message: "prompt".to_string(),
+                    task_id: Some(task_id_1.clone()),
+                    ..Default::default()
+                }),
+                event_stream,
+                cx,
+            )
+        })
+        .await;
+
+    assert!(matches!(result, Ok(SpawnAgentToolOutput::Success { .. })));
+    assert_eq!(
+        environment.cleanup_subagent_worktree_calls(),
+        vec![task_id_1.clone()]
+    );
+    assert!(crate::task_worktree::is_task_terminal(&task_id_typed_1));
+
+    // Case 2: Session with recorded commit error keeps worktree (cleanup is skipped).
+    let task_id_2 = "TASK-COMMIT-ERROR".to_string();
+    let task_id_typed_2 = AgentTaskId::from(task_id_2.clone());
+    crate::task_worktree::record_task_worktree_commit_error(
+        &task_id_typed_2,
+        "dirty worktree error".to_string(),
+    );
+
+    let (event_stream2, _rx2) = ToolCallEventStream::test();
+    let result2 = cx
+        .update(|cx| {
+            tool.clone().run(
+                ToolInput::resolved(SpawnAgentToolInput {
+                    label: "task 2".to_string(),
+                    message: "prompt".to_string(),
+                    task_id: Some(task_id_2.clone()),
+                    ..Default::default()
+                }),
+                event_stream2,
+                cx,
+            )
+        })
+        .await;
+
+    assert!(matches!(result2, Ok(SpawnAgentToolOutput::Success { .. })));
+    assert_eq!(
+        environment.cleanup_subagent_worktree_calls(),
+        vec![task_id_1.clone()]
+    );
+    assert!(crate::task_worktree::task_worktree_commit_error(&task_id_typed_2).is_some());
+
+    // Turns for task 1 and 2 had no worktree/base_sha -> diff is None
+    let recorded_turns = environment.recorded_turns();
+    let turn1 = recorded_turns
+        .iter()
+        .find(|(id, _)| id == &task_id_1)
+        .expect("turn 1 should be recorded");
+    assert_eq!(turn1.1.diff, None);
+
+    // Case 3: Turn end with registered worktree and base sha computes diff and passes to record_turn
+    let task_id_3 = "TASK-DIFF-TEST".to_string();
+    let task_id_typed_3 = AgentTaskId::from(task_id_3.clone());
+
+    if let Some(git_binary) = crate::task_worktree::system_git_binary() {
+        cx.executor().allow_parking();
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().to_path_buf();
+
+        util::command::new_command(&git_binary)
+            .args(["init"])
+            .current_dir(&path)
+            .output()
+            .await
+            .unwrap();
+        util::command::new_command(&git_binary)
+            .args(["config", "user.email", "test@test.com"])
+            .current_dir(&path)
+            .output()
+            .await
+            .unwrap();
+        util::command::new_command(&git_binary)
+            .args(["config", "user.name", "Test"])
+            .current_dir(&path)
+            .output()
+            .await
+            .unwrap();
+
+        std::fs::write(path.join("file.txt"), "line 1\n").unwrap();
+        util::command::new_command(&git_binary)
+            .args(["add", "."])
+            .current_dir(&path)
+            .output()
+            .await
+            .unwrap();
+        util::command::new_command(&git_binary)
+            .args(["commit", "-m", "initial"])
+            .current_dir(&path)
+            .output()
+            .await
+            .unwrap();
+
+        let base_sha_output = util::command::new_command(&git_binary)
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&path)
+            .output()
+            .await
+            .unwrap();
+        let base_sha = String::from_utf8_lossy(&base_sha_output.stdout)
+            .trim()
+            .to_string();
+
+        std::fs::write(path.join("file.txt"), "line 1\nline 2\n").unwrap();
+        std::fs::write(path.join("file2.txt"), "a\nb\n").unwrap();
+        util::command::new_command(&git_binary)
+            .args(["add", "."])
+            .current_dir(&path)
+            .output()
+            .await
+            .unwrap();
+        util::command::new_command(&git_binary)
+            .args(["commit", "-m", "second"])
+            .current_dir(&path)
+            .output()
+            .await
+            .unwrap();
+
+        crate::task_worktree::register_task_worktree_policy(
+            &task_id_typed_3,
+            path.clone(),
+            None,
+            None,
+            Some(base_sha),
+            None,
+        );
+
+        let (event_stream3, _rx3) = ToolCallEventStream::test();
+        let result3 = cx
+            .update(|cx| {
+                tool.run(
+                    ToolInput::resolved(SpawnAgentToolInput {
+                        label: "task 3".to_string(),
+                        message: "prompt".to_string(),
+                        task_id: Some(task_id_3.clone()),
+                        ..Default::default()
+                    }),
+                    event_stream3,
+                    cx,
+                )
+            })
+            .await;
+
+        assert!(matches!(result3, Ok(SpawnAgentToolOutput::Success { .. })));
+        let turns = environment.recorded_turns();
+        let turn3 = turns
+            .iter()
+            .find(|(id, _)| id == &task_id_3)
+            .expect("turn 3 should be recorded");
+        assert_eq!(
+            turn3.1.diff,
+            Some(crate::agent_task::AgentDiffShortstat {
+                files_changed: 2,
+                insertions: 3,
+                deletions: 0,
+            })
+        );
     }
 }
 

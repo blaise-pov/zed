@@ -28,7 +28,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use agent::{
-    AgentGoalStatus, AgentGoalSummary, AgentTaskArtifact, AgentTaskDetail, AgentTaskEvent,
+    AgentGoalStatus, AgentGoalSummary, AgentTaskArtifact, AgentTaskDetail,
     AgentTaskEventKind, AgentTaskId, AgentTaskMetrics, AgentTaskStatus, AgentTaskStore,
     AgentTaskSummary, DiffShortStat, GoalGitState, OrphanWorktree, TaskWorktreeStatus,
 };
@@ -192,7 +192,7 @@ pub fn init(file_system: Arc<dyn Fs>, cx: &mut App) {
             context_server_store,
             server_id,
         ));
-        let store = cx.new(|cx| agent::AgentTaskStore::new(provider, cx));
+        let store = cx.new(|cx| agent::AgentTaskStore::new_with_project(provider, Some(project.clone()), cx));
 
         let panel = cx.new(|cx| {
             AgentTaskPanel::new(
@@ -750,6 +750,106 @@ impl AgentTaskPanel {
                         });
                     }
 
+                    let goal_session_id = goal_summary
+                        .as_ref()
+                        .and_then(|g| g.session_id.as_deref())
+                        .filter(|s| !s.trim().is_empty())
+                        .map(ToString::to_string);
+
+                    if let Some(session_id) = goal_session_id {
+                        let workspace_for_open_thread = workspace.clone();
+                        let goal_title_for_open_thread = goal_summary
+                            .as_ref()
+                            .map(|g| SharedString::from(g.title.clone()));
+                        let session_id_for_open_thread = session_id.clone();
+                        menu = menu.entry("Open Thread", None, move |window, cx| {
+                            if let Some(workspace) = workspace_for_open_thread.upgrade() {
+                                workspace.update(cx, |workspace, cx| {
+                                    if let Some(panel) = workspace.panel::<crate::AgentPanel>(cx) {
+                                        let session_id =
+                                            agent_client_protocol::schema::v1::SessionId::new(
+                                                session_id_for_open_thread.clone(),
+                                            );
+                                        let title = goal_title_for_open_thread.clone();
+                                        panel.update(cx, |panel, cx| {
+                                            panel.open_thread_standalone(
+                                                session_id, None, title, window, cx,
+                                            );
+                                        });
+                                    }
+                                    workspace.focus_panel::<crate::AgentPanel>(window, cx);
+                                });
+                            }
+                        });
+
+                        let workspace_for_view_thread = workspace.clone();
+                        let goal_title_for_view_thread = goal_summary
+                            .as_ref()
+                            .map(|g| SharedString::from(g.title.clone()));
+                        let session_id_for_view_thread = session_id.clone();
+                        menu = menu.entry("View Thread", None, move |window, cx| {
+                            if let Some(workspace) = workspace_for_view_thread.upgrade() {
+                                workspace.update(cx, |workspace, cx| {
+                                    if let Some(panel) = workspace.panel::<crate::AgentPanel>(cx) {
+                                        let session_id =
+                                            agent_client_protocol::schema::v1::SessionId::new(
+                                                session_id_for_view_thread.clone(),
+                                            );
+                                        let title = goal_title_for_view_thread.clone();
+                                        panel.update(cx, |panel, cx| {
+                                            panel.view_thread_readonly(
+                                                session_id, title, window, cx,
+                                            );
+                                        });
+                                    }
+                                    workspace.focus_panel::<crate::AgentPanel>(window, cx);
+                                });
+                            }
+                        });
+
+                        let workspace_for_transcript = workspace.clone();
+                        let goal_id_for_preview = goal_id.clone();
+                        let session_id_for_transcript = session_id;
+                        menu = menu.entry("View Thread as Markdown", None, move |window, cx| {
+                            let db_task = agent::ThreadsDatabase::connect(cx);
+                            let session_id_acp = agent_client_protocol::schema::v1::SessionId::new(
+                                session_id_for_transcript.clone(),
+                            );
+                            let workspace = workspace_for_transcript.clone();
+                            let goal_id_for_preview = goal_id_for_preview.clone();
+                            let task = window.spawn(cx, async move |cx| {
+                                let database = db_task.await.map_err(|e| anyhow::anyhow!("{e}"))?;
+                                let thread = database.load_thread(session_id_acp).await?;
+                                let markdown = if let Some(thread) = thread {
+                                    thread.to_markdown()
+                                } else {
+                                    format!(
+                                        "No saved transcript found for goal {}.",
+                                        goal_id_for_preview
+                                    )
+                                };
+                                if let Some(workspace) = workspace.upgrade() {
+                                    let preview_task = cx.update(|window, cx| {
+                                        open_markdown_preview(
+                                            format!("Goal {} Thread", goal_id_for_preview),
+                                            markdown,
+                                            workspace,
+                                            window,
+                                            cx,
+                                        )
+                                    })?;
+                                    preview_task.await?;
+                                }
+                                Ok(())
+                            });
+                            Self::spawn_task_with_error_toast(
+                                task,
+                                workspace_for_transcript.clone(),
+                                cx,
+                            );
+                        });
+                    }
+
                     if branch_exists {
                         let branch = branch_name.clone();
                         let project = project.clone();
@@ -1033,21 +1133,116 @@ impl AgentTaskPanel {
 
                         let workspace_for_panel = workspace.clone();
                         let task_title = task.as_ref().map(|t| SharedString::from(t.title.clone()));
+                        let session_id_for_view = session_id.clone();
                         menu = menu.entry("View Thread", None, move |window, cx| {
                             if let Some(workspace) = workspace_for_panel.upgrade() {
                                 workspace.update(cx, |workspace, cx| {
                                     if let Some(panel) = workspace.panel::<crate::AgentPanel>(cx) {
                                         let session_id =
                                             agent_client_protocol::schema::v1::SessionId::new(
-                                                session_id.clone(),
+                                                session_id_for_view.clone(),
                                             );
                                         let title = task_title.clone();
                                         panel.update(cx, |panel, cx| {
-                                            panel.open_thread(session_id, None, title, window, cx);
+                                            panel.view_thread_readonly(
+                                                session_id, title, window, cx,
+                                            );
                                         });
                                     }
                                     workspace.focus_panel::<crate::AgentPanel>(window, cx);
                                 });
+                            }
+                        });
+
+                        let workspace_for_open_thread = workspace.clone();
+                        let task_title_for_open_thread =
+                            task.as_ref().map(|t| SharedString::from(t.title.clone()));
+                        let session_id_for_open_thread = session_id;
+                        let project_for_open_thread = project.clone();
+                        let task_id_for_open_thread = task_id.clone();
+                        let task_for_open_thread = task.clone();
+                        let branch_name_for_open_thread = branch_name.clone();
+                        let exists_on_disk_for_open_thread = exists_on_disk;
+                        let view_for_open_thread = view.clone();
+
+                        menu = menu.entry("Open Thread", None, move |window, cx| {
+                            let session_id = agent_client_protocol::schema::v1::SessionId::new(
+                                session_id_for_open_thread.clone(),
+                            );
+                            let title = task_title_for_open_thread.clone();
+                            let workspace = workspace_for_open_thread.clone();
+
+                            if exists_on_disk_for_open_thread {
+                                if let Some(workspace) = workspace.upgrade() {
+                                    workspace.update(cx, |workspace, cx| {
+                                        if let Some(panel) =
+                                            workspace.panel::<crate::AgentPanel>(cx)
+                                        {
+                                            panel.update(cx, |panel, cx| {
+                                                panel.open_thread_standalone(
+                                                    session_id, None, title, window, cx,
+                                                );
+                                            });
+                                        }
+                                        workspace.focus_panel::<crate::AgentPanel>(window, cx);
+                                    });
+                                }
+                            } else {
+                                let task_summary = task_for_open_thread
+                                    .clone()
+                                    .unwrap_or_else(|| agent::AgentTaskSummary {
+                                        id: task_id_for_open_thread.clone(),
+                                        title: task_id_for_open_thread.to_string(),
+                                        ..Default::default()
+                                    });
+                                let branch = branch_name_for_open_thread.clone();
+                                let ensure_task =
+                                    agent::task_worktree::ensure_task_worktree_with_policy(
+                                        project_for_open_thread.clone(),
+                                        &task_summary,
+                                        None,
+                                        None,
+                                        Some(branch.clone()),
+                                        cx,
+                                    );
+                                let view = view_for_open_thread.clone();
+                                let task = window.spawn(cx, async move |cx| {
+                                    if let Err(err) = ensure_task.await {
+                                        log::warn!(
+                                            "failed to ensure task worktree for branch {branch}: {err:?}"
+                                        );
+                                        return Err(err);
+                                    }
+                                    cx.update(|window, cx| {
+                                        if let Some(panel) = view.upgrade() {
+                                            panel.update(cx, |panel, cx| {
+                                                panel.refresh_worktree_status(cx);
+                                            });
+                                        }
+                                        if let Some(workspace) = workspace.upgrade() {
+                                            workspace.update(cx, |workspace, cx| {
+                                                if let Some(panel) =
+                                                    workspace.panel::<crate::AgentPanel>(cx)
+                                                {
+                                                    panel.update(cx, |panel, cx| {
+                                                        panel.open_thread_standalone(
+                                                            session_id, None, title, window, cx,
+                                                        );
+                                                    });
+                                                }
+                                                workspace.focus_panel::<crate::AgentPanel>(
+                                                    window, cx,
+                                                );
+                                            });
+                                        }
+                                    })?;
+                                    Ok(())
+                                });
+                                Self::spawn_task_with_error_toast(
+                                    task,
+                                    workspace_for_open_thread.clone(),
+                                    cx,
+                                );
                             }
                         });
                     }
@@ -1456,11 +1651,9 @@ impl AgentTaskPanel {
     fn render_task_tree(&self, cx: &mut Context<Self>) -> Div {
         let store = self.store.read(cx);
         let graph = store.graph();
-        let events = store.events();
         let groups = build_goal_groups(
             &graph.tasks,
             &graph.goals,
-            events,
             &self.category_filters,
             &self.other_status_filters,
             &self.search_query,
@@ -2025,11 +2218,7 @@ impl AgentTaskPanel {
 
         let is_hovered = self.hovered_row == Some(HoveredRow::Task(task.id.clone()));
 
-        let policy_denied = self
-            .store
-            .read(cx)
-            .policy_denied_event_for_task(&task.id)
-            .cloned();
+        let policy_denied: Option<agent::AgentTaskEvent> = None;
 
         let exists_on_disk = self
             .worktree_status
@@ -3173,7 +3362,7 @@ pub fn render_task_markdown(
             if index > 0 {
                 doc.push_str("\n\n");
             }
-            doc.push_str(&format!("### {} вЂ” {}\n\n", artifact.kind, artifact.id));
+            doc.push_str(&format!("### {} — {}\n\n", artifact.kind, artifact.id));
             doc.push_str(artifact.content.trim_end());
             doc.push_str("\n\n");
         }
@@ -3215,7 +3404,7 @@ pub fn render_task_markdown(
             ));
         }
         if !conflict_files.is_empty() {
-            doc.push_str("- **Status:** вљ пёЏ Merge conflict detected\n");
+            doc.push_str("- **Status:** ⚠️ Merge conflict detected\n");
             doc.push_str("  - Conflicting files:\n");
             for f in &conflict_files {
                 doc.push_str(&format!("    - `{f}`\n"));
@@ -3362,23 +3551,6 @@ pub fn open_markdown_preview(
     })
 }
 
-pub fn compute_task_creation_timestamps<'a>(
-    events: impl IntoIterator<Item = &'a AgentTaskEvent>,
-) -> HashMap<AgentTaskId, u64> {
-    let mut timestamps = HashMap::new();
-    for event in events {
-        if let Some(task_id) = &event.task_id {
-            timestamps
-                .entry(task_id.clone())
-                .and_modify(|existing: &mut u64| {
-                    *existing = (*existing).min(event.timestamp_millis)
-                })
-                .or_insert(event.timestamp_millis);
-        }
-    }
-    timestamps
-}
-
 pub fn filter_visible_tasks(
     tasks: &[AgentTaskSummary],
     category_filters: &HashSet<FilterCategory>,
@@ -3396,25 +3568,17 @@ pub fn filter_visible_tasks(
         .collect()
 }
 
-pub fn sort_tasks_newest_first(
-    tasks: &mut [AgentTaskSummary],
-    timestamps: &HashMap<AgentTaskId, u64>,
-) {
-    tasks.sort_by(|a, b| {
-        let time_a = a.created_at.or_else(|| timestamps.get(&a.id).copied());
-        let time_b = b.created_at.or_else(|| timestamps.get(&b.id).copied());
-        match (time_a, time_b) {
-            (Some(ta), Some(tb)) => tb.cmp(&ta).then_with(|| a.id.cmp(&b.id)),
-            (Some(_), None) => std::cmp::Ordering::Less,
-            (None, Some(_)) => std::cmp::Ordering::Greater,
-            (None, None) => a.id.cmp(&b.id),
-        }
+pub fn sort_tasks_by_created_at(tasks: &mut [AgentTaskSummary]) {
+    tasks.sort_by(|a, b| match (a.created_at, b.created_at) {
+        (Some(ta), Some(tb)) => ta.cmp(&tb).then_with(|| a.id.cmp(&b.id)),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => a.id.cmp(&b.id),
     });
 }
 
 pub fn visible_roots(
     visible_tasks: &[AgentTaskSummary],
-    timestamps: &HashMap<AgentTaskId, u64>,
 ) -> Vec<AgentTaskSummary> {
     let visible_ids: HashSet<AgentTaskId> =
         visible_tasks.iter().map(|task| task.id.clone()).collect();
@@ -3427,7 +3591,7 @@ pub fn visible_roots(
         })
         .cloned()
         .collect();
-    sort_tasks_newest_first(&mut roots, timestamps);
+    sort_tasks_by_created_at(&mut roots);
     roots
 }
 
@@ -3435,14 +3599,13 @@ pub fn visible_roots(
 pub fn visible_children(
     parent_id: &AgentTaskId,
     visible_tasks: &[AgentTaskSummary],
-    timestamps: &HashMap<AgentTaskId, u64>,
 ) -> Vec<AgentTaskSummary> {
     let mut children: Vec<AgentTaskSummary> = visible_tasks
         .iter()
         .filter(|task| task.parent_id.as_ref().map_or(false, |id| id == parent_id))
         .cloned()
         .collect();
-    sort_tasks_newest_first(&mut children, timestamps);
+    sort_tasks_by_created_at(&mut children);
     children
 }
 
@@ -3465,11 +3628,10 @@ pub struct GoalGroup {
 
 pub fn build_task_tree_rows(
     visible_tasks: &[AgentTaskSummary],
-    timestamps: &HashMap<AgentTaskId, u64>,
     collapsed_tasks: &HashSet<AgentTaskId>,
     under_goal: bool,
 ) -> Vec<TaskRow> {
-    let roots = visible_roots(visible_tasks, timestamps);
+    let roots = visible_roots(visible_tasks);
     let num_roots = roots.len();
     let mut rows = Vec::new();
     let mut visited = HashSet::new();
@@ -3484,7 +3646,7 @@ pub fn build_task_tree_rows(
         }
     }
     for children in children_by_parent.values_mut() {
-        sort_tasks_newest_first(children, timestamps);
+        sort_tasks_by_created_at(children);
     }
 
     fn collect_node(
@@ -3574,16 +3736,14 @@ pub fn build_task_tree_rows(
     rows
 }
 
-pub fn build_goal_groups<'a>(
+pub fn build_goal_groups(
     tasks: &[AgentTaskSummary],
     goals: &[AgentGoalSummary],
-    events: impl IntoIterator<Item = &'a AgentTaskEvent>,
     category_filters: &HashSet<FilterCategory>,
     other_status_filters: &HashSet<AgentTaskStatus>,
     search_query: &str,
     collapsed_tasks: &HashSet<AgentTaskId>,
 ) -> Vec<GoalGroup> {
-    let timestamps = compute_task_creation_timestamps(events);
     let visible_tasks = filter_visible_tasks(tasks, category_filters, other_status_filters);
 
     let trimmed_search = search_query.trim().to_lowercase();
@@ -3707,7 +3867,7 @@ pub fn build_goal_groups<'a>(
 
         if !filtered_tasks.is_empty() || goal_title_matches || (!has_search && goal_status_matches)
         {
-            let rows = build_task_tree_rows(&filtered_tasks, &timestamps, collapsed_tasks, true);
+            let rows = build_task_tree_rows(&filtered_tasks, collapsed_tasks, true);
             result.push(GoalGroup {
                 goal_id: Some(goal_id),
                 goal_summary: summary,
@@ -3719,7 +3879,7 @@ pub fn build_goal_groups<'a>(
     if let Some(no_goal_tasks) = tasks_by_goal.remove(&None) {
         let filtered_no_goal = filter_task_set_by_search(no_goal_tasks);
         if !filtered_no_goal.is_empty() {
-            let rows = build_task_tree_rows(&filtered_no_goal, &timestamps, collapsed_tasks, false);
+            let rows = build_task_tree_rows(&filtered_no_goal, collapsed_tasks, false);
             result.push(GoalGroup {
                 goal_id: None,
                 goal_summary: None,
@@ -3732,16 +3892,14 @@ pub fn build_goal_groups<'a>(
 }
 
 #[allow(dead_code)]
-pub fn build_task_rows<'a>(
+pub fn build_task_rows(
     tasks: &[AgentTaskSummary],
-    events: impl IntoIterator<Item = &'a AgentTaskEvent>,
     category_filters: &HashSet<FilterCategory>,
 ) -> Vec<TaskRow> {
-    let timestamps = compute_task_creation_timestamps(events);
     let empty_others = HashSet::new();
     let empty_collapsed = HashSet::new();
     let visible = filter_visible_tasks(tasks, category_filters, &empty_others);
-    build_task_tree_rows(&visible, &timestamps, &empty_collapsed, false)
+    build_task_tree_rows(&visible, &empty_collapsed, false)
 }
 
 #[cfg(test)]
@@ -3776,6 +3934,7 @@ mod tests {
         offline: bool,
         tasks: Vec<AgentTaskSummary>,
         goals: Vec<AgentGoalSummary>,
+        #[allow(dead_code)]
         events: Vec<AgentTaskEvent>,
         calls: Arc<std::sync::Mutex<CallCounts>>,
     }
@@ -4007,14 +4166,6 @@ mod tests {
             Task::ready(Ok(()))
         }
 
-        fn list_events(
-            &self,
-            _limit: u32,
-            _cx: &mut App,
-        ) -> Task<anyhow::Result<Vec<AgentTaskEvent>>> {
-            Task::ready(Ok(self.events.clone()))
-        }
-
         fn list_artifacts(
             &self,
             _task_id: &AgentTaskId,
@@ -4216,21 +4367,19 @@ mod tests {
             );
             assert_eq!(visible.len(), 3);
 
-            let timestamps = HashMap::new();
-            let roots = visible_roots(&visible, &timestamps);
+            let roots = visible_roots(&visible);
             assert_eq!(roots.len(), 2);
             let root_ids: Vec<&str> = roots.iter().map(|t| t.id.0.as_ref()).collect();
             assert!(root_ids.contains(&"TASK-COMPLETED"));
             assert!(root_ids.contains(&"TASK-READY"));
 
             let children =
-                visible_children(&AgentTaskId::from("TASK-COMPLETED"), &visible, &timestamps);
+                visible_children(&AgentTaskId::from("TASK-COMPLETED"), &visible);
             assert_eq!(children.len(), 1);
             assert_eq!(children[0].id.0.as_ref(), "TASK-FAILED-CHILD");
 
             let rows = build_task_rows(
                 &store.graph().tasks,
-                store.events(),
                 &panel.category_filters,
             );
             assert_eq!(rows.len(), 3);
@@ -4241,9 +4390,9 @@ mod tests {
             assert_eq!(
                 row_info,
                 vec![
-                    ("TASK-READY", "", 0),
                     ("TASK-COMPLETED", "", 0),
                     ("TASK-FAILED-CHILD", "└── ", 1),
+                    ("TASK-READY", "", 0),
                 ]
             );
         });
@@ -4269,8 +4418,7 @@ mod tests {
                     .all(|t| t.status != AgentTaskStatus::Completed)
             );
 
-            let timestamps = HashMap::new();
-            let roots = visible_roots(&visible, &timestamps);
+            let roots = visible_roots(&visible);
             assert_eq!(roots.len(), 2);
             let root_ids: Vec<&str> = roots.iter().map(|t| t.id.0.as_ref()).collect();
             assert!(root_ids.contains(&"TASK-FAILED-CHILD"));
@@ -4278,7 +4426,6 @@ mod tests {
 
             let rows = build_task_rows(
                 &store.graph().tasks,
-                store.events(),
                 &panel.category_filters,
             );
             assert_eq!(rows.len(), 2);
@@ -4398,7 +4545,6 @@ mod tests {
 
         let goals = vec![goal_1, goal_2];
         let tasks = vec![task_1a, task_1b, task_2_parent, task_2_child];
-        let empty_events: Vec<AgentTaskEvent> = vec![];
         let cat_filters = default_category_filters();
         let other_filters = HashSet::new();
         let collapsed = HashSet::new();
@@ -4406,7 +4552,6 @@ mod tests {
         let groups_by_goal_match = build_goal_groups(
             &tasks,
             &goals,
-            &empty_events,
             &cat_filters,
             &other_filters,
             "Database",
@@ -4419,7 +4564,6 @@ mod tests {
         let groups_by_task_match = build_goal_groups(
             &tasks,
             &goals,
-            &empty_events,
             &cat_filters,
             &other_filters,
             "Tailwind",
@@ -4436,6 +4580,60 @@ mod tests {
             groups_by_task_match[0].rows[1].task.id.0.as_ref(),
             "TASK-2C"
         );
+    }
+
+    #[test]
+    fn test_agent_task_panel_created_at_ordering() {
+        let task_1 = AgentTaskSummary {
+            id: AgentTaskId::from("TASK-1"),
+            parent_id: None,
+            goal_id: None,
+            title: "Task 1".to_string(),
+            status: AgentTaskStatus::Ready,
+            attempt: 1,
+            assignee: None,
+            write_scopes: vec![],
+            created_at: Some(200),
+            assigned_profile: None,
+            model: None,
+            session_id: None,
+            metrics: None,
+        };
+        let task_2 = AgentTaskSummary {
+            id: AgentTaskId::from("TASK-2"),
+            parent_id: None,
+            goal_id: None,
+            title: "Task 2".to_string(),
+            status: AgentTaskStatus::Ready,
+            attempt: 1,
+            assignee: None,
+            write_scopes: vec![],
+            created_at: Some(100),
+            assigned_profile: None,
+            model: None,
+            session_id: None,
+            metrics: None,
+        };
+        let task_none = AgentTaskSummary {
+            id: AgentTaskId::from("TASK-NONE"),
+            parent_id: None,
+            goal_id: None,
+            title: "Task None".to_string(),
+            status: AgentTaskStatus::Ready,
+            attempt: 1,
+            assignee: None,
+            write_scopes: vec![],
+            created_at: None,
+            assigned_profile: None,
+            model: None,
+            session_id: None,
+            metrics: None,
+        };
+
+        let tasks = vec![task_1, task_2, task_none];
+        let rows = build_task_rows(&tasks, &default_category_filters());
+        let ids: Vec<&str> = rows.iter().map(|r| r.task.id.0.as_ref()).collect();
+        assert_eq!(ids, vec!["TASK-2", "TASK-1", "TASK-NONE"]);
     }
 
     #[test]
@@ -4554,14 +4752,7 @@ mod tests {
             task_c,
             task_no_events,
         ];
-        let events = vec![AgentTaskEvent {
-            seq: 7,
-            timestamp_millis: 2000,
-            task_id: Some(AgentTaskId::from("TASK-C")),
-            kind: AgentTaskEventKind::StatusChanged,
-            message: "created C".to_string(),
-        }];
-        let rows = build_task_rows(&tasks, &events, &default_category_filters());
+        let rows = build_task_rows(&tasks, &default_category_filters());
         let extracted: Vec<(&str, &str, usize)> = rows
             .iter()
             .map(|r| (r.task.id.0.as_ref(), r.prefix.as_str(), r.depth))
@@ -4569,12 +4760,12 @@ mod tests {
         assert_eq!(
             extracted,
             vec![
-                ("TASK-B", "", 0),
-                ("TASK-B-CHILD-1", "├── ", 1),
-                ("TASK-B-GRANDCHILD", "│   └── ", 2),
-                ("TASK-B-CHILD-2", "└── ", 1),
-                ("TASK-C", "", 0),
                 ("TASK-A", "", 0),
+                ("TASK-B", "", 0),
+                ("TASK-B-CHILD-2", "├── ", 1),
+                ("TASK-B-CHILD-1", "└── ", 1),
+                ("TASK-B-GRANDCHILD", "    └── ", 2),
+                ("TASK-C", "", 0),
                 ("TASK-NO-EVENTS", "", 0),
             ]
         );
@@ -4641,7 +4832,7 @@ mod tests {
         assert!(md.contains("- [ ] Criteria 1: colored icons"));
         assert!(md.contains("- [ ] Criteria 2: box tree"));
         assert!(md.contains("## Artifacts"));
-        assert!(md.contains("### review вЂ” art-1\n\nLGTM approved"));
+        assert!(md.contains("### review — art-1\n\nLGTM approved"));
         assert!(md.contains("## Events"));
         assert!(md.contains("- `#159` [STATUS] task.created"));
         assert!(md.contains("- `#160` [TOOL] run terminal"));
@@ -4871,6 +5062,7 @@ mod tests {
             total_tokens: Some(21500),
             cost_usd: Some(0.04),
             turns_count: Some(1),
+            diff: None,
         };
         let mut task_with_metrics = task_full;
         task_with_metrics.metrics = Some(sample_metrics.clone());
@@ -5158,8 +5350,11 @@ mod tests {
         .await;
 
         let calls = Arc::new(std::sync::Mutex::new(CallCounts::default()));
+        let mut goals = TestProvider::default().goals;
+        goals[1].session_id = Some("session-goal-2".to_string());
         let provider = Arc::new(TestProvider {
             calls: calls.clone(),
+            goals,
             ..Default::default()
         });
         let store = cx.update(|cx| cx.new(|cx| AgentTaskStore::new(provider, cx)));
@@ -5180,6 +5375,10 @@ mod tests {
         });
         cx.run_until_parked();
 
+        assert!(
+            cx.debug_bounds("MENU_ITEM-Open Thread").is_none(),
+            "Open Thread should not be present when no session is registered"
+        );
         assert!(
             cx.debug_bounds("MENU_ITEM-View Thread").is_none(),
             "View Thread should not be present when no session is registered"
@@ -5218,6 +5417,10 @@ mod tests {
         cx.run_until_parked();
 
         assert!(
+            cx.debug_bounds("MENU_ITEM-Open Thread").is_some(),
+            "Open Thread should be present when a session is registered for the task"
+        );
+        assert!(
             cx.debug_bounds("MENU_ITEM-View Thread").is_some(),
             "View Thread should be present when a session is registered for the task"
         );
@@ -5233,6 +5436,58 @@ mod tests {
         assert!(
             cx.debug_bounds("MENU_ITEM-Complete").is_some(),
             "Complete should be present in context menu"
+        );
+
+        // Goal context menu without session_id (GOAL-1)
+        panel.update_in(cx, |panel, window, cx| {
+            panel.deploy_context_menu(
+                ContextMenuTarget::Goal("GOAL-1".to_string()),
+                Point::new(px(100.0), px(100.0)),
+                None,
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        assert!(
+            cx.debug_bounds("MENU_ITEM-Open Thread").is_none(),
+            "Open Thread should not be present for goal when session_id is None"
+        );
+        assert!(
+            cx.debug_bounds("MENU_ITEM-View Thread").is_none(),
+            "View Thread should not be present for goal when session_id is None"
+        );
+        assert!(
+            cx.debug_bounds("MENU_ITEM-View Thread as Markdown")
+                .is_none(),
+            "View Thread as Markdown should not be present for goal when session_id is None"
+        );
+
+        // Goal context menu with session_id (GOAL-2)
+        panel.update_in(cx, |panel, window, cx| {
+            panel.deploy_context_menu(
+                ContextMenuTarget::Goal("GOAL-2".to_string()),
+                Point::new(px(100.0), px(100.0)),
+                None,
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        assert!(
+            cx.debug_bounds("MENU_ITEM-Open Thread").is_some(),
+            "Open Thread should be present for goal when session_id is Some"
+        );
+        assert!(
+            cx.debug_bounds("MENU_ITEM-View Thread").is_some(),
+            "View Thread should be present for goal when session_id is Some"
+        );
+        assert!(
+            cx.debug_bounds("MENU_ITEM-View Thread as Markdown")
+                .is_some(),
+            "View Thread as Markdown should be present for goal when session_id is Some"
         );
     }
 
@@ -5758,7 +6013,7 @@ mod tests {
             Some(&goal_summary),
             Some(&goal_git),
         );
-        assert!(md_conf.contains("- **Status:** вљ пёЏ Merge conflict detected"));
+        assert!(md_conf.contains("- **Status:** ⚠️ Merge conflict detected"));
         assert!(md_conf.contains("`src/main.rs`"));
     }
 
@@ -5857,18 +6112,10 @@ mod tests {
             },
         ];
 
-        let mut timestamps = HashMap::new();
-        timestamps.insert(AgentTaskId::from("TASK-ROOT-1"), 10);
-        timestamps.insert(AgentTaskId::from("TASK-CHILD-1"), 20);
-        timestamps.insert(AgentTaskId::from("TASK-GRANDCHILD-1"), 30);
-        timestamps.insert(AgentTaskId::from("TASK-CHILD-2"), 40);
-        timestamps.insert(AgentTaskId::from("TASK-ROOT-2"), 50);
-        timestamps.insert(AgentTaskId::from("TASK-CHILD-3"), 60);
-
         let collapsed = HashSet::new();
 
         // Under goal: roots receive ├── / └── and subtasks inherit continuation prefix
-        let under_goal_rows = build_task_tree_rows(&tasks, &timestamps, &collapsed, true);
+        let under_goal_rows = build_task_tree_rows(&tasks, &collapsed, true);
         let under_goal_info: Vec<(&str, &str, &str)> = under_goal_rows
             .iter()
             .map(|r| {
@@ -5883,17 +6130,17 @@ mod tests {
         assert_eq!(
             under_goal_info,
             vec![
-                ("TASK-ROOT-2", "├── ", "│   "),
-                ("TASK-CHILD-3", "│   └── ", "│       "),
-                ("TASK-ROOT-1", "└── ", "    "),
-                ("TASK-CHILD-2", "    ├── ", "    │   "),
-                ("TASK-CHILD-1", "    └── ", "        "),
-                ("TASK-GRANDCHILD-1", "        └── ", "            "),
+                ("TASK-ROOT-1", "├── ", "│   "),
+                ("TASK-CHILD-1", "│   ├── ", "│   │   "),
+                ("TASK-GRANDCHILD-1", "│   │   └── ", "│   │       "),
+                ("TASK-CHILD-2", "│   └── ", "│       "),
+                ("TASK-ROOT-2", "└── ", "    "),
+                ("TASK-CHILD-3", "    └── ", "        "),
             ]
         );
 
         // No goal: roots have "" and subtasks receive ├── / └──
-        let no_goal_rows = build_task_tree_rows(&tasks, &timestamps, &collapsed, false);
+        let no_goal_rows = build_task_tree_rows(&tasks, &collapsed, false);
         let no_goal_info: Vec<(&str, &str, &str)> = no_goal_rows
             .iter()
             .map(|r| {
@@ -5908,12 +6155,12 @@ mod tests {
         assert_eq!(
             no_goal_info,
             vec![
+                ("TASK-ROOT-1", "", ""),
+                ("TASK-CHILD-1", "├── ", "│   "),
+                ("TASK-GRANDCHILD-1", "│   └── ", "│       "),
+                ("TASK-CHILD-2", "└── ", "    "),
                 ("TASK-ROOT-2", "", ""),
                 ("TASK-CHILD-3", "└── ", "    "),
-                ("TASK-ROOT-1", "", ""),
-                ("TASK-CHILD-2", "├── ", "│   "),
-                ("TASK-CHILD-1", "└── ", "    "),
-                ("TASK-GRANDCHILD-1", "    └── ", "        "),
             ]
         );
     }
@@ -6032,6 +6279,7 @@ mod tests {
             total_tokens: Some(21500),
             cost_usd: Some(0.04),
             turns_count: Some(1),
+            diff: None,
         };
         let goal = AgentGoalSummary {
             goal_id: "GOAL-10".to_string(),
@@ -6248,6 +6496,7 @@ mod tests {
             total_tokens: Some(3500),
             cost_usd: Some(0.05),
             turns_count: Some(7),
+            diff: None,
         };
 
         // Check render_metrics_elements directly: duration is omitted, turns controlled by flag

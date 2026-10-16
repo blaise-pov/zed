@@ -1,20 +1,21 @@
-use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
-use gpui::{App, Context, Task};
+use gpui::{App, Context, Entity, Task, TaskExt};
+use project::Project;
 use util::ResultExt;
 
 use crate::agent_task::{
-    AgentGoalStatus, AgentTaskArtifact, AgentTaskDetail, AgentTaskEvent,
-    AgentTaskEventKind, AgentTaskGraph, AgentTaskId, AgentTaskProvider, AgentTaskStatus,
+    AgentGoalStatus, AgentTaskArtifact, AgentTaskDetail, AgentTaskGraph,
+    AgentTaskId, AgentTaskProvider, AgentTaskStatus,
 };
 
 pub struct AgentTaskStore {
     provider: Arc<dyn AgentTaskProvider>,
+    project: Option<Entity<Project>>,
     graph: AgentTaskGraph,
-    events: VecDeque<AgentTaskEvent>,
+    has_initial_refresh: bool,
     is_offline: bool,
     last_error: Option<String>,
     _poll_task: Option<Task<()>>,
@@ -22,10 +23,19 @@ pub struct AgentTaskStore {
 
 impl AgentTaskStore {
     pub fn new(provider: Arc<dyn AgentTaskProvider>, cx: &mut Context<Self>) -> Self {
+        Self::new_with_project(provider, None, cx)
+    }
+
+    pub fn new_with_project(
+        provider: Arc<dyn AgentTaskProvider>,
+        project: Option<Entity<Project>>,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let mut store = Self {
             provider,
+            project,
             graph: AgentTaskGraph::default(),
-            events: VecDeque::new(),
+            has_initial_refresh: false,
             is_offline: false,
             last_error: None,
             _poll_task: None,
@@ -38,12 +48,20 @@ impl AgentTaskStore {
         &self.provider
     }
 
+    pub fn project(&self) -> Option<&Entity<Project>> {
+        self.project.as_ref()
+    }
+
+    pub fn set_project(&mut self, project: Option<Entity<Project>>) {
+        self.project = project;
+    }
+
     /// Swap the backing provider (e.g. when the configured task server id
     /// changes) and refresh from the new server.
     pub fn set_provider(&mut self, provider: Arc<dyn AgentTaskProvider>, cx: &mut Context<Self>) {
         self.provider = provider;
         self.graph = AgentTaskGraph::default();
-        self.events.clear();
+        self.has_initial_refresh = false;
         self.is_offline = false;
         self.last_error = None;
         self.refresh(cx).detach();
@@ -52,10 +70,6 @@ impl AgentTaskStore {
 
     pub fn graph(&self) -> &AgentTaskGraph {
         &self.graph
-    }
-
-    pub fn events(&self) -> &VecDeque<AgentTaskEvent> {
-        &self.events
     }
 
     pub fn is_offline(&self) -> bool {
@@ -82,10 +96,9 @@ impl AgentTaskStore {
     pub fn refresh(&mut self, cx: &mut Context<Self>) -> Task<Result<()>> {
         let provider = self.provider.clone();
         let graph_task = provider.fetch_graph(cx);
-        let events_task = provider.list_events(200, cx);
 
         cx.spawn(async move |this, cx| {
-            let (graph_result, events_result) = futures::join!(graph_task, events_task);
+            let graph_result = graph_task.await;
 
             this.update(cx, |store, cx| {
                 let mut changed = false;
@@ -101,16 +114,35 @@ impl AgentTaskStore {
                             }
                         }
 
-                        match events_result {
-                            Ok(events) => {
-                                if store.events.make_contiguous() != events.as_slice() {
-                                    store.events = events.into();
-                                    changed = true;
+                        if store.has_initial_refresh {
+                            if let Some(project) = store.project.clone() {
+                                for new_task in &graph.tasks {
+                                    let old_task =
+                                        store.graph.tasks.iter().find(|t| t.id == new_task.id);
+                                    let transitioned_to_terminal = old_task
+                                        .map_or(false, |old| !old.status.is_terminal())
+                                        && new_task.status.is_terminal();
+
+                                    if transitioned_to_terminal
+                                        && crate::task_worktree::task_worktree_path_for_id(
+                                            &new_task.id,
+                                        )
+                                        .is_some()
+                                        && !crate::task_worktree::has_active_subagent_session(
+                                            &new_task.id,
+                                        )
+                                    {
+                                        let project = project.clone();
+                                        let task_id = new_task.id.clone();
+                                        crate::task_worktree::auto_cleanup_task_worktree(
+                                            project, &task_id, cx,
+                                        )
+                                        .detach_and_log_err(cx);
+                                    }
                                 }
                             }
-                            Err(err) => {
-                                log::error!("failed to fetch events: {err:?}");
-                            }
+                        } else {
+                            store.has_initial_refresh = true;
                         }
 
                         if store.graph != graph {
@@ -148,12 +180,6 @@ impl AgentTaskStore {
             })
             .log_err();
             Ok(())
-        })
-    }
-
-    pub fn policy_denied_event_for_task(&self, task_id: &AgentTaskId) -> Option<&AgentTaskEvent> {
-        self.events.iter().find(|e| {
-            e.kind == AgentTaskEventKind::PolicyDenied && e.task_id.as_ref() == Some(task_id)
         })
     }
 
@@ -350,6 +376,9 @@ impl AgentTaskStore {
 
 #[cfg(test)]
 mod tests {
+    use crate::agent_task::AgentTaskEvent;
+    use fs::Fs;
+    use settings::Settings;
     use std::sync::Mutex;
 
     use super::*;
@@ -371,6 +400,64 @@ mod tests {
         update_task_title_calls: Vec<(AgentTaskId, String)>,
         update_goal_title_calls: Vec<(String, String)>,
         fetch_graph_count: usize,
+    }
+
+    #[derive(Default)]
+    struct DynamicProvider {
+        graph: parking_lot::Mutex<AgentTaskGraph>,
+        #[allow(dead_code)]
+        events: parking_lot::Mutex<Vec<AgentTaskEvent>>,
+    }
+
+    impl AgentTaskProvider for DynamicProvider {
+        fn server_id(&self) -> ContextServerId {
+            ContextServerId("dynamic_test".into())
+        }
+
+        fn fetch_graph(&self, _cx: &mut App) -> Task<Result<AgentTaskGraph>> {
+            Task::ready(Ok(self.graph.lock().clone()))
+        }
+
+        fn get_task(&self, _id: &AgentTaskId, _cx: &mut App) -> Task<Result<AgentTaskDetail>> {
+            Task::ready(Err(anyhow::anyhow!("not implemented")))
+        }
+
+        fn complete_task(&self, _id: &AgentTaskId, _cx: &mut App) -> Task<Result<()>> {
+            Task::ready(Ok(()))
+        }
+
+        fn fail_task(&self, _id: &AgentTaskId, _reason: &str, _cx: &mut App) -> Task<Result<()>> {
+            Task::ready(Ok(()))
+        }
+
+        fn archive_task(&self, _id: &AgentTaskId, _cx: &mut App) -> Task<Result<()>> {
+            Task::ready(Ok(()))
+        }
+
+        fn unarchive_task(&self, _id: &AgentTaskId, _cx: &mut App) -> Task<Result<()>> {
+            Task::ready(Ok(()))
+        }
+
+        fn delete_task(&self, _id: &AgentTaskId, _cx: &mut App) -> Task<Result<()>> {
+            Task::ready(Ok(()))
+        }
+
+
+        fn list_artifacts(
+            &self,
+            _task_id: &AgentTaskId,
+            _cx: &mut App,
+        ) -> Task<Result<Vec<AgentTaskArtifact>>> {
+            Task::ready(Ok(vec![]))
+        }
+
+        fn get_artifact(
+            &self,
+            _artifact_id: &str,
+            _cx: &mut App,
+        ) -> Task<Result<AgentTaskArtifact>> {
+            Task::ready(Err(anyhow::anyhow!("not implemented")))
+        }
     }
 
     #[derive(Default)]
@@ -486,12 +573,7 @@ mod tests {
             Task::ready(Ok(()))
         }
 
-        fn update_goal_title(
-            &self,
-            goal_id: &str,
-            title: &str,
-            _cx: &mut App,
-        ) -> Task<Result<()>> {
+        fn update_goal_title(&self, goal_id: &str, title: &str, _cx: &mut App) -> Task<Result<()>> {
             self.calls
                 .lock()
                 .unwrap()
@@ -546,9 +628,6 @@ mod tests {
             Task::ready(Ok(()))
         }
 
-        fn list_events(&self, _limit: u32, _cx: &mut App) -> Task<Result<Vec<AgentTaskEvent>>> {
-            Task::ready(Ok(vec![]))
-        }
 
         fn list_artifacts(
             &self,
@@ -845,70 +924,6 @@ mod tests {
     async fn test_agent_task_store_refresh_dirty_checking(cx: &mut TestAppContext) {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
-        struct DynamicProvider {
-            graph: parking_lot::Mutex<AgentTaskGraph>,
-            events: parking_lot::Mutex<Vec<AgentTaskEvent>>,
-        }
-
-        impl AgentTaskProvider for DynamicProvider {
-            fn server_id(&self) -> ContextServerId {
-                ContextServerId("dynamic_test".into())
-            }
-
-            fn fetch_graph(&self, _cx: &mut App) -> Task<Result<AgentTaskGraph>> {
-                Task::ready(Ok(self.graph.lock().clone()))
-            }
-
-            fn get_task(&self, _id: &AgentTaskId, _cx: &mut App) -> Task<Result<AgentTaskDetail>> {
-                Task::ready(Err(anyhow::anyhow!("not implemented")))
-            }
-
-            fn complete_task(&self, _id: &AgentTaskId, _cx: &mut App) -> Task<Result<()>> {
-                Task::ready(Ok(()))
-            }
-
-            fn fail_task(
-                &self,
-                _id: &AgentTaskId,
-                _reason: &str,
-                _cx: &mut App,
-            ) -> Task<Result<()>> {
-                Task::ready(Ok(()))
-            }
-
-            fn archive_task(&self, _id: &AgentTaskId, _cx: &mut App) -> Task<Result<()>> {
-                Task::ready(Ok(()))
-            }
-
-            fn unarchive_task(&self, _id: &AgentTaskId, _cx: &mut App) -> Task<Result<()>> {
-                Task::ready(Ok(()))
-            }
-
-            fn delete_task(&self, _id: &AgentTaskId, _cx: &mut App) -> Task<Result<()>> {
-                Task::ready(Ok(()))
-            }
-
-            fn list_events(&self, _limit: u32, _cx: &mut App) -> Task<Result<Vec<AgentTaskEvent>>> {
-                Task::ready(Ok(self.events.lock().clone()))
-            }
-
-            fn list_artifacts(
-                &self,
-                _task_id: &AgentTaskId,
-                _cx: &mut App,
-            ) -> Task<Result<Vec<AgentTaskArtifact>>> {
-                Task::ready(Ok(vec![]))
-            }
-
-            fn get_artifact(
-                &self,
-                _artifact_id: &str,
-                _cx: &mut App,
-            ) -> Task<Result<AgentTaskArtifact>> {
-                Task::ready(Err(anyhow::anyhow!("not implemented")))
-            }
-        }
-
         let initial_graph = AgentTaskGraph {
             tasks: vec![AgentTaskSummary {
                 id: AgentTaskId::from("TASK-1"),
@@ -1001,5 +1016,265 @@ mod tests {
             crate::task_worktree::task_session_id_for_id(&AgentTaskId::from("TASK-REHYDRATE-1")),
             Some("session-rehydrated-42".to_string())
         );
+    }
+
+    #[gpui::test]
+    async fn test_terminal_reaction_flips_to_completed_cleans_worktree(cx: &mut TestAppContext) {
+        crate::task_worktree::reset_registry_for_tests();
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            project::project_settings::ProjectSettings::register(cx);
+            agent_settings::AgentSettings::register(cx);
+        });
+
+        let fs = fs::FakeFs::new(cx.executor());
+        fs.insert_tree(
+            "/root",
+            serde_json::json!({
+                ".git": {}
+            }),
+        )
+        .await;
+
+        let project = Project::test(fs.clone(), ["/root".as_ref()], cx).await;
+        let task_id = AgentTaskId::from("TASK-TERM-1");
+        let task = AgentTaskSummary {
+            id: task_id.clone(),
+            title: "Terminal task".to_string(),
+            status: AgentTaskStatus::Ready,
+            ..Default::default()
+        };
+
+        let path = cx
+            .update(|cx| crate::task_worktree::ensure_task_worktree(project.clone(), &task, cx))
+            .await
+            .expect("worktree creation should succeed");
+        assert!(crate::task_worktree::task_worktree_path_for_id(&task_id).is_some());
+
+        let initial_graph = AgentTaskGraph {
+            tasks: vec![task.clone()],
+            goals: vec![],
+        };
+        let provider = Arc::new(DynamicProvider {
+            graph: parking_lot::Mutex::new(initial_graph),
+            events: parking_lot::Mutex::new(Vec::new()),
+        });
+
+        let store = cx.update(|cx| {
+            cx.new(|cx| AgentTaskStore::new_with_project(provider.clone(), Some(project), cx))
+        });
+        cx.run_until_parked();
+
+        assert!(crate::task_worktree::task_worktree_path_for_id(&task_id).is_some());
+
+        let mut completed_task = task.clone();
+        completed_task.status = AgentTaskStatus::Completed;
+        *provider.graph.lock() = AgentTaskGraph {
+            tasks: vec![completed_task],
+            goals: vec![],
+        };
+
+        let refresh_task = store.update(cx, |s, cx| s.refresh(cx));
+        refresh_task.await.ok();
+        cx.run_until_parked();
+
+        assert!(
+            crate::task_worktree::task_worktree_path_for_id(&task_id).is_none(),
+            "worktree should be unregistered after auto cleanup"
+        );
+        assert!(
+            !fs.is_dir(&path).await,
+            "worktree directory should be removed"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_terminal_reaction_active_subagent_session_retains_worktree(
+        cx: &mut TestAppContext,
+    ) {
+        crate::task_worktree::reset_registry_for_tests();
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            project::project_settings::ProjectSettings::register(cx);
+            agent_settings::AgentSettings::register(cx);
+        });
+
+        let fs = fs::FakeFs::new(cx.executor());
+        fs.insert_tree(
+            "/root",
+            serde_json::json!({
+                ".git": {}
+            }),
+        )
+        .await;
+
+        let project = Project::test(fs.clone(), ["/root".as_ref()], cx).await;
+        let task_id = AgentTaskId::from("TASK-TERM-2");
+        let task = AgentTaskSummary {
+            id: task_id.clone(),
+            title: "Terminal task with active session".to_string(),
+            status: AgentTaskStatus::Ready,
+            ..Default::default()
+        };
+
+        let path = cx
+            .update(|cx| crate::task_worktree::ensure_task_worktree(project.clone(), &task, cx))
+            .await
+            .expect("worktree creation should succeed");
+        assert!(crate::task_worktree::task_worktree_path_for_id(&task_id).is_some());
+
+        let initial_graph = AgentTaskGraph {
+            tasks: vec![task.clone()],
+            goals: vec![],
+        };
+        let provider = Arc::new(DynamicProvider {
+            graph: parking_lot::Mutex::new(initial_graph),
+            events: parking_lot::Mutex::new(Vec::new()),
+        });
+
+        let store = cx.update(|cx| {
+            cx.new(|cx| AgentTaskStore::new_with_project(provider.clone(), Some(project), cx))
+        });
+        cx.run_until_parked();
+
+        crate::task_worktree::register_subagent_session(&task_id);
+
+        let mut completed_task = task.clone();
+        completed_task.status = AgentTaskStatus::Completed;
+        *provider.graph.lock() = AgentTaskGraph {
+            tasks: vec![completed_task],
+            goals: vec![],
+        };
+
+        let refresh_task = store.update(cx, |s, cx| s.refresh(cx));
+        refresh_task.await.ok();
+        cx.run_until_parked();
+
+        assert!(
+            crate::task_worktree::task_worktree_path_for_id(&task_id).is_some(),
+            "worktree should be retained when active session is present"
+        );
+        assert!(
+            fs.is_dir(&path).await,
+            "worktree directory should still exist"
+        );
+
+        crate::task_worktree::unregister_subagent_session(&task_id);
+    }
+
+    #[gpui::test]
+    async fn test_terminal_reaction_terminal_status_unchanged_no_cleanup(cx: &mut TestAppContext) {
+        crate::task_worktree::reset_registry_for_tests();
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            project::project_settings::ProjectSettings::register(cx);
+            agent_settings::AgentSettings::register(cx);
+        });
+
+        let fs = fs::FakeFs::new(cx.executor());
+        fs.insert_tree(
+            "/root",
+            serde_json::json!({
+                ".git": {}
+            }),
+        )
+        .await;
+
+        let project = Project::test(fs.clone(), ["/root".as_ref()], cx).await;
+        let task_id = AgentTaskId::from("TASK-TERM-3");
+        let task = AgentTaskSummary {
+            id: task_id.clone(),
+            title: "Already completed task".to_string(),
+            status: AgentTaskStatus::Completed,
+            ..Default::default()
+        };
+
+        let path = cx
+            .update(|cx| crate::task_worktree::ensure_task_worktree(project.clone(), &task, cx))
+            .await
+            .expect("worktree creation should succeed");
+
+        let initial_graph = AgentTaskGraph {
+            tasks: vec![task.clone()],
+            goals: vec![],
+        };
+        let provider = Arc::new(DynamicProvider {
+            graph: parking_lot::Mutex::new(initial_graph.clone()),
+            events: parking_lot::Mutex::new(Vec::new()),
+        });
+
+        let store = cx.update(|cx| {
+            cx.new(|cx| AgentTaskStore::new_with_project(provider.clone(), Some(project), cx))
+        });
+        cx.run_until_parked();
+
+        let refresh_task = store.update(cx, |s, cx| s.refresh(cx));
+        refresh_task.await.ok();
+        cx.run_until_parked();
+
+        assert!(
+            crate::task_worktree::task_worktree_path_for_id(&task_id).is_some(),
+            "worktree should not be cleaned when terminal status did not change"
+        );
+        assert!(fs.is_dir(&path).await);
+    }
+
+    #[gpui::test]
+    async fn test_terminal_reaction_first_refresh_already_terminal_no_cleanup(
+        cx: &mut TestAppContext,
+    ) {
+        crate::task_worktree::reset_registry_for_tests();
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            project::project_settings::ProjectSettings::register(cx);
+            agent_settings::AgentSettings::register(cx);
+        });
+
+        let fs = fs::FakeFs::new(cx.executor());
+        fs.insert_tree(
+            "/root",
+            serde_json::json!({
+                ".git": {}
+            }),
+        )
+        .await;
+
+        let project = Project::test(fs.clone(), ["/root".as_ref()], cx).await;
+        let task_id = AgentTaskId::from("TASK-TERM-4");
+        let task = AgentTaskSummary {
+            id: task_id.clone(),
+            title: "Startup completed task".to_string(),
+            status: AgentTaskStatus::Completed,
+            ..Default::default()
+        };
+
+        let path = cx
+            .update(|cx| crate::task_worktree::ensure_task_worktree(project.clone(), &task, cx))
+            .await
+            .expect("worktree creation should succeed");
+
+        let initial_graph = AgentTaskGraph {
+            tasks: vec![task.clone()],
+            goals: vec![],
+        };
+        let provider = Arc::new(DynamicProvider {
+            graph: parking_lot::Mutex::new(initial_graph),
+            events: parking_lot::Mutex::new(Vec::new()),
+        });
+
+        let _store = cx.update(|cx| {
+            cx.new(|cx| AgentTaskStore::new_with_project(provider.clone(), Some(project), cx))
+        });
+        cx.run_until_parked();
+
+        assert!(
+            crate::task_worktree::task_worktree_path_for_id(&task_id).is_some(),
+            "worktree should not be cleaned on initial refresh bootstrap"
+        );
+        assert!(fs.is_dir(&path).await);
     }
 }

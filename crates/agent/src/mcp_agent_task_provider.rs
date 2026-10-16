@@ -4,8 +4,8 @@ use gpui::{App, Entity, Task};
 use project::context_server_store::ContextServerStore;
 
 use crate::agent_task::{
-    AgentGoalStatus, AgentTaskArtifact, AgentTaskDetail, AgentTaskEvent, AgentTaskGraph,
-    AgentTaskId, AgentTaskProvider, AgentTaskStatus, AgentTurnRecord,
+    AgentGoalStatus, AgentTaskArtifact, AgentTaskDetail, AgentTaskGraph, AgentTaskId,
+    AgentTaskProvider, AgentTaskStatus, AgentTurnRecord,
 };
 
 pub struct McpAgentTaskProvider {
@@ -305,18 +305,6 @@ impl AgentTaskProvider for McpAgentTaskProvider {
         })
     }
 
-    fn list_events(&self, limit: u32, cx: &mut App) -> Task<Result<Vec<AgentTaskEvent>>> {
-        let mut args = serde_json::Map::new();
-        args.insert("limit".to_string(), serde_json::Value::Number(limit.into()));
-        let task = self.call_tool("events_list", Some(args), cx);
-        cx.spawn(async move |_cx| {
-            let value = task.await?;
-            let events: Vec<AgentTaskEvent> = serde_json::from_value(value)
-                .context("failed to parse Vec<AgentTaskEvent> from events_list response")?;
-            Ok(events)
-        })
-    }
-
     fn list_artifacts(
         &self,
         task_id: &AgentTaskId,
@@ -440,6 +428,14 @@ impl AgentTaskProvider for McpAgentTaskProvider {
                 "output_summary".to_string(),
                 serde_json::Value::String(output_summary.to_string()),
             );
+        }
+        if let Some(diff) = record.diff {
+            let diff_obj = serde_json::json!({
+                "files_changed": diff.files_changed,
+                "insertions": diff.insertions,
+                "deletions": diff.deletions,
+            });
+            args.insert("diff".to_string(), diff_obj);
         }
         let task = self.call_tool("task_record_turn", Some(args), cx);
         cx.spawn(async move |_cx| {

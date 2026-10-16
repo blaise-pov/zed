@@ -4293,10 +4293,26 @@ impl Thread {
         input: &serde_json::Value,
         thread_task_id: Option<&str>,
     ) -> Option<String> {
-        if tool_name.ends_with("task_complete")
+        let is_terminal = if tool_name.ends_with("task_complete")
             || tool_name.ends_with("task_fail")
             || tool_name.ends_with("task_cancel")
         {
+            true
+        } else if tool_name.ends_with("task_update") {
+            input
+                .get("status")
+                .and_then(|v| v.as_str())
+                .map(|s| {
+                    s.eq_ignore_ascii_case("completed")
+                        || s.eq_ignore_ascii_case("failed")
+                        || s.eq_ignore_ascii_case("cancelled")
+                })
+                .unwrap_or(false)
+        } else {
+            false
+        };
+
+        if is_terminal {
             input
                 .get("task_id")
                 .or_else(|| input.get("id"))
@@ -8846,6 +8862,85 @@ mod tests {
         assert_eq!(
             Thread::extract_terminal_task_id("some_other_tool", &task_input, None),
             None
+        );
+
+        // 3. Task update with terminal vs non-terminal status
+        let task_update_completed = json!({
+            "task_id": "TASK-200",
+            "status": "completed",
+        });
+        assert_eq!(
+            Thread::extract_terminal_task_id("task_update", &task_update_completed, None),
+            Some("TASK-200".to_string())
+        );
+
+        let mcp_task_update_completed = json!({
+            "id": "TASK-200",
+            "status": "Completed",
+        });
+        assert_eq!(
+            Thread::extract_terminal_task_id(
+                "mcp__taskgraph__task_update",
+                &mcp_task_update_completed,
+                None
+            ),
+            Some("TASK-200".to_string())
+        );
+
+        let task_update_failed = json!({
+            "task_id": "TASK-200",
+            "status": "failed",
+        });
+        assert_eq!(
+            Thread::extract_terminal_task_id("task_update", &task_update_failed, None),
+            Some("TASK-200".to_string())
+        );
+
+        let task_update_cancelled = json!({
+            "task_id": "TASK-200",
+            "status": "cancelled",
+        });
+        assert_eq!(
+            Thread::extract_terminal_task_id("task_update", &task_update_cancelled, None),
+            Some("TASK-200".to_string())
+        );
+
+        let task_update_running = json!({
+            "task_id": "TASK-200",
+            "status": "running",
+        });
+        assert_eq!(
+            Thread::extract_terminal_task_id("task_update", &task_update_running, None),
+            None
+        );
+
+        let task_update_no_status = json!({
+            "task_id": "TASK-200",
+        });
+        assert_eq!(
+            Thread::extract_terminal_task_id("task_update", &task_update_no_status, None),
+            None
+        );
+
+        let other_tool_with_completed = json!({
+            "task_id": "TASK-200",
+            "status": "completed",
+        });
+        assert_eq!(
+            Thread::extract_terminal_task_id("other_tool", &other_tool_with_completed, None),
+            None
+        );
+
+        let task_update_fallback = json!({
+            "status": "completed",
+        });
+        assert_eq!(
+            Thread::extract_terminal_task_id(
+                "task_update",
+                &task_update_fallback,
+                Some("FALLBACK-TASK")
+            ),
+            Some("FALLBACK-TASK".to_string())
         );
     }
 

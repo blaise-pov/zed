@@ -270,6 +270,13 @@ where
     deserializer.deserialize_any(CreatedAtVisitor)
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentDiffShortstat {
+    pub files_changed: u64,
+    pub insertions: u64,
+    pub deletions: u64,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct AgentTaskMetrics {
     #[serde(default)]
@@ -288,6 +295,8 @@ pub struct AgentTaskMetrics {
     pub cost_usd: Option<f64>,
     #[serde(default, alias = "turns")]
     pub turns_count: Option<u32>,
+    #[serde(default)]
+    pub diff: Option<AgentDiffShortstat>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -365,7 +374,7 @@ impl Default for AgentGoalSummary {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AgentTurnRecord {
     pub duration_ms: u64,
     pub tokens: Option<language_model::TokenUsage>,
@@ -375,6 +384,8 @@ pub struct AgentTurnRecord {
     pub branch: Option<SharedString>,
     pub commit_sha: Option<SharedString>,
     pub output_summary: Option<SharedString>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diff: Option<AgentDiffShortstat>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
@@ -491,7 +502,6 @@ pub trait AgentTaskProvider: 'static + Send + Sync {
     fn archive_task(&self, id: &AgentTaskId, cx: &mut App) -> Task<Result<()>>;
     fn unarchive_task(&self, id: &AgentTaskId, cx: &mut App) -> Task<Result<()>>;
     fn delete_task(&self, id: &AgentTaskId, cx: &mut App) -> Task<Result<()>>;
-    fn list_events(&self, limit: u32, cx: &mut App) -> Task<Result<Vec<AgentTaskEvent>>>;
     fn list_artifacts(
         &self,
         task_id: &AgentTaskId,
@@ -821,6 +831,7 @@ mod tests {
                 tasks_done: 1,
                 created_at: None,
                 metrics: None,
+                session_id: None,
             }
         );
 
@@ -915,9 +926,6 @@ mod tests {
             fn delete_task(&self, _id: &AgentTaskId, _cx: &mut App) -> Task<Result<()>> {
                 Task::ready(Err(anyhow::anyhow!("not implemented")))
             }
-            fn list_events(&self, _limit: u32, _cx: &mut App) -> Task<Result<Vec<AgentTaskEvent>>> {
-                Task::ready(Err(anyhow::anyhow!("not implemented")))
-            }
             fn list_artifacts(
                 &self,
                 _task_id: &AgentTaskId,
@@ -936,9 +944,7 @@ mod tests {
 
         let provider = DefaultProvider;
         let task_res = cx
-            .update(|cx| {
-                provider.update_task_title(&AgentTaskId::from("TASK-1"), "New Title", cx)
-            })
+            .update(|cx| provider.update_task_title(&AgentTaskId::from("TASK-1"), "New Title", cx))
             .await;
         assert_eq!(
             task_res.unwrap_err().to_string(),
