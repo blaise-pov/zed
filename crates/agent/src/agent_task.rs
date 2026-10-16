@@ -345,6 +345,8 @@ pub struct AgentGoalSummary {
     pub created_at: Option<u64>,
     #[serde(default)]
     pub metrics: Option<AgentTaskMetrics>,
+    #[serde(default)]
+    pub session_id: Option<String>,
 }
 
 impl Default for AgentGoalSummary {
@@ -358,6 +360,7 @@ impl Default for AgentGoalSummary {
             tasks_done: 0,
             created_at: None,
             metrics: None,
+            session_id: None,
         }
     }
 }
