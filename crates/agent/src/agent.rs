@@ -280,6 +280,7 @@ impl Session {
 
 struct PendingSession {
     task: Shared<Task<Result<Entity<AcpThread>, Arc<anyhow::Error>>>>,
+    promoted: bool,
 }
 
 pub struct LanguageModels {
@@ -834,20 +835,25 @@ impl NativeAgent {
             )
         });
 
-        self.register_session(thread, project_id, cx)
+        self.register_session(thread, project_id, false, cx)
     }
 
     fn register_session(
         &mut self,
         thread_handle: Entity<Thread>,
         project_id: EntityId,
+        promote: bool,
         cx: &mut Context<Self>,
     ) -> Entity<AcpThread> {
         let connection = Rc::new(NativeAgentConnection(cx.entity()));
 
         let thread = thread_handle.read(cx);
         let session_id = thread.id().clone();
-        let parent_session_id = thread.parent_thread_id();
+        let parent_session_id = if promote {
+            None
+        } else {
+            thread.parent_thread_id()
+        };
         let title = thread.title();
         let draft_prompt = thread.draft_prompt().map(Vec::from);
         let scroll_position = thread.ui_scroll_position();
@@ -1746,9 +1752,31 @@ impl NativeAgent {
         project: Entity<Project>,
         cx: &mut Context<Self>,
     ) -> Task<Result<Entity<AcpThread>>> {
+        self.open_thread_internal(id, project, false, cx)
+    }
+
+    pub fn open_thread_standalone(
+        &mut self,
+        id: acp_v1::SessionId,
+        project: Entity<Project>,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<Entity<AcpThread>>> {
+        self.open_thread_internal(id, project, true, cx)
+    }
+
+    fn open_thread_internal(
+        &mut self,
+        id: acp_v1::SessionId,
+        project: Entity<Project>,
+        promote: bool,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<Entity<AcpThread>>> {
         if let Some(session) = self.sessions.get(&id) {
             if let Some(acp_thread) = session.acp_thread.upgrade() {
-                return Task::ready(Ok(acp_thread));
+                let is_already_standalone = acp_thread.read(cx).parent_session_id().is_none();
+                if !promote || is_already_standalone {
+                    return Task::ready(Ok(acp_thread));
+                }
             }
             let acp_thread_id = session.acp_thread.entity_id();
             let draft_prompt = session.draft_prompt(cx);
@@ -1756,8 +1784,10 @@ impl NativeAgent {
         }
 
         if let Some(pending) = self.pending_sessions.get(&id) {
-            let task = pending.task.clone();
-            return cx.background_spawn(async move { task.await.map_err(|err| anyhow!(err)) });
+            if pending.promoted == promote {
+                let task = pending.task.clone();
+                return cx.background_spawn(async move { task.await.map_err(|err| anyhow!(err)) });
+            }
         }
 
         let task = self.load_thread(id.clone(), project.clone(), cx);
@@ -1779,7 +1809,7 @@ impl NativeAgent {
                         .update(cx, |this, cx| {
                             let project_id = this.get_or_create_project_state(&project, cx);
                             this.pending_sessions.remove(&id);
-                            this.register_session(thread.clone(), project_id, cx)
+                            this.register_session(thread.clone(), project_id, promote, cx)
                         })
                         .map_err(Arc::new)?;
                     let events = thread.update(cx, |thread, cx| thread.replay(cx));
@@ -1801,6 +1831,7 @@ impl NativeAgent {
             id,
             PendingSession {
                 task: shared_task.clone(),
+                promoted: promote,
             },
         );
 
@@ -2883,6 +2914,19 @@ impl acp_thread::AgentConnection for NativeAgentConnection {
             .update(cx, |agent, cx| agent.open_thread(session_id, project, cx))
     }
 
+    fn load_session_standalone(
+        self: Rc<Self>,
+        session_id: acp_v1::SessionId,
+        project: Entity<Project>,
+        _work_dirs: PathList,
+        _title: Option<SharedString>,
+        cx: &mut App,
+    ) -> Task<Result<Entity<acp_thread::AcpThread>>> {
+        self.0.update(cx, |agent, cx| {
+            agent.open_thread_standalone(session_id, project, cx)
+        })
+    }
+
     fn auth_methods(&self) -> &[acp_v2::AuthMethod] {
         &[] // No auth for in-process
     }
@@ -3425,7 +3469,8 @@ impl NativeThreadEnvironment {
                     .get(&parent_session_id)
                     .map(|s| s.project_id)
                     .context("parent session not found")?;
-                let acp_thread = agent.register_session(subagent_thread.clone(), project_id, cx);
+                let acp_thread =
+                    agent.register_session(subagent_thread.clone(), project_id, false, cx);
                 let parent_session = agent
                     .sessions
                     .get_mut(&parent_session_id)
@@ -3528,7 +3573,7 @@ impl NativeThreadEnvironment {
                 thread
             });
 
-            let acp_thread = agent.register_session(subagent_thread.clone(), project_id, cx);
+            let acp_thread = agent.register_session(subagent_thread.clone(), project_id, false, cx);
             let parent_session = agent
                 .sessions
                 .get_mut(&parent_session_id)
@@ -3539,12 +3584,7 @@ impl NativeThreadEnvironment {
             let weak_acp = acp_thread.downgrade();
             cx.spawn(async move |_this, cx| {
                 cx.update(|cx| {
-                    NativeAgentConnection::handle_thread_events(
-                        events,
-                        weak_acp,
-                        None,
-                        cx,
-                    )
+                    NativeAgentConnection::handle_thread_events(events, weak_acp, None, cx)
                 })
                 .await
                 .log_err();
@@ -3820,7 +3860,10 @@ impl ThreadEnvironment for NativeThreadEnvironment {
     ) -> Task<Result<()>> {
         let (agent, project, parent_session_id) = match cx.update(|cx| {
             let agent = self.agent.upgrade().context("Agent no longer exists")?;
-            let parent_thread = self.thread.upgrade().context("Parent thread no longer exists")?;
+            let parent_thread = self
+                .thread
+                .upgrade()
+                .context("Parent thread no longer exists")?;
             if let Some(session) = agent.read(cx).sessions.get(session_id) {
                 if session.acp_thread.upgrade().is_some() {
                     return Ok(None);
@@ -3952,12 +3995,7 @@ impl ThreadEnvironment for NativeThreadEnvironment {
                     context_server_store,
                     server_id,
                 );
-                provider.ensure_task(
-                    &task_id_typed,
-                    &title_string,
-                    goal_id_string.as_deref(),
-                    cx,
-                )
+                provider.ensure_task(&task_id_typed, &title_string, goal_id_string.as_deref(), cx)
             });
             task.await
         })
@@ -4151,16 +4189,17 @@ impl ThreadEnvironment for NativeThreadEnvironment {
         let Some(parent_thread_entity) = self.thread.upgrade() else {
             return Task::ready(Err(anyhow!("Parent thread no longer exists")));
         };
-        let (project, task_id_typed, kind_string, content_string, summary_string) = cx.update(|cx| {
-            let project = parent_thread_entity.read(cx).project().clone();
-            (
-                project,
-                crate::AgentTaskId::from(task_id.to_string()),
-                kind.to_string(),
-                content.to_string(),
-                summary.map(str::to_string),
-            )
-        });
+        let (project, task_id_typed, kind_string, content_string, summary_string) =
+            cx.update(|cx| {
+                let project = parent_thread_entity.read(cx).project().clone();
+                (
+                    project,
+                    crate::AgentTaskId::from(task_id.to_string()),
+                    kind.to_string(),
+                    content.to_string(),
+                    summary.map(str::to_string),
+                )
+            });
         cx.spawn(async move |cx| {
             let task = cx.update(|cx| {
                 let context_server_store = project.read(cx).context_server_store();
@@ -6864,7 +6903,7 @@ mod internal_tests {
         // Run the subagent through the production registration path.
         // This is what installs the `SkillTool` on the thread.
         let _subagent_acp = agent.update(cx, |agent, cx| {
-            agent.register_session(subagent_thread.clone(), parent_project_id, cx)
+            agent.register_session(subagent_thread.clone(), parent_project_id, false, cx)
         });
 
         // Verify the subagent thread has the `SkillTool` installed —
@@ -8691,6 +8730,147 @@ mod internal_tests {
     }
 
     #[gpui::test]
+    async fn test_subagent_standalone_open_promotes_session(cx: &mut TestAppContext) {
+
+        let fake = init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            "/",
+            json!({
+                "a": {
+                    "file.txt": "hello"
+                }
+            }),
+        )
+        .await;
+        let project = Project::test(fs.clone(), [path!("/a").as_ref()], cx).await;
+        let thread_store = cx.new(|cx| ThreadStore::new(cx));
+        let agent = cx
+            .update(|cx| NativeAgent::new(thread_store.clone(), Templates::new(), fs.clone(), cx));
+        let connection = Rc::new(NativeAgentConnection(agent.clone()));
+
+        let acp_thread = cx
+            .update(|cx| {
+                connection
+                    .clone()
+                    .new_session(project.clone(), PathList::new(&[Path::new("")]), cx)
+            })
+            .await
+            .unwrap();
+        let parent_session_id = acp_thread.read_with(cx, |t, _| t.session_id().clone());
+        let parent_thread =
+            cx.update(|cx| native_thread_for_session(&agent, &parent_session_id, cx));
+        let environment = NativeThreadEnvironment {
+            agent: agent.downgrade(),
+            thread: parent_thread.downgrade(),
+            acp_thread: acp_thread.downgrade(),
+        };
+
+        cx.update(|cx| {
+            let mut settings = agent_settings::AgentSettings::get_global(cx).clone();
+            let default_profile_id = settings.default_profile.clone();
+            if let Some(profile) = settings.profiles.get_mut(&default_profile_id) {
+                profile.delegation = Some(agent_settings::Delegation {
+                    allowed: vec![default_profile_id.clone()],
+                    max_depth: 5,
+                });
+            }
+            agent_settings::AgentSettings::override_global(settings, cx);
+        });
+
+        let subagent_handle = cx
+            .update(|cx| {
+                environment.create_subagent_thread("worker".to_string(), None, None, None, cx)
+            })
+            .unwrap();
+        let subagent_session_id = subagent_handle.id();
+        let subagent_thread = agent.read_with(cx, |agent, _| {
+            agent
+                .sessions
+                .get(&subagent_session_id)
+                .unwrap()
+                .thread
+                .clone()
+        });
+
+        // Initially registered as a subagent
+        let initial_subagent_acp = agent.read_with(cx, |agent, _| {
+            agent.sessions.get(&subagent_session_id).unwrap().acp_thread.upgrade().unwrap()
+        });
+        assert!(initial_subagent_acp.read_with(cx, |t, _| t.parent_session_id().is_some()));
+        assert_eq!(
+            initial_subagent_acp.read_with(cx, |t, _| t.parent_session_id().cloned()),
+            Some(parent_session_id.clone())
+        );
+
+        let model = fake.model("fake");
+        subagent_thread.update(cx, |t, cx| {
+            t.set_model(model.clone(), cx);
+            t.send(ClientUserMessageId::new(), ["subagent task"], cx)
+                .unwrap();
+        });
+        cx.run_until_parked();
+
+        let completion = fake.pending_completions().pop().unwrap();
+        fake.send_text(&model, &completion, "completed work");
+        fake.end_stream(&model, &completion);
+        cx.run_until_parked();
+
+        agent.update(cx, |agent, cx| {
+            agent.save_thread(subagent_thread.clone(), cx);
+        });
+        cx.run_until_parked();
+
+        // 1. Open standalone while the subagent AcpThread is still alive in memory
+        let promoted_acp = cx
+            .update(|cx| {
+                use acp_thread::AgentConnection as _;
+                connection
+                    .clone()
+                    .load_session_standalone(
+                        subagent_session_id.clone(),
+                        project.clone(),
+                        PathList::new(&[Path::new("")]),
+                        None,
+                        cx,
+                    )
+            })
+            .await
+            .unwrap();
+
+        // The promoted AcpThread must have no parent session ID
+        assert_eq!(promoted_acp.read_with(cx, |t, _| t.parent_session_id().cloned()), None);
+
+        // Underlying Thread in database must preserve parent_thread_id
+        let db_future = cx.update(|cx| ThreadsDatabase::connect(cx));
+        let database = db_future.await.unwrap();
+        let loaded_from_db = database.load_thread(subagent_session_id.clone()).await.unwrap().unwrap();
+        assert_eq!(
+            loaded_from_db.subagent_context.as_ref().map(|c| c.parent_thread_id.0.as_ref()),
+            Some(parent_session_id.0.as_ref())
+        );
+
+        // 2. Re-opening standalone returns the already-promoted AcpThread
+        let reloaded_acp = cx
+            .update(|cx| {
+                use acp_thread::AgentConnection as _;
+                connection
+                    .clone()
+                    .load_session_standalone(
+                        subagent_session_id.clone(),
+                        project.clone(),
+                        PathList::new(&[Path::new("")]),
+                        None,
+                        cx,
+                    )
+            })
+            .await
+            .unwrap();
+        assert_eq!(promoted_acp.entity_id(), reloaded_acp.entity_id());
+        assert_eq!(reloaded_acp.read_with(cx, |t, _| t.parent_session_id().cloned()), None);
+    }
+
+    #[gpui::test]
     async fn test_subagent_persists_task_id_and_resumes_across_restarts(cx: &mut TestAppContext) {
         use crate::ThreadEnvironment;
 
@@ -8720,7 +8900,8 @@ mod internal_tests {
             .await
             .unwrap();
         let parent_session_id = acp_thread.read_with(cx, |t, _| t.session_id().clone());
-        let parent_thread = cx.update(|cx| native_thread_for_session(&agent, &parent_session_id, cx));
+        let parent_thread =
+            cx.update(|cx| native_thread_for_session(&agent, &parent_session_id, cx));
         let environment = NativeThreadEnvironment {
             agent: agent.downgrade(),
             thread: parent_thread.downgrade(),
@@ -8746,14 +8927,20 @@ mod internal_tests {
             .unwrap();
         let subagent_session_id = subagent_handle.id();
         let subagent_thread = agent.read_with(cx, |agent, _| {
-            agent.sessions.get(&subagent_session_id).unwrap().thread.clone()
+            agent
+                .sessions
+                .get(&subagent_session_id)
+                .unwrap()
+                .thread
+                .clone()
         });
 
         let model = fake.model("fake");
         subagent_thread.update(cx, |t, cx| {
             t.set_model(model.clone(), cx);
             t.set_task_id(Some("TASK-42".to_string()));
-            t.send(ClientUserMessageId::new(), ["subagent task"], cx).unwrap();
+            t.send(ClientUserMessageId::new(), ["subagent task"], cx)
+                .unwrap();
         });
         cx.run_until_parked();
 
@@ -8783,7 +8970,9 @@ mod internal_tests {
                 }
             });
         });
-        assert!(!agent.read_with(cx, |agent, _| agent.sessions.contains_key(&subagent_session_id)));
+        assert!(!agent.read_with(cx, |agent, _| {
+            agent.sessions.contains_key(&subagent_session_id)
+        }));
 
         // 3. Verify subagent_task_id falls back to SQLite
         assert_eq!(
@@ -8822,7 +9011,9 @@ mod internal_tests {
                 }
             });
         });
-        assert!(!agent.read_with(cx, |agent, _| agent.sessions.contains_key(&subagent_session_id)));
+        assert!(!agent.read_with(cx, |agent, _| {
+            agent.sessions.contains_key(&subagent_session_id)
+        }));
 
         let direct_resumed = cx
             .update(|cx| {
@@ -8833,7 +9024,10 @@ mod internal_tests {
         agent.read_with(cx, |agent, cx| {
             assert!(agent.sessions.contains_key(&subagent_session_id));
             assert_eq!(
-                agent.sessions[&subagent_session_id].thread.read(cx).task_id(),
+                agent.sessions[&subagent_session_id]
+                    .thread
+                    .read(cx)
+                    .task_id(),
                 Some("TASK-42")
             );
         });

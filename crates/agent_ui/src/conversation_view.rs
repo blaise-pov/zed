@@ -771,8 +771,17 @@ fn affects_thread_metadata(event: &AcpThreadEvent) -> bool {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ResumeMode {
+    #[default]
+    Normal,
+    Standalone,
+    Readonly,
+}
+
 pub enum AcpServerViewEvent {
     ActiveThreadChanged,
+    MinimizeFallback,
 }
 
 impl EventEmitter<AcpServerViewEvent> for ConversationView {}
@@ -787,6 +796,8 @@ pub struct ConversationView {
     thread_store: Option<Entity<ThreadStore>>,
     pub(crate) thread_id: ThreadId,
     pub(crate) root_session_id: Option<acp_v1::SessionId>,
+    pub(crate) resume_mode: ResumeMode,
+    pub(crate) is_transient: bool,
     server_state: ServerState,
     pending_selections: Vec<AgentContextSelection>,
     focus_handle: FocusHandle,
@@ -806,6 +817,14 @@ pub struct ConversationView {
 }
 
 impl ConversationView {
+    pub(crate) fn is_transient(&self) -> bool {
+        self.is_transient
+    }
+
+    pub(crate) fn resume_mode(&self) -> ResumeMode {
+        self.resume_mode
+    }
+
     pub fn has_auth_methods(&self) -> bool {
         self.as_connected().map_or(false, |connected| {
             connected
@@ -898,6 +917,11 @@ impl ConversationView {
         let Some(connected) = self.as_connected_mut() else {
             return;
         };
+
+        if !connected.threads.contains_key(&session_id) {
+            cx.emit(AcpServerViewEvent::MinimizeFallback);
+            return;
+        }
 
         connected.navigate_to_thread(session_id);
         if let Some(view) = self.active_thread() {
@@ -1007,6 +1031,43 @@ impl ConversationView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        Self::new_with_mode(
+            agent,
+            connection_store,
+            connection_key,
+            resume_session_id,
+            ResumeMode::Normal,
+            thread_id,
+            work_dirs,
+            title,
+            initial_content,
+            workspace,
+            project,
+            thread_store,
+            source,
+            window,
+            cx,
+        )
+    }
+
+    pub fn new_with_mode(
+        agent: Rc<dyn AgentServer>,
+        connection_store: Entity<AgentConnectionStore>,
+        connection_key: Agent,
+        resume_session_id: Option<acp_v1::SessionId>,
+        resume_mode: ResumeMode,
+        thread_id: Option<ThreadId>,
+        work_dirs: Option<PathList>,
+        title: Option<SharedString>,
+        initial_content: Option<AgentInitialContent>,
+        workspace: WeakEntity<Workspace>,
+        project: Entity<Project>,
+        thread_store: Option<Entity<ThreadStore>>,
+        source: AgentThreadSource,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let is_transient = resume_mode == ResumeMode::Readonly;
         let agent_server_store = project.read(cx).agent_server_store().clone();
         let code_span_resolver = AgentCodeSpanResolver::new(&project.downgrade(), cx);
         let mut subscriptions = vec![
@@ -1062,11 +1123,14 @@ impl ConversationView {
             thread_store,
             thread_id,
             root_session_id: resume_session_id.clone(),
+            resume_mode,
+            is_transient,
             server_state: Self::initial_state(
                 agent.clone(),
                 connection_store,
                 connection_key,
                 resume_session_id,
+                resume_mode,
                 work_dirs,
                 title,
                 project,
@@ -1204,6 +1268,7 @@ impl ConversationView {
             self.connection_store.clone(),
             self.connection_key.clone(),
             resume_session_id,
+            self.resume_mode,
             work_dirs,
             title,
             self.project.clone(),
@@ -1229,6 +1294,7 @@ impl ConversationView {
         connection_store: Entity<AgentConnectionStore>,
         connection_key: Agent,
         resume_session_id: Option<acp_v1::SessionId>,
+        resume_mode: ResumeMode,
         work_dirs: Option<PathList>,
         title: Option<SharedString>,
         project: Entity<Project>,
@@ -1314,13 +1380,22 @@ impl ConversationView {
             let result = if let Some(session_id) = resume_session_id.clone() {
                 cx.update(|_, cx| {
                     if connection.supports_load_session() {
-                        connection.clone().load_session(
-                            session_id,
-                            project.clone(),
-                            session_work_dirs,
-                            title,
-                            cx,
-                        )
+                        match resume_mode {
+                            ResumeMode::Standalone => connection.clone().load_session_standalone(
+                                session_id,
+                                project.clone(),
+                                session_work_dirs,
+                                title,
+                                cx,
+                            ),
+                            ResumeMode::Normal | ResumeMode::Readonly => connection.clone().load_session(
+                                session_id,
+                                project.clone(),
+                                session_work_dirs,
+                                title,
+                                cx,
+                            ),
+                        }
                     } else if connection.supports_resume_session() {
                         resumed_without_history = true;
                         connection.clone().resume_session(

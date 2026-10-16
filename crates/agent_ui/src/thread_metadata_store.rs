@@ -1190,7 +1190,10 @@ impl ThreadMetadataStore {
     fn new(db: ThreadMetadataDb, cx: &mut Context<Self>) -> Self {
         let weak_store = cx.weak_entity();
 
-        cx.observe_new::<crate::ConversationView>(move |_view, _window, cx| {
+        cx.observe_new::<crate::ConversationView>(move |view, _window, cx| {
+            if view.is_transient() {
+                return;
+            }
             let view_entity = cx.entity();
             let entity_id = view_entity.entity_id();
 
