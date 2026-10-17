@@ -3963,44 +3963,6 @@ impl ThreadEnvironment for NativeThreadEnvironment {
         })
     }
 
-    fn ensure_task_registered(
-        &self,
-        task_id: &str,
-        title: &str,
-        goal_id: Option<&str>,
-        cx: &mut AsyncApp,
-    ) -> Task<Result<()>> {
-        let Some(parent_thread_entity) = self.thread.upgrade() else {
-            return Task::ready(Err(anyhow!("Parent thread no longer exists")));
-        };
-        let (project, task_id_typed, title_string, goal_id_string) = cx.update(|cx| {
-            let project = parent_thread_entity.read(cx).project().clone();
-            (
-                project,
-                crate::AgentTaskId::from(task_id.to_string()),
-                title.to_string(),
-                goal_id.map(|goal_id| goal_id.to_string()),
-            )
-        });
-        cx.spawn(async move |cx| {
-            let task = cx.update(|cx| {
-                let context_server_store = project.read(cx).context_server_store();
-                let server_id = context_server::ContextServerId(
-                    agent_settings::AgentSettings::get_for_project(project.read(cx), cx)
-                        .task_graph_server_id
-                        .clone()
-                        .into(),
-                );
-                let provider = crate::mcp_agent_task_provider::McpAgentTaskProvider::new(
-                    context_server_store,
-                    server_id,
-                );
-                provider.ensure_task(&task_id_typed, &title_string, goal_id_string.as_deref(), cx)
-            });
-            task.await
-        })
-    }
-
     fn fail_task_registered(
         &self,
         task_id: &str,

@@ -274,12 +274,10 @@ pub(crate) struct FakeThreadEnvironment {
     terminal_output_limits: std::cell::RefCell<Vec<Option<u64>>>,
     terminal_commands: std::cell::RefCell<Vec<String>>,
     subagent_models: std::cell::RefCell<Vec<Option<AgentModelId>>>,
-    registered_tasks: std::cell::RefCell<Vec<(String, String, Option<String>)>>,
     failed_tasks: std::cell::RefCell<Vec<(String, String)>>,
     updated_task_metadata:
         std::cell::RefCell<Vec<(String, Option<String>, Option<String>, Option<String>)>>,
     task_status_transitions: std::cell::RefCell<Vec<(String, crate::AgentTaskStatus)>>,
-    ensure_task_error: std::cell::RefCell<Option<String>>,
     ensure_worktree_calls: std::cell::RefCell<Vec<String>>,
     recorded_turns: std::cell::RefCell<Vec<(String, crate::AgentTurnRecord)>>,
     published_artifacts: std::cell::RefCell<Vec<(String, String, String, Option<String>)>>,
@@ -318,10 +316,6 @@ impl FakeThreadEnvironment {
         self.subagent_models.borrow().clone()
     }
 
-    pub(crate) fn registered_tasks(&self) -> Vec<(String, String, Option<String>)> {
-        self.registered_tasks.borrow().clone()
-    }
-
     pub(crate) fn failed_tasks(&self) -> Vec<(String, String)> {
         self.failed_tasks.borrow().clone()
     }
@@ -334,10 +328,6 @@ impl FakeThreadEnvironment {
 
     pub(crate) fn task_status_transitions(&self) -> Vec<(String, crate::AgentTaskStatus)> {
         self.task_status_transitions.borrow().clone()
-    }
-
-    pub(crate) fn set_ensure_task_error(&self, error: Option<String>) {
-        *self.ensure_task_error.borrow_mut() = error;
     }
 
     pub(crate) fn ensure_worktree_calls(&self) -> Vec<String> {
@@ -362,6 +352,29 @@ impl FakeThreadEnvironment {
             .borrow_mut()
             .insert(task_id.to_string(), detail);
         self
+    }
+
+    pub(crate) fn with_task_id(self, task_id: &str) -> Self {
+        self.register_fake_task(task_id);
+        self
+    }
+
+    pub(crate) fn register_fake_task(&self, task_id: &str) {
+        let detail = crate::AgentTaskDetail {
+            summary: crate::AgentTaskSummary {
+                id: crate::AgentTaskId::from(task_id),
+                title: task_id.to_string(),
+                status: crate::AgentTaskStatus::Ready,
+                attempt: 1,
+                ..Default::default()
+            },
+            description: String::new(),
+            acceptance_criteria: Vec::new(),
+            events_tail: Vec::new(),
+        };
+        self.task_details
+            .borrow_mut()
+            .insert(task_id.to_string(), detail);
     }
 
     pub(crate) fn subagent_handle(&self) -> Option<Rc<FakeSubagentHandle>> {
@@ -435,25 +448,6 @@ impl crate::ThreadEnvironment for FakeThreadEnvironment {
         Task::ready(Err(anyhow::anyhow!(
             crate::task_worktree::NoGitRepositoryError
         )))
-    }
-
-    fn ensure_task_registered(
-        &self,
-        task_id: &str,
-        title: &str,
-        goal_id: Option<&str>,
-        _cx: &mut AsyncApp,
-    ) -> Task<Result<()>> {
-        self.registered_tasks.borrow_mut().push((
-            task_id.to_string(),
-            title.to_string(),
-            goal_id.map(str::to_string),
-        ));
-        if let Some(ref err) = *self.ensure_task_error.borrow() {
-            Task::ready(Err(anyhow::anyhow!("{err}")))
-        } else {
-            Task::ready(Ok(()))
-        }
     }
 
     fn fail_task_registered(
@@ -7024,6 +7018,116 @@ fn setup_context_server(
     mcp_tool_calls_rx
 }
 
+fn setup_mock_tgs(
+    context_server_store: &Entity<ContextServerStore>,
+    cx: &mut TestAppContext,
+) {
+    let name = DEFAULT_TASK_GRAPH_SERVER_ID;
+    cx.update(|cx| {
+        let mut settings = ProjectSettings::get_global(cx).clone();
+        settings.context_servers.insert(
+            name.into(),
+            project::project_settings::ContextServerSettings::Stdio {
+                enabled: true,
+                remote: false,
+                command: ContextServerCommand {
+                    path: "mock_tgs".into(),
+                    args: Vec::new(),
+                    env: None,
+                    timeout: None,
+                    platforms: Default::default(),
+                },
+            },
+        );
+        ProjectSettings::override_global(settings, cx);
+    });
+
+    let fake_transport = context_server::test::create_fake_transport(name, cx.executor())
+        .on_request::<context_server::types::requests::Initialize, _>(move |_params| async move {
+            context_server::types::InitializeResponse {
+                protocol_version: context_server::types::ProtocolVersion(
+                    context_server::types::LATEST_PROTOCOL_VERSION.to_string(),
+                ),
+                server_info: context_server::types::Implementation {
+                    name: name.into(),
+                    title: None,
+                    version: "1.0.0".to_string(),
+                    description: None,
+                },
+                capabilities: context_server::types::ServerCapabilities {
+                    tools: Some(context_server::types::ToolsCapabilities {
+                        list_changed: Some(true),
+                    }),
+                    ..Default::default()
+                },
+                meta: None,
+            }
+        })
+        .on_request::<context_server::types::requests::ListTools, _>(move |_params| async move {
+            let make_tool = |tool_name: &'static str| context_server::types::Tool {
+                name: tool_name.into(),
+                title: None,
+                description: None,
+                input_schema: serde_json::Value::Object(Default::default()),
+                output_schema: None,
+                annotations: None,
+            };
+            context_server::types::ListToolsResponse {
+                tools: vec![
+                    make_tool("task_get"),
+                    make_tool("task_update"),
+                    make_tool("task_record_turn"),
+                    make_tool("artifact_publish"),
+                ],
+                next_cursor: None,
+                meta: None,
+            }
+        })
+        .on_request::<context_server::types::requests::CallTool, _>(move |params| async move {
+            let text = if params.name == "task_get" {
+                let task_id = params
+                    .arguments
+                    .as_ref()
+                    .and_then(|args| args.get("task_id"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("TASK-DEFAULT");
+                let detail = crate::AgentTaskDetail {
+                    summary: crate::AgentTaskSummary {
+                        id: crate::AgentTaskId::from(task_id),
+                        title: task_id.to_string(),
+                        status: crate::AgentTaskStatus::Ready,
+                        attempt: 1,
+                        ..Default::default()
+                    },
+                    description: String::new(),
+                    acceptance_criteria: Vec::new(),
+                    events_tail: Vec::new(),
+                };
+                serde_json::to_string(&detail).unwrap_or_default()
+            } else if params.name == "task_record_turn" {
+                "1".to_string()
+            } else {
+                "{}".to_string()
+            };
+            context_server::types::CallToolResponse {
+                content: vec![context_server::types::ToolResponseContent::Text { text }],
+                is_error: None,
+                meta: None,
+                structured_content: None,
+            }
+        });
+
+    context_server_store.update(cx, |store, cx| {
+        store.start_server(
+            Arc::new(ContextServer::new(
+                ContextServerId(name.into()),
+                Arc::new(fake_transport),
+            )),
+            cx,
+        );
+    });
+    cx.run_until_parked();
+}
 #[gpui::test]
 async fn test_tokens_before_message(cx: &mut TestAppContext) {
     let ThreadTest {
@@ -7779,6 +7883,7 @@ async fn test_spawn_agent_one_session_per_task(cx: &mut TestAppContext) {
 
     let environment = Rc::new(
         FakeThreadEnvironment::default()
+            .with_task_id("TASK-SINGLE-SESSION")
             .with_subagent(FakeSubagentHandle::new(
                 acp::SessionId::new("subagent-1"),
                 Task::ready("done".to_string()).shared(),
@@ -7856,13 +7961,17 @@ async fn test_spawn_agent_session_end_cleanup_flow(cx: &mut TestAppContext) {
     init_test(cx);
     crate::task_worktree::reset_registry_for_tests();
 
-    let environment = Rc::new(FakeThreadEnvironment::default().with_subagent(
-        FakeSubagentHandle::new(
-            acp::SessionId::new("subagent-cleanup"),
-            Task::ready("done".to_string()).shared(),
-            None,
-        ),
-    ));
+    let environment = Rc::new(
+        FakeThreadEnvironment::default()
+            .with_task_id("TASK-CLEANUP-SUCCESS")
+            .with_task_id("TASK-COMMIT-ERROR")
+            .with_task_id("TASK-DIFF-TEST")
+            .with_subagent(FakeSubagentHandle::new(
+                acp::SessionId::new("subagent-cleanup"),
+                Task::ready("done".to_string()).shared(),
+                None,
+            )),
+    );
     #[allow(clippy::arc_with_non_send_sync)]
     let tool = Arc::new(SpawnAgentTool::new(environment.clone()));
 
@@ -8110,11 +8219,12 @@ fn test_classify_send_error() {
 }
 
 #[gpui::test]
-async fn test_spawn_agent_ensures_task_registration_best_effort(cx: &mut TestAppContext) {
+async fn test_spawn_agent_validates_task_id_exists(cx: &mut TestAppContext) {
     init_test(cx);
 
     let environment = Rc::new(
         FakeThreadEnvironment::default()
+            .with_task_id("TASK-EXISTS")
             .with_subagent(FakeSubagentHandle::new(
                 acp::SessionId::new("subagent-1"),
                 Task::ready("subagent output 1".to_string()).shared(),
@@ -8129,7 +8239,7 @@ async fn test_spawn_agent_ensures_task_registration_best_effort(cx: &mut TestApp
     #[allow(clippy::arc_with_non_send_sync)]
     let tool = Arc::new(SpawnAgentTool::new(environment.clone()));
 
-    // 1. Spawning with task_id records ensure_task_registered
+    // 1. Spawning with non-existent task_id fails immediately with SpawnAgentToolOutput::Error
     let (event_stream, _rx) = ToolCallEventStream::test();
     let result = cx
         .update(|cx| {
@@ -8137,7 +8247,40 @@ async fn test_spawn_agent_ensures_task_registration_best_effort(cx: &mut TestApp
                 ToolInput::resolved(SpawnAgentToolInput {
                     label: "Researching fix".to_string(),
                     message: "investigate defect".to_string(),
-                    task_id: Some("TASK-100".to_string()),
+                    task_id: Some("TASK-MISSING".to_string()),
+                    ..Default::default()
+                }),
+                event_stream,
+                cx,
+            )
+        })
+        .await;
+
+    match result {
+        Err(SpawnAgentToolOutput::Error { error, .. }) => {
+            assert!(
+                error.contains("Task 'TASK-MISSING' does not exist in Task Graph Service"),
+                "expected task missing error, got: {error}"
+            );
+            assert!(
+                error.contains(
+                    "Tasks must be created first via task_create before spawning an agent."
+                ),
+                "expected hint about task_create, got: {error}"
+            );
+        }
+        other => panic!("expected Err(SpawnAgentToolOutput::Error), got {other:?}"),
+    }
+
+    // 2. Spawning with registered task_id succeeds
+    let (event_stream, _rx) = ToolCallEventStream::test();
+    let result = cx
+        .update(|cx| {
+            tool.clone().run(
+                ToolInput::resolved(SpawnAgentToolInput {
+                    label: "Fixing defect".to_string(),
+                    message: "implement changes".to_string(),
+                    task_id: Some("TASK-EXISTS".to_string()),
                     ..Default::default()
                 }),
                 event_stream,
@@ -8147,22 +8290,16 @@ async fn test_spawn_agent_ensures_task_registration_best_effort(cx: &mut TestApp
         .await;
 
     assert!(matches!(result, Ok(SpawnAgentToolOutput::Success { .. })));
-    assert_eq!(
-        environment.registered_tasks(),
-        vec![("TASK-100".to_string(), "Researching fix".to_string(), None)]
-    );
 
-    // 2. Spawning with task_id and goal_id when registration fails -> best-effort continues and succeeds
-    environment.set_ensure_task_error(Some("TGS server unavailable".to_string()));
+    // 3. Spawning with task_id=None (ad-hoc) continues to work
     let (event_stream, _rx) = ToolCallEventStream::test();
     let result = cx
         .update(|cx| {
             tool.run(
                 ToolInput::resolved(SpawnAgentToolInput {
-                    label: "Fixing defect".to_string(),
-                    message: "implement changes".to_string(),
-                    task_id: Some("TASK-101".to_string()),
-                    goal_id: Some("GOAL-42".to_string()),
+                    label: "Ad-hoc task".to_string(),
+                    message: "run ad-hoc".to_string(),
+                    task_id: None,
                     ..Default::default()
                 }),
                 event_stream,
@@ -8172,17 +8309,6 @@ async fn test_spawn_agent_ensures_task_registration_best_effort(cx: &mut TestApp
         .await;
 
     assert!(matches!(result, Ok(SpawnAgentToolOutput::Success { .. })));
-    assert_eq!(
-        environment.registered_tasks(),
-        vec![
-            ("TASK-100".to_string(), "Researching fix".to_string(), None),
-            (
-                "TASK-101".to_string(),
-                "Fixing defect".to_string(),
-                Some("GOAL-42".to_string())
-            ),
-        ]
-    );
 }
 
 #[gpui::test]
@@ -8197,13 +8323,15 @@ async fn test_spawn_agent_updates_task_metadata_and_status_lifecycle(cx: &mut Te
         );
     });
 
-    let environment = Rc::new(FakeThreadEnvironment::default().with_subagent(
-        FakeSubagentHandle::new(
-            acp::SessionId::new("session-xyz-999"),
-            Task::ready("done".to_string()).shared(),
-            None,
-        ),
-    ));
+    let environment = Rc::new(
+        FakeThreadEnvironment::default()
+            .with_task_id("TASK-META-1")
+            .with_subagent(FakeSubagentHandle::new(
+                acp::SessionId::new("session-xyz-999"),
+                Task::ready("done".to_string()).shared(),
+                None,
+            )),
+    );
     #[allow(clippy::arc_with_non_send_sync)]
     let tool = Arc::new(SpawnAgentTool::new(environment.clone()));
 
@@ -8266,7 +8394,11 @@ async fn test_spawn_agent_turn_recording_and_metrics(cx: &mut TestAppContext) {
     )
     .with_token_usage(token_usage);
 
-    let environment = Rc::new(FakeThreadEnvironment::default().with_subagent(subagent));
+    let environment = Rc::new(
+        FakeThreadEnvironment::default()
+            .with_task_id("TASK-TURN-1")
+            .with_subagent(subagent),
+    );
     #[allow(clippy::arc_with_non_send_sync)]
     let tool = Arc::new(SpawnAgentTool::new(environment.clone()));
     let (event_stream, _rx) = ToolCallEventStream::test();
@@ -8492,7 +8624,10 @@ CUSTOM_CONTRACT_END",
             status: crate::AgentTaskStatus::Ready,
             attempt: 1,
             assignee: None,
-            write_scopes: vec!["crates/agent/**".to_string(), "crates/agent_ui/**".to_string()],
+            write_scopes: vec![
+                "crates/agent/**".to_string(),
+                "crates/agent_ui/**".to_string(),
+            ],
             created_at: None,
             assigned_profile: None,
             model: None,
@@ -8503,7 +8638,8 @@ CUSTOM_CONTRACT_END",
 
 Strict constraints:
 - No panic
-- Best effort MCP".to_string(),
+- Best effort MCP"
+            .to_string(),
         acceptance_criteria: vec![
             "AgentTaskMetrics defined".to_string(),
             "Contract injected on turn 1".to_string(),
@@ -8739,13 +8875,15 @@ async fn test_spawn_agent_differentiated_error_handling(cx: &mut TestAppContext)
     init_test(cx);
 
     // Case 1: Definitive error triggers fail_task_registered
-    let environment_def = Rc::new(FakeThreadEnvironment::default().with_subagent(
-        FakeSubagentHandle::new(
-            acp::SessionId::new("subagent-def"),
-            Task::ready("unused".to_string()).shared(),
-            Some("Parent thread no longer exists".to_string()),
-        ),
-    ));
+    let environment_def = Rc::new(
+        FakeThreadEnvironment::default()
+            .with_task_id("TASK-DEF-1")
+            .with_subagent(FakeSubagentHandle::new(
+                acp::SessionId::new("subagent-def"),
+                Task::ready("unused".to_string()).shared(),
+                Some("Parent thread no longer exists".to_string()),
+            )),
+    );
     #[allow(clippy::arc_with_non_send_sync)]
     let tool_def = Arc::new(SpawnAgentTool::new(environment_def.clone()));
 
@@ -8778,13 +8916,15 @@ async fn test_spawn_agent_differentiated_error_handling(cx: &mut TestAppContext)
     );
 
     // Case 2: Transient error ("User canceled") does NOT trigger fail_task_registered
-    let environment_trans1 = Rc::new(FakeThreadEnvironment::default().with_subagent(
-        FakeSubagentHandle::new(
-            acp::SessionId::new("subagent-trans1"),
-            Task::ready("unused".to_string()).shared(),
-            Some("User canceled".to_string()),
-        ),
-    ));
+    let environment_trans1 = Rc::new(
+        FakeThreadEnvironment::default()
+            .with_task_id("TASK-TRANS-1")
+            .with_subagent(FakeSubagentHandle::new(
+                acp::SessionId::new("subagent-trans1"),
+                Task::ready("unused".to_string()).shared(),
+                Some("User canceled".to_string()),
+            )),
+    );
     #[allow(clippy::arc_with_non_send_sync)]
     let tool_trans1 = Arc::new(SpawnAgentTool::new(environment_trans1.clone()));
 
@@ -8814,13 +8954,15 @@ async fn test_spawn_agent_differentiated_error_handling(cx: &mut TestAppContext)
     );
 
     // Case 3: Transient error (token limit) does NOT trigger fail_task_registered
-    let environment_trans2 = Rc::new(FakeThreadEnvironment::default().with_subagent(
-        FakeSubagentHandle::new(
-            acp::SessionId::new("subagent-trans2"),
-            Task::ready("unused".to_string()).shared(),
-            Some("The agent reached the maximum number of tokens.".to_string()),
-        ),
-    ));
+    let environment_trans2 = Rc::new(
+        FakeThreadEnvironment::default()
+            .with_task_id("TASK-TRANS-2")
+            .with_subagent(FakeSubagentHandle::new(
+                acp::SessionId::new("subagent-trans2"),
+                Task::ready("unused".to_string()).shared(),
+                Some("The agent reached the maximum number of tokens.".to_string()),
+            )),
+    );
     #[allow(clippy::arc_with_non_send_sync)]
     let tool_trans2 = Arc::new(SpawnAgentTool::new(environment_trans2.clone()));
 
@@ -8969,13 +9111,15 @@ async fn test_spawn_agent_disabled_isolation_preserves_task_linkage_without_work
         insert_profile_with_isolation(cx, "researcher", agent_settings::TaskIsolation::Disabled);
     });
 
-    let environment = Rc::new(FakeThreadEnvironment::default().with_subagent(
-        FakeSubagentHandle::new(
-            acp::SessionId::new("subagent-researcher"),
-            Task::ready("research findings".to_string()).shared(),
-            None,
-        ),
-    ));
+    let environment = Rc::new(
+        FakeThreadEnvironment::default()
+            .with_task_id("TASK-RESEARCH-99")
+            .with_subagent(FakeSubagentHandle::new(
+                acp::SessionId::new("subagent-researcher"),
+                Task::ready("research findings".to_string()).shared(),
+                None,
+            )),
+    );
     #[allow(clippy::arc_with_non_send_sync)]
     let tool = Arc::new(SpawnAgentTool::new(environment.clone()));
     let (event_stream, _rx) = ToolCallEventStream::test();
@@ -9020,16 +9164,20 @@ async fn test_spawn_agent_disabled_isolation_preserves_task_linkage_without_work
         "subagent should have its task_id linked"
     );
 
-    // (3) TGS ensure_task registration was called
-    let registered = environment.registered_tasks();
+    // (3) TGS task status/metadata updated
+    let transitions = environment.task_status_transitions();
     assert_eq!(
-        registered,
-        vec![(
-            "TASK-RESEARCH-99".to_string(),
-            "research task".to_string(),
-            None
-        )],
-        "TGS ensure_task registration must occur even without worktree isolation"
+        transitions,
+        vec![
+            (
+                "TASK-RESEARCH-99".to_string(),
+                crate::AgentTaskStatus::Running
+            ),
+            (
+                "TASK-RESEARCH-99".to_string(),
+                crate::AgentTaskStatus::Completed
+            ),
+        ]
     );
 }
 
@@ -13329,6 +13477,7 @@ async fn test_subagent_task_id_prompt_formatting(cx: &mut TestAppContext) {
     let fs = FakeFs::new(cx.executor());
     fs.insert_tree("/", json!({})).await;
     let project = Project::test(fs.clone(), [path!("/").as_ref()], cx).await;
+    setup_mock_tgs(&project.read_with(cx, |p, _| p.context_server_store()), cx);
     let thread_store = cx.new(|cx| ThreadStore::new(cx));
     let agent = cx.update(|cx| NativeAgent::new(thread_store, Templates::new(), fs, cx));
     let connection = Rc::new(NativeAgentConnection(agent.clone()));
@@ -13889,6 +14038,7 @@ async fn test_spawn_agent_two_tasks_isolated_worktrees(cx: &mut TestAppContext) 
     )
     .await;
     let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
+    setup_mock_tgs(&project.read_with(cx, |p, _| p.context_server_store()), cx);
     let thread_store = cx.new(|cx| ThreadStore::new(cx));
     let agent =
         cx.update(|cx| NativeAgent::new(thread_store.clone(), Templates::new(), fs.clone(), cx));
@@ -14210,6 +14360,7 @@ async fn test_spawn_agent_non_git_degrades_isolation(cx: &mut TestAppContext) {
     )
     .await;
     let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
+    setup_mock_tgs(&project.read_with(cx, |p, _| p.context_server_store()), cx);
     let thread_store = cx.new(|cx| ThreadStore::new(cx));
     let agent =
         cx.update(|cx| NativeAgent::new(thread_store.clone(), Templates::new(), fs.clone(), cx));
@@ -14336,6 +14487,7 @@ async fn test_spawn_agent_error_creates_wip_commit(cx: &mut TestAppContext) {
     )
     .await;
     let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
+    setup_mock_tgs(&project.read_with(cx, |p, _| p.context_server_store()), cx);
     let thread_store = cx.new(|cx| ThreadStore::new(cx));
     let agent =
         cx.update(|cx| NativeAgent::new(thread_store.clone(), Templates::new(), fs.clone(), cx));
@@ -14787,6 +14939,7 @@ async fn test_subagent_lsp_rename_denied_outside_task_worktree(cx: &mut TestAppC
     )
     .await;
     let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
+    setup_mock_tgs(&project.read_with(cx, |p, _| p.context_server_store()), cx);
     let thread_store = cx.new(|cx| ThreadStore::new(cx));
     let agent =
         cx.update(|cx| NativeAgent::new(thread_store.clone(), Templates::new(), fs.clone(), cx));
@@ -14932,6 +15085,7 @@ async fn test_spawn_agent_with_goal_id_and_base_branch(cx: &mut TestAppContext) 
     )
     .await;
     let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
+    setup_mock_tgs(&project.read_with(cx, |p, _| p.context_server_store()), cx);
     let thread_store = cx.new(|cx| ThreadStore::new(cx));
     let agent =
         cx.update(|cx| NativeAgent::new(thread_store.clone(), Templates::new(), fs.clone(), cx));
@@ -15084,6 +15238,7 @@ async fn test_spawn_agent_with_goal_id_and_base_branch(cx: &mut TestAppContext) 
     fake.end_last(&model);
     send2.await.unwrap();
 
+    setup_mock_tgs(&project.read_with(cx, |p, _| p.context_server_store()), cx);
     let _send3 = acp_thread.update(cx, |thread, cx| thread.send_raw("Start standard task", cx));
     cx.run_until_parked();
     fake.send_last_text(&model, "spawning standard subagent");
@@ -15114,6 +15269,8 @@ async fn test_spawn_agent_with_goal_id_and_base_branch(cx: &mut TestAppContext) 
     );
     fake.end_last(&model);
     cx.run_until_parked();
+
+
 
     fake.send_last_text(&model, "done with standard task");
     fake.end_last(&model);
@@ -15167,6 +15324,7 @@ async fn test_spawn_agent_with_on_branch_goal_and_exclusivity(cx: &mut TestAppCo
     )
     .await;
     let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
+    setup_mock_tgs(&project.read_with(cx, |p, _| p.context_server_store()), cx);
     let thread_store = cx.new(|cx| ThreadStore::new(cx));
     let agent =
         cx.update(|cx| NativeAgent::new(thread_store.clone(), Templates::new(), fs.clone(), cx));

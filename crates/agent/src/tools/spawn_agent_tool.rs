@@ -56,9 +56,8 @@ pub struct SpawnAgentToolInput {
     #[serde(default, deserialize_with = "deserialize_session_id")]
     pub session_id: Option<acp::SessionId>,
     /// Optional reference to a task managed in the Task Graph Service (e.g. `TASK-42`).
-    /// The runtime registers or links this task in the task graph service (get-or-create,
-    /// best-effort) before spawning, and the spawned agent is expected to fetch details
-    /// and drive the task to completion via the task tools.
+    /// The task must be created first via `task_create` before spawning an agent.
+    /// Spawning will fail if the task does not exist in the Task Graph Service.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_id: Option<String>,
     /// Optional profile ID to use for this subagent. If not specified, the subagent will use the default profile.
@@ -396,6 +395,25 @@ impl AgentTool for SpawnAgentTool {
                 });
             }
 
+            let task_detail = if let Some(ref task_id) = task_id {
+                match self.environment.get_task_registered(task_id, &mut cx).await {
+                    Ok(detail) => Some(detail),
+                    Err(error) => {
+                        return Err(SpawnAgentToolOutput::Error {
+                            session_id: input.session_id.clone(),
+                            error: format!(
+                                "Task '{task_id}' does not exist in Task Graph Service: {error:#}. Tasks must be created first via task_create before spawning an agent."
+                            ),
+                            session_info: None,
+                            isolation: None,
+                            isolation_details: None,
+                        });
+                    }
+                }
+            } else {
+                None
+            };
+
             let session_guard = if let Some(ref task_id) = task_id {
                 let task_id_typed = crate::AgentTaskId::from(task_id.clone());
                 if crate::task_worktree::has_active_subagent_session(&task_id_typed) {
@@ -555,20 +573,6 @@ impl AgentTool for SpawnAgentTool {
             })?;
 
             if let Some(ref task_id) = task_id {
-                if let Err(error) = self
-                    .environment
-                    .ensure_task_registered(
-                        task_id,
-                        &input.label,
-                        input.goal_id.as_deref(),
-                        &mut cx,
-                    )
-                    .await
-                {
-                    log::warn!(
-                        "failed to ensure task {task_id} registered in task graph service: {error:#}"
-                    );
-                }
                 let session_id_str = session_info.session_id.to_string();
                 if let Err(error) = self
                     .environment
@@ -601,31 +605,24 @@ impl AgentTool for SpawnAgentTool {
 
             if let Some(ref task_id) = task_id {
                 if is_initial_turn {
-                    match self.environment.get_task_registered(task_id, &mut cx).await {
-                        Ok(detail) => {
-                            let (custom_template_path, worktree_root, templates) = cx.update(|cx| {
-                                let settings = agent_settings::AgentSettings::get_global(cx);
-                                let template_path = settings.task_contract_template.clone();
-                                let worktree_root = self.environment.worktree_root_path(cx);
-                                let templates = self
-                                    .environment
-                                    .templates(cx)
-                                    .unwrap_or_else(|| self.templates.clone());
-                                (template_path, worktree_root, templates)
-                            });
-                            contract_block = build_task_contract(
-                                task_id,
-                                &detail,
-                                &templates,
-                                custom_template_path.as_deref(),
-                                worktree_root.as_deref(),
-                            );
-                        }
-                        Err(error) => {
-                            log::warn!(
-                                "failed to get task {task_id} detail for contract injection: {error:#}"
-                            );
-                        }
+                    if let Some(ref detail) = task_detail {
+                        let (custom_template_path, worktree_root, templates) = cx.update(|cx| {
+                            let settings = agent_settings::AgentSettings::get_global(cx);
+                            let template_path = settings.task_contract_template.clone();
+                            let worktree_root = self.environment.worktree_root_path(cx);
+                            let templates = self
+                                .environment
+                                .templates(cx)
+                                .unwrap_or_else(|| self.templates.clone());
+                            (template_path, worktree_root, templates)
+                        });
+                        contract_block = build_task_contract(
+                            task_id,
+                            detail,
+                            &templates,
+                            custom_template_path.as_deref(),
+                            worktree_root.as_deref(),
+                        );
                     }
                 }
             }

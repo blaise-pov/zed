@@ -982,16 +982,6 @@ pub trait ThreadEnvironment {
         Task::ready(Ok(false))
     }
 
-    fn ensure_task_registered(
-        &self,
-        _task_id: &str,
-        _title: &str,
-        _goal_id: Option<&str>,
-        _cx: &mut AsyncApp,
-    ) -> Task<Result<()>> {
-        Task::ready(Ok(()))
-    }
-
     fn fail_task_registered(
         &self,
         _task_id: &str,
