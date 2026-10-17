@@ -197,12 +197,35 @@ pub fn ensure_task_worktree(
     ensure_task_worktree_with_policy(project, task, None, None, None, cx)
 }
 
+pub fn ensure_task_worktree_interactive(
+    project: Entity<Project>,
+    task: &AgentTaskSummary,
+    goal_id: Option<String>,
+    base_branch: Option<String>,
+    on_branch: Option<String>,
+    cx: &mut App,
+) -> Task<Result<PathBuf>> {
+    ensure_task_worktree_with_options(project, task, goal_id, base_branch, on_branch, true, cx)
+}
+
 pub fn ensure_task_worktree_with_policy(
     project: Entity<Project>,
     task: &AgentTaskSummary,
     goal_id: Option<String>,
     base_branch: Option<String>,
     on_branch: Option<String>,
+    cx: &mut App,
+) -> Task<Result<PathBuf>> {
+    ensure_task_worktree_with_options(project, task, goal_id, base_branch, on_branch, false, cx)
+}
+
+pub fn ensure_task_worktree_with_options(
+    project: Entity<Project>,
+    task: &AgentTaskSummary,
+    goal_id: Option<String>,
+    base_branch: Option<String>,
+    on_branch: Option<String>,
+    allow_overflow: bool,
     cx: &mut App,
 ) -> Task<Result<PathBuf>> {
     let task_id = task.id.clone();
@@ -370,6 +393,7 @@ pub fn ensure_task_worktree_with_policy(
                 &anchor_path,
                 &base_dir,
                 &task_id,
+                allow_overflow,
                 cx,
             )
             .await?;
@@ -386,22 +410,27 @@ pub fn ensure_task_worktree_with_policy(
                 create_task.await?
             } else {
                 let branch_name = format!("agent-task/{}", task_id);
+                let exists = resolve_ref_to_sha(&git_repo, &branch_name)
+                    .await?
+                    .is_some();
+                let target = if exists {
+                    CreateWorktreeTarget::ExistingBranch {
+                        branch_name: branch_name.clone(),
+                    }
+                } else {
+                    CreateWorktreeTarget::NewBranch {
+                        branch_name: branch_name.clone(),
+                        base_sha: base_sha_for_worktree.clone(),
+                    }
+                };
                 let create_task = repository.update(cx, |repository, _| {
-                    repository.create_worktree(
-                        CreateWorktreeTarget::NewBranch {
-                            branch_name: branch_name.clone(),
-                            base_sha: base_sha_for_worktree.clone(),
-                        },
-                        worktree_path.clone(),
-                    )
+                    repository.create_worktree(target, worktree_path.clone())
                 });
 
                 let mut res = create_task.await?;
                 if let Err(error) = res {
                     let error_message = error.to_string();
                     if error_message.contains("already exists") {
-                        // The branch survives an earlier crashed run; check it
-                        // out instead of creating it again.
                         let retry_task = repository.update(cx, |repository, _| {
                             repository.create_worktree(
                                 CreateWorktreeTarget::ExistingBranch { branch_name },
@@ -526,9 +555,14 @@ pub fn ensure_task_worktree_with_policy(
                         }
                     }
                 }
-            } else if let Some(ref g_branch) = goal_branch {
-                let g_id = g_branch.strip_prefix("agent-goal/").unwrap_or(g_branch);
-                initial_files = get_goal_files(g_id);
+            } else {
+                let recorded = get_task_recorded_files(&task_id);
+                if !recorded.is_empty() {
+                    initial_files = recorded;
+                } else if let Some(ref g_branch) = goal_branch {
+                    let g_id = g_branch.strip_prefix("agent-goal/").unwrap_or(g_branch);
+                    initial_files = get_goal_files(g_id);
+                }
             }
 
             for (rel_path, content) in &initial_files {
@@ -1204,6 +1238,7 @@ async fn acquire_task_worktree_slot(
     anchor_path: &Path,
     base_dir: &Path,
     current_task_id: &AgentTaskId,
+    allow_overflow: bool,
     cx: &mut AsyncApp,
 ) -> Result<TaskWorktreeSlotGuard> {
     let pool_key = ProjectPoolKey::new(anchor_path, file_system);
@@ -1364,6 +1399,15 @@ async fn acquire_task_worktree_slot(
 
         if evicted {
             drop(notified_guard);
+            return Ok(TaskWorktreeSlotGuard::new(pool_key));
+        }
+
+        if allow_overflow {
+            drop(notified_guard);
+            {
+                let mut in_flight_map = IN_FLIGHT_CREATIONS.lock();
+                *in_flight_map.entry(pool_key.clone()).or_insert(0) += 1;
+            }
             return Ok(TaskWorktreeSlotGuard::new(pool_key));
         }
 
@@ -6813,6 +6857,218 @@ mod tests {
             .expect("task2 must proceed after cleanup")
             .unwrap();
         assert!(fs.is_dir(&path2).await);
+    }
+
+    #[gpui::test]
+    async fn test_pool_allow_overflow_bypasses_slot_wait(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/root"),
+            json!({
+                ".git": {
+                    "HEAD": "ref: refs/heads/main\n"
+                }
+            }),
+        )
+        .await;
+
+        let dot_git = std::path::Path::new(path!("/root/.git"));
+        fs.with_git_state(dot_git, true, |state| {
+            state
+                .refs
+                .insert("refs/heads/main".into(), "main-sha-overflow".into());
+            state.refs.insert("HEAD".into(), "main-sha-overflow".into());
+            state.branches.insert("main".into());
+        })
+        .unwrap();
+
+        let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
+
+        cx.update(|cx| {
+            cx.update_global(|store: &mut settings::SettingsStore, cx| {
+                store
+                    .set_user_settings(r#"{ "agent": { "task_worktree_limit": 1 } }"#, cx)
+                    .unwrap();
+            });
+        });
+
+        let task1 = AgentTaskSummary {
+            id: AgentTaskId::from("TASK-OVERFLOW-1"),
+            parent_id: None,
+            goal_id: None,
+            title: "Task 1".to_string(),
+            status: AgentTaskStatus::Running,
+            attempt: 1,
+            assignee: None,
+            write_scopes: vec![],
+            created_at: None,
+            assigned_profile: None,
+            model: None,
+            session_id: None,
+            metrics: None,
+        };
+        let task2 = AgentTaskSummary {
+            id: AgentTaskId::from("TASK-OVERFLOW-2"),
+            parent_id: None,
+            goal_id: None,
+            title: "Task 2".to_string(),
+            status: AgentTaskStatus::Ready,
+            attempt: 1,
+            assignee: None,
+            write_scopes: vec![],
+            created_at: None,
+            assigned_profile: None,
+            model: None,
+            session_id: None,
+            metrics: None,
+        };
+        let task3 = AgentTaskSummary {
+            id: AgentTaskId::from("TASK-OVERFLOW-3"),
+            parent_id: None,
+            goal_id: None,
+            title: "Task 3".to_string(),
+            status: AgentTaskStatus::Ready,
+            attempt: 1,
+            assignee: None,
+            write_scopes: vec![],
+            created_at: None,
+            assigned_profile: None,
+            model: None,
+            session_id: None,
+            metrics: None,
+        };
+
+        let _guard1 = SubagentSessionGuard::new(task1.id.clone());
+        let path1 = cx
+            .update(|cx| ensure_task_worktree(project.clone(), &task1, cx))
+            .await
+            .unwrap();
+        assert!(fs.is_dir(&path1).await);
+
+        let path2 = cx
+            .update(|cx| {
+                ensure_task_worktree_with_options(
+                    project.clone(),
+                    &task2,
+                    None,
+                    None,
+                    None,
+                    true,
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+        assert!(fs.is_dir(&path2).await);
+        assert_ne!(path1, path2);
+        assert!(fs.is_dir(&path1).await);
+
+        let mut ensure_task3 = cx.spawn({
+            let project = project.clone();
+            let task3 = task3.clone();
+            |cx| async move {
+                cx.update(|cx| {
+                    ensure_task_worktree_with_options(project, &task3, None, None, None, false, cx)
+                })
+                .await
+            }
+        });
+        cx.run_until_parked();
+        assert!(
+            (&mut ensure_task3).now_or_never().is_none(),
+            "task3 with allow_overflow=false must block when pool is full"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_ensure_task_worktree_restores_existing_task_branch(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/root"),
+            json!({
+                ".git": {
+                    "HEAD": "ref: refs/heads/main\n"
+                }
+            }),
+        )
+        .await;
+
+        let dot_git = std::path::Path::new(path!("/root/.git"));
+        fs.with_git_state(dot_git, true, |state| {
+            state
+                .refs
+                .insert("refs/heads/main".into(), "main-sha-restore".into());
+            state.refs.insert("HEAD".into(), "main-sha-restore".into());
+            state.branches.insert("main".into());
+        })
+        .unwrap();
+
+        let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
+
+        let task = AgentTaskSummary {
+            id: AgentTaskId::from("TASK-RESTORE-1"),
+            parent_id: None,
+            goal_id: None,
+            title: "Task Restore".to_string(),
+            status: AgentTaskStatus::Running,
+            attempt: 1,
+            assignee: None,
+            write_scopes: vec![],
+            created_at: None,
+            assigned_profile: None,
+            model: None,
+            session_id: None,
+            metrics: None,
+        };
+
+        let path1 = cx
+            .update(|cx| ensure_task_worktree(project.clone(), &task, cx))
+            .await
+            .unwrap();
+        assert!(fs.is_dir(&path1).await);
+
+        fs.save(
+            &path1.join("task_file.txt"),
+            &"task file content".into(),
+            text::LineEnding::Unix,
+        )
+        .await
+        .unwrap();
+
+        cx.spawn({
+            let fs = fs.clone();
+            let path1 = path1.clone();
+            let task_id = task.id.to_string();
+            |mut cx| async move { commit_task_worktree(fs, path1, task_id, false, &mut cx).await }
+        })
+        .await
+        .unwrap();
+
+        cx.update(|cx| remove_task_worktree(project.clone(), &task.id, cx))
+            .await
+            .unwrap();
+        assert!(!fs.is_dir(&path1).await);
+
+        let path2 = cx
+            .update(|cx| {
+                ensure_task_worktree_with_options(
+                    project.clone(),
+                    &task,
+                    None,
+                    None,
+                    None,
+                    false,
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+        assert!(fs.is_dir(&path2).await);
+
+        let content = fs.load(&path2.join("task_file.txt")).await.unwrap();
+        assert_eq!(content, "task file content");
     }
 
     #[gpui::test]
