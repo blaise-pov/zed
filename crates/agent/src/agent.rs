@@ -4258,6 +4258,18 @@ impl ThreadEnvironment for NativeThreadEnvironment {
             })
         }
     }
+
+    fn worktree_root_path(&self, cx: &App) -> Option<Arc<Path>> {
+        self.thread
+            .upgrade()
+            .and_then(|thread| thread.read(cx).worktree_root_path(cx))
+    }
+
+    fn templates(&self, cx: &App) -> Option<Arc<Templates>> {
+        self.thread
+            .upgrade()
+            .map(|thread| thread.read(cx).templates.clone())
+    }
 }
 
 pub struct NativeSubagentHandle {

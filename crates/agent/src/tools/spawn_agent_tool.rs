@@ -5,12 +5,13 @@ use gpui::{App, SharedString, Task};
 use language_model::LanguageModelToolResultContent;
 use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer, Serialize};
+use std::path::Path;
 use std::rc::Rc;
 use std::sync::Arc;
 
 use crate::agent_task::AgentDiffShortstat;
 use crate::task_worktree::SubagentIsolationDetails;
-use crate::{AgentTool, ThreadEnvironment, ToolCallEventStream, ToolInput};
+use crate::{AgentTool, Template as _, ThreadEnvironment, ToolCallEventStream, ToolInput};
 use acp_thread::AgentModelId;
 use settings::Settings as _;
 
@@ -207,11 +208,20 @@ impl From<SpawnAgentToolOutput> for LanguageModelToolResultContent {
 /// Tool that spawns an agent thread to work on a task.
 pub struct SpawnAgentTool {
     environment: Rc<dyn ThreadEnvironment>,
+    templates: Arc<crate::Templates>,
 }
 
 impl SpawnAgentTool {
     pub fn new(environment: Rc<dyn ThreadEnvironment>) -> Self {
-        Self { environment }
+        Self {
+            environment,
+            templates: crate::Templates::new(),
+        }
+    }
+
+    pub fn with_templates(mut self, templates: Arc<crate::Templates>) -> Self {
+        self.templates = templates;
+        self
     }
 }
 
@@ -593,7 +603,23 @@ impl AgentTool for SpawnAgentTool {
                 if is_initial_turn {
                     match self.environment.get_task_registered(task_id, &mut cx).await {
                         Ok(detail) => {
-                            contract_block = build_task_contract(task_id, &detail);
+                            let (custom_template_path, worktree_root, templates) = cx.update(|cx| {
+                                let settings = agent_settings::AgentSettings::get_global(cx);
+                                let template_path = settings.task_contract_template.clone();
+                                let worktree_root = self.environment.worktree_root_path(cx);
+                                let templates = self
+                                    .environment
+                                    .templates(cx)
+                                    .unwrap_or_else(|| self.templates.clone());
+                                (template_path, worktree_root, templates)
+                            });
+                            contract_block = build_task_contract(
+                                task_id,
+                                &detail,
+                                &templates,
+                                custom_template_path.as_deref(),
+                                worktree_root.as_deref(),
+                            );
                         }
                         Err(error) => {
                             log::warn!(
@@ -902,7 +928,13 @@ fn extract_contract_parts(desc: &str) -> (String, Vec<String>) {
     }
 }
 
-fn build_task_contract(task_id: &str, detail: &crate::AgentTaskDetail) -> Option<String> {
+fn build_task_contract(
+    task_id: &str,
+    detail: &crate::AgentTaskDetail,
+    templates: &crate::Templates,
+    custom_template_path: Option<&str>,
+    worktree_root: Option<&Path>,
+) -> Option<String> {
     let has_description = !detail.description.trim().is_empty();
     let has_criteria = !detail.acceptance_criteria.is_empty();
     if !has_description && !has_criteria {
@@ -918,31 +950,45 @@ fn build_task_contract(task_id: &str, detail: &crate::AgentTaskDetail) -> Option
         detail.summary.title.clone()
     };
 
-    let mut contract = String::new();
-    contract.push_str("<task_contract>\n");
-    contract.push_str(&format!("Task ID: {}\n", task_id));
-    contract.push_str(&format!("Title: {}\n", detail.summary.title));
-    contract.push_str(&format!("Objective: {}\n", objective));
-
-    if has_criteria {
-        contract.push_str("Acceptance Criteria:\n");
-        for criterion in &detail.acceptance_criteria {
-            contract.push_str(&format!("- {}\n", criterion));
-        }
-    }
-
-    if !constraints.is_empty() {
-        contract.push_str("Constraints:\n");
-        for constraint in &constraints {
-            contract.push_str(&format!("- {}\n", constraint));
-        }
-    }
-
     let write_scopes = detail.summary.write_scopes.join(", ");
-    contract.push_str(&format!("Write Scopes: {}\n", write_scopes));
-    contract.push_str("</task_contract>");
+    let data = crate::TaskContractTemplate {
+        task_id,
+        title: &detail.summary.title,
+        objective: &objective,
+        acceptance_criteria: &detail.acceptance_criteria,
+        constraints: &constraints,
+        write_scopes: &write_scopes,
+    };
 
-    Some(contract)
+    let render_default = || match data.render(templates) {
+        Ok(rendered) => Some(rendered),
+        Err(err) => {
+            log::warn!("failed to render default task contract template: {err}");
+            None
+        }
+    };
+
+    if let Some(path) = custom_template_path.filter(|p| !p.trim().is_empty()) {
+        match agent_settings::read_prompt_file(path, worktree_root) {
+            Some(custom_template) => {
+                match templates.render_custom_template(&custom_template, &data, worktree_root) {
+                    Ok(rendered) => Some(rendered),
+                    Err(err) => {
+                        log::warn!(
+                            "failed to render custom task contract template from {path}: {err}"
+                        );
+                        render_default()
+                    }
+                }
+            }
+            None => {
+                log::warn!("failed to read custom task contract template file from {path}");
+                render_default()
+            }
+        }
+    } else {
+        render_default()
+    }
 }
 
 pub(crate) fn parse_git_shortstat(output: &str) -> Option<AgentDiffShortstat> {

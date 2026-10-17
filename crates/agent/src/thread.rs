@@ -1071,6 +1071,14 @@ pub trait ThreadEnvironment {
             "Listing available agents is not supported in this environment"
         ))
     }
+
+    fn worktree_root_path(&self, _cx: &App) -> Option<Arc<Path>> {
+        None
+    }
+
+    fn templates(&self, _cx: &App) -> Option<Arc<Templates>> {
+        None
+    }
 }
 
 /// A request to create a new sibling thread.
@@ -2750,7 +2758,9 @@ impl Thread {
         // it from the model when `agent.nested_sub_agents` doesn't allow
         // spawning at this thread's depth. Keeping registration unconditional
         // means the depth limit can respond to settings changes mid-session.
-        self.add_tool(SpawnAgentTool::new(environment.clone()));
+        self.add_tool(
+            SpawnAgentTool::new(environment.clone()).with_templates(self.templates.clone()),
+        );
 
         // Sibling-thread tools are exposed at every depth: a subagent should
         // still be able to kick off independent sibling work on behalf of the

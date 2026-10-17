@@ -419,6 +419,8 @@ pub struct AgentSettingsContent {
     /// When specified and successfully read, completely replaces the default
     /// title generation prompt.
     pub thread_title_template: Option<String>,
+    /// Path to a custom Handlebars template file for the task contract injected into subagents.
+    pub task_contract_template: Option<String>,
     /// Path to a custom base Handlebars/Markdown template file for the agent system prompt.
     pub system_prompt_template: Option<String>,
     /// Model to use for generating thread summaries. Defaults to default_model when not specified.

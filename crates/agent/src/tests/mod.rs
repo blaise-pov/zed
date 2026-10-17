@@ -8452,6 +8452,289 @@ async fn test_spawn_agent_resumed_turn_bypasses_contract_injection(cx: &mut Test
 }
 
 #[gpui::test]
+async fn test_spawn_agent_contract_injection_custom_template(cx: &mut TestAppContext) {
+    init_test(cx);
+
+    let template_path = std::env::temp_dir().join(format!(
+        "zed-test-task-contract-{}-{}.hbs",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+    ));
+    std::fs::write(
+        &template_path,
+        "CUSTOM_CONTRACT_START
+ID: {{task_id}}
+NAME: {{title}}
+OBJ: {{objective}}
+SCOPES: {{write_scopes}}
+CUSTOM_CONTRACT_END",
+    )
+    .unwrap();
+
+    cx.update(|cx| {
+        settings::SettingsStore::update_global(cx, |store, cx| {
+            store.update_user_settings(cx, |content| {
+                content.agent.get_or_insert_default().task_contract_template =
+                    Some(template_path.to_string_lossy().to_string());
+            });
+        });
+    });
+
+    let task_detail = crate::AgentTaskDetail {
+        summary: crate::AgentTaskSummary {
+            id: crate::AgentTaskId::from("TASK-CONTRACT-CUSTOM"),
+            parent_id: None,
+            goal_id: Some("GOAL-42".to_string()),
+            title: "Implement metrics and turn tracking".to_string(),
+            status: crate::AgentTaskStatus::Ready,
+            attempt: 1,
+            assignee: None,
+            write_scopes: vec!["crates/agent/**".to_string(), "crates/agent_ui/**".to_string()],
+            created_at: None,
+            assigned_profile: None,
+            model: None,
+            session_id: None,
+            metrics: None,
+        },
+        description: "Add metrics tracking to subagent runtime.
+
+Strict constraints:
+- No panic
+- Best effort MCP".to_string(),
+        acceptance_criteria: vec![
+            "AgentTaskMetrics defined".to_string(),
+            "Contract injected on turn 1".to_string(),
+        ],
+        events_tail: vec![],
+    };
+
+    let subagent = FakeSubagentHandle::new(
+        acp::SessionId::new("subagent-contract-custom"),
+        Task::ready("done".to_string()).shared(),
+        None,
+    );
+
+    let environment = Rc::new(
+        FakeThreadEnvironment::default()
+            .with_subagent(subagent)
+            .with_task_detail("TASK-CONTRACT-CUSTOM", task_detail),
+    );
+    let subagent_handle = environment.subagent_handle().unwrap();
+
+    #[allow(clippy::arc_with_non_send_sync)]
+    let tool = Arc::new(SpawnAgentTool::new(environment.clone()));
+    let (event_stream, _rx) = ToolCallEventStream::test();
+
+    let result = cx
+        .update(|cx| {
+            tool.run(
+                ToolInput::resolved(SpawnAgentToolInput {
+                    label: "Initial turn".to_string(),
+                    message: "Please begin your task".to_string(),
+                    task_id: Some("TASK-CONTRACT-CUSTOM".to_string()),
+                    session_id: None,
+                    ..Default::default()
+                }),
+                event_stream,
+                cx,
+            )
+        })
+        .await;
+
+    assert!(matches!(result, Ok(SpawnAgentToolOutput::Success { .. })));
+
+    let sent = subagent_handle.sent_messages();
+    assert_eq!(sent.len(), 1);
+    let sent_msg = &sent[0];
+    assert!(sent_msg.contains("CUSTOM_CONTRACT_START"));
+    assert!(sent_msg.contains("ID: TASK-CONTRACT-CUSTOM"));
+    assert!(sent_msg.contains("NAME: Implement metrics and turn tracking"));
+    assert!(sent_msg.contains("OBJ: Add metrics tracking to subagent runtime."));
+    assert!(sent_msg.contains("SCOPES: crates/agent/**, crates/agent_ui/**"));
+    assert!(sent_msg.contains("CUSTOM_CONTRACT_END"));
+    assert!(!sent_msg.contains("<task_contract>"));
+    assert!(sent_msg.contains("Please begin your task"));
+
+    std::fs::remove_file(&template_path).log_err();
+}
+
+#[gpui::test]
+async fn test_spawn_agent_contract_injection_fallback_on_unreadable_or_invalid_template(
+    cx: &mut TestAppContext,
+) {
+    init_test(cx);
+
+    // Case 1: unreadable template path falls back to built-in default
+    cx.update(|cx| {
+        settings::SettingsStore::update_global(cx, |store, cx| {
+            store.update_user_settings(cx, |content| {
+                content.agent.get_or_insert_default().task_contract_template =
+                    Some("nonexistent/missing_template.hbs".to_string());
+            });
+        });
+    });
+
+    let task_detail_1 = crate::AgentTaskDetail {
+        summary: crate::AgentTaskSummary {
+            id: crate::AgentTaskId::from("TASK-FALLBACK-1"),
+            parent_id: None,
+            goal_id: None,
+            title: "Fallback Task 1".to_string(),
+            status: crate::AgentTaskStatus::Ready,
+            attempt: 1,
+            assignee: None,
+            write_scopes: vec!["crates/agent/**".to_string()],
+            created_at: None,
+            assigned_profile: None,
+            model: None,
+            session_id: None,
+            metrics: None,
+        },
+        description: "Objective for fallback 1".to_string(),
+        acceptance_criteria: vec!["Criteria 1".to_string()],
+        events_tail: vec![],
+    };
+
+    let subagent_1 = FakeSubagentHandle::new(
+        acp::SessionId::new("subagent-fallback-1"),
+        Task::ready("done".to_string()).shared(),
+        None,
+    );
+    let environment_1 = Rc::new(
+        FakeThreadEnvironment::default()
+            .with_subagent(subagent_1)
+            .with_task_detail("TASK-FALLBACK-1", task_detail_1),
+    );
+    let subagent_handle_1 = environment_1.subagent_handle().unwrap();
+
+    #[allow(clippy::arc_with_non_send_sync)]
+    let tool_1 = Arc::new(SpawnAgentTool::new(environment_1.clone()));
+    let (event_stream_1, _rx_1) = ToolCallEventStream::test();
+
+    let result_1 = cx
+        .update(|cx| {
+            tool_1.run(
+                ToolInput::resolved(SpawnAgentToolInput {
+                    label: "Initial turn".to_string(),
+                    message: "Begin fallback 1".to_string(),
+                    task_id: Some("TASK-FALLBACK-1".to_string()),
+                    session_id: None,
+                    ..Default::default()
+                }),
+                event_stream_1,
+                cx,
+            )
+        })
+        .await;
+
+    assert!(matches!(result_1, Ok(SpawnAgentToolOutput::Success { .. })));
+    let sent_1 = subagent_handle_1.sent_messages();
+    assert_eq!(sent_1.len(), 1);
+    let msg_1 = &sent_1[0];
+    assert!(msg_1.contains("<task_contract>"));
+    assert!(msg_1.contains("Task ID: TASK-FALLBACK-1"));
+    assert!(msg_1.contains("Title: Fallback Task 1"));
+    assert!(msg_1.contains("Objective: Objective for fallback 1"));
+    assert!(msg_1.contains("Acceptance Criteria:"));
+    assert!(msg_1.contains("- Criteria 1"));
+    assert!(msg_1.contains("Write Scopes: crates/agent/**"));
+    assert!(msg_1.contains("</task_contract>"));
+    assert!(msg_1.contains("Begin fallback 1"));
+
+    // Case 2: invalid template file (syntax error or unknown variable) falls back to built-in default
+    let invalid_template_path = std::env::temp_dir().join(format!(
+        "zed-test-invalid-template-{}-{}.hbs",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+    ));
+    std::fs::write(&invalid_template_path, "Invalid template {{#unclosed_block").unwrap();
+
+    cx.update(|cx| {
+        settings::SettingsStore::update_global(cx, |store, cx| {
+            store.update_user_settings(cx, |content| {
+                content.agent.get_or_insert_default().task_contract_template =
+                    Some(invalid_template_path.to_string_lossy().to_string());
+            });
+        });
+    });
+
+    let task_detail_2 = crate::AgentTaskDetail {
+        summary: crate::AgentTaskSummary {
+            id: crate::AgentTaskId::from("TASK-FALLBACK-2"),
+            parent_id: None,
+            goal_id: None,
+            title: "Fallback Task 2".to_string(),
+            status: crate::AgentTaskStatus::Ready,
+            attempt: 1,
+            assignee: None,
+            write_scopes: vec!["crates/agent_ui/**".to_string()],
+            created_at: None,
+            assigned_profile: None,
+            model: None,
+            session_id: None,
+            metrics: None,
+        },
+        description: "Objective for fallback 2".to_string(),
+        acceptance_criteria: vec!["Criteria 2".to_string()],
+        events_tail: vec![],
+    };
+
+    let subagent_2 = FakeSubagentHandle::new(
+        acp::SessionId::new("subagent-fallback-2"),
+        Task::ready("done".to_string()).shared(),
+        None,
+    );
+    let environment_2 = Rc::new(
+        FakeThreadEnvironment::default()
+            .with_subagent(subagent_2)
+            .with_task_detail("TASK-FALLBACK-2", task_detail_2),
+    );
+    let subagent_handle_2 = environment_2.subagent_handle().unwrap();
+
+    #[allow(clippy::arc_with_non_send_sync)]
+    let tool_2 = Arc::new(SpawnAgentTool::new(environment_2.clone()));
+    let (event_stream_2, _rx_2) = ToolCallEventStream::test();
+
+    let result_2 = cx
+        .update(|cx| {
+            tool_2.run(
+                ToolInput::resolved(SpawnAgentToolInput {
+                    label: "Initial turn".to_string(),
+                    message: "Begin fallback 2".to_string(),
+                    task_id: Some("TASK-FALLBACK-2".to_string()),
+                    session_id: None,
+                    ..Default::default()
+                }),
+                event_stream_2,
+                cx,
+            )
+        })
+        .await;
+
+    assert!(matches!(result_2, Ok(SpawnAgentToolOutput::Success { .. })));
+    let sent_2 = subagent_handle_2.sent_messages();
+    assert_eq!(sent_2.len(), 1);
+    let msg_2 = &sent_2[0];
+    assert!(msg_2.contains("<task_contract>"));
+    assert!(msg_2.contains("Task ID: TASK-FALLBACK-2"));
+    assert!(msg_2.contains("Title: Fallback Task 2"));
+    assert!(msg_2.contains("Objective: Objective for fallback 2"));
+    assert!(msg_2.contains("Acceptance Criteria:"));
+    assert!(msg_2.contains("- Criteria 2"));
+    assert!(msg_2.contains("Write Scopes: crates/agent_ui/**"));
+    assert!(msg_2.contains("</task_contract>"));
+    assert!(msg_2.contains("Begin fallback 2"));
+
+    std::fs::remove_file(&invalid_template_path).log_err();
+}
+
+#[gpui::test]
 async fn test_spawn_agent_differentiated_error_handling(cx: &mut TestAppContext) {
     init_test(cx);
 

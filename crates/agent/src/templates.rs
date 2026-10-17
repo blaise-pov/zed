@@ -316,6 +316,20 @@ impl Template for SystemPromptTemplate<'_> {
     const TEMPLATE_NAME: &'static str = "system_prompt.hbs";
 }
 
+#[derive(Serialize)]
+pub struct TaskContractTemplate<'a> {
+    pub task_id: &'a str,
+    pub title: &'a str,
+    pub objective: &'a str,
+    pub acceptance_criteria: &'a [String],
+    pub constraints: &'a [String],
+    pub write_scopes: &'a str,
+}
+
+impl Template for TaskContractTemplate<'_> {
+    const TEMPLATE_NAME: &'static str = "task_contract.hbs";
+}
+
 /// Handlebars helper for checking if an item is in a list
 fn contains(
     h: &handlebars::Helper,
@@ -397,6 +411,36 @@ mod tests {
         assert!(rendered.contains("Today's Date: 2026-01-01"));
         assert!(rendered.contains("## Fixing Diagnostics"));
         assert!(rendered.contains("test-model"));
+    }
+
+    #[test]
+    fn test_task_contract_template() {
+        let criteria = vec!["Crit 1".to_string(), "Crit 2".to_string()];
+        let constraints = vec!["No panic".to_string()];
+        let template = TaskContractTemplate {
+            task_id: "TASK-123",
+            title: "Test Task",
+            objective: "Do the task",
+            acceptance_criteria: &criteria,
+            constraints: &constraints,
+            write_scopes: "crates/agent/**",
+        };
+        let templates = Templates::new();
+        let rendered = template.render(&templates).unwrap();
+        let expected = "<task_contract>\nTask ID: TASK-123\nTitle: Test Task\nObjective: Do the task\nAcceptance Criteria:\n- Crit 1\n- Crit 2\nConstraints:\n- No panic\nWrite Scopes: crates/agent/**\n</task_contract>";
+        assert_eq!(rendered.lines().collect::<Vec<_>>(), expected.lines().collect::<Vec<_>>());
+
+        let empty_template = TaskContractTemplate {
+            task_id: "TASK-456",
+            title: "Empty Task",
+            objective: "No criteria or constraints",
+            acceptance_criteria: &[],
+            constraints: &[],
+            write_scopes: "crates/agent/**",
+        };
+        let rendered_empty = empty_template.render(&templates).unwrap();
+        let expected_empty = "<task_contract>\nTask ID: TASK-456\nTitle: Empty Task\nObjective: No criteria or constraints\nWrite Scopes: crates/agent/**\n</task_contract>";
+        assert_eq!(rendered_empty.lines().collect::<Vec<_>>(), expected_empty.lines().collect::<Vec<_>>());
     }
 
     #[test]
