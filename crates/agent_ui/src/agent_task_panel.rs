@@ -49,9 +49,8 @@ use ui::{
     IconPosition, IconSize, Label, LabelSize, PopoverMenu, Tooltip, prelude::*,
 };
 use util::ResultExt;
-use workspace::ToggleZoom;
-use workspace::Workspace;
 use workspace::dock::{DockPosition, Panel, PanelEvent};
+use workspace::{PathList, ToggleZoom, Workspace};
 use zed_actions::SwitchWorktree;
 
 #[allow(dead_code)]
@@ -285,6 +284,65 @@ pub struct AgentTaskPanel {
 }
 
 impl AgentTaskPanel {
+    pub fn show_error_toast(
+        workspace: WeakEntity<Workspace>,
+        message: impl Into<std::borrow::Cow<'static, str>>,
+        cx: &mut App,
+    ) {
+        if let Some(workspace) = workspace.upgrade() {
+            workspace.update(cx, |workspace, cx| {
+                workspace.show_toast(
+                    workspace::Toast::new(
+                        workspace::notifications::NotificationId::unique::<TaskOperationErrorToast>(
+                        ),
+                        message,
+                    ),
+                    cx,
+                );
+            });
+        }
+    }
+
+    pub fn humanize_error(error: &anyhow::Error) -> String {
+        let err_str = format!("{error:#}");
+        Self::humanize_error_str(&err_str)
+    }
+
+    pub fn humanize_error_str(err_str: &str) -> String {
+        let lower = err_str.to_lowercase();
+        if lower.contains("database is locked") || lower.contains("database locked") {
+            "Database is locked by another process. Please wait and try again.".to_string()
+        } else if lower.contains("index.lock")
+            || lower.contains("file is locked")
+            || lower.contains("being used by another process")
+            || lower.contains("could not lock config file")
+            || lower.contains("resource temporarily unavailable")
+        {
+            "Git index or file is locked by another process. Please wait and try again.".to_string()
+        } else if lower.contains("not a valid object name")
+            || (lower.contains("branch") && lower.contains("not found"))
+            || lower.contains("did not match any file")
+            || (lower.contains("reference") && lower.contains("not found"))
+            || lower.contains("no such branch")
+        {
+            format!("Git branch not found: {err_str}")
+        } else {
+            err_str.to_string()
+        }
+    }
+
+    pub fn format_task_panel_error(action: Option<&str>, error: &anyhow::Error) -> String {
+        let humanized = Self::humanize_error(error);
+        if let Some(action) = action {
+            format!("Task Panel: {action}: {humanized}")
+        } else if humanized.starts_with("Task Panel: ") {
+            humanized
+        } else {
+            format!("Task Panel: {humanized}")
+        }
+    }
+
+    #[allow(dead_code)]
     pub fn spawn_with_error_toast<F>(&self, task: F, _window: &mut Window, cx: &mut Context<Self>)
     where
         F: Future<Output = anyhow::Result<()>> + 'static,
@@ -292,26 +350,40 @@ impl AgentTaskPanel {
         Self::spawn_task_with_error_toast(task, self.workspace.clone(), cx);
     }
 
+    pub fn spawn_with_action_error_toast<F>(
+        &self,
+        task: F,
+        action: &'static str,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) where
+        F: Future<Output = anyhow::Result<()>> + 'static,
+    {
+        Self::spawn_task_with_action_error_toast(task, Some(action), self.workspace.clone(), cx);
+    }
+
+    #[allow(dead_code)]
     pub fn spawn_task_with_error_toast<F>(task: F, workspace: WeakEntity<Workspace>, cx: &mut App)
     where
         F: Future<Output = anyhow::Result<()>> + 'static,
     {
+        Self::spawn_task_with_action_error_toast(task, None, workspace, cx);
+    }
+
+    pub fn spawn_task_with_action_error_toast<F>(
+        task: F,
+        action: Option<&'static str>,
+        workspace: WeakEntity<Workspace>,
+        cx: &mut App,
+    ) where
+        F: Future<Output = anyhow::Result<()>> + 'static,
+    {
         cx.spawn(async move |cx| {
             if let Err(error) = task.await {
-                if let Some(workspace) = workspace.upgrade() {
-                    workspace.update(cx, |workspace, cx| {
-                        workspace.show_toast(
-                            workspace::Toast::new(
-                                workspace::notifications::NotificationId::unique::<
-                                    TaskOperationErrorToast,
-                                >(),
-                                format!("TGS: {error:#}"),
-                            )
-                            .autohide(),
-                            cx,
-                        );
-                    });
-                }
+                let message = Self::format_task_panel_error(action, &error);
+                cx.update(|cx| {
+                    Self::show_error_toast(workspace, message, cx);
+                });
             }
         })
         .detach();
@@ -385,14 +457,14 @@ impl AgentTaskPanel {
                 let task = store.update(cx, |store, cx| {
                     store.update_goal_title(&goal_id, &new_title, cx)
                 });
-                self.spawn_with_error_toast(task, window, cx);
+                self.spawn_with_action_error_toast(task, "Rename Goal", window, cx);
             }
             RenamingTarget::Task(task_id) => {
                 let store = self.store.clone();
                 let task = store.update(cx, |store, cx| {
                     store.update_task_title(&task_id, &new_title, cx)
                 });
-                self.spawn_with_error_toast(task, window, cx);
+                self.spawn_with_action_error_toast(task, "Rename Task", window, cx);
             }
         }
         cx.notify();
@@ -845,8 +917,9 @@ impl AgentTaskPanel {
                                 }
                                 Ok(())
                             });
-                            Self::spawn_task_with_error_toast(
+                            Self::spawn_task_with_action_error_toast(
                                 task,
+                                Some("View Thread as Markdown"),
                                 workspace_for_transcript.clone(),
                                 cx,
                             );
@@ -856,8 +929,15 @@ impl AgentTaskPanel {
                     if branch_exists {
                         let branch = branch_name.clone();
                         let project = project.clone();
+                        let workspace = workspace.clone();
                         menu = menu.entry("Go to Branch", None, move |window, cx| {
-                            Self::go_to_branch(branch.clone(), project.clone(), window, cx);
+                            Self::go_to_branch(
+                                branch.clone(),
+                                project.clone(),
+                                workspace.clone(),
+                                window,
+                                cx,
+                            );
                         });
                     }
 
@@ -906,7 +986,12 @@ impl AgentTaskPanel {
                         menu = menu.entry("Archive", None, move |_window, cx| {
                             let task =
                                 store.update(cx, |store, cx| store.archive_goal(&goal_id, cx));
-                            Self::spawn_task_with_error_toast(task, workspace.clone(), cx);
+                            Self::spawn_task_with_action_error_toast(
+                                task,
+                                Some("Archive Goal"),
+                                workspace.clone(),
+                                cx,
+                            );
                         });
                     } else {
                         let store = store.clone();
@@ -915,7 +1000,12 @@ impl AgentTaskPanel {
                         menu = menu.entry("Unarchive", None, move |_window, cx| {
                             let task =
                                 store.update(cx, |store, cx| store.unarchive_goal(&goal_id, cx));
-                            Self::spawn_task_with_error_toast(task, workspace.clone(), cx);
+                            Self::spawn_task_with_action_error_toast(
+                                task,
+                                Some("Unarchive Goal"),
+                                workspace.clone(),
+                                cx,
+                            );
                         });
                     }
 
@@ -926,7 +1016,12 @@ impl AgentTaskPanel {
                         menu = menu.entry("Delete", None, move |_window, cx| {
                             let task =
                                 store.update(cx, |store, cx| store.delete_goal(&goal_id, cx));
-                            Self::spawn_task_with_error_toast(task, workspace.clone(), cx);
+                            Self::spawn_task_with_action_error_toast(
+                                task,
+                                Some("Delete Goal"),
+                                workspace.clone(),
+                                cx,
+                            );
                         });
                     }
 
@@ -967,8 +1062,9 @@ impl AgentTaskPanel {
                                                     cx,
                                                 )
                                             });
-                                            Self::spawn_task_with_error_toast(
+                                            Self::spawn_task_with_action_error_toast(
                                                 task,
+                                                Some("Set Goal Status"),
                                                 workspace.clone(),
                                                 cx,
                                             );
@@ -983,6 +1079,7 @@ impl AgentTaskPanel {
                     if can_cleanup {
                         let project = project.clone();
                         let view = view.clone();
+                        let workspace = workspace.clone();
                         menu = menu.separator().entry(
                             "Cleanup Goal Branches",
                             None,
@@ -990,6 +1087,7 @@ impl AgentTaskPanel {
                                 let project = project.clone();
                                 let goal_id = goal_id.clone();
                                 let view = view.clone();
+                                let workspace = workspace.clone();
                                 let cleanup_task = agent::task_worktree::cleanup_graduated_goal(
                                     project, &goal_id, cx,
                                 );
@@ -1011,6 +1109,14 @@ impl AgentTaskPanel {
                                     }
                                     Err(e) => {
                                         log::warn!("Failed to clean up goal {goal_id}: {e}");
+                                        let humanized = Self::humanize_error(&e);
+                                        cx.update(|cx| {
+                                            Self::show_error_toast(
+                                                workspace,
+                                                format!("Task Panel: Clean up Goal: {humanized}"),
+                                                cx,
+                                            );
+                                        });
                                     }
                                 })
                                 .detach();
@@ -1127,8 +1233,9 @@ impl AgentTaskPanel {
                                 }
                                 Ok(())
                             });
-                            Self::spawn_task_with_error_toast(
+                            Self::spawn_task_with_action_error_toast(
                                 task,
+                                Some("View Thread as Markdown"),
                                 workspace_for_transcript.clone(),
                                 cx,
                             );
@@ -1165,7 +1272,10 @@ impl AgentTaskPanel {
                         let task_id_for_open_thread = task_id.clone();
                         let task_for_open_thread = task.clone();
                         let branch_name_for_open_thread = branch_name.clone();
+                        let branch_exists_for_open_thread = branch_exists;
                         let exists_on_disk_for_open_thread = exists_on_disk;
+                        let worktree_path_for_open_thread = worktree_path.clone();
+                        let goal_id_for_open_thread = goal_id.clone();
                         let view_for_open_thread = view.clone();
 
                         menu = menu.entry("Open Thread", None, move |window, cx| {
@@ -1183,14 +1293,31 @@ impl AgentTaskPanel {
                                         {
                                             panel.update(cx, |panel, cx| {
                                                 panel.open_thread_standalone(
-                                                    session_id, None, title, window, cx,
+                                                    session_id,
+                                                    worktree_path_for_open_thread
+                                                        .as_ref()
+                                                        .map(|p| PathList::new(&[p.as_path()])),
+                                                    title,
+                                                    window,
+                                                    cx,
                                                 );
                                             });
                                         }
                                         workspace.focus_panel::<crate::AgentPanel>(window, cx);
                                     });
                                 }
+                            } else if !branch_exists_for_open_thread {
+                                let task_id = task_id_for_open_thread.clone();
+                                let branch_name = branch_name_for_open_thread.clone();
+                                Self::show_error_toast(
+                                    workspace,
+                                    format!(
+                                        "Task Panel: Open Thread: Cannot open thread for task {task_id}: branch '{branch_name}' was not found in git repository; worktree cannot be restored."
+                                    ),
+                                    cx,
+                                );
                             } else {
+                                let task_id = task_id_for_open_thread.clone();
                                 let task_summary = task_for_open_thread
                                     .clone()
                                     .unwrap_or_else(|| agent::AgentTaskSummary {
@@ -1198,54 +1325,66 @@ impl AgentTaskPanel {
                                         title: task_id_for_open_thread.to_string(),
                                         ..Default::default()
                                     });
-                                let branch = branch_name_for_open_thread.clone();
                                 let ensure_task =
-                                    agent::task_worktree::ensure_task_worktree_with_policy(
+                                    agent::task_worktree::ensure_task_worktree_with_options(
                                         project_for_open_thread.clone(),
                                         &task_summary,
+                                        goal_id_for_open_thread.clone(),
                                         None,
                                         None,
-                                        Some(branch.clone()),
+                                        true,
                                         cx,
                                     );
                                 let view = view_for_open_thread.clone();
-                                let task = window.spawn(cx, async move |cx| {
-                                    if let Err(err) = ensure_task.await {
-                                        log::warn!(
-                                            "failed to ensure task worktree for branch {branch}: {err:?}"
-                                        );
-                                        return Err(err);
-                                    }
-                                    cx.update(|window, cx| {
-                                        if let Some(panel) = view.upgrade() {
-                                            panel.update(cx, |panel, cx| {
-                                                panel.refresh_worktree_status(cx);
-                                            });
-                                        }
-                                        if let Some(workspace) = workspace.upgrade() {
-                                            workspace.update(cx, |workspace, cx| {
-                                                if let Some(panel) =
-                                                    workspace.panel::<crate::AgentPanel>(cx)
-                                                {
-                                                    panel.update(cx, |panel, cx| {
-                                                        panel.open_thread_standalone(
-                                                            session_id, None, title, window, cx,
-                                                        );
-                                                    });
-                                                }
-                                                workspace.focus_panel::<crate::AgentPanel>(
-                                                    window, cx,
-                                                );
-                                            });
-                                        }
-                                    })?;
-                                    Ok(())
-                                });
-                                Self::spawn_task_with_error_toast(
-                                    task,
-                                    workspace_for_open_thread.clone(),
-                                    cx,
-                                );
+                                window
+                                    .spawn(cx, async move |cx| -> anyhow::Result<()> {
+                                        let path = match ensure_task.await {
+                                            Ok(path) => path,
+                                            Err(err) => {
+                                                let humanized = Self::humanize_error(&err);
+                                                cx.update(|_window, cx| {
+                                                    Self::show_error_toast(
+                                                        workspace,
+                                                        format!(
+                                                            "Task Panel: Open Thread: Failed to restore worktree for task {task_id}: {humanized}"
+                                                        ),
+                                                        cx,
+                                                    );
+                                                })
+                                                .ok();
+                                                return Ok(());
+                                            }
+                                        };
+                                        cx.update(|window, cx| {
+                                            if let Some(panel) = view.upgrade() {
+                                                panel.update(cx, |panel, cx| {
+                                                    panel.refresh_worktree_status(cx);
+                                                });
+                                            }
+                                            if let Some(workspace) = workspace.upgrade() {
+                                                workspace.update(cx, |workspace, cx| {
+                                                    if let Some(panel) =
+                                                        workspace.panel::<crate::AgentPanel>(cx)
+                                                    {
+                                                        panel.update(cx, |panel, cx| {
+                                                            panel.open_thread_standalone(
+                                                                session_id,
+                                                                Some(PathList::new(&[path.as_path()])),
+                                                                title,
+                                                                window,
+                                                                cx,
+                                                            );
+                                                        });
+                                                    }
+                                                    workspace.focus_panel::<crate::AgentPanel>(
+                                                        window, cx,
+                                                    );
+                                                });
+                                            }
+                                        })?;
+                                        Ok(())
+                                    })
+                                    .detach();
                             }
                         });
                     }
@@ -1269,8 +1408,15 @@ impl AgentTaskPanel {
                     if branch_exists {
                         let branch = branch_name.clone();
                         let project = project.clone();
+                        let workspace = workspace.clone();
                         menu = menu.entry("Go to Branch", None, move |window, cx| {
-                            Self::go_to_branch(branch.clone(), project.clone(), window, cx);
+                            Self::go_to_branch(
+                                branch.clone(),
+                                project.clone(),
+                                workspace.clone(),
+                                window,
+                                cx,
+                            );
                         });
                     }
 
@@ -1279,6 +1425,8 @@ impl AgentTaskPanel {
                             let project = project.clone();
                             let branch = branch_name;
                             let view = view.clone();
+                            let workspace = workspace.clone();
+                            let goal_id = goal_id.clone();
                             menu = menu.entry(
                                 "Restore Worktree from Branch",
                                 None,
@@ -1286,13 +1434,15 @@ impl AgentTaskPanel {
                                     let task_id = task.id.clone();
                                     let branch_for_switch = branch.clone();
                                     let view = view.clone();
+                                    let workspace = workspace.clone();
                                     let ensure_task =
-                                        agent::task_worktree::ensure_task_worktree_with_policy(
+                                        agent::task_worktree::ensure_task_worktree_with_options(
                                             project.clone(),
                                             &task,
+                                            goal_id.clone(),
                                             None,
                                             None,
-                                            Some(branch.clone()),
+                                            true,
                                             cx,
                                         );
                                     window.spawn(cx, async move |cx| {
@@ -1321,6 +1471,17 @@ impl AgentTaskPanel {
                                                 log::warn!(
                                                     "failed to restore worktree from branch {branch_for_switch}: {e:?}"
                                                 );
+                                                let humanized = Self::humanize_error(&e);
+                                                cx.update(|_window, cx| {
+                                                    Self::show_error_toast(
+                                                        workspace,
+                                                        format!(
+                                                            "Task Panel: Restore Worktree: {humanized}"
+                                                        ),
+                                                        cx,
+                                                    );
+                                                })
+                                                .ok();
                                             }
                                         }
                                     })
@@ -1368,7 +1529,12 @@ impl AgentTaskPanel {
                                 }
                                 Ok(())
                             });
-                            Self::spawn_task_with_error_toast(task, workspace.clone(), cx);
+                            Self::spawn_task_with_action_error_toast(
+                                task,
+                                Some("Delete Worktree"),
+                                workspace.clone(),
+                                cx,
+                            );
                         });
                     }
 
@@ -1400,7 +1566,12 @@ impl AgentTaskPanel {
                         menu = menu.entry("Complete", None, move |_window, cx| {
                             let task =
                                 store.update(cx, |store, cx| store.complete_task(&task_id, cx));
-                            Self::spawn_task_with_error_toast(task, workspace.clone(), cx);
+                            Self::spawn_task_with_action_error_toast(
+                                task,
+                                Some("Complete Task"),
+                                workspace.clone(),
+                                cx,
+                            );
                         });
                     }
 
@@ -1411,7 +1582,12 @@ impl AgentTaskPanel {
                         menu = menu.entry("Archive", None, move |_window, cx| {
                             let task =
                                 store.update(cx, |store, cx| store.archive_task(&task_id, cx));
-                            Self::spawn_task_with_error_toast(task, workspace.clone(), cx);
+                            Self::spawn_task_with_action_error_toast(
+                                task,
+                                Some("Archive Task"),
+                                workspace.clone(),
+                                cx,
+                            );
                         });
                     } else {
                         let store = store.clone();
@@ -1420,7 +1596,12 @@ impl AgentTaskPanel {
                         menu = menu.entry("Unarchive", None, move |_window, cx| {
                             let task =
                                 store.update(cx, |store, cx| store.unarchive_task(&task_id, cx));
-                            Self::spawn_task_with_error_toast(task, workspace.clone(), cx);
+                            Self::spawn_task_with_action_error_toast(
+                                task,
+                                Some("Unarchive Task"),
+                                workspace.clone(),
+                                cx,
+                            );
                         });
                     }
 
@@ -1431,7 +1612,12 @@ impl AgentTaskPanel {
                         menu = menu.entry("Delete", None, move |_window, cx| {
                             let task =
                                 store.update(cx, |store, cx| store.delete_task(&task_id, cx));
-                            Self::spawn_task_with_error_toast(task, workspace.clone(), cx);
+                            Self::spawn_task_with_action_error_toast(
+                                task,
+                                Some("Delete Task"),
+                                workspace.clone(),
+                                cx,
+                            );
                         });
                     }
 
@@ -1471,8 +1657,9 @@ impl AgentTaskPanel {
                                                     cx,
                                                 )
                                             });
-                                            Self::spawn_task_with_error_toast(
+                                            Self::spawn_task_with_action_error_toast(
                                                 task,
+                                                Some("Set Task Status"),
                                                 workspace.clone(),
                                                 cx,
                                             );
@@ -1503,7 +1690,13 @@ impl AgentTaskPanel {
         cx.notify();
     }
 
-    fn go_to_branch(branch: String, project: Entity<Project>, window: &mut Window, cx: &mut App) {
+    fn go_to_branch(
+        branch: String,
+        project: Entity<Project>,
+        workspace: WeakEntity<Workspace>,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
         let existing_repo = project
             .read(cx)
             .repositories(cx)
@@ -1551,14 +1744,43 @@ impl AgentTaskPanel {
                     }
                     Ok(Err(err)) => {
                         log::warn!("failed to checkout branch {branch}: {err:?}");
+                        let humanized = Self::humanize_error_str(&err.to_string());
+                        cx.update(|_window, cx| {
+                            Self::show_error_toast(
+                                workspace,
+                                format!(
+                                    "Task Panel: Go to Branch: Failed to checkout '{branch}': {humanized}"
+                                ),
+                                cx,
+                            );
+                        })
+                        .ok();
                     }
                     Err(err) => {
                         log::warn!("checkout receiver cancelled for branch {branch}: {err:?}");
+                        let humanized = Self::humanize_error_str(&err.to_string());
+                        cx.update(|_window, cx| {
+                            Self::show_error_toast(
+                                workspace,
+                                format!(
+                                    "Task Panel: Go to Branch: Checkout cancelled for '{branch}': {humanized}"
+                                ),
+                                cx,
+                            );
+                        })
+                        .ok();
                     }
                 })
                 .detach();
         } else {
             log::warn!("could not find repository to checkout branch {branch}");
+            Self::show_error_toast(
+                workspace,
+                format!(
+                    "Task Panel: Go to Branch: Could not find repository to checkout branch '{branch}'"
+                ),
+                cx,
+            );
         }
     }
 
@@ -1591,6 +1813,17 @@ impl AgentTaskPanel {
                         "failed to find worktree at {}: not a directory",
                         worktree_path.display()
                     );
+                    cx.update(|_window, cx| {
+                        Self::show_error_toast(
+                            workspace,
+                            format!(
+                                "Task Panel: Open Diff: Worktree path '{}' is not a directory",
+                                worktree_path.display()
+                            ),
+                            cx,
+                        );
+                    })
+                    .ok();
                     return;
                 }
 
@@ -1605,6 +1838,18 @@ impl AgentTaskPanel {
                             "failed to find worktree at {}: {err:?}",
                             worktree_path.display()
                         );
+                        let humanized = Self::humanize_error(&err);
+                        cx.update(|_window, cx| {
+                            Self::show_error_toast(
+                                workspace,
+                                format!(
+                                    "Task Panel: Open Diff: Failed to find worktree at '{}': {humanized}",
+                                    worktree_path.display()
+                                ),
+                                cx,
+                            );
+                        })
+                        .ok();
                         return;
                     }
                 };
@@ -1631,6 +1876,17 @@ impl AgentTaskPanel {
                         "could not resolve repository for worktree at {}",
                         worktree_path.display()
                     );
+                    cx.update(|_window, cx| {
+                        Self::show_error_toast(
+                            workspace,
+                            format!(
+                                "Task Panel: Open Diff: Could not resolve repository for worktree at '{}'",
+                                worktree_path.display()
+                            ),
+                            cx,
+                        );
+                    })
+                    .ok();
                     return;
                 };
                 if let Some(workspace) = workspace.upgrade() {
@@ -1640,6 +1896,17 @@ impl AgentTaskPanel {
                         );
                     }) {
                         log::warn!("failed to deploy branch diff in workspace: {err:?}");
+                        let humanized = Self::humanize_error(&err);
+                        cx.update(|_window, cx| {
+                            Self::show_error_toast(
+                                workspace.downgrade(),
+                                format!(
+                                    "Task Panel: Open Diff: Failed to deploy branch diff: {humanized}"
+                                ),
+                                cx,
+                            );
+                        })
+                        .ok();
                     }
                 }
             })
@@ -1653,7 +1920,7 @@ impl AgentTaskPanel {
         window: &mut Window,
         cx: &mut App,
     ) {
-        let base_ref: SharedString = branch.into();
+        let base_ref: SharedString = branch.clone().into();
         let repo = project
             .read(cx)
             .active_repository(cx)
@@ -1664,6 +1931,12 @@ impl AgentTaskPanel {
                     workspace, project, repo, base_ref, None, window, cx,
                 );
             });
+        } else {
+            Self::show_error_toast(
+                workspace,
+                format!("Task Panel: Open Diff: Could not find repository for branch '{branch}'"),
+                cx,
+            );
         }
     }
 
@@ -1727,6 +2000,7 @@ impl AgentTaskPanel {
                     let project = this.project.clone();
                     let path = path.clone();
                     let task_id_hint_for_async = task_id_hint.clone();
+                    let workspace = this.workspace.clone();
                     let remove_task =
                         agent::task_worktree::remove_orphan_worktree(project, path, cx);
                     cx.spawn(async move |this, cx| {
@@ -1734,6 +2008,14 @@ impl AgentTaskPanel {
                             log::warn!(
                                 "Failed to remove orphan worktree for {task_id_hint_for_async}: {e}"
                             );
+                            let humanized = Self::humanize_error(&e);
+                            cx.update(|cx| {
+                                Self::show_error_toast(
+                                    workspace,
+                                    format!("Task Panel: Delete Orphan Worktree: {humanized}"),
+                                    cx,
+                                );
+                            });
                         }
                         this.update(cx, |this, cx| {
                             this.refresh_worktree_status(cx);
@@ -3074,8 +3356,9 @@ impl Render for AgentTaskPanel {
                                     .on_click(cx.listener(|this, _event, _window, cx| {
                                         let store = this.store.clone();
                                         let task = store.update(cx, |store, cx| store.refresh(cx));
-                                        Self::spawn_task_with_error_toast(
+                                        Self::spawn_task_with_action_error_toast(
                                             task,
+                                            Some("Refresh"),
                                             this.workspace.clone(),
                                             cx,
                                         );
@@ -6565,6 +6848,350 @@ mod tests {
                 >())
             }),
             "Error toast should be shown on operation failure"
+        );
+
+        // Advance executor past the 5-second autohide threshold; error toast must remain persistent.
+        cx.background_executor
+            .advance_clock(std::time::Duration::from_secs(10));
+        cx.run_until_parked();
+
+        assert!(
+            workspace.read_with(cx, |workspace, _cx| {
+                workspace.has_notification(&workspace::notifications::NotificationId::unique::<
+                    TaskOperationErrorToast,
+                >())
+            }),
+            "Error toast must not autohide after 10s"
+        );
+    }
+
+    #[test]
+    fn test_format_task_panel_error_humanization_and_prefix() {
+        let err = anyhow::anyhow!("sqlite error: database is locked");
+        let formatted = AgentTaskPanel::format_task_panel_error(Some("Archive Goal"), &err);
+        assert_eq!(
+            formatted,
+            "Task Panel: Archive Goal: Database is locked by another process. Please wait and try again."
+        );
+        assert!(!formatted.contains("TGS: "));
+
+        let err = anyhow::anyhow!("fatal: Unable to create '.git/index.lock': File exists");
+        let formatted = AgentTaskPanel::format_task_panel_error(Some("Restore Worktree"), &err);
+        assert_eq!(
+            formatted,
+            "Task Panel: Restore Worktree: Git index or file is locked by another process. Please wait and try again."
+        );
+        assert!(!formatted.contains("TGS: "));
+
+        let err = anyhow::anyhow!("fatal: branch 'agent-task/TASK-99' not found");
+        let formatted = AgentTaskPanel::format_task_panel_error(Some("Go to Branch"), &err);
+        assert_eq!(
+            formatted,
+            "Task Panel: Go to Branch: Git branch not found: fatal: branch 'agent-task/TASK-99' not found"
+        );
+        assert!(!formatted.contains("TGS: "));
+
+        let err = anyhow::anyhow!("operation timeout");
+        let formatted = AgentTaskPanel::format_task_panel_error(None, &err);
+        assert_eq!(formatted, "Task Panel: operation timeout");
+        assert!(!formatted.contains("TGS: "));
+    }
+
+    #[test]
+    fn test_open_thread_error_toast_strings() {
+        let task_id = AgentTaskId::from("TASK-123");
+        let branch_name = "agent-task/TASK-123";
+        let missing_branch_message = format!(
+            "Task Panel: Open Thread: Cannot open thread for task {task_id}: branch '{branch_name}' was not found in git repository; worktree cannot be restored."
+        );
+        assert_eq!(
+            missing_branch_message,
+            "Task Panel: Open Thread: Cannot open thread for task TASK-123: branch 'agent-task/TASK-123' was not found in git repository; worktree cannot be restored."
+        );
+
+        let err = anyhow::anyhow!("fatal: branch 'agent-task/TASK-123' not found");
+        let humanized = AgentTaskPanel::humanize_error(&err);
+        let restore_error_message =
+            format!("Task Panel: Open Thread: Failed to restore worktree for task {task_id}: {humanized}");
+        assert_eq!(
+            restore_error_message,
+            "Task Panel: Open Thread: Failed to restore worktree for task TASK-123: Git branch not found: fatal: branch 'agent-task/TASK-123' not found"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_open_thread_missing_branch_shows_persistent_error_toast_immediately(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let file_system = FakeFs::new(cx.executor());
+        let project = Project::test(file_system.clone(), [], cx).await;
+        let (workspace, _) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
+
+        let task_id = AgentTaskId::from("TASK-NO-BRANCH");
+        let provider = Arc::new(TestProvider {
+            tasks: vec![AgentTaskSummary {
+                id: task_id.clone(),
+                title: "Task without branch".to_string(),
+                status: AgentTaskStatus::Ready,
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        let store = cx.update(|cx| cx.new(|cx| AgentTaskStore::new(provider, cx)));
+
+        let (panel, cx) = cx.add_window_view(|_window, cx| {
+            AgentTaskPanel::new(
+                store,
+                workspace.downgrade(),
+                project.clone(),
+                file_system.clone(),
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        agent::task_worktree::register_task_session(&task_id, "session-no-branch".to_string());
+
+        panel.update(cx, |panel, cx| {
+            panel.worktree_status.update(cx, |status, cx| {
+                let mut snap = TaskGitSnapshot::default();
+                snap.tasks.insert(
+                    task_id.clone(),
+                    TaskGitState {
+                        worktree_path: std::path::PathBuf::from("/fake/task-no-branch"),
+                        exists_on_disk: false,
+                        branch: Some("agent-task/TASK-NO-BRANCH".to_string()),
+                        branch_exists: false,
+                        diff: None,
+                    },
+                );
+                status.set_snapshot_for_test(snap, cx);
+            });
+        });
+        cx.run_until_parked();
+
+        panel.update_in(cx, |panel, window, cx| {
+            panel.deploy_context_menu(
+                ContextMenuTarget::Task(task_id.clone()),
+                Point::new(px(100.0), px(100.0)),
+                None,
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        let open_thread_item = cx
+            .debug_bounds("MENU_ITEM-Open Thread")
+            .expect("Open Thread should be present in context menu");
+        cx.simulate_click(open_thread_item.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+
+        assert!(
+            workspace.read_with(cx, |workspace, _cx| {
+                workspace.has_notification(&workspace::notifications::NotificationId::unique::<
+                    TaskOperationErrorToast,
+                >())
+            }),
+            "Persistent error toast should be shown immediately when branch is missing"
+        );
+
+        cx.background_executor
+            .advance_clock(std::time::Duration::from_secs(10));
+        cx.run_until_parked();
+
+        assert!(
+            workspace.read_with(cx, |workspace, _cx| {
+                workspace.has_notification(&workspace::notifications::NotificationId::unique::<
+                    TaskOperationErrorToast,
+                >())
+            }),
+            "Missing branch error toast must remain persistent"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_open_thread_existing_branch_restores_worktree(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            "/root",
+            serde_json::json!({
+                ".git": {
+                    "HEAD": "ref: refs/heads/main\n"
+                }
+            }),
+        )
+        .await;
+
+        let dot_git = std::path::Path::new("/root/.git");
+        fs.with_git_state(dot_git, true, |state| {
+            state
+                .refs
+                .insert("refs/heads/main".into(), "main-sha".into());
+            state.refs.insert("HEAD".into(), "main-sha".into());
+            state.branches.insert("main".into());
+            state.refs.insert(
+                "refs/heads/agent-task/TASK-RESTORE".into(),
+                "main-sha".into(),
+            );
+            state.branches.insert("agent-task/TASK-RESTORE".into());
+        })
+        .unwrap();
+
+        let project = Project::test(fs.clone(), [std::path::Path::new("/root")], cx).await;
+        let (workspace, _) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
+
+        let task_id = AgentTaskId::from("TASK-RESTORE");
+        let provider = Arc::new(TestProvider {
+            tasks: vec![AgentTaskSummary {
+                id: task_id.clone(),
+                title: "Task with branch".to_string(),
+                status: AgentTaskStatus::Ready,
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        let store = cx.update(|cx| cx.new(|cx| AgentTaskStore::new(provider, cx)));
+
+        let (panel, cx) = cx.add_window_view(|_window, cx| {
+            AgentTaskPanel::new(
+                store,
+                workspace.downgrade(),
+                project.clone(),
+                fs.clone(),
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        agent::task_worktree::register_task_session(&task_id, "session-restore".to_string());
+
+        panel.update(cx, |panel, cx| {
+            panel.worktree_status.update(cx, |status, cx| {
+                let mut snap = TaskGitSnapshot::default();
+                snap.tasks.insert(
+                    task_id.clone(),
+                    TaskGitState {
+                        worktree_path: std::path::PathBuf::from(
+                            "/root/.zed/worktrees/agent-task-TASK-RESTORE",
+                        ),
+                        exists_on_disk: false,
+                        branch: Some("agent-task/TASK-RESTORE".to_string()),
+                        branch_exists: true,
+                        diff: None,
+                    },
+                );
+                status.set_snapshot_for_test(snap, cx);
+            });
+        });
+        cx.run_until_parked();
+
+        panel.update_in(cx, |panel, window, cx| {
+            panel.deploy_context_menu(
+                ContextMenuTarget::Task(task_id.clone()),
+                Point::new(px(100.0), px(100.0)),
+                None,
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        let open_thread_item = cx
+            .debug_bounds("MENU_ITEM-Open Thread")
+            .expect("Open Thread should be present in context menu");
+        cx.simulate_click(open_thread_item.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+
+        assert!(
+            !workspace.read_with(cx, |workspace, _cx| {
+                workspace.has_notification(&workspace::notifications::NotificationId::unique::<
+                    TaskOperationErrorToast,
+                >())
+            }),
+            "No error toast should be shown when worktree is restored successfully"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_open_thread_exists_on_disk(cx: &mut TestAppContext) {
+        init_test(cx);
+        let file_system = FakeFs::new(cx.executor());
+        let project = Project::test(file_system.clone(), [], cx).await;
+        let (workspace, _) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
+
+        let task_id = AgentTaskId::from("TASK-DISK");
+        let provider = Arc::new(TestProvider {
+            tasks: vec![AgentTaskSummary {
+                id: task_id.clone(),
+                title: "Task on disk".to_string(),
+                status: AgentTaskStatus::Ready,
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        let store = cx.update(|cx| cx.new(|cx| AgentTaskStore::new(provider, cx)));
+
+        let (panel, cx) = cx.add_window_view(|_window, cx| {
+            AgentTaskPanel::new(
+                store,
+                workspace.downgrade(),
+                project.clone(),
+                file_system.clone(),
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        agent::task_worktree::register_task_session(&task_id, "session-disk".to_string());
+
+        panel.update(cx, |panel, cx| {
+            panel.worktree_status.update(cx, |status, cx| {
+                let mut snap = TaskGitSnapshot::default();
+                snap.tasks.insert(
+                    task_id.clone(),
+                    TaskGitState {
+                        worktree_path: std::path::PathBuf::from("/fake/task-disk"),
+                        exists_on_disk: true,
+                        branch: Some("agent-task/TASK-DISK".to_string()),
+                        branch_exists: true,
+                        diff: None,
+                    },
+                );
+                status.set_snapshot_for_test(snap, cx);
+            });
+        });
+        cx.run_until_parked();
+
+        panel.update_in(cx, |panel, window, cx| {
+            panel.deploy_context_menu(
+                ContextMenuTarget::Task(task_id.clone()),
+                Point::new(px(100.0), px(100.0)),
+                None,
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        let open_thread_item = cx
+            .debug_bounds("MENU_ITEM-Open Thread")
+            .expect("Open Thread should be present in context menu");
+        cx.simulate_click(open_thread_item.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+
+        assert!(
+            !workspace.read_with(cx, |workspace, _cx| {
+                workspace.has_notification(&workspace::notifications::NotificationId::unique::<
+                    TaskOperationErrorToast,
+                >())
+            }),
+            "No error toast when opening existing thread on disk"
         );
     }
 
