@@ -463,7 +463,8 @@ impl RenderOnce for ThreadItem {
                     .child(
                         Label::new(agent_name)
                             .size(LabelSize::Small)
-                            .color(Color::Muted),
+                            .color(Color::Muted)
+                            .truncate(),
                     )
                     .into_any_element(),
             );
@@ -479,7 +480,8 @@ impl RenderOnce for ThreadItem {
                         .child(
                             Label::new(model_name)
                                 .size(LabelSize::Small)
-                                .color(Color::Muted),
+                                .color(Color::Muted)
+                                .truncate(),
                         )
                         .into_any_element(),
                 );
