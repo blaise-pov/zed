@@ -1,15 +1,83 @@
+use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+#[cfg(not(any(test, feature = "test-support")))]
+use std::sync::LazyLock;
 
 use anyhow::Result;
-use gpui::{App, Context, Entity, Task, TaskExt};
+use gpui::{App, Context, Entity, Task, TaskExt, WeakEntity};
 use project::Project;
 use util::ResultExt;
 
 use crate::agent_task::{
-    AgentGoalStatus, AgentTaskArtifact, AgentTaskDetail, AgentTaskGraph,
-    AgentTaskId, AgentTaskProvider, AgentTaskStatus,
+    AgentGoalStatus, AgentTaskArtifact, AgentTaskDetail, AgentTaskGraph, AgentTaskId,
+    AgentTaskProvider, AgentTaskStatus,
 };
+
+#[cfg(any(test, feature = "test-support"))]
+struct TestThreadLocal<T: 'static>(fn() -> &'static T);
+
+#[cfg(any(test, feature = "test-support"))]
+impl<T: 'static> std::ops::Deref for TestThreadLocal<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        (self.0)()
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+macro_rules! task_store_static {
+    ($name:ident: $ty:ty = $init:expr) => {
+        static $name: TestThreadLocal<$ty> = TestThreadLocal(|| {
+            thread_local! {
+                static INSTANCE: &'static $ty = Box::leak(Box::new($init));
+            }
+            INSTANCE.with(|instance| *instance)
+        });
+    };
+}
+
+#[cfg(not(any(test, feature = "test-support")))]
+macro_rules! task_store_static {
+    ($name:ident: $ty:ty = $init:expr) => {
+        static $name: LazyLock<$ty> = LazyLock::new(|| $init);
+    };
+}
+
+task_store_static!(
+    PROJECT_TASK_STORES: parking_lot::RwLock<HashMap<gpui::EntityId, WeakEntity<AgentTaskStore>>> =
+        parking_lot::RwLock::new(HashMap::default())
+);
+
+pub fn register_task_store_for_project(
+    project_id: gpui::EntityId,
+    store: WeakEntity<AgentTaskStore>,
+) {
+    let mut reg = PROJECT_TASK_STORES.write();
+    reg.retain(|_, weak| weak.upgrade().is_some());
+    reg.insert(project_id, store);
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub fn reset_registry_for_tests() {
+    let mut reg = PROJECT_TASK_STORES.write();
+    reg.clear();
+}
+
+pub fn refresh_task_store_for_project(project: &Entity<Project>, cx: &mut App) {
+    let store = {
+        let mut reg = PROJECT_TASK_STORES.write();
+        reg.retain(|_, weak| weak.upgrade().is_some());
+        reg.get(&project.entity_id()).cloned()
+    };
+    if let Some(store) = store {
+        if let Some(store) = store.upgrade() {
+            store.update(cx, |store, cx| {
+                store.refresh(cx).detach_and_log_err(cx);
+            });
+        }
+    }
+}
 
 pub struct AgentTaskStore {
     provider: Arc<dyn AgentTaskProvider>,
@@ -18,7 +86,6 @@ pub struct AgentTaskStore {
     has_initial_refresh: bool,
     is_offline: bool,
     last_error: Option<String>,
-    _poll_task: Option<Task<()>>,
 }
 
 impl AgentTaskStore {
@@ -31,6 +98,10 @@ impl AgentTaskStore {
         project: Option<Entity<Project>>,
         cx: &mut Context<Self>,
     ) -> Self {
+        if let Some(project) = &project {
+            register_task_store_for_project(project.entity_id(), cx.weak_entity());
+        }
+
         let mut store = Self {
             provider,
             project,
@@ -38,9 +109,8 @@ impl AgentTaskStore {
             has_initial_refresh: false,
             is_offline: false,
             last_error: None,
-            _poll_task: None,
         };
-        store.start_polling(cx);
+        store.refresh(cx).detach_and_log_err(cx);
         store
     }
 
@@ -64,7 +134,7 @@ impl AgentTaskStore {
         self.has_initial_refresh = false;
         self.is_offline = false;
         self.last_error = None;
-        self.refresh(cx).detach();
+        self.refresh(cx).detach_and_log_err(cx);
         cx.notify();
     }
 
@@ -78,19 +148,6 @@ impl AgentTaskStore {
 
     pub fn last_error(&self) -> Option<&str> {
         self.last_error.as_deref()
-    }
-
-    pub fn start_polling(&mut self, cx: &mut Context<Self>) {
-        let poll_task = cx.spawn(async move |this, cx| {
-            loop {
-                let refresh_task = this.update(cx, |store, cx| store.refresh(cx));
-                if let Ok(task) = refresh_task {
-                    task.await.log_err();
-                }
-                cx.background_executor().timer(Duration::from_secs(5)).await;
-            }
-        });
-        self._poll_task = Some(poll_task);
     }
 
     pub fn refresh(&mut self, cx: &mut Context<Self>) -> Task<Result<()>> {
@@ -442,7 +499,6 @@ mod tests {
             Task::ready(Ok(()))
         }
 
-
         fn list_artifacts(
             &self,
             _task_id: &AgentTaskId,
@@ -627,7 +683,6 @@ mod tests {
             self.calls.lock().unwrap().delete_calls.push(id.clone());
             Task::ready(Ok(()))
         }
-
 
         fn list_artifacts(
             &self,
@@ -1276,5 +1331,54 @@ mod tests {
             "worktree should not be cleaned on initial refresh bootstrap"
         );
         assert!(fs.is_dir(&path).await);
+    }
+
+    #[gpui::test]
+    async fn test_refresh_task_store_for_project(cx: &mut TestAppContext) {
+        reset_registry_for_tests();
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            project::project_settings::ProjectSettings::register(cx);
+            agent_settings::AgentSettings::register(cx);
+        });
+
+        let fs = fs::FakeFs::new(cx.executor());
+        let project = Project::test(fs.clone(), [], cx).await;
+
+        let calls = Arc::new(Mutex::new(CallCounts::default()));
+        let provider = Arc::new(TestProvider {
+            calls: calls.clone(),
+            ..Default::default()
+        });
+
+        let store = cx.update(|cx| {
+            cx.new(|cx| AgentTaskStore::new_with_project(provider, Some(project.clone()), cx))
+        });
+        cx.run_until_parked();
+
+        let initial_refreshes = calls.lock().unwrap().fetch_graph_count;
+        assert_eq!(initial_refreshes, 1);
+
+        cx.update(|cx| {
+            refresh_task_store_for_project(&project, cx);
+        });
+        cx.run_until_parked();
+
+        assert_eq!(calls.lock().unwrap().fetch_graph_count, 2);
+
+        drop(store);
+        cx.update(|cx| {
+            refresh_task_store_for_project(&project, cx);
+        });
+        cx.run_until_parked();
+
+        assert_eq!(calls.lock().unwrap().fetch_graph_count, 2);
+
+        let reg = PROJECT_TASK_STORES.read();
+        assert!(
+            !reg.contains_key(&project.entity_id()),
+            "dead weak store handle should be pruned on refresh"
+        );
     }
 }

@@ -4358,6 +4358,25 @@ impl Thread {
         }
     }
 
+    pub(crate) fn is_mutating_task_or_goal_tool(tool_name: &str) -> bool {
+        const MUTATING_TOOLS: &[&str] = &[
+            "task_create",
+            "task_update",
+            "task_complete",
+            "task_fail",
+            "task_cancel",
+            "task_delete",
+            "goal_create",
+            "goal_update",
+            "goal_complete",
+            "goal_delete",
+        ];
+
+        MUTATING_TOOLS
+            .iter()
+            .any(|suffix| tool_name.ends_with(suffix))
+    }
+
     fn handle_tool_use_event(
         &mut self,
         tool_use: LanguageModelToolUse,
@@ -4694,6 +4713,14 @@ impl Thread {
                             );
                         }
                     }
+                }
+
+                if Self::is_mutating_task_or_goal_tool(&tool_name) {
+                    let project = project.clone();
+                    this.update(cx, |_this, cx| {
+                        crate::agent_task_store::refresh_task_store_for_project(&project, cx);
+                    })
+                    .log_err();
                 }
             }
 
@@ -8954,6 +8981,68 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_is_mutating_task_or_goal_tool() {
+        // Bare mutating tools
+        assert!(Thread::is_mutating_task_or_goal_tool("task_create"));
+        assert!(Thread::is_mutating_task_or_goal_tool("task_update"));
+        assert!(Thread::is_mutating_task_or_goal_tool("task_complete"));
+        assert!(Thread::is_mutating_task_or_goal_tool("task_fail"));
+        assert!(Thread::is_mutating_task_or_goal_tool("task_cancel"));
+        assert!(Thread::is_mutating_task_or_goal_tool("task_delete"));
+        assert!(Thread::is_mutating_task_or_goal_tool("goal_create"));
+        assert!(Thread::is_mutating_task_or_goal_tool("goal_update"));
+        assert!(Thread::is_mutating_task_or_goal_tool("goal_complete"));
+        assert!(Thread::is_mutating_task_or_goal_tool("goal_delete"));
+
+        // Prefixed MCP tool names
+        assert!(Thread::is_mutating_task_or_goal_tool(
+            "mcp__taskgraph__task_create"
+        ));
+        assert!(Thread::is_mutating_task_or_goal_tool(
+            "mcp__taskgraph__task_update"
+        ));
+        assert!(Thread::is_mutating_task_or_goal_tool(
+            "mcp__taskgraph__task_complete"
+        ));
+        assert!(Thread::is_mutating_task_or_goal_tool(
+            "mcp__taskgraph__task_fail"
+        ));
+        assert!(Thread::is_mutating_task_or_goal_tool(
+            "mcp__taskgraph__task_cancel"
+        ));
+        assert!(Thread::is_mutating_task_or_goal_tool(
+            "mcp__taskgraph__task_delete"
+        ));
+        assert!(Thread::is_mutating_task_or_goal_tool(
+            "mcp__custom_server__goal_create"
+        ));
+        assert!(Thread::is_mutating_task_or_goal_tool(
+            "mcp__custom_server__goal_update"
+        ));
+        assert!(Thread::is_mutating_task_or_goal_tool(
+            "mcp__custom_server__goal_complete"
+        ));
+        assert!(Thread::is_mutating_task_or_goal_tool(
+            "mcp__custom_server__goal_delete"
+        ));
+
+        // Non-mutating or unrelated tools
+        assert!(!Thread::is_mutating_task_or_goal_tool("task_read"));
+        assert!(!Thread::is_mutating_task_or_goal_tool("task_list"));
+        assert!(!Thread::is_mutating_task_or_goal_tool("goal_read"));
+        assert!(!Thread::is_mutating_task_or_goal_tool("fetch_graph"));
+        assert!(!Thread::is_mutating_task_or_goal_tool("terminal"));
+        assert!(!Thread::is_mutating_task_or_goal_tool("read_file"));
+        assert!(!Thread::is_mutating_task_or_goal_tool("edit_file"));
+        assert!(!Thread::is_mutating_task_or_goal_tool(
+            "mcp__taskgraph__task_list"
+        ));
+        assert!(!Thread::is_mutating_task_or_goal_tool(
+            "mcp__taskgraph__task_query"
+        ));
+    }
+
     #[gpui::test]
     async fn test_run_tool_task_complete_interception_commit_error_and_success(
         cx: &mut TestAppContext,
@@ -9135,6 +9224,181 @@ mod tests {
             }),
             "model output must contain the merge conflict information: {output_text}"
         );
+    }
+
+    #[gpui::test]
+    async fn test_run_tool_mutating_tool_refreshes_project_task_store(cx: &mut TestAppContext) {
+        crate::task_worktree::reset_registry_for_tests();
+        crate::agent_task_store::reset_registry_for_tests();
+        let (thread, event_stream, _fake) = setup_thread_for_test(cx).await;
+
+        struct MockMutatingTool;
+        impl AnyAgentTool for MockMutatingTool {
+            fn name(&self) -> SharedString {
+                "mcp__taskgraph__task_create".into()
+            }
+            fn description(&self) -> SharedString {
+                "Create task".into()
+            }
+            fn kind(&self) -> acp::ToolKind {
+                acp::ToolKind::Execute
+            }
+            fn initial_title(&self, _input: serde_json::Value, _cx: &mut App) -> SharedString {
+                "Creating task".into()
+            }
+            fn input_schema(&self) -> serde_json::Value {
+                json!({})
+            }
+            fn run(
+                self: Arc<Self>,
+                _input: ToolInput<serde_json::Value>,
+                _event_stream: ToolCallEventStream,
+                _cx: &mut App,
+            ) -> Task<Result<AgentToolOutput, AgentToolOutput>> {
+                Task::ready(Ok(AgentToolOutput {
+                    llm_output: vec![LanguageModelToolResultContent::Text("Task created".into())],
+                    raw_output: json!({"status": "created"}),
+                }))
+            }
+            fn replay(
+                &self,
+                _input: serde_json::Value,
+                _output: serde_json::Value,
+                _event_stream: ToolCallEventStream,
+                _cx: &mut App,
+            ) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        #[derive(Default)]
+        struct TestProvider {
+            fetch_count: Arc<std::sync::atomic::AtomicUsize>,
+        }
+
+        impl crate::agent_task::AgentTaskProvider for TestProvider {
+            fn server_id(&self) -> context_server::ContextServerId {
+                context_server::ContextServerId("test".into())
+            }
+
+            fn fetch_graph(
+                &self,
+                _cx: &mut App,
+            ) -> Task<Result<crate::agent_task::AgentTaskGraph>> {
+                self.fetch_count
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Task::ready(Ok(crate::agent_task::AgentTaskGraph::default()))
+            }
+
+            fn get_task(
+                &self,
+                _id: &crate::agent_task::AgentTaskId,
+                _cx: &mut App,
+            ) -> Task<Result<crate::agent_task::AgentTaskDetail>> {
+                Task::ready(Err(anyhow::anyhow!("not implemented")))
+            }
+
+            fn complete_task(
+                &self,
+                _id: &crate::agent_task::AgentTaskId,
+                _cx: &mut App,
+            ) -> Task<Result<()>> {
+                Task::ready(Ok(()))
+            }
+
+            fn fail_task(
+                &self,
+                _id: &crate::agent_task::AgentTaskId,
+                _reason: &str,
+                _cx: &mut App,
+            ) -> Task<Result<()>> {
+                Task::ready(Ok(()))
+            }
+
+            fn archive_task(
+                &self,
+                _id: &crate::agent_task::AgentTaskId,
+                _cx: &mut App,
+            ) -> Task<Result<()>> {
+                Task::ready(Ok(()))
+            }
+
+            fn unarchive_task(
+                &self,
+                _id: &crate::agent_task::AgentTaskId,
+                _cx: &mut App,
+            ) -> Task<Result<()>> {
+                Task::ready(Ok(()))
+            }
+
+            fn delete_task(
+                &self,
+                _id: &crate::agent_task::AgentTaskId,
+                _cx: &mut App,
+            ) -> Task<Result<()>> {
+                Task::ready(Ok(()))
+            }
+
+            fn list_artifacts(
+                &self,
+                _task_id: &crate::agent_task::AgentTaskId,
+                _cx: &mut App,
+            ) -> Task<Result<Vec<crate::agent_task::AgentTaskArtifact>>> {
+                Task::ready(Ok(vec![]))
+            }
+
+            fn get_artifact(
+                &self,
+                _artifact_id: &str,
+                _cx: &mut App,
+            ) -> Task<Result<crate::agent_task::AgentTaskArtifact>> {
+                Task::ready(Err(anyhow::anyhow!("not implemented")))
+            }
+        }
+
+        let fetch_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let provider = Arc::new(TestProvider {
+            fetch_count: fetch_count.clone(),
+        });
+
+        let project = thread.read_with(cx, |t, _| t.project().clone());
+        let _store = cx.update(|cx| {
+            cx.new(|cx| {
+                crate::agent_task_store::AgentTaskStore::new_with_project(
+                    provider,
+                    Some(project),
+                    cx,
+                )
+            })
+        });
+        cx.run_until_parked();
+
+        assert_eq!(fetch_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        let tool = Arc::new(MockMutatingTool);
+        let (_tx, cancellation_rx) = watch::channel(false);
+        let tool_input = ToolInput::ready(json!({"title": "New Task"}));
+
+        let run_task = thread.update(cx, |thread, cx| {
+            thread.run_tool(
+                tool,
+                tool_input,
+                LanguageModelToolUseId::from("tool_call_create"),
+                Arc::from("mcp__taskgraph__task_create"),
+                None,
+                None,
+                0,
+                &event_stream,
+                cancellation_rx,
+                cx,
+            )
+        });
+
+        let (_msg_ix, result) = run_task.await;
+        assert!(!result.is_error);
+        cx.run_until_parked();
+
+        assert_eq!(fetch_count.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
     fn user_text_message(id: ClientUserMessageId, text: &str) -> Arc<Message> {
