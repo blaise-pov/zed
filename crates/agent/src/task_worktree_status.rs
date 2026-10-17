@@ -574,16 +574,6 @@ impl TaskWorktreeStatus {
         goals: Vec<AgentGoalSummary>,
         cx: &mut Context<Self>,
     ) -> Task<Result<TaskGitSnapshot>> {
-        if self.snapshot.is_some()
-            && self.last_error.is_none()
-            && self.last_tasks.as_ref() == Some(&tasks)
-            && self.last_goals.as_ref() == Some(&goals)
-        {
-            if let Some(snapshot) = self.snapshot.clone() {
-                return Task::ready(Ok(snapshot));
-            }
-        }
-
         self.current_epoch = self.current_epoch.wrapping_add(1);
         let request_epoch = self.current_epoch;
         self.is_loading = true;
@@ -1167,14 +1157,120 @@ mod tests {
         let notifies_after_first = notify_count.load(std::sync::atomic::Ordering::SeqCst);
         assert!(notifies_after_first > 0);
 
+        // refresh_if_needed reuses cached snapshot and does not notify
         let snap2 = status_entity
-            .update(cx, |s, cx| s.refresh(tasks.clone(), vec![], cx))
+            .update(cx, |s, cx| s.refresh_if_needed(tasks.clone(), vec![], cx))
             .await
             .unwrap();
         assert_eq!(snap1, snap2);
         assert_eq!(
             notify_count.load(std::sync::atomic::Ordering::SeqCst),
             notifies_after_first
+        );
+
+        // refresh unconditionally re-evaluates snapshot and notifies
+        let snap3 = status_entity
+            .update(cx, |s, cx| s.refresh(tasks.clone(), vec![], cx))
+            .await
+            .unwrap();
+        assert_eq!(snap1, snap3);
+        assert!(notify_count.load(std::sync::atomic::Ordering::SeqCst) > notifies_after_first);
+    }
+
+    #[gpui::test]
+    async fn test_task_worktree_status_refresh_reevaluates_snapshot_on_disk_changes(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/root"),
+            json!({
+                ".git": {
+                    "HEAD": "ref: refs/heads/main\n"
+                }
+            }),
+        )
+        .await;
+
+        let dot_git = std::path::Path::new(path!("/root/.git"));
+        fs.with_git_state(dot_git, true, |state| {
+            state.branches.insert("main".into());
+            state
+                .refs
+                .insert("refs/heads/main".into(), "main-sha-100".into());
+            state.refs.insert("HEAD".into(), "main-sha-100".into());
+        })
+        .unwrap();
+
+        let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
+        let status_entity =
+            cx.update(|cx| cx.new(|cx| TaskWorktreeStatus::new(project.clone(), cx)));
+
+        let tasks = vec![AgentTaskSummary {
+            id: AgentTaskId::from("TASK-1"),
+            parent_id: None,
+            goal_id: None,
+            title: "Task 1".to_string(),
+            status: AgentTaskStatus::Running,
+            attempt: 1,
+            assignee: None,
+            write_scopes: vec![],
+            created_at: None,
+            assigned_profile: None,
+            model: None,
+            session_id: None,
+            metrics: None,
+        }];
+
+        // Initial snapshot: worktree does not exist on disk
+        let snap1 = status_entity
+            .update(cx, |s, cx| s.refresh(tasks.clone(), vec![], cx))
+            .await
+            .unwrap();
+        assert!(
+            !snap1
+                .tasks
+                .get(&AgentTaskId::from("TASK-1"))
+                .unwrap()
+                .exists_on_disk
+        );
+
+        // Now create worktree on disk
+        fs.insert_tree(
+            path!("/worktrees/root"),
+            json!({
+                "agent-task-TASK-1": {
+                    "file.rs": "fn main() {}"
+                }
+            }),
+        )
+        .await;
+
+        // refresh_if_needed retains the cached snapshot
+        let snap_cached = status_entity
+            .update(cx, |s, cx| s.refresh_if_needed(tasks.clone(), vec![], cx))
+            .await
+            .unwrap();
+        assert!(
+            !snap_cached
+                .tasks
+                .get(&AgentTaskId::from("TASK-1"))
+                .unwrap()
+                .exists_on_disk
+        );
+
+        // refresh re-queries filesystem and git despite tasks and goals being unchanged
+        let snap_refreshed = status_entity
+            .update(cx, |s, cx| s.refresh(tasks.clone(), vec![], cx))
+            .await
+            .unwrap();
+        assert!(
+            snap_refreshed
+                .tasks
+                .get(&AgentTaskId::from("TASK-1"))
+                .unwrap()
+                .exists_on_disk
         );
     }
 

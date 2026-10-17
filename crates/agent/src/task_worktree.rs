@@ -992,6 +992,7 @@ async fn remove_worktree_from_git_and_fs(
     repository: &Entity<Repository>,
     file_system: &Arc<dyn Fs>,
     worktree_path: &Path,
+    anchor_path: &Path,
     force: bool,
     description: &str,
     cx: &mut AsyncApp,
@@ -1060,6 +1061,7 @@ async fn remove_worktree_from_git_and_fs(
                     }
                 }
             }
+            prune_git_worktrees(anchor_path).await;
         }
     } else if directory_still_exists {
         for attempt in 0..MAX_REMOVAL_ATTEMPTS {
@@ -1090,6 +1092,7 @@ async fn remove_worktree_from_git_and_fs(
                 }
             }
         }
+        prune_git_worktrees(anchor_path).await;
     }
 
     Ok(())
@@ -1159,6 +1162,12 @@ async fn release_stale_task_worktree(
                 })
                 .map(|w| w.read(cx).id())
         });
+        {
+            let mut project_worktrees = PROJECT_TASK_WORKTREES.write();
+            for map in project_worktrees.values_mut() {
+                map.remove(stale_task_id);
+            }
+        }
         if let Some(id) = stale_worktree_id {
             project.update(cx, |project, cx| {
                 project.remove_worktree(id, cx);
@@ -1170,6 +1179,7 @@ async fn release_stale_task_worktree(
                 repository,
                 file_system,
                 stale_path,
+                anchor_path,
                 true,
                 "stale worktree",
                 cx,
@@ -1981,10 +1991,19 @@ fn remove_task_worktree_internal(
                 })
                 .map(|w| w.read(cx).id())
         });
+        {
+            let mut project_worktrees = PROJECT_TASK_WORKTREES.write();
+            for map in project_worktrees.values_mut() {
+                map.remove(&task_id);
+            }
+        }
         if let Some(id) = worktree_id {
-            project.update(cx, |project, cx| {
+            let wait = project.update(cx, |project, cx| {
+                let wait = project.wait_for_worktree_release(id, cx);
                 project.remove_worktree(id, cx);
+                wait
             });
+            wait.await.log_err();
         }
 
         if file_system.is_dir(&worktree_path).await {
@@ -1992,6 +2011,7 @@ fn remove_task_worktree_internal(
                 &repository,
                 &file_system,
                 &worktree_path,
+                &anchor_path,
                 force,
                 "task worktree",
                 cx,
@@ -2012,7 +2032,7 @@ pub fn remove_task_worktree(
     clear_task_worktree_cleanup_error(task_id);
     clear_task_worktree_merge_conflict(task_id);
     let task_id_clone = task_id.clone();
-    let task = remove_task_worktree_internal(project, task_id, false, cx);
+    let task = remove_task_worktree_internal(project, task_id, true, cx);
     cx.spawn(async move |_cx| {
         task.await?;
         unregister_task_worktree(&task_id_clone);
