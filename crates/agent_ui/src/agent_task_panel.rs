@@ -24,13 +24,14 @@
 //! }
 //! ```
 
+use anyhow::Context as _;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use agent::{
-    AgentGoalStatus, AgentGoalSummary, AgentTaskArtifact, AgentTaskDetail,
-    AgentTaskEventKind, AgentTaskId, AgentTaskMetrics, AgentTaskStatus, AgentTaskStore,
-    AgentTaskSummary, DiffShortStat, GoalGitState, OrphanWorktree, TaskWorktreeStatus,
+    AgentGoalStatus, AgentGoalSummary, AgentTaskArtifact, AgentTaskDetail, AgentTaskEventKind,
+    AgentTaskId, AgentTaskMetrics, AgentTaskStatus, AgentTaskStore, AgentTaskSummary,
+    DiffShortStat, GoalGitState, OrphanWorktree, TaskWorktreeStatus,
 };
 use agent_settings::AgentSettings;
 use editor::Editor;
@@ -192,7 +193,8 @@ pub fn init(file_system: Arc<dyn Fs>, cx: &mut App) {
             context_server_store,
             server_id,
         ));
-        let store = cx.new(|cx| agent::AgentTaskStore::new_with_project(provider, Some(project.clone()), cx));
+        let store = cx
+            .new(|cx| agent::AgentTaskStore::new_with_project(provider, Some(project.clone()), cx));
 
         let panel = cx.new(|cx| {
             AgentTaskPanel::new(
@@ -241,6 +243,7 @@ pub enum RenamingTarget {
 }
 
 struct TaskOperationErrorToast;
+pub(crate) struct WorktreeDeletedToast;
 
 pub struct RenamingItem {
     pub target: RenamingTarget,
@@ -1331,25 +1334,41 @@ impl AgentTaskPanel {
                         let project = project.clone();
                         let task_id = task_id.clone();
                         let view = view.clone();
+                        let workspace = workspace.clone();
                         menu = menu.entry("Delete Worktree", None, move |_window, cx| {
                             let project = project.clone();
-                            let task_id_for_async = task_id.clone();
+                            let task_id = task_id.clone();
                             let view = view.clone();
+                            let workspace_for_task = workspace.clone();
                             let remove_task =
                                 agent::task_worktree::remove_task_worktree(project, &task_id, cx);
-                            cx.spawn(async move |cx| {
-                                if let Err(e) = remove_task.await {
-                                    log::warn!(
-                                        "Failed to remove worktree for {task_id_for_async}: {e}"
-                                    );
-                                }
+                            let task = cx.spawn(async move |cx| {
+                                let remove_result = remove_task.await;
                                 if let Some(panel) = view.upgrade() {
                                     panel.update(cx, |this, cx| {
                                         this.refresh_worktree_status(cx);
                                     });
                                 }
-                            })
-                            .detach();
+                                remove_result.with_context(|| {
+                                    format!("failed to remove worktree for {task_id}")
+                                })?;
+                                if let Some(workspace) = workspace_for_task.upgrade() {
+                                    workspace.update(cx, |workspace, cx| {
+                                        workspace.show_toast(
+                                            workspace::Toast::new(
+                                                workspace::notifications::NotificationId::unique::<
+                                                    WorktreeDeletedToast,
+                                                >(),
+                                                format!("Worktree for {task_id} deleted"),
+                                            )
+                                            .autohide(),
+                                            cx,
+                                        );
+                                    });
+                                }
+                                Ok(())
+                            });
+                            Self::spawn_task_with_error_toast(task, workspace.clone(), cx);
                         });
                     }
 
@@ -2378,25 +2397,6 @@ impl AgentTaskPanel {
                         h_flex()
                             .items_center()
                             .gap_1()
-                            .when(exists_on_disk, |this| {
-                                this.child(
-                                    div()
-                                        .id(SharedString::from(format!(
-                                            "task-worktree-icon-{}",
-                                            task.id
-                                        )))
-                                        .debug_selector({
-                                            let task_id = task.id.clone();
-                                            move || format!("task-worktree-icon-{}", task_id)
-                                        })
-                                        .child(
-                                            Icon::new(IconName::GitWorktree)
-                                                .size(IconSize::Small)
-                                                .color(Color::Muted),
-                                        )
-                                        .tooltip(Tooltip::text("Worktree on disk")),
-                                )
-                            })
                             .when_some(policy_denied, |this, denied_event| {
                                 let denied_message = denied_event.message;
                                 this.child(
@@ -2484,6 +2484,25 @@ impl AgentTaskPanel {
                                     || (!row.has_children && row.prefix.is_empty()),
                                 |this| this.child(div().w_4().h_4().flex_shrink_0()),
                             )
+                            .when(exists_on_disk, |this| {
+                                this.child(
+                                    div()
+                                        .id(SharedString::from(format!(
+                                            "task-worktree-icon-{}",
+                                            task.id
+                                        )))
+                                        .debug_selector({
+                                            let task_id = task.id.clone();
+                                            move || format!("task-worktree-icon-{}", task_id)
+                                        })
+                                        .child(
+                                            Icon::new(IconName::GitWorktree)
+                                                .size(IconSize::Small)
+                                                .color(Color::Muted),
+                                        )
+                                        .tooltip(Tooltip::text("Worktree on disk")),
+                                )
+                            })
                             .child(
                                 Label::new({
                                     if task.id.starts_with("TASK-") {
@@ -3577,9 +3596,7 @@ pub fn sort_tasks_by_created_at(tasks: &mut [AgentTaskSummary]) {
     });
 }
 
-pub fn visible_roots(
-    visible_tasks: &[AgentTaskSummary],
-) -> Vec<AgentTaskSummary> {
+pub fn visible_roots(visible_tasks: &[AgentTaskSummary]) -> Vec<AgentTaskSummary> {
     let visible_ids: HashSet<AgentTaskId> =
         visible_tasks.iter().map(|task| task.id.clone()).collect();
     let mut roots: Vec<AgentTaskSummary> = visible_tasks
@@ -4373,15 +4390,11 @@ mod tests {
             assert!(root_ids.contains(&"TASK-COMPLETED"));
             assert!(root_ids.contains(&"TASK-READY"));
 
-            let children =
-                visible_children(&AgentTaskId::from("TASK-COMPLETED"), &visible);
+            let children = visible_children(&AgentTaskId::from("TASK-COMPLETED"), &visible);
             assert_eq!(children.len(), 1);
             assert_eq!(children[0].id.0.as_ref(), "TASK-FAILED-CHILD");
 
-            let rows = build_task_rows(
-                &store.graph().tasks,
-                &panel.category_filters,
-            );
+            let rows = build_task_rows(&store.graph().tasks, &panel.category_filters);
             assert_eq!(rows.len(), 3);
             let row_info: Vec<(&str, &str, usize)> = rows
                 .iter()
@@ -4424,10 +4437,7 @@ mod tests {
             assert!(root_ids.contains(&"TASK-FAILED-CHILD"));
             assert!(root_ids.contains(&"TASK-READY"));
 
-            let rows = build_task_rows(
-                &store.graph().tasks,
-                &panel.category_filters,
-            );
+            let rows = build_task_rows(&store.graph().tasks, &panel.category_filters);
             assert_eq!(rows.len(), 2);
             assert_eq!(rows[0].prefix, "");
             assert_eq!(rows[0].depth, 0);
@@ -5881,13 +5891,15 @@ mod tests {
             cx,
         )
         .await;
+        let (workspace, _) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
         let provider = Arc::new(TestProvider::default());
         let store = cx.update(|cx| cx.new(|cx| AgentTaskStore::new(provider, cx)));
 
         let (panel, cx) = cx.add_window_view(|_window, cx| {
             AgentTaskPanel::new(
                 store,
-                WeakEntity::new_invalid(),
+                workspace.downgrade(),
                 project.clone(),
                 file_system.clone(),
                 cx,
@@ -5941,6 +5953,83 @@ mod tests {
             .expect("Delete Worktree should be in context menu when worktree exists");
         cx.simulate_click(remove_item.center(), gpui::Modifiers::default());
         cx.run_until_parked();
+
+        assert!(
+            workspace.read_with(cx, |workspace, _cx| {
+                workspace.has_notification(&workspace::notifications::NotificationId::unique::<
+                    WorktreeDeletedToast,
+                >())
+            }),
+            "Success toast should be shown on worktree deletion"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_agent_task_panel_context_menu_delete_worktree_error_toast(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let file_system = FakeFs::new(cx.executor());
+        let project = Project::test(file_system.clone(), [], cx).await;
+        let (workspace, _) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
+        let provider = Arc::new(TestProvider::default());
+        let store = cx.update(|cx| cx.new(|cx| AgentTaskStore::new(provider, cx)));
+
+        let (panel, cx) = cx.add_window_view(|_window, cx| {
+            AgentTaskPanel::new(
+                store,
+                workspace.downgrade(),
+                project.clone(),
+                file_system.clone(),
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        panel.update(cx, |panel, cx| {
+            panel.worktree_status.update(cx, |status, cx| {
+                let mut snap = TaskGitSnapshot::default();
+                snap.tasks.insert(
+                    AgentTaskId::from("TASK-1"),
+                    TaskGitState {
+                        worktree_path: std::path::PathBuf::from("/fake/task-1"),
+                        exists_on_disk: true,
+                        branch: Some("agent-task/TASK-1".to_string()),
+                        branch_exists: true,
+                        diff: None,
+                    },
+                );
+                status.set_snapshot_for_test(snap, cx);
+            });
+        });
+        cx.run_until_parked();
+
+        panel.update_in(cx, |panel, window, cx| {
+            panel.deploy_context_menu(
+                ContextMenuTarget::Task(AgentTaskId::from("TASK-1")),
+                Point::new(px(100.0), px(100.0)),
+                None,
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        let remove_item = cx
+            .debug_bounds("MENU_ITEM-Delete Worktree")
+            .expect("Delete Worktree should be in context menu when worktree exists");
+        cx.simulate_click(remove_item.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+
+        assert!(
+            workspace.read_with(cx, |workspace, _cx| {
+                workspace.has_notification(&workspace::notifications::NotificationId::unique::<
+                    TaskOperationErrorToast,
+                >())
+            }),
+            "Error toast should be shown when worktree deletion fails"
+        );
     }
 
     #[test]
@@ -6593,6 +6682,17 @@ mod tests {
         assert!(
             cx.debug_bounds("task-worktree-icon-TASK-1").is_some(),
             "Worktree icon should be present when exists_on_disk is true"
+        );
+
+        let icon_bounds = cx
+            .debug_bounds("task-worktree-icon-TASK-1")
+            .expect("worktree icon should be present");
+        let meta_bounds = cx
+            .debug_bounds("task-meta-TASK-1")
+            .expect("task-meta should be present");
+        assert!(
+            icon_bounds.top() >= meta_bounds.top() && icon_bounds.bottom() <= meta_bounds.bottom(),
+            "Worktree icon should be in task-meta row"
         );
 
         // Update snapshot to exists_on_disk = false
