@@ -259,6 +259,7 @@
   },
   "agent": {
     "task_graph_server_id": "taskgraph",
+    "task_worktree_limit": 8,
     "tool_permissions": {
       "default": "deny",
       "tools": {
@@ -587,8 +588,7 @@
                 "specs/**",
                 "ARCHITECTURE.md",
                 "README.md",
-                ".gitignore",
-                ".zed/**"
+                ".gitignore"
               ]
             },
             "write_file": {
@@ -1026,6 +1026,7 @@
       "agent_engineer": {
         "name": "Agent Runtime Engineer",
         "task_isolation": "required",
+        "task_worktree_language_servers": false,
         "custom_prompt_path": ".zed/prompts/agents/agent_engineer.md",
         "description": "Implements agent runtime, ACP thread handling, task graph integration, and LLM integrations",
         "default_model": {
@@ -1087,6 +1088,8 @@
                 "crates/prompt_store/**",
                 "crates/language_model/**",
                 "crates/language_models/**",
+                "crates/language_model_core/**",
+                "crates/google_ai/**",
                 "crates/project/**",
                 "crates/settings_content/**",
                 "crates/git/**",
@@ -1107,6 +1110,8 @@
                 "crates/prompt_store/**",
                 "crates/language_model/**",
                 "crates/language_models/**",
+                "crates/language_model_core/**",
+                "crates/google_ai/**",
                 "crates/project/**",
                 "crates/settings_content/**",
                 "crates/git/**",
@@ -1129,6 +1134,7 @@
       "editor_engineer": {
         "name": "Editor & Language Engineer",
         "task_isolation": "required",
+        "task_worktree_language_servers": false,
         "custom_prompt_path": ".zed/prompts/agents/editor_engineer.md",
         "description": "Implements core editor buffers, display maps, project worktrees, and LSP integrations",
         "default_model": {
@@ -1225,6 +1231,7 @@
       "ui_engineer": {
         "name": "GPUI & UI Engineer",
         "task_isolation": "required",
+        "task_worktree_language_servers": false,
         "custom_prompt_path": ".zed/prompts/agents/ui_engineer.md",
         "description": "Implements GPUI framework features, UI components, themes, and platform renderers",
         "default_model": {
@@ -1320,6 +1327,7 @@
       "collab_engineer": {
         "name": "Collab & Network Engineer",
         "task_isolation": "required",
+        "task_worktree_language_servers": false,
         "custom_prompt_path": ".zed/prompts/agents/collab_engineer.md",
         "description": "Implements collaboration backend server, RPC protocol, network sync, and database migrations",
         "default_model": {
@@ -1576,7 +1584,7 @@
               "default": "deny",
               "always_allow": [
                 {
-                  "pattern": "^([A-Z_]+=\\S+\\s+)*git\\s+(-C\\s+\\S+\\s+)?(--no-pager\\s+|--no-optional-locks\\s+)*(status|diff|log|show|branch|rev-parse|merge-base|switch|merge|reset|commit)\\b.*"
+                  "pattern": "^([A-Z_]+=\\S+\\s+)*git\\s+(-C\\s+\\S+\\s+)?(--no-pager\\s+|--no-optional-locks\\s+)*(status|diff|add|log|show|branch|rev-parse|merge-base|switch|merge|reset|commit|checkout|restore)\\b.*"
                 }
               ]
             },
@@ -1792,7 +1800,7 @@
       },
       "ci_release": {
         "name": "CI Release",
-        "task_isolation": "optional",
+        "task_isolation": "disabled",
         "custom_prompt_path": ".zed/prompts/agents/ci_release.md",
         "description": "Dispatches build-release.yml at repo HEAD on GitHub Actions, waits via gh run watch until green, delegates build-breaking code fixes to agent_engineer, and verifies all 8 release artifacts",
         "default_model": {
@@ -2140,6 +2148,7 @@
           "find_path": true,
           "list_directory": true,
           "edit_file": true,
+          "write_file": true,
           "diagnostics": true
         },
         "skills": [],
@@ -2166,6 +2175,13 @@
               "default": "allow"
             },
             "edit_file": {
+              "default": "allow",
+              "write_scopes": [
+                "crates/**",
+                "script/**"
+              ]
+            },
+            "write_file": {
               "default": "allow",
               "write_scopes": [
                 "crates/**",
