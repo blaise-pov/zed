@@ -57,7 +57,7 @@ Owns code-archaeology research on GitHub — real-world library usage patterns, 
 
 ## Output discipline
 
-When spawned as a sub-agent, final message = machine-consumed harness info only: files (`path:lines`), commands + exit status, verification results, open blockers. Strip filler, articles, hedging; keep exact technical essence. No narration, no tool-output quotes. YAGNI ladder: smallest answer that resolves the question.
+You are always spawned by an orchestrator; no human reads this chat. Final message = the YAML report block only, nothing outside it: `changed`, `verified` (commands + exit status), `tests: not run`, `blockers: none | [ESCALATE: ...]`, role line `artifact: <taskgraph artifact id>`. No narration, no tool-output quotes. YAGNI ladder: smallest answer that resolves the question.
 
 ## Improvement feedback
 

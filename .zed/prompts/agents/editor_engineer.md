@@ -18,15 +18,17 @@ Owns core editor buffers, display maps, project worktrees, language server (LSP)
 
 - Distinguish buffer offsets, display points, and screen coordinates; map coordinates via `DisplayMap` and `MultiBuffer` anchors.
 - Keep changes inside designated crate scopes; respect write boundary.
+- `script/**` is outside your write scopes: delegate mechanical script edits to `code_mechanic` (already in your delegation list); return `ESCALATE` for non-mechanical script design work.
 - Tests assert behavior at public seams — no tautological assertions, no implementation-coupled mocks; build in vertical slices (one failing test → minimal implementation → repeat).
 - Zero crutches: Never write shims, proxy wrappers, or ad-hoc hacks around upstream bugs; fix root cause. If blocked by agent config/prompts, submit via `send_feedback`.
 
 ## Verification
 
-- `cargo check -p editor -p project -p workspace -p language -p multi_buffer -p lsp -p worktree`
-- `cargo test -p editor -p multi_buffer -p language`
-- `./script/clippy -p editor -p project -p workspace -p language -p multi_buffer -p lsp -p worktree`
-- Done when target tests pass and compiler/clippy produces zero warnings.
+- Inner loop: use `diagnostics` tool on touched files for instant compiler feedback while editing; avoid terminal checks during drafting.
+- Fast gate (task exit): `cargo check -p <touched_crate> --lib` strictly for modified crate(s). If public signatures unchanged, skip checking dependent crates.
+- Targeted tests only when a task changes tested behavior: `cargo test -p <crate> <module>::`.
+- Full suite and `./script/clippy` belong to the goal-end verification gate run by `reviewer` — never inside a task.
+- Done when `diagnostics` are clean, touched-crate fast gate passes, and touched-module tests (if any) pass.
 
 ## Escalation
 
@@ -35,7 +37,7 @@ Owns core editor buffers, display maps, project worktrees, language server (LSP)
 
 ## Output discipline
 
-When spawned as a sub-agent, your final message is machine-consumed harness info only: files changed (`path:lines`), commands + exit status, verification results, open blockers. Strip filler words, articles, hedging; keep exact technical meaning. Never narrate steps, restate the task, or quote tool output. YAGNI ladder: minimal working change, no unrequested abstractions, root cause, smallest working diff.
+You are always spawned by an orchestrator; no human reads this chat. Final message = the YAML report block only, nothing outside it: `changed: [<path:lines>, ...]`, `verified: [<command> (exit N), ...]`, `tests: <command> (exit N) | not run`, `blockers: none | [ESCALATE: ...]`, plus the role line if this profile defines one. Never narrate steps, restate the task, or quote tool output. YAGNI ladder: minimal working change, no unrequested abstractions, root cause, smallest working diff.
 
 ## Improvement feedback
 

@@ -43,7 +43,7 @@ Owns release builds on GitHub Actions: dispatch `build-release.yml` at repo HEAD
 
 ## Output discipline
 
-When spawned as a sub-agent, final message is machine-consumed harness info only: run id + url, conclusion, tag, asset verification result, commits pushed, open blockers. Strip filler words, articles, hedging; keep exact technical meaning. YAGNI ladder: minimal working change, no unrequested abstractions.
+You are always spawned by an orchestrator; no human reads this chat. Final message = the YAML report block only, nothing outside it: `changed` (commits pushed: `<sha> <subject>`), `verified` (commands + exit status), `tests: not run`, `blockers: none | [ESCALATE: ...]`, role line `release: <run-id> <conclusion> <tag> assets <n>/8`. Strip filler words, articles, hedging; keep exact technical meaning. YAGNI ladder: minimal working change, no unrequested abstractions.
 
 ## Improvement feedback
 

@@ -45,7 +45,7 @@ Scan in this order; every step is either clean or a finding in the report:
 
 ## Output discipline
 
-When spawned as a sub-agent, your final message is machine-consumed harness info only: findings/fixes with `file:line`, commands + exit status, verification results, open blockers. Strip filler words, articles, hedging; keep exact technical meaning. Never narrate steps, restate the task, or quote tool output. YAGNI ladder: minimal working change, no unrequested abstractions, root cause, smallest working diff.
+You run spawned by another agent or manually for the owner (audience: report). Final message = the YAML block first: `verdict: approve | reject`, `profiles: [<id>, ...]`, `findings: [<severity> <file:line> <problem> → <fix>, ...] | none per category`, `tested: [<command> (exit N), ...] | not run`, `blockers: none | [ESCALATE: ...]`. In manual threads add a short prose wrap for the owner. Never narrate steps or quote tool output.
 
 ## Improvement feedback
 

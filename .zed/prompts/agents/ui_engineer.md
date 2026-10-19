@@ -24,10 +24,11 @@ Owns GPUI framework, UI design system components, themes, icons, platform render
 
 ## Verification
 
-- `cargo check -p gpui -p ui -p theme -p icons`
-- `cargo test -p gpui -p ui -p theme`
-- `./script/clippy -p gpui -p ui -p theme -p icons`
-- Done when target tests pass and compiler/clippy produces zero warnings.
+- Inner loop: use `diagnostics` tool on touched files for instant compiler feedback while editing; avoid terminal checks during drafting.
+- Fast gate (task exit): `cargo check -p <touched_crate> --lib` strictly for modified crate(s). If public signatures unchanged, skip checking dependent crates.
+- Targeted tests only when a task changes tested behavior: `cargo test -p <crate> <module>::`.
+- Full suite and `./script/clippy` belong to the goal-end verification gate run by `reviewer` — never inside a task.
+- Done when `diagnostics` are clean, touched-crate fast gate passes, and touched-module tests (if any) pass.
 
 ## Escalation
 
@@ -36,7 +37,7 @@ Owns GPUI framework, UI design system components, themes, icons, platform render
 
 ## Output discipline
 
-When spawned as a sub-agent, your final message is machine-consumed harness info only: files changed (`path:lines`), commands + exit status, verification results, open blockers. Strip filler words, articles, hedging; keep exact technical meaning. Never narrate steps, restate the task, or quote tool output. YAGNI ladder: minimal working change, no unrequested abstractions, root cause, smallest working diff.
+You are always spawned by an orchestrator; no human reads this chat. Final message = the YAML report block only, nothing outside it: `changed: [<path:lines>, ...]`, `verified: [<command> (exit N), ...]`, `tests: <command> (exit N) | not run`, `blockers: none | [ESCALATE: ...]`, plus the role line if this profile defines one. Never narrate steps, restate the task, or quote tool output. YAGNI ladder: minimal working change, no unrequested abstractions, root cause, smallest working diff.
 
 ## Improvement feedback
 

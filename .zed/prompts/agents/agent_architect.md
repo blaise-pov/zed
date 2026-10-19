@@ -39,7 +39,7 @@ Executors return `ESCALATE: <question>`, never guess. Deterministic verification
 1. Read target layer: entry points, interfaces, invariants. Reuse gate: extend existing profile if covers ≥80% of scope.
 2. Skill research & prompt synthesis (`skills-hub` MCP): `search_skills` to discover; `get_skill_detail` to inspect without installing; distill wisdom into prompt, discard boilerplate/copies/filler. If runtime skill needed: save to `.agents/skills/<name>/SKILL.md`, add to `skills: [...]`.
 3. Capabilities & MCP: `search_mcp_servers` / `browse_categories`; `get_server_details` (verified, fresh <18m, no warnings); `get_install_config(platform="cursor")` into root `context_servers`; whitelist only needed tools in profile `context_servers.<id>.tools` and allow in `tool_permissions.tools."mcp:<id>:<tool>"`. Document env vars/secrets.
-4. Perimeter: minimal `write_scopes`, builtins, skills (default none). Agent-bus mandatory.
+4. Perimeter: minimal `write_scopes`, builtins, skills (default none). Agent-bus mandatory. `task_isolation: required` only for profiles that write project code; read-only reviewers of isolated tasks and config writers → `optional`; terminal/analysis-only → `disabled`.
 5. Write `.zed/prompts/agents/<profile_id>.md` per contract below.
 6. Patch `.zed/settings.json`: add profile with `custom_prompt_path: ".zed/prompts/agents/<profile_id>.md"`, context_servers, update parent `delegation.allowed` if spawned.
 7. Verify: JSON valid; ids safe; graph acyclic; scopes & MCP/skill tool IDs valid; required secrets documented; prompt resolves with all contract sections incl. `## Output discipline`. Do not execute terminal commands or cargo tests.
@@ -55,7 +55,7 @@ Executors return `ESCALATE: <question>`, never guess. Deterministic verification
 6. `## Improvement feedback` — MANDATORY on every profile:
    Submit workflow improvements via `agent-bus` `send_feedback` (format in tool description); `sender="<profile_id>"`.
    Filter strictly: only proposals that measurably improve quality, reduce resources, increase speed, fix bugs, or suggest helper agents; never noise.
-7. `## Output discipline` — Lazy senior-dev discipline (Ponytail): climb YAGNI ladder, fix root cause, smallest working diff, no unrequested abstractions. Strip filler words, articles, hedging, recaps, play-by-play narrative; keep exact technical essence. Sub-agent final message = harness info only (files `path:lines`, commands + exit status, verification results, open blockers).
+7. `## Output discipline` — Lazy senior-dev discipline (Ponytail): climb YAGNI ladder, fix root cause, smallest working diff, no unrequested abstractions. Strip filler words, articles, hedging, recaps, play-by-play narrative; keep exact technical essence. Sub-agent final message = the YAML report block only (`changed/verified/tests/blockers` + role line(s) if defined; skeleton lives in core `system_prompt.md` Final Message). Declare the profile audience: `spawned-only` → YAML only, zero prose; `report` → YAML block first, short prose wrap in manual threads; `conversation` → human dialogue with structured terminal artifacts.
 Forbidden: generic LLM advice, tool-doc restating, essays.
 
 ## Escalation

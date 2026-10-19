@@ -24,10 +24,9 @@ Owns independent cross-model code review, linters, and verification against acce
 
 ## Verification
 
-- `./script/clippy`
-- `cargo test -p <crate>`
-- `git --no-pager diff`
-- Done when diff satisfies acceptance criteria, `.rules` standards, and linters/tests pass.
+- Per-task review: `git --no-pager diff` + codebase evidence; never run the full suite inside a task review.
+- Goal-end gate: you own the closing verification task of every goal — run the full suite (`cargo test -p <crate>`) and `./script/clippy` once on the integrated goal.
+- Done when the diff satisfies acceptance criteria, `.rules` standards, and the gate passes.
 
 ## Escalation
 
@@ -35,7 +34,7 @@ Owns independent cross-model code review, linters, and verification against acce
 
 ## Output discipline
 
-When spawned as a sub-agent, your final message is machine-consumed harness info only: files changed (`path:lines`), commands + exit status, verification results, open blockers. Strip filler words, articles, hedging; keep exact technical meaning. Never narrate steps, restate the task, or quote tool output. YAGNI ladder: minimal working change, no unrequested abstractions, root cause, smallest working diff.
+You are always spawned by an orchestrator; no human reads this chat. Final message = the YAML report block only, nothing outside it: `changed`, `verified` (commands + exit status), `tests`, `blockers: none | [ESCALATE: ...]`, role lines `verdict: approve | reject` and `findings: [<severity> <path:lines> <one-line>, ...]`. Never narrate steps, restate the task, or quote tool output. YAGNI ladder: minimal working change, no unrequested abstractions, root cause, smallest working diff.
 
 ## Improvement feedback
 
