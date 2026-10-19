@@ -231,6 +231,7 @@ pub fn ensure_task_worktree_with_options(
     let task_id = task.id.clone();
     let task_title = task.title.clone();
     let goal_id = goal_id.or_else(|| task.goal_id.clone());
+    let write_scopes = task.write_scopes.clone();
     cx.spawn(async move |cx| {
         record_task_title(&task_id, &task_title);
         if on_branch.is_some() && base_branch.is_some() {
@@ -518,6 +519,7 @@ pub fn ensure_task_worktree_with_options(
             base_sha_for_worktree.clone(),
             target_checkout_branch.clone(),
             Some(pool_key),
+            Some(write_scopes),
         );
         claim_guard.defused = true;
 
@@ -705,6 +707,7 @@ struct TaskWorktreeState {
     slot_notified: bool,
     is_cleaning: bool,
     pub session_id: Option<String>,
+    pub write_scopes: Vec<String>,
 }
 
 impl TaskWorktreeState {
@@ -1475,6 +1478,7 @@ fn finish_slot_and_register_policy(
     base_sha: Option<String>,
     checkout_target: Option<String>,
     pool_key: Option<ProjectPoolKey>,
+    write_scopes: Option<Vec<String>>,
 ) {
     let mut reg = REGISTRY.write();
     let mut in_flight = IN_FLIGHT_CREATIONS.lock();
@@ -1505,6 +1509,17 @@ fn finish_slot_and_register_policy(
         }
     });
     let preserved_session_id = entry.session_id.clone().or(session_from_map);
+    let preserved_write_scopes = match write_scopes {
+        Some(scopes) if !scopes.is_empty() => scopes,
+        Some(scopes) => {
+            if entry.write_scopes.is_empty() {
+                scopes
+            } else {
+                entry.write_scopes.clone()
+            }
+        }
+        None => entry.write_scopes.clone(),
+    };
     *entry = TaskWorktreeState {
         worktree_path,
         commit_error: None,
@@ -1522,6 +1537,7 @@ fn finish_slot_and_register_policy(
         slot_notified: false,
         is_cleaning: false,
         session_id: preserved_session_id,
+        write_scopes: preserved_write_scopes,
     };
 }
 
@@ -1533,6 +1549,26 @@ pub fn register_task_worktree_policy(
     base_sha: Option<String>,
     checkout_target: Option<String>,
 ) {
+    register_task_worktree_policy_with_scopes(
+        task_id,
+        worktree_path,
+        goal_branch,
+        base_ref,
+        base_sha,
+        checkout_target,
+        None,
+    );
+}
+
+pub fn register_task_worktree_policy_with_scopes(
+    task_id: &AgentTaskId,
+    worktree_path: PathBuf,
+    goal_branch: Option<String>,
+    base_ref: Option<String>,
+    base_sha: Option<String>,
+    checkout_target: Option<String>,
+    write_scopes: Option<Vec<String>>,
+) {
     finish_slot_and_register_policy(
         None,
         task_id,
@@ -1542,6 +1578,7 @@ pub fn register_task_worktree_policy(
         base_sha,
         checkout_target,
         None,
+        write_scopes,
     );
 }
 
@@ -1590,11 +1627,13 @@ pub fn claim_branch_or_error(
     let session_from_map = reg.task_sessions.get(task_id).cloned();
     let entry = reg.entries.entry(task_id.clone()).or_default();
     let preserved_session_id = entry.session_id.clone().or(session_from_map);
+    let preserved_write_scopes = entry.write_scopes.clone();
     *entry = TaskWorktreeState {
         checkout_target,
         is_terminal: false,
         last_session_ended_at: initial_ended_at,
         session_id: preserved_session_id,
+        write_scopes: preserved_write_scopes,
         ..Default::default()
     };
     Ok(())
@@ -1695,9 +1734,7 @@ pub fn task_session_id_for_id(task_id: &AgentTaskId) -> Option<String> {
 pub fn record_task_worktree_changed_files(task_id: &AgentTaskId, files: Vec<String>) {
     let mut reg = REGISTRY.write();
     if let Some(entry) = reg.entries.get_mut(task_id) {
-        if !files.is_empty() || entry.changed_files.is_empty() {
-            entry.changed_files = files;
-        }
+        entry.changed_files = files;
     }
 }
 
@@ -1707,6 +1744,21 @@ pub fn task_worktree_changed_files(task_id: &AgentTaskId) -> Vec<String> {
         .get(task_id)
         .map(|e| e.changed_files.clone())
         .unwrap_or_default()
+}
+
+pub fn task_worktree_write_scopes(task_id: &AgentTaskId) -> Vec<String> {
+    let reg = REGISTRY.read();
+    reg.entries
+        .get(task_id)
+        .map(|e| e.write_scopes.clone())
+        .unwrap_or_default()
+}
+
+pub fn record_task_worktree_write_scopes(task_id: &AgentTaskId, scopes: Vec<String>) {
+    let mut reg = REGISTRY.write();
+    if let Some(entry) = reg.entries.get_mut(task_id) {
+        entry.write_scopes = scopes;
+    }
 }
 
 pub fn record_task_worktree_merge_conflict(task_id: &AgentTaskId, conflict: Vec<String>) {
@@ -2519,6 +2571,45 @@ pub struct GoalBranchSummary {
     pub has_conflict: bool,
 }
 
+fn is_path_in_write_scopes(path: &RepoPath, scopes: &[String]) -> bool {
+    let valid_scopes: Vec<Arc<str>> = scopes
+        .iter()
+        .map(|scope| scope.trim())
+        .filter(|scope| !scope.is_empty())
+        .map(Arc::from)
+        .collect();
+
+    if valid_scopes.is_empty() {
+        return false;
+    }
+
+    let Ok(write_scopes) = agent_settings::WriteScopes::new(valid_scopes) else {
+        return false;
+    };
+
+    if write_scopes.is_match(path) {
+        return true;
+    }
+
+    for scope in scopes {
+        let trimmed_scope = scope.trim().trim_start_matches("./");
+        if let Some((_root_name, relative_pattern)) = trimmed_scope.split_once('/') {
+            let relative_pattern = relative_pattern.trim_matches('/');
+            if !relative_pattern.is_empty() {
+                if let Ok(sub_scopes) =
+                    agent_settings::WriteScopes::new(vec![Arc::from(relative_pattern)])
+                {
+                    if sub_scopes.is_match(path) {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+
+    false
+}
+
 pub async fn commit_task_worktree(
     fs: Arc<dyn Fs>,
     task_worktree: PathBuf,
@@ -2564,7 +2655,23 @@ pub async fn commit_task_worktree(
         }
     };
 
-    if status.entries.is_empty() {
+    let write_scopes = task_worktree_write_scopes(&task_id_typed);
+    let paths: Vec<RepoPath> = status
+        .entries
+        .iter()
+        .filter_map(|(path, _)| {
+            let is_injected_settings = path.as_unix_str() == ".zed/settings.json"
+                || path.as_unix_str() == "./.zed/settings.json";
+            if is_injected_settings && !is_path_in_write_scopes(path, &write_scopes) {
+                None
+            } else {
+                Some(path.clone())
+            }
+        })
+        .collect();
+
+    if paths.is_empty() {
+        record_task_worktree_changed_files(&task_id_typed, Vec::new());
         let head_sha = git_repo.head_sha().await;
         // Snapshot existing worktree files if any
         #[cfg(any(test, feature = "test-support"))]
@@ -2597,13 +2704,7 @@ pub async fn commit_task_worktree(
         });
     }
 
-    let changed_files = status.entries.len();
-    let paths: Vec<RepoPath> = status
-        .entries
-        .iter()
-        .map(|(path, _)| path.clone())
-        .collect();
-
+    let changed_files = paths.len();
     let file_strings: Vec<String> = paths.iter().map(|p| p.as_unix_str().to_string()).collect();
     record_task_worktree_changed_files(&task_id_typed, file_strings);
 
@@ -8160,6 +8261,429 @@ mod tests {
         assert!(
             error_message.contains("commit error"),
             "error message must list hold reason 'commit error', got: {error_message}"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_commit_task_worktree_excludes_settings_json_when_out_of_scope(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/root"),
+            json!({
+                ".git": {
+                    "HEAD": "ref: refs/heads/main\n"
+                }
+            }),
+        )
+        .await;
+
+        let dot_git = std::path::Path::new(path!("/root/.git"));
+        fs.with_git_state(dot_git, true, |state| {
+            state
+                .refs
+                .insert("refs/heads/main".into(), "main-sha-exclude".into());
+            state.refs.insert("HEAD".into(), "main-sha-exclude".into());
+            state.branches.insert("main".into());
+        })
+        .unwrap();
+
+        let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
+        let task = AgentTaskSummary {
+            id: AgentTaskId::from("TASK-OUT-OF-SCOPE-1"),
+            parent_id: None,
+            goal_id: None,
+            title: "Out of scope task".to_string(),
+            status: AgentTaskStatus::Ready,
+            attempt: 1,
+            assignee: None,
+            write_scopes: vec!["src/".to_string()],
+            created_at: None,
+            assigned_profile: None,
+            model: None,
+            session_id: None,
+            metrics: None,
+        };
+
+        let worktree_path = cx
+            .update(|cx| ensure_task_worktree(project.clone(), &task, cx))
+            .await
+            .unwrap();
+
+        let head_before = fs
+            .with_git_state(&worktree_path.join(".git"), false, |state| {
+                state.refs.get("HEAD").cloned()
+            })
+            .unwrap();
+
+        ensure_task_worktree_settings(&(fs.clone() as Arc<dyn Fs>), &worktree_path)
+            .await
+            .unwrap();
+
+        let details = cx
+            .spawn({
+                let fs = fs.clone();
+                let worktree_path = worktree_path.clone();
+                let task_id = task.id.to_string();
+                |mut cx| async move {
+                    commit_task_worktree(fs, worktree_path, task_id, false, &mut cx).await
+                }
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(details.changed_files, 0);
+        assert_eq!(details.commit_error, None);
+        assert_eq!(details.head_sha, head_before);
+
+        let head_after = fs
+            .with_git_state(&worktree_path.join(".git"), false, |state| {
+                state.refs.get("HEAD").cloned()
+            })
+            .unwrap();
+        assert_eq!(head_after, head_before);
+        assert!(task_worktree_changed_files(&task.id).is_empty());
+    }
+
+    #[gpui::test]
+    async fn test_commit_task_worktree_commits_settings_json_when_in_scope(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/root"),
+            json!({
+                ".git": {
+                    "HEAD": "ref: refs/heads/main\n"
+                }
+            }),
+        )
+        .await;
+
+        let dot_git = std::path::Path::new(path!("/root/.git"));
+        fs.with_git_state(dot_git, true, |state| {
+            state
+                .refs
+                .insert("refs/heads/main".into(), "main-sha-in-scope".into());
+            state.refs.insert("HEAD".into(), "main-sha-in-scope".into());
+            state.branches.insert("main".into());
+        })
+        .unwrap();
+
+        let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
+        let task = AgentTaskSummary {
+            id: AgentTaskId::from("TASK-IN-SCOPE-1"),
+            parent_id: None,
+            goal_id: None,
+            title: "In scope task".to_string(),
+            status: AgentTaskStatus::Ready,
+            attempt: 1,
+            assignee: None,
+            write_scopes: vec![".zed/".to_string()],
+            created_at: None,
+            assigned_profile: None,
+            model: None,
+            session_id: None,
+            metrics: None,
+        };
+
+        let worktree_path = cx
+            .update(|cx| ensure_task_worktree(project.clone(), &task, cx))
+            .await
+            .unwrap();
+
+        let head_before = fs
+            .with_git_state(&worktree_path.join(".git"), false, |state| {
+                state.refs.get("HEAD").cloned()
+            })
+            .unwrap();
+
+        ensure_task_worktree_settings(&(fs.clone() as Arc<dyn Fs>), &worktree_path)
+            .await
+            .unwrap();
+
+        let details = cx
+            .spawn({
+                let fs = fs.clone();
+                let worktree_path = worktree_path.clone();
+                let task_id = task.id.to_string();
+                |mut cx| async move {
+                    commit_task_worktree(fs, worktree_path, task_id, false, &mut cx).await
+                }
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(details.changed_files, 1);
+        assert_eq!(details.commit_error, None);
+        assert_ne!(details.head_sha, head_before);
+
+        let head_after = fs
+            .with_git_state(&worktree_path.join(".git"), false, |state| {
+                state.refs.get("HEAD").cloned()
+            })
+            .unwrap();
+        assert_ne!(head_after, head_before);
+        assert_eq!(
+            task_worktree_changed_files(&task.id),
+            vec![".zed/settings.json".to_string()]
+        );
+    }
+
+    #[gpui::test]
+    async fn test_commit_task_worktree_excludes_settings_json_when_scopes_empty(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/root"),
+            json!({
+                ".git": {
+                    "HEAD": "ref: refs/heads/main\n"
+                }
+            }),
+        )
+        .await;
+
+        let dot_git = std::path::Path::new(path!("/root/.git"));
+        fs.with_git_state(dot_git, true, |state| {
+            state
+                .refs
+                .insert("refs/heads/main".into(), "main-sha-empty".into());
+            state.refs.insert("HEAD".into(), "main-sha-empty".into());
+            state.branches.insert("main".into());
+        })
+        .unwrap();
+
+        let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
+        let task = AgentTaskSummary {
+            id: AgentTaskId::from("TASK-EMPTY-SCOPES-1"),
+            parent_id: None,
+            goal_id: None,
+            title: "Empty scopes task".to_string(),
+            status: AgentTaskStatus::Ready,
+            attempt: 1,
+            assignee: None,
+            write_scopes: vec![],
+            created_at: None,
+            assigned_profile: None,
+            model: None,
+            session_id: None,
+            metrics: None,
+        };
+
+        let worktree_path = cx
+            .update(|cx| ensure_task_worktree(project.clone(), &task, cx))
+            .await
+            .unwrap();
+
+        let head_before = fs
+            .with_git_state(&worktree_path.join(".git"), false, |state| {
+                state.refs.get("HEAD").cloned()
+            })
+            .unwrap();
+
+        ensure_task_worktree_settings(&(fs.clone() as Arc<dyn Fs>), &worktree_path)
+            .await
+            .unwrap();
+
+        let details = cx
+            .spawn({
+                let fs = fs.clone();
+                let worktree_path = worktree_path.clone();
+                let task_id = task.id.to_string();
+                |mut cx| async move {
+                    commit_task_worktree(fs, worktree_path, task_id, false, &mut cx).await
+                }
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(details.changed_files, 0);
+        assert_eq!(details.commit_error, None);
+        assert_eq!(details.head_sha, head_before);
+
+        let head_after = fs
+            .with_git_state(&worktree_path.join(".git"), false, |state| {
+                state.refs.get("HEAD").cloned()
+            })
+            .unwrap();
+        assert_eq!(head_after, head_before);
+        assert!(task_worktree_changed_files(&task.id).is_empty());
+    }
+
+    #[gpui::test]
+    async fn test_commit_task_worktree_excludes_settings_json_while_committing_in_scope_changes(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/root"),
+            json!({
+                ".git": {
+                    "HEAD": "ref: refs/heads/main\n"
+                }
+            }),
+        )
+        .await;
+
+        let dot_git = std::path::Path::new(path!("/root/.git"));
+        fs.with_git_state(dot_git, true, |state| {
+            state
+                .refs
+                .insert("refs/heads/main".into(), "main-sha-mixed".into());
+            state.refs.insert("HEAD".into(), "main-sha-mixed".into());
+            state.branches.insert("main".into());
+        })
+        .unwrap();
+
+        let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
+        let task = AgentTaskSummary {
+            id: AgentTaskId::from("TASK-MIXED-1"),
+            parent_id: None,
+            goal_id: None,
+            title: "Mixed changes task".to_string(),
+            status: AgentTaskStatus::Ready,
+            attempt: 1,
+            assignee: None,
+            write_scopes: vec!["src/".to_string()],
+            created_at: None,
+            assigned_profile: None,
+            model: None,
+            session_id: None,
+            metrics: None,
+        };
+
+        let worktree_path = cx
+            .update(|cx| ensure_task_worktree(project.clone(), &task, cx))
+            .await
+            .unwrap();
+
+        let head_before = fs
+            .with_git_state(&worktree_path.join(".git"), false, |state| {
+                state.refs.get("HEAD").cloned()
+            })
+            .unwrap();
+
+        ensure_task_worktree_settings(&(fs.clone() as Arc<dyn Fs>), &worktree_path)
+            .await
+            .unwrap();
+
+        fs.save(
+            &worktree_path.join("src/lib.rs"),
+            &"pub fn hello() {}".into(),
+            text::LineEnding::Unix,
+        )
+        .await
+        .unwrap();
+
+        let details = cx
+            .spawn({
+                let fs = fs.clone();
+                let worktree_path = worktree_path.clone();
+                let task_id = task.id.to_string();
+                |mut cx| async move {
+                    commit_task_worktree(fs, worktree_path, task_id, false, &mut cx).await
+                }
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(details.changed_files, 1);
+        assert_eq!(details.commit_error, None);
+        assert_ne!(details.head_sha, head_before);
+
+        assert_eq!(
+            task_worktree_changed_files(&task.id),
+            vec!["src/lib.rs".to_string()]
+        );
+
+        let snapshot = fs
+            .with_git_state(&worktree_path.join(".git"), false, |state| {
+                state.commit_history.last().cloned()
+            })
+            .unwrap()
+            .expect("commit snapshot must exist");
+
+        let committed_paths: Vec<String> = snapshot
+            .index_contents
+            .keys()
+            .map(|p| p.as_unix_str().to_string())
+            .collect();
+        assert!(committed_paths.contains(&"src/lib.rs".to_string()));
+        assert!(!committed_paths.contains(&".zed/settings.json".to_string()));
+    }
+
+    #[test]
+    fn test_task_worktree_write_scopes_preserved_across_reregistration() {
+        reset_registry_for_tests();
+        let task_id = AgentTaskId::from("TASK-SCOPES-PRESERVE-1");
+
+        register_task_worktree_policy_with_scopes(
+            &task_id,
+            PathBuf::from("/worktree/path"),
+            None,
+            None,
+            None,
+            None,
+            Some(vec!["src/".to_string(), "docs/".to_string()]),
+        );
+
+        assert_eq!(
+            task_worktree_write_scopes(&task_id),
+            vec!["src/".to_string(), "docs/".to_string()]
+        );
+
+        // Re-register without scopes preserves existing write_scopes
+        register_task_worktree_policy(
+            &task_id,
+            PathBuf::from("/worktree/path"),
+            None,
+            None,
+            None,
+            None,
+        );
+
+        assert_eq!(
+            task_worktree_write_scopes(&task_id),
+            vec!["src/".to_string(), "docs/".to_string()]
+        );
+
+        // Re-register with empty scopes preserves existing non-empty write_scopes
+        register_task_worktree_policy_with_scopes(
+            &task_id,
+            PathBuf::from("/worktree/path"),
+            None,
+            None,
+            None,
+            None,
+            Some(vec![]),
+        );
+
+        assert_eq!(
+            task_worktree_write_scopes(&task_id),
+            vec!["src/".to_string(), "docs/".to_string()]
+        );
+
+        // Re-register with new non-empty scopes updates them
+        register_task_worktree_policy_with_scopes(
+            &task_id,
+            PathBuf::from("/worktree/path"),
+            None,
+            None,
+            None,
+            None,
+            Some(vec!["crates/".to_string()]),
+        );
+
+        assert_eq!(
+            task_worktree_write_scopes(&task_id),
+            vec!["crates/".to_string()]
         );
     }
 }
