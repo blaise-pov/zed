@@ -1351,7 +1351,7 @@ impl AgentTaskPanel {
                                                         cx,
                                                     );
                                                 })
-                                                .ok();
+                                                .log_err();
                                                 return Ok(());
                                             }
                                         };
@@ -1465,7 +1465,7 @@ impl AgentTaskPanel {
                                                         });
                                                     }
                                                 })
-                                                .ok();
+                                                .log_err();
                                             }
                                             Err(e) => {
                                                 log::warn!(
@@ -1481,7 +1481,7 @@ impl AgentTaskPanel {
                                                         cx,
                                                     );
                                                 })
-                                                .ok();
+                                                .log_err();
                                             }
                                         }
                                     })
@@ -1740,7 +1740,7 @@ impl AgentTaskPanel {
                                 cx,
                             );
                         })
-                        .ok();
+                        .log_err();
                     }
                     Ok(Err(err)) => {
                         log::warn!("failed to checkout branch {branch}: {err:?}");
@@ -1754,7 +1754,7 @@ impl AgentTaskPanel {
                                 cx,
                             );
                         })
-                        .ok();
+                        .log_err();
                     }
                     Err(err) => {
                         log::warn!("checkout receiver cancelled for branch {branch}: {err:?}");
@@ -1768,7 +1768,7 @@ impl AgentTaskPanel {
                                 cx,
                             );
                         })
-                        .ok();
+                        .log_err();
                     }
                 })
                 .detach();
@@ -1823,7 +1823,7 @@ impl AgentTaskPanel {
                             cx,
                         );
                     })
-                    .ok();
+                    .log_err();
                     return;
                 }
 
@@ -1849,7 +1849,7 @@ impl AgentTaskPanel {
                                 cx,
                             );
                         })
-                        .ok();
+                        .log_err();
                         return;
                     }
                 };
@@ -1860,7 +1860,7 @@ impl AgentTaskPanel {
                             .as_local()
                             .map(|local| local.scan_complete())
                     })
-                    .ok()
+                    .log_err()
                     .flatten();
                 if let Some(scan) = scan_complete {
                     scan.await;
@@ -1869,7 +1869,7 @@ impl AgentTaskPanel {
                     .update(|_window, cx| {
                         find_repository_for_worktree_path(&project, &worktree_path, cx)
                     })
-                    .ok()
+                    .log_err()
                     .flatten();
                 let Some(task_repo) = task_repo else {
                     log::warn!(
@@ -1886,7 +1886,7 @@ impl AgentTaskPanel {
                             cx,
                         );
                     })
-                    .ok();
+                    .log_err();
                     return;
                 };
                 if let Some(workspace) = workspace.upgrade() {
@@ -1906,7 +1906,7 @@ impl AgentTaskPanel {
                                 cx,
                             );
                         })
-                        .ok();
+                        .log_err();
                     }
                 }
             })
@@ -2020,7 +2020,7 @@ impl AgentTaskPanel {
                         this.update(cx, |this, cx| {
                             this.refresh_worktree_status(cx);
                         })
-                        .ok();
+                        .log_err();
                     })
                     .detach();
                 }
@@ -6911,8 +6911,9 @@ mod tests {
 
         let err = anyhow::anyhow!("fatal: branch 'agent-task/TASK-123' not found");
         let humanized = AgentTaskPanel::humanize_error(&err);
-        let restore_error_message =
-            format!("Task Panel: Open Thread: Failed to restore worktree for task {task_id}: {humanized}");
+        let restore_error_message = format!(
+            "Task Panel: Open Thread: Failed to restore worktree for task {task_id}: {humanized}"
+        );
         assert_eq!(
             restore_error_message,
             "Task Panel: Open Thread: Failed to restore worktree for task TASK-123: Git branch not found: fatal: branch 'agent-task/TASK-123' not found"
