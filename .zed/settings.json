@@ -259,7 +259,7 @@
   },
   "agent": {
     "task_graph_server_id": "taskgraph",
-    "task_worktree_limit": 8,
+    "task_worktree_limit": 18,
     "tool_permissions": {
       "default": "deny",
       "tools": {
@@ -560,6 +560,7 @@
             "git_merger",
             "fork_merger",
             "ci_release",
+            "ci_verifier",
             "researcher",
             "github_researcher",
             "code_mechanic"
@@ -1460,7 +1461,12 @@
               "default": "allow"
             },
             "terminal": {
-              "default": "allow"
+              "default": "deny",
+              "always_allow": [
+                {
+                  "pattern": "^([A-Z_]+=\\S+\\s+)*git\\s+(-C\\s+\\S+\\s+)?(--no-pager\\s+|--no-optional-locks\\s+)*(status|diff|log|rev-parse|show|branch|describe|merge-base)\\b.*"
+                }
+              ]
             },
             "mcp:agent-bus:send_feedback": {
               "default": "allow"
@@ -1832,6 +1838,46 @@
             },
             "spawn_agent": {
               "default": "allow"
+            },
+            "mcp:agent-bus:send_feedback": {
+              "default": "allow"
+            }
+          }
+        }
+      },
+      "ci_verifier": {
+        "name": "CI Verifier",
+        "task_isolation": "disabled",
+        "custom_prompt_path": ".zed/prompts/agents/ci_verifier.md",
+        "description": "Pushes the integrated branch and verifies it on GitHub Actions via agent_verify.yml (clippy + tests), waits with gh run watch, and returns structured failure triage; never runs local cargo or tests",
+        "default_model": {
+          "provider": "${MID_TIER_MODEL_PROVIDER}",
+          "model": "${MID_TIER_MODEL}"
+        },
+        "tools": {
+          "terminal": true
+        },
+        "skills": [],
+        "context_servers": {
+          "agent-bus": {
+            "tools": {
+              "send_feedback": true
+            }
+          }
+        },
+        "tool_permissions": {
+          "default": "deny",
+          "tools": {
+            "terminal": {
+              "default": "deny",
+              "always_allow": [
+                {
+                  "pattern": "^([A-Z_]+=\\S+\\s+)*git\\s+(-C\\s+\\S+\\s+)?(--no-pager\\s+|--no-optional-locks\\s+)*(push|fetch|ls-remote|rev-parse|status|log|branch)\\b.*"
+                },
+                {
+                  "pattern": "^([A-Z_]+=\\S+\\s+)*gh\\s+.*"
+                }
+              ]
             },
             "mcp:agent-bus:send_feedback": {
               "default": "allow"

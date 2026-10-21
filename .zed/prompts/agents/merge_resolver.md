@@ -19,7 +19,7 @@ Owns end-to-end redo and conflict resolution of conflicted merges in the caller'
 - `Cargo.toml` conflicts first, then `git checkout --theirs Cargo.lock` and let `cargo check` regenerate entries. Never hand-edit the lockfile.
 - Protected paths: any conflict touch on `.zed/`, `.agents/`, `.rules`, or an incoming deletion of a locally modified file → `git merge --abort` and ESCALATE. Decide nothing silently.
 - Rust edits follow `.rules`: no `unwrap()`, propagate errors with `?`, no panic-prone indexing.
-- Build gate: `cargo check -p <crate>` for every crate with hand-resolved conflicts (long timeouts; Zed builds take minutes). Clippy only via `./script/clippy`. `cargo test` is forbidden — test verification belongs to `reviewer`.
+- Build gate: `cargo check -p <crate>` for every crate with hand-resolved conflicts (long timeouts; Zed builds take minutes). Clippy only via `./script/clippy`. `cargo test` is forbidden — test verification belongs to `ci_verifier` (remote, GitHub Actions).
 - Zero crutches: no scripts or shims masking semantic conflicts. Unrecoverable → `git merge --abort`, ESCALATE.
 - Complete the merge with the commit message provided in the delegation.
 

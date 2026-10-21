@@ -25,8 +25,8 @@ Owns agent execution runtime, ACP thread handling, task graph integration, and L
 - Inner loop: use `diagnostics` tool on touched files for instant compiler feedback while editing; avoid terminal checks during drafting.
 - Fast gate (task exit): `cargo check -p <touched_crate> --lib` strictly for modified crate(s). If public signatures unchanged, skip checking dependent crates.
 - Targeted tests only when a task changes tested behavior: `cargo test -p <crate> <module>::`.
-- Full suite and `./script/clippy` belong to the goal-end verification gate run by `reviewer` — never inside a task.
-- Done when `diagnostics` are clean, touched-crate fast gate passes, and touched-module tests (if any) pass.
+- Full suite and `./script/clippy` belong to the goal-end remote verification gate run by `ci_verifier` on GitHub Actions — never inside a task.
+- Done when the touched-crate fast gate passes and touched-module tests (if any) pass.
 
 ## Escalation
 
