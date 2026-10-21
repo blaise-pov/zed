@@ -3491,6 +3491,29 @@ impl Thread {
         }
     }
 
+    fn spawn_agent_failed_meta(
+        tool_name: &str,
+        result: &LanguageModelToolResult,
+    ) -> Option<acp::Meta> {
+        if tool_name != "spawn_agent" {
+            return None;
+        }
+        result.output.as_ref().and_then(|out| {
+            let err: crate::tools::SpawnAgentToolOutput =
+                serde_json::from_value(out.clone()).ok()?;
+            match err {
+                crate::tools::SpawnAgentToolOutput::Error {
+                    session_info: Some(session_info),
+                    ..
+                } => Some(acp::Meta::from_iter([(
+                    acp_thread::SUBAGENT_SESSION_INFO_META_KEY.into(),
+                    serde_json::json!(&session_info),
+                )])),
+                _ => None,
+            }
+        })
+    }
+
     fn finalize_in_flight_tool_calls(
         &mut self,
         event_stream: &ThreadEventStream,
@@ -3519,24 +3542,7 @@ impl Thread {
                             Some(failure_reason),
                             cx,
                         );
-                        let meta = if tool_use.name.as_ref() == "spawn_agent" {
-                            result.output.as_ref().and_then(|out| {
-                                let err: crate::tools::SpawnAgentToolOutput =
-                                    serde_json::from_value(out.clone()).ok()?;
-                                match err {
-                                    crate::tools::SpawnAgentToolOutput::Error {
-                                        session_info: Some(session_info),
-                                        ..
-                                    } => Some(acp::Meta::from_iter([(
-                                        acp_thread::SUBAGENT_SESSION_INFO_META_KEY.into(),
-                                        serde_json::json!(&session_info),
-                                    )])),
-                                    _ => None,
-                                }
-                            })
-                        } else {
-                            None
-                        };
+                        let meta = Self::spawn_agent_failed_meta(&tool_use.name, &result);
                         pending.tool_results.insert(tool_use.id.clone(), result);
                         let tool_call_id = scoped_tool_call_id(owning_message_ix, &tool_use.id);
                         event_stream.update_tool_call_fields(
@@ -3568,24 +3574,7 @@ impl Thread {
                                 Some(failure_reason),
                                 cx,
                             );
-                            let meta = if tool_use.name.as_ref() == "spawn_agent" {
-                                result.output.as_ref().and_then(|out| {
-                                    let err: crate::tools::SpawnAgentToolOutput =
-                                        serde_json::from_value(out.clone()).ok()?;
-                                    match err {
-                                        crate::tools::SpawnAgentToolOutput::Error {
-                                            session_info: Some(session_info),
-                                            ..
-                                        } => Some(acp::Meta::from_iter([(
-                                            acp_thread::SUBAGENT_SESSION_INFO_META_KEY.into(),
-                                            serde_json::json!(&session_info),
-                                        )])),
-                                        _ => None,
-                                    }
-                                })
-                            } else {
-                                None
-                            };
+                            let meta = Self::spawn_agent_failed_meta(&tool_use.name, &result);
                             agent_msg.tool_results.insert(tool_use.id.clone(), result);
                             let tool_call_id = scoped_tool_call_id(msg_ix, &tool_use.id);
                             event_stream.update_tool_call_fields(
@@ -3700,7 +3689,6 @@ impl Thread {
 
         let (events_tx, events_rx) = mpsc::unbounded::<Result<ThreadEvent>>();
         let event_stream = ThreadEventStream::new(events_tx);
-        let message_ix = self.messages.len().saturating_sub(1);
         self.clear_summary();
         let tools = self.enabled_tools(cx);
         let (cancellation_tx, mut cancellation_rx) = watch::channel(false);
@@ -3800,7 +3788,6 @@ impl Thread {
                             event_stream.send_stop(acp::StopReason::Refusal);
                             _ = this.update(cx, |this, cx| {
                                 this.flush_pending_message(cx);
-                                this.messages.truncate(message_ix);
                                 crate::task_worktree::sweep_guards_for_thread(&this.id);
                             });
                         } else {

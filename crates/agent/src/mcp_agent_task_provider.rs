@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use anyhow::{Context as _, Result};
 use context_server::ContextServerId;
 use gpui::{App, Entity, Task};
@@ -8,6 +10,7 @@ use crate::agent_task::{
     AgentTaskProvider, AgentTaskStatus, AgentTurnRecord,
 };
 
+#[derive(Clone)]
 pub struct McpAgentTaskProvider {
     store: Entity<ContextServerStore>,
     server_id: ContextServerId,
@@ -15,7 +18,9 @@ pub struct McpAgentTaskProvider {
 
 impl McpAgentTaskProvider {
     pub fn new(store: Entity<ContextServerStore>, server_id: ContextServerId) -> Self {
-        Self { store, server_id }
+        let provider = Self { store, server_id };
+        crate::task_worktree::register_task_provider(Arc::new(provider.clone()));
+        provider
     }
 
     fn call_tool(

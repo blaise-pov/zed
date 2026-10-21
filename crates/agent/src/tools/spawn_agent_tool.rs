@@ -1012,30 +1012,32 @@ impl AgentTool for SpawnAgentTool {
                     None
                 };
 
-                if let Some(ref task_id) = task_id {
-                    let fail_fut = self
-                        .environment
-                        .fail_task_registered(task_id, "cancelled", &mut cx);
-                    match timeout_step(
-                        Some(task_id),
-                        "salvage_fail_task",
-                        TGS_STEP_TIMEOUT,
-                        &cx,
-                        fail_fut,
-                    )
-                    .await
-                    {
-                        StepOutcome::Ok(()) => {}
-                        StepOutcome::Err(failure_error) => {
-                            log::warn!(
-                                "failed to fail task {task_id} in task graph service: {failure_error:#}"
-                            );
-                        }
-                        StepOutcome::Timeout => {
-                            log::warn!(
-                                "fail task timed out after {}s for task {task_id}",
-                                TGS_STEP_TIMEOUT.as_secs()
-                            );
+                if !is_agent_mode {
+                    if let Some(ref task_id) = task_id {
+                        let fail_fut = self
+                            .environment
+                            .fail_task_registered(task_id, "cancelled", &mut cx);
+                        match timeout_step(
+                            Some(task_id),
+                            "salvage_fail_task",
+                            TGS_STEP_TIMEOUT,
+                            &cx,
+                            fail_fut,
+                        )
+                        .await
+                        {
+                            StepOutcome::Ok(()) => {}
+                            StepOutcome::Err(failure_error) => {
+                                log::warn!(
+                                    "failed to fail task {task_id} in task graph service: {failure_error:#}"
+                                );
+                            }
+                            StepOutcome::Timeout => {
+                                log::warn!(
+                                    "fail task timed out after {}s for task {task_id}",
+                                    TGS_STEP_TIMEOUT.as_secs()
+                                );
+                            }
                         }
                     }
                 }
@@ -1060,7 +1062,18 @@ impl AgentTool for SpawnAgentTool {
                 });
             }
 
-            let send_result = send_result.expect("send_result present when not cancelled");
+            let send_result = match send_result {
+                Some(send_result) => send_result,
+                None => {
+                    return Err(cancelled_error(
+                        "subagent.send",
+                        Some(session_info.session_id.clone()),
+                        Some(session_info),
+                        isolation,
+                        None,
+                    ));
+                }
+            };
 
             let duration_ms = start_instant.elapsed().as_millis() as u64;
             let end_tokens = cx.update(|cx| subagent.cumulative_token_usage(cx));
