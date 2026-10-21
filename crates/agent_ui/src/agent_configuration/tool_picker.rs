@@ -11,8 +11,7 @@ use picker::{Picker, PickerDelegate};
 use project::project_settings::ProjectSettings;
 use settings::{
     AgentProfileContent, ContextServerPresetContent, DelegationContent, Settings as _,
-    SettingsFile, SettingsStore, ToolPermissionMode, ToolPermissionsContent, ToolRulesContent,
-    update_settings_file,
+    SettingsFile, SettingsStore, update_settings_file,
 };
 use ui::{ListItem, ListItemSpacing, prelude::*};
 use util::ResultExt as _;
@@ -376,7 +375,6 @@ impl PickerDelegate for ToolPickerDelegate {
         let profile_id = self.profile_id.clone();
         let default_profile = self.profile_settings.clone();
         let item = item.clone();
-        let all_items = self.items.clone();
 
         let update_fn = move |settings: &mut settings::SettingsContent, _cx: &App| {
             let profiles = settings
@@ -440,10 +438,10 @@ impl PickerDelegate for ToolPickerDelegate {
                     task_worktree_language_servers: default_profile.task_worktree_language_servers,
                 });
 
-            match &item {
+            match item {
                 PickerItem::ContextServer { server_id } => {
                     profile.context_servers.insert(
-                        server_id.clone(),
+                        server_id,
                         ContextServerPresetContent::Enabled(!is_currently_enabled),
                     );
                 }
@@ -452,29 +450,22 @@ impl PickerDelegate for ToolPickerDelegate {
                     server_id,
                 } => {
                     if let Some(server_id) = server_id {
-                        let preset = profile.context_servers.entry(server_id.clone()).or_default();
+                        let preset = profile.context_servers.entry(server_id).or_default();
                         match preset {
                             ContextServerPresetContent::Enabled(enabled) => {
                                 let enabled = *enabled;
-                                let tools = [(tool_name.clone(), !enabled)].into_iter().collect();
+                                let tools = [(tool_name, !enabled)].into_iter().collect();
                                 *preset = ContextServerPresetContent::Tools { tools };
                             }
                             ContextServerPresetContent::Tools { tools } => {
-                                *tools.entry(tool_name.clone()).or_default() = !is_currently_enabled;
+                                *tools.entry(tool_name).or_default() = !is_currently_enabled;
                             }
                         }
                     } else {
-                        *profile.tools.entry(tool_name.clone()).or_default() = !is_currently_enabled;
+                        *profile.tools.entry(tool_name).or_default() = !is_currently_enabled;
                     }
                 }
             }
-
-            sync_profile_tool_permissions(
-                profile,
-                &item,
-                &all_items,
-                !is_currently_enabled,
-            );
         };
 
         match &self.profile_settings.origin {
@@ -595,361 +586,5 @@ impl PickerDelegate for ToolPickerDelegate {
                 )
             }
         }
-    }
-}
-
-fn sync_tool_permission(
-    tool_permissions: &mut ToolPermissionsContent,
-    server_id: Option<&str>,
-    tool_name: &str,
-    enabled: bool,
-) {
-    let key: Arc<str> = match server_id {
-        Some(server_id) => format!("mcp:{server_id}:{tool_name}").into(),
-        None => tool_name.to_string().into(),
-    };
-    if enabled {
-        tool_permissions.tools.insert(
-            key,
-            ToolRulesContent {
-                default: Some(ToolPermissionMode::Allow),
-                ..Default::default()
-            },
-        );
-    } else {
-        tool_permissions.tools.remove(&key);
-    }
-}
-
-fn sync_profile_tool_permissions(
-    profile: &mut AgentProfileContent,
-    item: &PickerItem,
-    all_items: &[PickerItem],
-    enabled: bool,
-) {
-    let Some(tool_permissions) = profile.tool_permissions.as_mut() else {
-        return;
-    };
-
-    match item {
-        PickerItem::ContextServer { server_id } => {
-            for picker_item in all_items {
-                if let PickerItem::Tool {
-                    name: tool_name,
-                    server_id: Some(tool_server_id),
-                } = picker_item
-                {
-                    if tool_server_id == server_id {
-                        sync_tool_permission(
-                            tool_permissions,
-                            Some(server_id.as_ref()),
-                            tool_name,
-                            enabled,
-                        );
-                    }
-                }
-            }
-        }
-        PickerItem::Tool {
-            name: tool_name,
-            server_id,
-        } => {
-            sync_tool_permission(
-                tool_permissions,
-                server_id.as_deref(),
-                tool_name,
-                enabled,
-            );
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use collections::HashMap;
-
-    fn test_profile(tool_permissions: Option<ToolPermissionsContent>) -> AgentProfileContent {
-        AgentProfileContent {
-            name: "test_profile".into(),
-            origin: None,
-            tools: Default::default(),
-            enable_all_context_servers: None,
-            context_servers: Default::default(),
-            default_model: None,
-            custom_prompt_path: None,
-            system_prompt_template: None,
-            description: None,
-            skills: None,
-            delegation: None,
-            tool_permissions,
-            permission_mode: None,
-            terminal_wrapper_command: None,
-            task_isolation: None,
-            task_worktree_language_servers: None,
-        }
-    }
-
-    #[test]
-    fn test_sync_mcp_tool_enables_and_inserts_allow_permission() {
-        let mut profile = test_profile(Some(ToolPermissionsContent {
-            default: Some(ToolPermissionMode::Deny),
-            tools: HashMap::default(),
-        }));
-
-        let item = PickerItem::Tool {
-            name: "search".into(),
-            server_id: Some("fetch".into()),
-        };
-        let items = vec![item.clone()];
-
-        sync_profile_tool_permissions(&mut profile, &item, &items, true);
-
-        let permissions = profile.tool_permissions.as_ref().unwrap();
-        let rule = permissions
-            .tools
-            .get("mcp:fetch:search")
-            .expect("permission rule should be inserted for enabled MCP tool");
-        assert_eq!(rule.default, Some(ToolPermissionMode::Allow));
-    }
-
-    #[test]
-    fn test_sync_mcp_tool_disables_and_removes_permission() {
-        let mut tools = HashMap::default();
-        tools.insert(
-            "mcp:fetch:search".into(),
-            ToolRulesContent {
-                default: Some(ToolPermissionMode::Allow),
-                ..Default::default()
-            },
-        );
-
-        let mut profile = test_profile(Some(ToolPermissionsContent {
-            default: Some(ToolPermissionMode::Deny),
-            tools,
-        }));
-
-        let item = PickerItem::Tool {
-            name: "search".into(),
-            server_id: Some("fetch".into()),
-        };
-        let items = vec![item.clone()];
-
-        sync_profile_tool_permissions(&mut profile, &item, &items, false);
-
-        let permissions = profile.tool_permissions.as_ref().unwrap();
-        assert!(
-            !permissions.tools.contains_key("mcp:fetch:search"),
-            "permission rule should be removed when MCP tool is disabled"
-        );
-    }
-
-    #[test]
-    fn test_sync_builtin_tool_enables_and_inserts_allow_permission() {
-        let mut profile = test_profile(Some(ToolPermissionsContent {
-            default: Some(ToolPermissionMode::Deny),
-            tools: HashMap::default(),
-        }));
-
-        let item = PickerItem::Tool {
-            name: "terminal".into(),
-            server_id: None,
-        };
-        let items = vec![item.clone()];
-
-        sync_profile_tool_permissions(&mut profile, &item, &items, true);
-
-        let permissions = profile.tool_permissions.as_ref().unwrap();
-        let rule = permissions
-            .tools
-            .get("terminal")
-            .expect("permission rule should be inserted for enabled builtin tool");
-        assert_eq!(rule.default, Some(ToolPermissionMode::Allow));
-    }
-
-    #[test]
-    fn test_sync_builtin_tool_disables_and_removes_permission() {
-        let mut tools = HashMap::default();
-        tools.insert(
-            "terminal".into(),
-            ToolRulesContent {
-                default: Some(ToolPermissionMode::Allow),
-                ..Default::default()
-            },
-        );
-
-        let mut profile = test_profile(Some(ToolPermissionsContent {
-            default: Some(ToolPermissionMode::Deny),
-            tools,
-        }));
-
-        let item = PickerItem::Tool {
-            name: "terminal".into(),
-            server_id: None,
-        };
-        let items = vec![item.clone()];
-
-        sync_profile_tool_permissions(&mut profile, &item, &items, false);
-
-        let permissions = profile.tool_permissions.as_ref().unwrap();
-        assert!(
-            !permissions.tools.contains_key("terminal"),
-            "permission rule should be removed when builtin tool is disabled"
-        );
-    }
-
-    #[test]
-    fn test_sync_context_server_enables_all_its_tools() {
-        let mut profile = test_profile(Some(ToolPermissionsContent {
-            default: Some(ToolPermissionMode::Deny),
-            tools: HashMap::default(),
-        }));
-
-        let server_id: Arc<str> = "server_alpha".into();
-        let items = vec![
-            PickerItem::ContextServer {
-                server_id: server_id.clone(),
-            },
-            PickerItem::Tool {
-                name: "query".into(),
-                server_id: Some(server_id.clone()),
-            },
-            PickerItem::Tool {
-                name: "mutate".into(),
-                server_id: Some(server_id.clone()),
-            },
-            PickerItem::Tool {
-                name: "other_tool".into(),
-                server_id: Some("server_beta".into()),
-            },
-            PickerItem::Tool {
-                name: "builtin_tool".into(),
-                server_id: None,
-            },
-        ];
-
-        let context_server_item = PickerItem::ContextServer {
-            server_id: server_id.clone(),
-        };
-
-        sync_profile_tool_permissions(&mut profile, &context_server_item, &items, true);
-
-        let permissions = profile.tool_permissions.as_ref().unwrap();
-        let rule1 = permissions
-            .tools
-            .get("mcp:server_alpha:query")
-            .expect("query tool should be allowed");
-        assert_eq!(rule1.default, Some(ToolPermissionMode::Allow));
-
-        let rule2 = permissions
-            .tools
-            .get("mcp:server_alpha:mutate")
-            .expect("mutate tool should be allowed");
-        assert_eq!(rule2.default, Some(ToolPermissionMode::Allow));
-
-        assert!(
-            !permissions.tools.contains_key("mcp:server_beta:other_tool"),
-            "tools from other servers should not be touched"
-        );
-        assert!(
-            !permissions.tools.contains_key("builtin_tool"),
-            "builtin tools should not be touched when toggling context server"
-        );
-    }
-
-    #[test]
-    fn test_sync_context_server_disables_all_its_tools() {
-        let mut tools = HashMap::default();
-        tools.insert(
-            "mcp:server_alpha:query".into(),
-            ToolRulesContent {
-                default: Some(ToolPermissionMode::Allow),
-                ..Default::default()
-            },
-        );
-        tools.insert(
-            "mcp:server_alpha:mutate".into(),
-            ToolRulesContent {
-                default: Some(ToolPermissionMode::Allow),
-                ..Default::default()
-            },
-        );
-        tools.insert(
-            "mcp:server_beta:other_tool".into(),
-            ToolRulesContent {
-                default: Some(ToolPermissionMode::Allow),
-                ..Default::default()
-            },
-        );
-
-        let mut profile = test_profile(Some(ToolPermissionsContent {
-            default: Some(ToolPermissionMode::Deny),
-            tools,
-        }));
-
-        let server_id: Arc<str> = "server_alpha".into();
-        let items = vec![
-            PickerItem::ContextServer {
-                server_id: server_id.clone(),
-            },
-            PickerItem::Tool {
-                name: "query".into(),
-                server_id: Some(server_id.clone()),
-            },
-            PickerItem::Tool {
-                name: "mutate".into(),
-                server_id: Some(server_id.clone()),
-            },
-            PickerItem::Tool {
-                name: "other_tool".into(),
-                server_id: Some("server_beta".into()),
-            },
-        ];
-
-        let context_server_item = PickerItem::ContextServer {
-            server_id: server_id.clone(),
-        };
-
-        sync_profile_tool_permissions(&mut profile, &context_server_item, &items, false);
-
-        let permissions = profile.tool_permissions.as_ref().unwrap();
-        assert!(
-            !permissions.tools.contains_key("mcp:server_alpha:query"),
-            "query tool should be removed"
-        );
-        assert!(
-            !permissions.tools.contains_key("mcp:server_alpha:mutate"),
-            "mutate tool should be removed"
-        );
-        assert!(
-            permissions.tools.contains_key("mcp:server_beta:other_tool"),
-            "tools from other servers must remain intact"
-        );
-    }
-
-    #[test]
-    fn test_sync_tool_permissions_noop_when_profile_has_no_permissions() {
-        let mut profile = test_profile(None);
-
-        let mcp_tool = PickerItem::Tool {
-            name: "query".into(),
-            server_id: Some("server_alpha".into()),
-        };
-        let context_server = PickerItem::ContextServer {
-            server_id: "server_alpha".into(),
-        };
-        let items = vec![context_server.clone(), mcp_tool.clone()];
-
-        sync_profile_tool_permissions(&mut profile, &mcp_tool, &items, true);
-        assert!(profile.tool_permissions.is_none());
-
-        sync_profile_tool_permissions(&mut profile, &context_server, &items, true);
-        assert!(profile.tool_permissions.is_none());
-
-        sync_profile_tool_permissions(&mut profile, &mcp_tool, &items, false);
-        assert!(profile.tool_permissions.is_none());
-
-        sync_profile_tool_permissions(&mut profile, &context_server, &items, false);
-        assert!(profile.tool_permissions.is_none());
     }
 }
