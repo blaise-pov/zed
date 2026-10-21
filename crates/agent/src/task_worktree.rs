@@ -11,7 +11,9 @@ use anyhow::{Context as _, Result};
 use fs::Fs;
 use futures::FutureExt as _;
 use git::repository::{AskPassDelegate, CommitOptions, CreateWorktreeTarget, RepoPath};
-use gpui::{App, AsyncApp, Entity, Task};
+use agent_client_protocol::schema::v1 as acp;
+use gpui::{App, AsyncApp, Entity, Task, WeakEntity};
+use language_model::LanguageModelToolUseId;
 use project::{
     Project, git_store::Repository, git_store::worktrees_directory_for_repo,
     project_settings::ProjectSettings,
@@ -329,7 +331,7 @@ pub fn ensure_task_worktree_with_options(
                 if !self.defused {
                     unregister_subagent_session(&self.task_id);
                     let mut reg = REGISTRY.write();
-                    reg.active_sessions.remove(&self.task_id);
+                    reg.active_guards.remove(&self.task_id);
                     reg.entries.remove(&self.task_id);
                 }
             }
@@ -376,6 +378,7 @@ pub fn ensure_task_worktree_with_options(
                 &stale_task_id,
                 &stale_path,
                 &log_reason,
+                false,
                 cx,
             )
             .await?;
@@ -667,7 +670,7 @@ async fn ensure_task_worktree_settings(
 #[derive(Default)]
 struct TaskWorktreeRegistry {
     entries: HashMap<AgentTaskId, TaskWorktreeState>,
-    active_sessions: HashMap<AgentTaskId, usize>,
+    active_guards: HashMap<AgentTaskId, HashMap<SubagentSessionGuardId, SubagentSessionOwner>>,
     goal_history: HashMap<String, Vec<GoalMergeEntry>>,
     #[cfg(any(test, feature = "test-support"))]
     goal_files: HashMap<String, HashMap<PathBuf, Vec<u8>>>,
@@ -786,9 +789,25 @@ fn worktree_release_safety_for_state(
     }
 }
 
+impl TaskWorktreeRegistry {
+    pub fn live_active_sessions_count(&self, task_id: &AgentTaskId) -> usize {
+        let Some(guards) = self.active_guards.get(task_id) else {
+            return 0;
+        };
+        guards
+            .values()
+            .filter(|owner| is_owner_alive(owner))
+            .count()
+    }
+
+    pub fn has_active_session(&self, task_id: &AgentTaskId) -> bool {
+        self.live_active_sessions_count(task_id) > 0
+    }
+}
+
 pub fn worktree_release_safety(task_id: &AgentTaskId) -> WorktreeReleaseSafety {
     let reg = REGISTRY.read();
-    let active_sessions = reg.active_sessions.get(task_id).copied().unwrap_or(0);
+    let active_sessions = reg.live_active_sessions_count(task_id);
     reg.entries.get(task_id).map_or(
         if active_sessions > 0 {
             WorktreeReleaseSafety::ActiveSession
@@ -1168,9 +1187,10 @@ async fn release_stale_task_worktree(
     stale_task_id: &AgentTaskId,
     stale_path: &Path,
     reason: &str,
+    already_marked_cleaning: bool,
     cx: &mut AsyncApp,
 ) -> Result<()> {
-    {
+    if !already_marked_cleaning {
         let mut reg = REGISTRY.write();
         if let Some(entry) = reg.entries.get_mut(stale_task_id) {
             if entry.is_cleaning {
@@ -1180,83 +1200,97 @@ async fn release_stale_task_worktree(
         }
     }
 
-    if !stale_path.as_os_str().is_empty() {
-        if file_system.is_dir(stale_path).await {
-            let dot_git = stale_path.join(".git");
-            let has_git = file_system.is_file(&dot_git).await || file_system.is_dir(&dot_git).await;
-            if has_git {
-                let salvage_details = commit_task_worktree(
-                    file_system.clone(),
-                    stale_path.to_path_buf(),
-                    stale_task_id.to_string(),
-                    false,
-                    cx,
-                )
-                .await;
+    let perform_release = async {
+        if !stale_path.as_os_str().is_empty() {
+            if file_system.is_dir(stale_path).await {
+                let dot_git = stale_path.join(".git");
+                let has_git = file_system.is_file(&dot_git).await || file_system.is_dir(&dot_git).await;
+                if has_git {
+                    let salvage_details = commit_task_worktree(
+                        file_system.clone(),
+                        stale_path.to_path_buf(),
+                        stale_task_id.to_string(),
+                        false,
+                        cx,
+                    )
+                    .await;
 
-                match salvage_details {
-                    Ok(details) => {
-                        if let Some(err) = details.commit_error {
+                    match salvage_details {
+                        Ok(details) => {
+                            if let Some(err) = details.commit_error {
+                                anyhow::bail!(
+                                    "failed to salvage uncommitted changes from stale worktree for task {stale_task_id} {reason}: {err}; inspect or resolve that worktree manually"
+                                );
+                            }
+                        }
+                        Err(err) => {
                             anyhow::bail!(
                                 "failed to salvage uncommitted changes from stale worktree for task {stale_task_id} {reason}: {err}; inspect or resolve that worktree manually"
                             );
                         }
                     }
-                    Err(err) => {
-                        anyhow::bail!(
-                            "failed to salvage uncommitted changes from stale worktree for task {stale_task_id} {reason}: {err}; inspect or resolve that worktree manually"
-                        );
-                    }
+                }
+            }
+
+            let stale_worktree_id = project.read_with(cx, |project, cx| {
+                project
+                    .worktrees(cx)
+                    .find(|w| {
+                        let w_abs = w.read(cx).abs_path();
+                        w_abs.as_ref() == stale_path
+                            || util::paths::normalize_lexically(w_abs.as_ref())
+                                .ok()
+                                .as_deref()
+                                == util::paths::normalize_lexically(stale_path).ok().as_deref()
+                    })
+                    .map(|w| w.read(cx).id())
+            });
+            {
+                let mut project_worktrees = PROJECT_TASK_WORKTREES.write();
+                for map in project_worktrees.values_mut() {
+                    map.remove(stale_task_id);
+                }
+            }
+            if let Some(id) = stale_worktree_id {
+                let wait = project.update(cx, |project, cx| {
+                    let wait = project.wait_for_worktree_release(id, cx);
+                    project.remove_worktree(id, cx);
+                    wait
+                });
+                wait.await.log_err();
+            }
+
+            if file_system.is_dir(stale_path).await {
+                remove_worktree_from_git_and_fs(
+                    repository,
+                    file_system,
+                    stale_path,
+                    anchor_path,
+                    true,
+                    "stale worktree",
+                    cx,
+                )
+                .await?;
+
+                if !file_system.is_fake() {
+                    prune_git_worktrees(anchor_path).await;
                 }
             }
         }
 
-        let stale_worktree_id = project.read_with(cx, |project, cx| {
-            project
-                .worktrees(cx)
-                .find(|w| {
-                    let w_abs = w.read(cx).abs_path();
-                    w_abs.as_ref() == stale_path
-                        || util::paths::normalize_lexically(w_abs.as_ref())
-                            .ok()
-                            .as_deref()
-                            == util::paths::normalize_lexically(stale_path).ok().as_deref()
-                })
-                .map(|w| w.read(cx).id())
-        });
-        {
-            let mut project_worktrees = PROJECT_TASK_WORKTREES.write();
-            for map in project_worktrees.values_mut() {
-                map.remove(stale_task_id);
-            }
-        }
-        if let Some(id) = stale_worktree_id {
-            project.update(cx, |project, cx| {
-                project.remove_worktree(id, cx);
-            });
-        }
+        unregister_task_worktree(stale_task_id);
+        log::info!("Released stale worktree of task {stale_task_id} {reason}");
+        Ok(())
+    };
 
-        if file_system.is_dir(stale_path).await {
-            remove_worktree_from_git_and_fs(
-                repository,
-                file_system,
-                stale_path,
-                anchor_path,
-                true,
-                "stale worktree",
-                cx,
-            )
-            .await?;
-
-            if !file_system.is_fake() {
-                prune_git_worktrees(anchor_path).await;
-            }
+    let result = perform_release.await;
+    if result.is_err() {
+        let mut reg = REGISTRY.write();
+        if let Some(entry) = reg.entries.get_mut(stale_task_id) {
+            entry.is_cleaning = false;
         }
     }
-
-    unregister_task_worktree(stale_task_id);
-    log::info!("Released stale worktree of task {stale_task_id} {reason}");
-    Ok(())
+    result
 }
 
 async fn acquire_task_worktree_slot(
@@ -1274,8 +1308,9 @@ async fn acquire_task_worktree_slot(
     let mut notified_guard: Option<NotifiedWaiterGuard> = None;
 
     loop {
-        let limit = project.read_with(cx, |project, cx| {
-            agent_settings::AgentSettings::get_for_project(project, cx).task_worktree_limit
+        let (limit, cleanup_enabled) = project.read_with(cx, |project, cx| {
+            let settings = agent_settings::AgentSettings::get_for_project(project, cx);
+            (settings.task_worktree_limit, settings.cleanup)
         });
 
         let mut snapshotted_ids = collections::HashSet::default();
@@ -1290,12 +1325,12 @@ async fn acquire_task_worktree_slot(
                 .iter()
                 .filter(|(_, state)| {
                     state.pool_key.as_ref() == Some(&pool_key)
-                        && !state.worktree_path.as_os_str().is_empty()
-                        && state.worktree_path.starts_with(&base_dir)
+                        && (state.worktree_path.as_os_str().is_empty()
+                            || state.worktree_path.starts_with(&base_dir))
                 })
                 .map(|(id, state)| {
                     snapshotted_ids.insert(id.clone());
-                    let active = reg.active_sessions.get(id).copied().unwrap_or(0);
+                    let active = reg.live_active_sessions_count(id);
                     let safety = worktree_release_safety_for_state(id, state, active);
                     (
                         id.clone(),
@@ -1315,7 +1350,7 @@ async fn acquire_task_worktree_slot(
             }
             if !path.as_os_str().is_empty() && file_system.is_dir(path).await {
                 confirmed_existing_ids.insert(id.clone());
-                if safety.is_eviction_safe() {
+                if cleanup_enabled && safety.is_eviction_safe() {
                     candidates.push((id.clone(), path.clone(), *last_session_ended_at));
                 }
             }
@@ -1384,6 +1419,7 @@ async fn acquire_task_worktree_slot(
                 &candidate_id,
                 &candidate_path,
                 "due to LRU pool limit",
+                false,
                 cx,
             )
             .await;
@@ -1478,7 +1514,7 @@ async fn acquire_task_worktree_slot(
             unregister_subagent_session(current_task_id);
             {
                 let mut reg = REGISTRY.write();
-                reg.active_sessions.remove(current_task_id);
+                reg.active_guards.remove(current_task_id);
                 reg.entries.remove(current_task_id);
             }
 
@@ -1530,7 +1566,7 @@ fn finish_slot_and_register_policy(
         }
     }
 
-    let has_active = reg.active_sessions.get(task_id).copied().unwrap_or(0) > 0;
+    let has_active = reg.has_active_session(task_id);
     let initial_ended_at = if has_active {
         None
     } else {
@@ -1625,7 +1661,7 @@ pub fn claim_branch_or_error(
     checkout_target: Option<String>,
 ) -> Result<()> {
     let mut reg = REGISTRY.write();
-    let active_sessions = reg.active_sessions.get(task_id).copied().unwrap_or(0);
+    let active_sessions = reg.live_active_sessions_count(task_id);
     if active_sessions > 1 {
         anyhow::bail!(
             "task {task_id} already has an active session; wait for it to finish or resume via session_id later"
@@ -1635,7 +1671,7 @@ pub fn claim_branch_or_error(
         if other_task_id != task_id {
             let occupied = entry.checked_out_branch(other_task_id);
             if occupied == branch {
-                let active = reg.active_sessions.get(other_task_id).copied().unwrap_or(0);
+                let active = reg.live_active_sessions_count(other_task_id);
                 let safety = worktree_release_safety_for_state(other_task_id, entry, active);
                 match safety {
                     WorktreeReleaseSafety::ActiveSession => {
@@ -1687,7 +1723,7 @@ fn stale_worktree_tasks_for_branch(
             *other_id != current_task_id && entry.checked_out_branch(other_id) == branch
         })
         .map(|(other_id, entry)| {
-            let active = reg.active_sessions.get(other_id).copied().unwrap_or(0);
+            let active = reg.live_active_sessions_count(other_id);
             let safety = worktree_release_safety_for_state(other_id, entry, active);
             (
                 other_id.clone(),
@@ -1947,6 +1983,7 @@ pub fn unregister_task_worktree(task_id: &AgentTaskId) {
     clear_task_lsp_suppressed(task_id);
     let mut reg = REGISTRY.write();
     let entry = reg.entries.remove(task_id);
+    reg.active_guards.remove(task_id);
     let mut project_worktrees = PROJECT_TASK_WORKTREES.write();
     for map in project_worktrees.values_mut() {
         map.remove(task_id);
@@ -2049,28 +2086,273 @@ pub fn is_task_terminal(task_id: &AgentTaskId) -> bool {
     reg.entries.get(task_id).map_or(false, |e| e.is_terminal)
 }
 
-pub fn register_subagent_session(task_id: &AgentTaskId) {
+static NEXT_GUARD_ID: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub struct SubagentSessionGuardId(usize);
+
+#[derive(Clone, Debug)]
+pub struct SubagentSessionOwner {
+    pub thread_id: acp::SessionId,
+    pub tool_use_id: LanguageModelToolUseId,
+    pub thread: Option<WeakEntity<crate::Thread>>,
+    #[cfg(any(test, feature = "test-support"))]
+    pub is_test_live: bool,
+}
+
+pub fn is_owner_alive(owner: &SubagentSessionOwner) -> bool {
+    if let Some(ref thread) = owner.thread {
+        if thread.upgrade().is_none() {
+            return false;
+        }
+        crate::thread::is_thread_turn_running(&owner.thread_id)
+    } else {
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            owner.is_test_live || crate::thread::is_thread_turn_running(&owner.thread_id)
+        }
+        #[cfg(not(any(test, feature = "test-support")))]
+        {
+            crate::thread::is_thread_turn_running(&owner.thread_id)
+        }
+    }
+}
+
+pub struct SubagentSessionGuard {
+    task_id: AgentTaskId,
+    guard_id: SubagentSessionGuardId,
+}
+
+impl SubagentSessionGuard {
+    pub fn new(task_id: AgentTaskId, owner: SubagentSessionOwner) -> Self {
+        register_subagent_session_guard(&task_id, owner)
+    }
+
+    pub fn task_id(&self) -> &AgentTaskId {
+        &self.task_id
+    }
+
+    pub fn id(&self) -> SubagentSessionGuardId {
+        self.guard_id
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn test_new(task_id: AgentTaskId) -> Self {
+        let owner = SubagentSessionOwner {
+            thread_id: acp::SessionId::new("test-thread"),
+            tool_use_id: LanguageModelToolUseId::from("test-tool-use"),
+            thread: None,
+            is_test_live: true,
+        };
+        register_subagent_session_guard(&task_id, owner)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn test_new_stale(task_id: AgentTaskId) -> Self {
+        let owner = SubagentSessionOwner {
+            thread_id: acp::SessionId::new("test-stale-thread"),
+            tool_use_id: LanguageModelToolUseId::from("test-stale-tool-use"),
+            thread: None,
+            is_test_live: false,
+        };
+        register_subagent_session_guard(&task_id, owner)
+    }
+}
+
+impl Drop for SubagentSessionGuard {
+    fn drop(&mut self) {
+        unregister_subagent_session_guard(&self.task_id, self.guard_id);
+    }
+}
+
+pub fn register_subagent_session_guard(
+    task_id: &AgentTaskId,
+    owner: SubagentSessionOwner,
+) -> SubagentSessionGuard {
+    let guard_id = SubagentSessionGuardId(NEXT_GUARD_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
     let mut reg = REGISTRY.write();
-    *reg.active_sessions.entry(task_id.clone()).or_insert(0) += 1;
+    let guards = reg.active_guards.entry(task_id.clone()).or_default();
+    guards.insert(guard_id, owner);
     if let Some(entry) = reg.entries.get_mut(task_id) {
         entry.last_session_ended_at = None;
         entry.slot_notified = false;
     }
+    SubagentSessionGuard {
+        task_id: task_id.clone(),
+        guard_id,
+    }
+}
+
+pub fn unregister_subagent_session_guard(
+    task_id: &AgentTaskId,
+    guard_id: SubagentSessionGuardId,
+) {
+    let mut reg = REGISTRY.write();
+    let mut session_ended = false;
+    let mut pool_key = None;
+    let (live_count, is_empty) = if let Some(guards) = reg.active_guards.get_mut(task_id) {
+        guards.remove(&guard_id);
+        (
+            guards.values().filter(|o| is_owner_alive(o)).count(),
+            guards.is_empty(),
+        )
+    } else {
+        (0, false)
+    };
+    if is_empty {
+        reg.active_guards.remove(task_id);
+    }
+    if live_count == 0 {
+        if let Some(entry) = reg.entries.get_mut(task_id) {
+            entry.last_session_ended_at = Some(std::time::Instant::now());
+            session_ended = true;
+            pool_key = entry.pool_key.clone();
+        }
+    }
+    drop(reg);
+
+    if session_ended {
+        if let Some(pool_key) = pool_key {
+            let already_in_flight = {
+                let notified = NOTIFIED_WAITERS.lock();
+                notified.get(&pool_key).copied().unwrap_or(0)
+            };
+            if already_in_flight == 0 {
+                notify_task_worktree_slot_available_for_pool(&pool_key);
+            }
+        } else {
+            notify_task_worktree_slot_available();
+        }
+    }
+}
+
+pub fn sweep_guards_for_thread(thread_id: &acp::SessionId) {
+    let mut reg = REGISTRY.write();
+    let mut ended_pools = Vec::new();
+    let mut tasks_to_clean = Vec::new();
+    let mut ended_tasks = Vec::new();
+
+    for (task_id, guards) in reg.active_guards.iter_mut() {
+        let before_live = guards.values().filter(|o| is_owner_alive(o)).count();
+        guards.retain(|_, owner| owner.thread_id != *thread_id);
+        let after_live = guards.values().filter(|o| is_owner_alive(o)).count();
+
+        if before_live > 0 && after_live == 0 {
+            ended_tasks.push(task_id.clone());
+        }
+        if guards.is_empty() {
+            tasks_to_clean.push(task_id.clone());
+        }
+    }
+
+    for task_id in tasks_to_clean {
+        reg.active_guards.remove(&task_id);
+    }
+
+    for task_id in ended_tasks {
+        if let Some(entry) = reg.entries.get_mut(&task_id) {
+            entry.last_session_ended_at = Some(std::time::Instant::now());
+            if let Some(ref pk) = entry.pool_key {
+                ended_pools.push(pk.clone());
+            }
+        }
+    }
+
+    drop(reg);
+
+    for pool_key in ended_pools {
+        let already_in_flight = {
+            let notified = NOTIFIED_WAITERS.lock();
+            notified.get(&pool_key).copied().unwrap_or(0)
+        };
+        if already_in_flight == 0 {
+            notify_task_worktree_slot_available_for_pool(&pool_key);
+        }
+    }
+}
+
+pub fn sweep_guards_for_tool_use(
+    thread_id: &acp::SessionId,
+    tool_use_id: &LanguageModelToolUseId,
+) {
+    let mut reg = REGISTRY.write();
+    let mut ended_pools = Vec::new();
+    let mut tasks_to_clean = Vec::new();
+    let mut ended_tasks = Vec::new();
+
+    for (task_id, guards) in reg.active_guards.iter_mut() {
+        let before_live = guards.values().filter(|o| is_owner_alive(o)).count();
+        guards.retain(|_, owner| !(owner.thread_id == *thread_id && owner.tool_use_id == *tool_use_id));
+        let after_live = guards.values().filter(|o| is_owner_alive(o)).count();
+
+        if before_live > 0 && after_live == 0 {
+            ended_tasks.push(task_id.clone());
+        }
+        if guards.is_empty() {
+            tasks_to_clean.push(task_id.clone());
+        }
+    }
+
+    for task_id in tasks_to_clean {
+        reg.active_guards.remove(&task_id);
+    }
+
+    for task_id in ended_tasks {
+        if let Some(entry) = reg.entries.get_mut(&task_id) {
+            entry.last_session_ended_at = Some(std::time::Instant::now());
+            if let Some(ref pk) = entry.pool_key {
+                ended_pools.push(pk.clone());
+            }
+        }
+    }
+
+    drop(reg);
+
+    for pool_key in ended_pools {
+        let already_in_flight = {
+            let notified = NOTIFIED_WAITERS.lock();
+            notified.get(&pool_key).copied().unwrap_or(0)
+        };
+        if already_in_flight == 0 {
+            notify_task_worktree_slot_available_for_pool(&pool_key);
+        }
+    }
+}
+
+pub fn register_subagent_session(task_id: &AgentTaskId) {
+    let owner = SubagentSessionOwner {
+        thread_id: acp::SessionId::new("legacy-test-thread"),
+        tool_use_id: LanguageModelToolUseId::from("legacy-test-tool-use"),
+        thread: None,
+        #[cfg(any(test, feature = "test-support"))]
+        is_test_live: true,
+    };
+    register_subagent_session_guard(task_id, owner);
 }
 
 pub fn unregister_subagent_session(task_id: &AgentTaskId) {
     let mut reg = REGISTRY.write();
     let mut session_ended = false;
     let mut pool_key = None;
-    if let Some(count) = reg.active_sessions.get_mut(task_id) {
-        *count = count.saturating_sub(1);
-        if *count == 0 {
-            reg.active_sessions.remove(task_id);
-            if let Some(entry) = reg.entries.get_mut(task_id) {
-                entry.last_session_ended_at = Some(std::time::Instant::now());
-                session_ended = true;
-                pool_key = entry.pool_key.clone();
-            }
+    let (live_count, is_empty) = if let Some(guards) = reg.active_guards.get_mut(task_id) {
+        if let Some(&guard_id) = guards.keys().next() {
+            guards.remove(&guard_id);
+        }
+        (
+            guards.values().filter(|o| is_owner_alive(o)).count(),
+            guards.is_empty(),
+        )
+    } else {
+        (0, false)
+    };
+    if is_empty {
+        reg.active_guards.remove(task_id);
+    }
+    if live_count == 0 {
+        if let Some(entry) = reg.entries.get_mut(task_id) {
+            entry.last_session_ended_at = Some(std::time::Instant::now());
+            session_ended = true;
+            pool_key = entry.pool_key.clone();
         }
     }
     drop(reg);
@@ -2092,22 +2374,13 @@ pub fn unregister_subagent_session(task_id: &AgentTaskId) {
 
 pub fn has_active_subagent_session(task_id: &AgentTaskId) -> bool {
     let reg = REGISTRY.read();
-    reg.active_sessions.get(task_id).copied().unwrap_or(0) > 0
+    reg.has_active_session(task_id)
 }
 
-pub struct SubagentSessionGuard(AgentTaskId);
-
-impl SubagentSessionGuard {
-    pub fn new(task_id: AgentTaskId) -> Self {
-        register_subagent_session(&task_id);
-        Self(task_id)
-    }
-}
-
-impl Drop for SubagentSessionGuard {
-    fn drop(&mut self) {
-        unregister_subagent_session(&self.0);
-    }
+#[cfg(any(test, feature = "test-support"))]
+pub fn active_guards_count(task_id: &AgentTaskId) -> usize {
+    let reg = REGISTRY.read();
+    reg.active_guards.get(task_id).map_or(0, |m| m.len())
 }
 
 fn remove_task_worktree_internal(
@@ -2351,14 +2624,30 @@ pub fn auto_cleanup_task_worktree(
     }
 
     let task_id_clone = task_id.clone();
-    let remove_task = remove_task_worktree_internal(project, task_id, false, cx);
-    cx.spawn(async move |_cx| {
-        if let Err(e) = remove_task.await {
+    cx.spawn(async move |cx| {
+        let (repository, anchor_path, _path_style, _worktree_setting, file_system) = project
+            .update(cx, |project, cx| {
+                anyhow::Ok(task_worktree_context(project, cx))
+            })??;
+        let worktree_path = task_worktree_path_for_id(&task_id_clone)
+            .unwrap_or_else(|| PathBuf::new());
+        if let Err(e) = release_stale_task_worktree(
+            &project,
+            &repository,
+            &file_system,
+            &anchor_path,
+            &task_id_clone,
+            &worktree_path,
+            "auto-cleanup",
+            true,
+            cx,
+        )
+        .await
+        {
             let err_msg = e.to_string();
             record_task_worktree_cleanup_error(&task_id_clone, err_msg);
             return Err(e);
         }
-        unregister_task_worktree(&task_id_clone);
         log::info!("Auto-cleaned worktree for terminal task {task_id_clone}");
         Ok(true)
     })
@@ -2442,7 +2731,7 @@ pub fn startup_sweep(
                         .map_or(true, |pk| pk == &pool_key)
                 })
                 .map(|(id, state)| {
-                    let active = reg.active_sessions.get(id).copied().unwrap_or(0);
+                    let active = reg.live_active_sessions_count(id);
                     let safety = worktree_release_safety_for_state(id, state, active);
                     (
                         id.clone(),
@@ -2516,6 +2805,7 @@ pub fn startup_sweep(
                     &candidate_id,
                     &candidate_path,
                     "startup sweep LRU eviction",
+                    false,
                     cx,
                 )
                 .await;
@@ -3980,7 +4270,7 @@ mod tests {
         assert!(!has_active_subagent_session(&task_id));
 
         {
-            let _guard = SubagentSessionGuard::new(task_id.clone());
+            let _guard = SubagentSessionGuard::test_new(task_id.clone());
             assert!(has_active_subagent_session(&task_id));
         }
 
@@ -5404,7 +5694,7 @@ mod tests {
         };
 
         // Task 1 checks out shared-branch
-        let guard1 = SubagentSessionGuard::new(task1.id.clone());
+        let guard1 = SubagentSessionGuard::test_new(task1.id.clone());
         let path1 = cx
             .update(|cx| {
                 ensure_task_worktree_with_policy(
@@ -5559,7 +5849,7 @@ mod tests {
             .await
             .unwrap();
 
-        let guard_a = SubagentSessionGuard::new(task_a.id.clone());
+        let guard_a = SubagentSessionGuard::test_new(task_a.id.clone());
         let path_a = cx
             .update(|cx| {
                 ensure_task_worktree_with_policy(
@@ -5695,7 +5985,7 @@ mod tests {
         };
 
         // Task 1 checks out branch-c with an active session guard
-        let guard1 = SubagentSessionGuard::new(task1.id.clone());
+        let guard1 = SubagentSessionGuard::test_new(task1.id.clone());
         let path1 = cx
             .update(|cx| {
                 ensure_task_worktree_with_policy(
@@ -6631,14 +6921,14 @@ mod tests {
         };
 
         // Task 1 and Task 2 active sessions
-        let guard1 = SubagentSessionGuard::new(task1.id.clone());
+        let guard1 = SubagentSessionGuard::test_new(task1.id.clone());
         let path1 = cx
             .update(|cx| ensure_task_worktree(project.clone(), &task1, cx))
             .await
             .unwrap();
         assert!(fs.is_dir(&path1).await);
 
-        let guard2 = SubagentSessionGuard::new(task2.id.clone());
+        let guard2 = SubagentSessionGuard::test_new(task2.id.clone());
         let path2 = cx
             .update(|cx| ensure_task_worktree(project.clone(), &task2, cx))
             .await
@@ -6803,7 +7093,7 @@ mod tests {
         };
 
         // Create Task 1 with guard
-        let guard1 = SubagentSessionGuard::new(task1.id.clone());
+        let guard1 = SubagentSessionGuard::test_new(task1.id.clone());
         let path1 = cx
             .update(|cx| ensure_task_worktree(project.clone(), &task1, cx))
             .await
@@ -6823,7 +7113,7 @@ mod tests {
             .unwrap();
         assert!(commit_res1.head_sha.is_some());
 
-        let guard2 = SubagentSessionGuard::new(task2.id.clone());
+        let guard2 = SubagentSessionGuard::test_new(task2.id.clone());
         let path2 = cx
             .update(|cx| ensure_task_worktree(project.clone(), &task2, cx))
             .await
@@ -6954,7 +7244,7 @@ mod tests {
         };
 
         // Task Err is created, guard dropped, but has commit_error
-        let guard_err = SubagentSessionGuard::new(task_err.id.clone());
+        let guard_err = SubagentSessionGuard::test_new(task_err.id.clone());
         let path_err = cx
             .update(|cx| ensure_task_worktree(project.clone(), &task_err, cx))
             .await
@@ -6963,7 +7253,7 @@ mod tests {
         record_task_worktree_commit_error(&task_err.id, "disk quota exceeded".to_string());
 
         // Task Dirty is created, guard dropped, has uncommitted dirty file
-        let guard_dirty = SubagentSessionGuard::new(task_dirty.id.clone());
+        let guard_dirty = SubagentSessionGuard::test_new(task_dirty.id.clone());
         let path_dirty = cx
             .update(|cx| ensure_task_worktree(project.clone(), &task_dirty, cx))
             .await
@@ -7096,7 +7386,7 @@ mod tests {
         };
 
         // Task 1 has active session guard
-        let guard1 = SubagentSessionGuard::new(task1.id.clone());
+        let guard1 = SubagentSessionGuard::test_new(task1.id.clone());
         let path1 = cx
             .update(|cx| ensure_task_worktree(project.clone(), &task1, cx))
             .await
@@ -7216,7 +7506,7 @@ mod tests {
             metrics: None,
         };
 
-        let _guard1 = SubagentSessionGuard::new(task1.id.clone());
+        let _guard1 = SubagentSessionGuard::test_new(task1.id.clone());
         let path1 = cx
             .update(|cx| ensure_task_worktree(project.clone(), &task1, cx))
             .await
@@ -7433,14 +7723,14 @@ mod tests {
         };
 
         // Tasks 1 and 2 occupy the entire pool (limit = 2) with active sessions.
-        let guard1 = SubagentSessionGuard::new(task1.id.clone());
+        let guard1 = SubagentSessionGuard::test_new(task1.id.clone());
         let path1 = cx
             .update(|cx| ensure_task_worktree(project.clone(), &task1, cx))
             .await
             .unwrap();
         assert!(fs.is_dir(&path1).await);
 
-        let guard2 = SubagentSessionGuard::new(task2.id.clone());
+        let guard2 = SubagentSessionGuard::test_new(task2.id.clone());
         let path2 = cx
             .update(|cx| ensure_task_worktree(project.clone(), &task2, cx))
             .await
@@ -7570,17 +7860,17 @@ mod tests {
             metrics: None,
         };
 
-        let g1 = SubagentSessionGuard::new(task1.id.clone());
+        let g1 = SubagentSessionGuard::test_new(task1.id.clone());
         let path1 = cx
             .update(|cx| ensure_task_worktree(project.clone(), &task1, cx))
             .await
             .unwrap();
-        let g2 = SubagentSessionGuard::new(task2.id.clone());
+        let g2 = SubagentSessionGuard::test_new(task2.id.clone());
         let path2 = cx
             .update(|cx| ensure_task_worktree(project.clone(), &task2, cx))
             .await
             .unwrap();
-        let g3 = SubagentSessionGuard::new(task3.id.clone());
+        let g3 = SubagentSessionGuard::test_new(task3.id.clone());
         let path3 = cx
             .update(|cx| ensure_task_worktree(project.clone(), &task3, cx))
             .await
@@ -8080,6 +8370,7 @@ mod tests {
             &task.id,
             &path,
             "for order testing",
+            false,
             &mut cx.to_async(),
         )
         .await;
@@ -8245,6 +8536,7 @@ mod tests {
                     &task_id,
                     &path,
                     "testing retry",
+                    false,
                     &mut cx,
                 )
                 .await
@@ -9243,14 +9535,14 @@ mod tests {
             metrics: None,
         };
 
-        let guard1 = SubagentSessionGuard::new(task1.id.clone());
+        let guard1 = SubagentSessionGuard::test_new(task1.id.clone());
         let path1 = cx
             .update(|cx| ensure_task_worktree(project.clone(), &task1, cx))
             .await
             .unwrap();
         assert!(fs.is_dir(&path1).await);
 
-        let guard2 = SubagentSessionGuard::new(task2.id.clone());
+        let guard2 = SubagentSessionGuard::test_new(task2.id.clone());
         let path2 = cx
             .update(|cx| ensure_task_worktree(project.clone(), &task2, cx))
             .await
@@ -9387,7 +9679,7 @@ mod tests {
                 metrics: None,
             };
 
-            let _guard = SubagentSessionGuard::new(failed_task.id.clone());
+            let _guard = SubagentSessionGuard::test_new(failed_task.id.clone());
             let mut spawn_task = cx.spawn({
                 let project = project.clone();
                 let failed_task = failed_task.clone();
@@ -9791,5 +10083,389 @@ mod tests {
             .await
             .expect("slot must be free and available for next task");
         assert!(fs.is_dir(&succeed_path).await);
+    }
+
+    #[gpui::test]
+    async fn test_pool_stale_guard_with_dead_owner_salvaged_and_evicted(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/root"),
+            json!({
+                ".git": {
+                    "HEAD": "ref: refs/heads/main\n"
+                }
+            }),
+        )
+        .await;
+
+        let dot_git = std::path::Path::new(path!("/root/.git"));
+        fs.with_git_state(dot_git, true, |state| {
+            state
+                .refs
+                .insert("refs/heads/main".into(), "main-sha-stale".into());
+            state.refs.insert("HEAD".into(), "main-sha-stale".into());
+            state.branches.insert("main".into());
+        })
+        .expect("git state setup");
+
+        let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
+
+        cx.update(|cx| {
+            cx.update_global(|store: &mut settings::SettingsStore, cx| {
+                store
+                    .set_user_settings(r#"{ "agent": { "task_worktree_limit": 1 } }"#, cx)
+                    .expect("settings update");
+            });
+        });
+
+        let task1 = AgentTaskSummary {
+            id: AgentTaskId::from("TASK-STALE-OWNER-1"),
+            parent_id: None,
+            goal_id: None,
+            title: "Task 1".to_string(),
+            status: AgentTaskStatus::Running,
+            attempt: 1,
+            assignee: None,
+            write_scopes: vec![],
+            created_at: None,
+            assigned_profile: None,
+            model: None,
+            session_id: None,
+            metrics: None,
+        };
+        let task2 = AgentTaskSummary {
+            id: AgentTaskId::from("TASK-STALE-OWNER-2"),
+            parent_id: None,
+            goal_id: None,
+            title: "Task 2".to_string(),
+            status: AgentTaskStatus::Ready,
+            attempt: 1,
+            assignee: None,
+            write_scopes: vec![],
+            created_at: None,
+            assigned_profile: None,
+            model: None,
+            session_id: None,
+            metrics: None,
+        };
+
+        // Task 1 gets created with a stale guard (owner is gone/dead)
+        let _guard1 = SubagentSessionGuard::test_new_stale(task1.id.clone());
+        let path1 = cx
+            .update(|cx| ensure_task_worktree(project.clone(), &task1, cx))
+            .await
+            .expect("ensure task 1");
+        assert!(fs.is_dir(&path1).await);
+
+        // Add dirty uncommitted file in task 1 worktree
+        fs.save(
+            &path1.join("salvage_file.txt"),
+            &"important dirty changes".into(),
+            text::LineEnding::Unix,
+        )
+        .await
+        .expect("save dirty file");
+
+        // Stale guard means no active session, and safety is Safe
+        assert!(!has_active_subagent_session(&task1.id));
+        assert_eq!(worktree_release_safety(&task1.id), WorktreeReleaseSafety::Safe);
+
+        // Task 2 ensures worktree: pool limit is 1, Task 1 is evicted via salvage path
+        let path2 = cx
+            .update(|cx| ensure_task_worktree(project.clone(), &task2, cx))
+            .await
+            .expect("task 2 acquires slot by evicting stale task 1");
+
+        assert!(!fs.is_dir(&path1).await, "stale task 1 worktree must be removed");
+        assert!(fs.is_dir(&path2).await, "task 2 worktree must exist");
+
+        // Verify task 1 uncommitted changes were salvaged to branch
+        let branch_name = format!("agent-task/{}", task1.id);
+        fs.with_git_state(dot_git, true, |state| {
+            assert!(state.branches.contains(&branch_name), "salvaged branch must exist");
+        })
+        .expect("git state verification");
+    }
+
+    #[gpui::test]
+    async fn test_pool_live_resumed_session_not_evicted(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/root"),
+            json!({
+                ".git": {
+                    "HEAD": "ref: refs/heads/main\n"
+                }
+            }),
+        )
+        .await;
+
+        let dot_git = std::path::Path::new(path!("/root/.git"));
+        fs.with_git_state(dot_git, true, |state| {
+            state
+                .refs
+                .insert("refs/heads/main".into(), "main-sha-resume".into());
+            state.refs.insert("HEAD".into(), "main-sha-resume".into());
+            state.branches.insert("main".into());
+        })
+        .expect("git state setup");
+
+        let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
+
+        cx.update(|cx| {
+            cx.update_global(|store: &mut settings::SettingsStore, cx| {
+                store
+                    .set_user_settings(r#"{ "agent": { "task_worktree_limit": 1 } }"#, cx)
+                    .expect("settings update");
+            });
+        });
+
+        let task1 = AgentTaskSummary {
+            id: AgentTaskId::from("TASK-RESUME-1"),
+            parent_id: None,
+            goal_id: None,
+            title: "Task 1".to_string(),
+            status: AgentTaskStatus::Completed,
+            attempt: 1,
+            assignee: None,
+            write_scopes: vec![],
+            created_at: None,
+            assigned_profile: None,
+            model: None,
+            session_id: None,
+            metrics: None,
+        };
+        let task2 = AgentTaskSummary {
+            id: AgentTaskId::from("TASK-RESUME-2"),
+            parent_id: None,
+            goal_id: None,
+            title: "Task 2".to_string(),
+            status: AgentTaskStatus::Ready,
+            attempt: 1,
+            assignee: None,
+            write_scopes: vec![],
+            created_at: None,
+            assigned_profile: None,
+            model: None,
+            session_id: None,
+            metrics: None,
+        };
+
+        // Create Task 1 worktree initially
+        let path1 = cx
+            .update(|cx| ensure_task_worktree(project.clone(), &task1, cx))
+            .await
+            .expect("ensure task 1");
+        assert!(fs.is_dir(&path1).await);
+        mark_task_terminal(&task1.id);
+
+        // Resume session for completed Task 1 with live owner
+        let resumed_guard = SubagentSessionGuard::test_new(task1.id.clone());
+        assert!(has_active_subagent_session(&task1.id));
+        assert_eq!(
+            worktree_release_safety(&task1.id),
+            WorktreeReleaseSafety::ActiveSession
+        );
+
+        // Task 2 attempts to ensure: pool limit is 1, Task 1 is live resumed session -> must NOT evict -> Task 2 blocks!
+        let mut ensure_task2 = cx.spawn({
+            let project = project.clone();
+            let task2 = task2.clone();
+            |cx| async move {
+                cx.update(|cx| ensure_task_worktree(project, &task2, cx))
+                    .await
+            }
+        });
+
+        cx.run_until_parked();
+        assert!(
+            (&mut ensure_task2).now_or_never().is_none(),
+            "task 2 must block because resumed task 1 has live owner"
+        );
+        assert!(fs.is_dir(&path1).await, "task 1 must remain");
+
+        // End the resumed session
+        drop(resumed_guard);
+        assert!(!has_active_subagent_session(&task1.id));
+
+        // Now task 2 can proceed
+        cx.run_until_parked();
+        let path2 = (&mut ensure_task2)
+            .now_or_never()
+            .expect("task 2 must unblock")
+            .expect("task 2 worktree path");
+        assert!(fs.is_dir(&path2).await);
+    }
+
+    #[test]
+    fn test_timeout_path_leaves_zero_phantoms() {
+        reset_registry_for_tests();
+        let task_id = AgentTaskId::from("TASK-TIMEOUT-PHANTOM");
+
+        let guard = SubagentSessionGuard::test_new(task_id.clone());
+        assert_eq!(active_guards_count(&task_id), 1);
+        assert!(has_active_subagent_session(&task_id));
+
+        drop(guard);
+        assert_eq!(active_guards_count(&task_id), 0);
+        assert!(!has_active_subagent_session(&task_id));
+    }
+
+    #[test]
+    fn test_turn_end_sweep_releases_guards() {
+        reset_registry_for_tests();
+        let task_a = AgentTaskId::from("TASK-SWEEP-A");
+        let task_b = AgentTaskId::from("TASK-SWEEP-B");
+
+        let thread_1 = acp::SessionId::new("thread-turn-1");
+        let thread_2 = acp::SessionId::new("thread-turn-2");
+
+        let tool_use_1 = LanguageModelToolUseId::from("tool-call-1");
+        let tool_use_2 = LanguageModelToolUseId::from("tool-call-2");
+
+        let owner_1a = SubagentSessionOwner {
+            thread_id: thread_1.clone(),
+            tool_use_id: tool_use_1.clone(),
+            thread: None,
+            is_test_live: true,
+        };
+        let owner_1b = SubagentSessionOwner {
+            thread_id: thread_1.clone(),
+            tool_use_id: tool_use_2,
+            thread: None,
+            is_test_live: true,
+        };
+        let owner_2 = SubagentSessionOwner {
+            thread_id: thread_2,
+            tool_use_id: LanguageModelToolUseId::from("tool-call-other"),
+            thread: None,
+            is_test_live: true,
+        };
+
+        let _guard_1a = register_subagent_session_guard(&task_a, owner_1a);
+        let _guard_1b = register_subagent_session_guard(&task_a, owner_1b);
+        let _guard_2 = register_subagent_session_guard(&task_b, owner_2);
+
+        assert_eq!(active_guards_count(&task_a), 2);
+        assert_eq!(active_guards_count(&task_b), 1);
+
+        // Sweeping a single tool use removes only that tool's guard
+        sweep_guards_for_tool_use(&thread_1, &tool_use_1);
+        assert_eq!(active_guards_count(&task_a), 1);
+        assert!(has_active_subagent_session(&task_a));
+
+        // Sweeping thread_1 removes all remaining guards for thread_1
+        sweep_guards_for_thread(&thread_1);
+        assert_eq!(active_guards_count(&task_a), 0);
+        assert!(!has_active_subagent_session(&task_a));
+        assert_eq!(active_guards_count(&task_b), 1);
+        assert!(has_active_subagent_session(&task_b));
+    }
+
+    #[gpui::test]
+    async fn test_lru_eviction_skipped_when_cleanup_disabled(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/root"),
+            json!({
+                ".git": {
+                    "HEAD": "ref: refs/heads/main\n"
+                }
+            }),
+        )
+        .await;
+
+        let dot_git = std::path::Path::new(path!("/root/.git"));
+        fs.with_git_state(dot_git, true, |state| {
+            state
+                .refs
+                .insert("refs/heads/main".into(), "main-sha-nocleanup".into());
+            state.refs.insert("HEAD".into(), "main-sha-nocleanup".into());
+            state.branches.insert("main".into());
+        })
+        .expect("git state setup");
+
+        let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
+
+        // Set limit = 1 and cleanup = false
+        cx.update(|cx| {
+            cx.update_global(|store: &mut settings::SettingsStore, cx| {
+                store
+                    .set_user_settings(
+                        r#"{ "agent": { "task_worktree_limit": 1, "cleanup": false } }"#,
+                        cx,
+                    )
+                    .expect("settings update");
+            });
+        });
+
+        let task1 = AgentTaskSummary {
+            id: AgentTaskId::from("TASK-NOCLEANUP-1"),
+            parent_id: None,
+            goal_id: None,
+            title: "Task 1".to_string(),
+            status: AgentTaskStatus::Completed,
+            attempt: 1,
+            assignee: None,
+            write_scopes: vec![],
+            created_at: None,
+            assigned_profile: None,
+            model: None,
+            session_id: None,
+            metrics: None,
+        };
+        let task2 = AgentTaskSummary {
+            id: AgentTaskId::from("TASK-NOCLEANUP-2"),
+            parent_id: None,
+            goal_id: None,
+            title: "Task 2".to_string(),
+            status: AgentTaskStatus::Ready,
+            attempt: 1,
+            assignee: None,
+            write_scopes: vec![],
+            created_at: None,
+            assigned_profile: None,
+            model: None,
+            session_id: None,
+            metrics: None,
+        };
+
+        // Create Task 1 worktree and commit it so it is Safe for eviction
+        let path1 = cx
+            .update(|cx| ensure_task_worktree(project.clone(), &task1, cx))
+            .await
+            .expect("ensure task 1");
+        assert!(fs.is_dir(&path1).await);
+        let commit_res = commit_task_worktree(
+            fs.clone(),
+            path1.clone(),
+            task1.id.to_string(),
+            false,
+            &mut cx.to_async(),
+        )
+        .await
+        .expect("commit task 1");
+        assert!(commit_res.head_sha.is_some());
+        assert_eq!(worktree_release_safety(&task1.id), WorktreeReleaseSafety::Safe);
+
+        // Task 2 attempts to acquire a slot: because cleanup is disabled, Task 1 must NOT be evicted!
+        let mut ensure_task2 = cx.spawn({
+            let project = project.clone();
+            let task2 = task2.clone();
+            |cx| async move {
+                cx.update(|cx| ensure_task_worktree(project, &task2, cx))
+                    .await
+            }
+        });
+
+        cx.run_until_parked();
+        assert!(
+            (&mut ensure_task2).now_or_never().is_none(),
+            "task 2 must block because cleanup is disabled and eviction is skipped"
+        );
+        assert!(fs.is_dir(&path1).await, "task 1 must remain intact");
     }
 }

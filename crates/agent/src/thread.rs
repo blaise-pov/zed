@@ -2974,6 +2974,7 @@ impl Thread {
             }
         }
 
+        crate::task_worktree::sweep_guards_for_thread(&self.id);
         let Some(running_turn) = self.running_turn.take() else {
             self.flush_pending_message(cx);
             self.is_canceling = false;
@@ -3504,6 +3505,7 @@ impl Thread {
             for content in &pending.content {
                 if let AgentMessageContent::ToolUse(tool_use) = content {
                     if !pending.tool_results.contains_key(&tool_use.id) {
+                        crate::task_worktree::sweep_guards_for_tool_use(&thread_id, &tool_use.id);
                         log::info!(
                             "[cancel-audit] thread={} tool_use_id={} tool_name={} source={}",
                             thread_id,
@@ -3552,6 +3554,7 @@ impl Thread {
                 for content in &agent_msg.content {
                     if let AgentMessageContent::ToolUse(tool_use) = content {
                         if !agent_msg.tool_results.contains_key(&tool_use.id) {
+                            crate::task_worktree::sweep_guards_for_tool_use(&thread_id, &tool_use.id);
                             log::info!(
                                 "[cancel-audit] thread={} tool_use_id={} tool_name={} source={}",
                                 thread_id,
@@ -3603,6 +3606,7 @@ impl Thread {
         error: &anyhow::Error,
         cx: &mut Context<Self>,
     ) {
+        crate::task_worktree::sweep_guards_for_thread(&self.id);
         let thread_id = self.id.clone();
         log::info!(
             "[cancel-audit] thread={} source=continuation_failure error={}",
@@ -3639,6 +3643,7 @@ impl Thread {
         timeout: Duration,
         cx: &mut Context<Self>,
     ) {
+        crate::task_worktree::sweep_guards_for_thread(&self.id);
         let thread_id = self.id.clone();
         let timeout_secs = timeout.as_secs();
         log::info!(
@@ -3695,7 +3700,7 @@ impl Thread {
 
         let (events_tx, events_rx) = mpsc::unbounded::<Result<ThreadEvent>>();
         let event_stream = ThreadEventStream::new(events_tx);
-        let _message_ix = self.messages.len().saturating_sub(1);
+        let message_ix = self.messages.len().saturating_sub(1);
         self.clear_summary();
         let tools = self.enabled_tools(cx);
         let (cancellation_tx, mut cancellation_rx) = watch::channel(false);
@@ -3780,7 +3785,10 @@ impl Thread {
                 match turn_result {
                     Ok(()) => {
                         log::debug!("Turn execution completed");
-                        _ = this.update(cx, |this, cx| this.flush_pending_message(cx));
+                        _ = this.update(cx, |this, cx| {
+                            this.flush_pending_message(cx);
+                            crate::task_worktree::sweep_guards_for_thread(&this.id);
+                        });
                         event_stream.send_stop(acp::StopReason::EndTurn);
                     }
                     Err(error) => {
@@ -3792,6 +3800,8 @@ impl Thread {
                             event_stream.send_stop(acp::StopReason::Refusal);
                             _ = this.update(cx, |this, cx| {
                                 this.flush_pending_message(cx);
+                                this.messages.truncate(message_ix);
+                                crate::task_worktree::sweep_guards_for_thread(&this.id);
                             });
                         } else {
                             _ = this.update(cx, |this, cx| {
@@ -5496,6 +5506,7 @@ impl Thread {
                     tool_use.id,
                     tool_use.name
                 );
+                crate::task_worktree::sweep_guards_for_tool_use(&self.id, &tool_use.id);
                 let result = Self::synthetic_canceled_tool_result(
                     tool_use,
                     &self.running_subagents,
@@ -6583,12 +6594,27 @@ impl WatchdogHandle {
     }
 }
 
+static RUNNING_TURNS: std::sync::LazyLock<parking_lot::RwLock<HashSet<acp::SessionId>>> =
+    std::sync::LazyLock::new(|| parking_lot::RwLock::new(HashSet::default()));
+
+pub fn is_thread_turn_running(thread_id: &acp::SessionId) -> bool {
+    RUNNING_TURNS.read().contains(thread_id)
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub fn register_running_turn_for_tests(thread_id: acp::SessionId) -> impl Drop {
+    RUNNING_TURNS.write().insert(thread_id.clone());
+    util::defer(move || {
+        RUNNING_TURNS.write().remove(&thread_id);
+    })
+}
+
 struct RunningTurn {
     thread_id: acp::SessionId,
     /// Holds the task that handles agent interaction until the end of the turn.
     /// Survives across multiple requests as the model performs tool calls and
     /// we run tools, report their results.
-    _task: Task<()>,
+    _task: Option<Task<()>>,
     _watchdog_task: Task<()>,
     /// The current event stream for the running turn. Used to report a final
     /// cancellation event if we cancel the turn.
@@ -6615,9 +6641,10 @@ impl RunningTurn {
         watchdog_task: Task<()>,
         watchdog_handle: WatchdogHandle,
     ) -> Self {
+        RUNNING_TURNS.write().insert(thread_id.clone());
         Self {
             thread_id,
-            _task: task,
+            _task: Some(task),
             _watchdog_task: watchdog_task,
             event_stream,
             tools,
@@ -6627,7 +6654,7 @@ impl RunningTurn {
         }
     }
 
-    fn cancel(self) -> Task<()> {
+    fn cancel(mut self) -> Task<()> {
         log::debug!("Cancelling in progress turn");
         log::info!(
             "[cancel-audit] thread={} source=cancellation_tx_signaled",
@@ -6635,7 +6662,14 @@ impl RunningTurn {
         );
         self.cancellation_tx.lock().send(true).ok();
         self.event_stream.send_canceled();
-        self._task
+        self._task.take().unwrap_or_else(|| Task::ready(()))
+    }
+}
+
+impl Drop for RunningTurn {
+    fn drop(&mut self) {
+        RUNNING_TURNS.write().remove(&self.thread_id);
+        crate::task_worktree::sweep_guards_for_thread(&self.thread_id);
     }
 }
 
@@ -7683,6 +7717,17 @@ impl ToolCallEventStream {
             profile_id,
             is_subagent,
         }
+    }
+
+    pub fn thread(&self) -> Option<&WeakEntity<Thread>> {
+        self.thread.as_ref()
+    }
+
+    pub fn session_id(&self, cx: &App) -> Option<acp::SessionId> {
+        self.thread
+            .as_ref()
+            .and_then(|t| t.upgrade())
+            .map(|t| t.read(cx).id().clone())
     }
 
     /// Whether the owning thread is a subagent, so prompts can say "for this
