@@ -62,6 +62,8 @@ use test_tools::*;
 
 /// Returns the fake provider that serves the registry's default model.
 pub(crate) fn init_test(cx: &mut TestAppContext) -> Arc<FakeLanguageModelProvider> {
+    crate::task_worktree::reset_registry_for_tests();
+    crate::agent_task_store::reset_registry_for_tests();
     cx.update(|cx| {
         let settings_store = SettingsStore::test(cx);
         cx.set_global(settings_store);
@@ -7949,7 +7951,7 @@ async fn test_spawn_agent_one_session_per_task(cx: &mut TestAppContext) {
     let task_id_typed = AgentTaskId::from(task_id.clone());
 
     // Hold a session guard to simulate an actively running session for task_id
-    let guard = task_worktree::SubagentSessionGuard::new(task_id_typed.clone());
+    let guard = task_worktree::SubagentSessionGuard::test_new(task_id_typed.clone());
 
     // A second spawn with the same task_id while guard is alive -> returns Error
     let (event_stream, _rx) = ToolCallEventStream::test();

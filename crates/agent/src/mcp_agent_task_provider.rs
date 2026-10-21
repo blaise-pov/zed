@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use anyhow::{Context as _, Result};
 use context_server::ContextServerId;
 use gpui::{App, Entity, Task};
@@ -8,6 +10,7 @@ use crate::agent_task::{
     AgentTaskProvider, AgentTaskStatus, AgentTurnRecord,
 };
 
+#[derive(Clone)]
 pub struct McpAgentTaskProvider {
     store: Entity<ContextServerStore>,
     server_id: ContextServerId,
@@ -15,7 +18,9 @@ pub struct McpAgentTaskProvider {
 
 impl McpAgentTaskProvider {
     pub fn new(store: Entity<ContextServerStore>, server_id: ContextServerId) -> Self {
-        Self { store, server_id }
+        let provider = Self { store, server_id };
+        crate::task_worktree::register_task_provider(Arc::new(provider.clone()));
+        provider
     }
 
     fn call_tool(
@@ -70,6 +75,66 @@ impl McpAgentTaskProvider {
                 Ok(parsed)
             }
         })
+    }
+
+    pub fn record_task_event(
+        &self,
+        id: &AgentTaskId,
+        kind: &str,
+        message: &str,
+        cx: &mut App,
+    ) -> Task<Result<()>> {
+        let mut event_args = serde_json::Map::new();
+        event_args.insert(
+            "task_id".to_string(),
+            serde_json::Value::String(id.to_string()),
+        );
+        event_args.insert(
+            "kind".to_string(),
+            serde_json::Value::String(kind.to_string()),
+        );
+        event_args.insert(
+            "message".to_string(),
+            serde_json::Value::String(message.to_string()),
+        );
+
+        let event_task = self.call_tool("task_event", Some(event_args), cx);
+        let store = self.store.clone();
+        let server_id = self.server_id.clone();
+        let id_clone = id.clone();
+        let message_clone = message.to_string();
+
+        cx.spawn(async move |cx| {
+            if event_task.await.is_ok() {
+                return Ok(());
+            }
+
+            let mut update_args = serde_json::Map::new();
+            update_args.insert(
+                "task_id".to_string(),
+                serde_json::Value::String(id_clone.to_string()),
+            );
+            update_args.insert(
+                "error".to_string(),
+                serde_json::Value::String(message_clone),
+            );
+
+            let fallback_task = cx.update(|cx| {
+                let provider = McpAgentTaskProvider::new(store, server_id);
+                provider.call_tool("task_update", Some(update_args), cx)
+            });
+            fallback_task.await?;
+            Ok(())
+        })
+    }
+
+    pub fn record_task_error(
+        &self,
+        id: &AgentTaskId,
+        error: &str,
+        cx: &mut App,
+    ) -> Task<Result<()>> {
+        self.record_task_event(id, "error", error, cx)
     }
 }
 
@@ -623,5 +688,193 @@ impl AgentTaskProvider for McpAgentTaskProvider {
             task.await?;
             Ok(())
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fs::Fs as _;
+    use futures::StreamExt as _;
+    use futures::channel::mpsc;
+    use gpui::TestAppContext;
+    use project::Project;
+    use settings::Settings as _;
+    use std::sync::Arc;
+
+    async fn setup_test_provider(
+        cx: &mut TestAppContext,
+        fake_transport: context_server::test::FakeTransport,
+    ) -> McpAgentTaskProvider {
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+
+            let mut settings = project::project_settings::ProjectSettings::get_global(cx).clone();
+            settings.context_servers.insert(
+                "tgs".into(),
+                project::project_settings::ContextServerSettings::Stdio {
+                    enabled: true,
+                    remote: false,
+                    command: context_server::ContextServerCommand {
+                        path: "mock".into(),
+                        args: Vec::new(),
+                        env: None,
+                        timeout: None,
+                        platforms: Default::default(),
+                    },
+                },
+            );
+            project::project_settings::ProjectSettings::override_global(settings, cx);
+        });
+
+        let fs = fs::FakeFs::new(cx.executor());
+        fs.create_dir(std::path::Path::new("/root")).await.unwrap();
+        let project = Project::test(fs.clone(), [std::path::Path::new("/root")], cx).await;
+
+        let context_server_store = project.read_with(cx, |p, _| p.context_server_store());
+        context_server_store.update(cx, |store, cx| {
+            store.start_server(
+                Arc::new(context_server::ContextServer::new(
+                    ContextServerId("tgs".into()),
+                    Arc::new(fake_transport),
+                )),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        McpAgentTaskProvider::new(
+            context_server_store,
+            ContextServerId("tgs".into()),
+        )
+    }
+
+    #[gpui::test]
+    async fn test_record_task_error_uses_task_event(cx: &mut TestAppContext) {
+        let (calls_tx, mut calls_rx) = mpsc::unbounded();
+
+        let fake_transport = context_server::test::create_fake_transport("tgs", cx.executor())
+            .on_request::<context_server::types::requests::Initialize, _>(
+                move |_params| async move {
+                    context_server::types::InitializeResponse {
+                        protocol_version: context_server::types::ProtocolVersion(
+                            context_server::types::LATEST_PROTOCOL_VERSION.to_string(),
+                        ),
+                        server_info: context_server::types::Implementation {
+                            name: "tgs".into(),
+                            title: None,
+                            version: "1.0.0".to_string(),
+                            description: None,
+                        },
+                        capabilities: context_server::types::ServerCapabilities {
+                            tools: Some(context_server::types::ToolsCapabilities {
+                                list_changed: Some(true),
+                            }),
+                            ..Default::default()
+                        },
+                        meta: None,
+                    }
+                },
+            )
+            .on_request::<context_server::types::requests::CallTool, _>(move |params| {
+                let calls_tx = calls_tx.clone();
+                async move {
+                    calls_tx.unbounded_send(params).ok();
+                    context_server::types::CallToolResponse {
+                        content: vec![context_server::types::ToolResponseContent::Text {
+                            text: "ok".into(),
+                        }],
+                        is_error: None,
+                        meta: None,
+                        structured_content: None,
+                    }
+                }
+            });
+
+        let provider = setup_test_provider(cx, fake_transport).await;
+
+        let task = cx.update(|cx| {
+            provider.record_task_error(&AgentTaskId::from("TASK-42"), "simulated commit error", cx)
+        });
+        task.await.unwrap();
+
+        let call = calls_rx.next().await.expect("expected task_event call");
+        assert_eq!(call.name, "task_event");
+        let args = call.arguments.expect("expected args");
+        assert_eq!(args.get("task_id").and_then(|v| v.as_str()), Some("TASK-42"));
+        assert_eq!(args.get("kind").and_then(|v| v.as_str()), Some("error"));
+        assert_eq!(args.get("message").and_then(|v| v.as_str()), Some("simulated commit error"));
+    }
+
+    #[gpui::test]
+    async fn test_record_task_error_falls_back_to_task_update(cx: &mut TestAppContext) {
+        let (calls_tx, mut calls_rx) = mpsc::unbounded();
+
+        let fake_transport = context_server::test::create_fake_transport("tgs", cx.executor())
+            .on_request::<context_server::types::requests::Initialize, _>(
+                move |_params| async move {
+                    context_server::types::InitializeResponse {
+                        protocol_version: context_server::types::ProtocolVersion(
+                            context_server::types::LATEST_PROTOCOL_VERSION.to_string(),
+                        ),
+                        server_info: context_server::types::Implementation {
+                            name: "tgs".into(),
+                            title: None,
+                            version: "1.0.0".to_string(),
+                            description: None,
+                        },
+                        capabilities: context_server::types::ServerCapabilities {
+                            tools: Some(context_server::types::ToolsCapabilities {
+                                list_changed: Some(true),
+                            }),
+                            ..Default::default()
+                        },
+                        meta: None,
+                    }
+                },
+            )
+            .on_request::<context_server::types::requests::CallTool, _>(move |params| {
+                let calls_tx = calls_tx.clone();
+                async move {
+                    let is_task_event = params.name == "task_event";
+                    calls_tx.unbounded_send(params).ok();
+                    if is_task_event {
+                        context_server::types::CallToolResponse {
+                            content: vec![context_server::types::ToolResponseContent::Text {
+                                text: "task_event not supported".into(),
+                            }],
+                            is_error: Some(true),
+                            meta: None,
+                            structured_content: None,
+                        }
+                    } else {
+                        context_server::types::CallToolResponse {
+                            content: vec![context_server::types::ToolResponseContent::Text {
+                                text: "ok".into(),
+                            }],
+                            is_error: None,
+                            meta: None,
+                            structured_content: None,
+                        }
+                    }
+                }
+            });
+
+        let provider = setup_test_provider(cx, fake_transport).await;
+
+        let task = cx.update(|cx| {
+            provider.record_task_error(&AgentTaskId::from("TASK-42"), "simulated commit error", cx)
+        });
+        task.await.unwrap();
+
+        let first_call = calls_rx.next().await.expect("expected task_event call");
+        assert_eq!(first_call.name, "task_event");
+
+        let second_call = calls_rx.next().await.expect("expected task_update fallback call");
+        assert_eq!(second_call.name, "task_update");
+        let args = second_call.arguments.expect("expected args");
+        assert_eq!(args.get("task_id").and_then(|v| v.as_str()), Some("TASK-42"));
+        assert_eq!(args.get("error").and_then(|v| v.as_str()), Some("simulated commit error"));
     }
 }

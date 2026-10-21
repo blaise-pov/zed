@@ -2056,10 +2056,7 @@ impl Thread {
         stream: &ThreadEventStream,
         cx: &mut Context<Self>,
     ) {
-        // A tool call left only with the canceled sentinel produced nothing useful
-        // (the sentinel is model-facing only, and is inserted exactly when a tool
-        // had no real result). Don't replay it into the UI at all.
-        if tool_result.is_some_and(Self::is_canceled_tool_result) {
+        if tool_result.is_some_and(Self::is_canceled_tool_result) && tool_use.name.as_ref() != "spawn_agent" {
             return;
         }
 
@@ -2097,6 +2094,41 @@ impl Thread {
                 })
         });
 
+        let meta = if tool_use.name.as_ref() == "spawn_agent" {
+            let session_info = output
+                .as_ref()
+                .and_then(|out| serde_json::from_value::<crate::tools::SpawnAgentToolOutput>(out.clone()).ok())
+                .and_then(|spawn_out| match spawn_out {
+                    crate::tools::SpawnAgentToolOutput::Success { session_info, .. } => Some(session_info),
+                    crate::tools::SpawnAgentToolOutput::Error { session_info, .. } => session_info,
+                })
+                .or_else(|| {
+                    let json = tool_use.input.clone().into_json().ok()?;
+                    let parsed_input = serde_json::from_value::<crate::tools::SpawnAgentToolInput>(json).ok()?;
+                    let task_id = parsed_input.task_id.clone();
+                    let session_id = parsed_input.session_id.or_else(|| {
+                        task_id.as_ref().and_then(|tid| {
+                            crate::task_worktree::task_session_id_for_id(&crate::AgentTaskId::from(tid.clone()))
+                                .map(acp::SessionId::new)
+                        })
+                    })?;
+                    Some(acp_thread::SubagentSessionInfo {
+                        session_id,
+                        message_start_index: 0,
+                        message_end_index: None,
+                    })
+                });
+
+            session_info.map(|session_info| {
+                acp::Meta::from_iter([(
+                    acp_thread::SUBAGENT_SESSION_INFO_META_KEY.into(),
+                    serde_json::json!(&session_info),
+                )])
+            })
+        } else {
+            None
+        };
+
         let Some(tool) = tool else {
             // Tool not found (e.g., MCP server not connected after restart),
             // but still display the saved result if available.
@@ -2115,7 +2147,7 @@ impl Thread {
             if let Some(content) = replay_content {
                 fields = fields.content(content);
             }
-            stream.update_tool_call_fields(&tool_call_id, fields, None);
+            stream.update_tool_call_fields(&tool_call_id, fields, meta);
             return;
         };
 
@@ -2152,12 +2184,26 @@ impl Thread {
             tool.replay(input, output, tool_event_stream, cx).log_err();
         }
 
+        if tool_use.name.as_ref() == "spawn_agent" && output.is_none() {
+            stream.update_tool_call_fields(
+                &tool_call_id,
+                acp::ToolCallUpdateFields::new().content(vec![
+                    acp::ToolCallContent::Content(acp::Content::new(
+                        acp::ContentBlock::Text(acp::TextContent::new(
+                            "spawn_agent canceled: result not delivered".to_string(),
+                        )),
+                    )),
+                ]),
+                meta.clone(),
+            );
+        }
+
         stream.update_tool_call_fields(
             &tool_call_id,
             acp::ToolCallUpdateFields::new()
                 .status(status)
                 .raw_output(output),
-            None,
+            meta,
         );
     }
 
@@ -2928,6 +2974,7 @@ impl Thread {
             }
         }
 
+        crate::task_worktree::sweep_guards_for_thread(&self.id);
         let Some(running_turn) = self.running_turn.take() else {
             self.flush_pending_message(cx);
             self.is_canceling = false;
@@ -3368,11 +3415,111 @@ impl Thread {
         cx.notify();
     }
 
+    fn synthetic_canceled_tool_result(
+        tool_use: &LanguageModelToolUse,
+        running_subagents: &[WeakEntity<Thread>],
+        failure_reason: Option<&str>,
+        cx: Option<&App>,
+    ) -> LanguageModelToolResult {
+        if tool_use.name.as_ref() == "spawn_agent" {
+            let parsed_input = tool_use
+                .input
+                .clone()
+                .into_json()
+                .ok()
+                .and_then(|json| {
+                    serde_json::from_value::<crate::tools::SpawnAgentToolInput>(json).ok()
+                });
+            let task_id = parsed_input.as_ref().and_then(|i| i.task_id.clone());
+            let session_id = parsed_input
+                .as_ref()
+                .and_then(|i| i.session_id.clone())
+                .or_else(|| {
+                    task_id.as_ref().and_then(|tid| {
+                        crate::task_worktree::task_session_id_for_id(
+                            &crate::AgentTaskId::from(tid.clone()),
+                        )
+                        .map(acp::SessionId::new)
+                    })
+                })
+                .or_else(|| {
+                    let cx = cx?;
+                    running_subagents.iter().find_map(|sub| {
+                        sub.upgrade().map(|s| s.read(cx).id.clone())
+                    })
+                });
+
+            let session_info = session_id.map(|sid| acp_thread::SubagentSessionInfo {
+                session_id: sid,
+                message_start_index: 0,
+                message_end_index: None,
+            });
+
+            let error_msg = failure_reason.map_or_else(
+                || "spawn_agent canceled: result not delivered".to_string(),
+                |reason| format!("Tool call failed: {reason}"),
+            );
+
+            let output = serde_json::to_value(crate::tools::SpawnAgentToolOutput::Error {
+                session_id: session_info.as_ref().map(|s| s.session_id.clone()),
+                error: error_msg.clone(),
+                session_info,
+                isolation: None,
+                isolation_details: None,
+            })
+            .ok();
+
+            LanguageModelToolResult {
+                tool_use_id: tool_use.id.clone(),
+                tool_name: tool_use.name.clone(),
+                is_error: true,
+                content: vec![LanguageModelToolResultContent::Text(error_msg.into())],
+                output,
+            }
+        } else {
+            let content_text = failure_reason.map_or_else(
+                || TOOL_CANCELED_MESSAGE.to_string(),
+                |reason| format!("Tool call failed: {reason}"),
+            );
+            LanguageModelToolResult {
+                tool_use_id: tool_use.id.clone(),
+                tool_name: tool_use.name.clone(),
+                is_error: true,
+                content: vec![LanguageModelToolResultContent::Text(content_text.into())],
+                output: None,
+            }
+        }
+    }
+
+    fn spawn_agent_failed_meta(
+        tool_name: &str,
+        result: &LanguageModelToolResult,
+    ) -> Option<acp::Meta> {
+        if tool_name != "spawn_agent" {
+            return None;
+        }
+        result.output.as_ref().and_then(|out| {
+            let err: crate::tools::SpawnAgentToolOutput =
+                serde_json::from_value(out.clone()).ok()?;
+            match err {
+                crate::tools::SpawnAgentToolOutput::Error {
+                    session_info: Some(session_info),
+                    ..
+                } => Some(acp::Meta::from_iter([(
+                    acp_thread::SUBAGENT_SESSION_INFO_META_KEY.into(),
+                    serde_json::json!(&session_info),
+                )])),
+                _ => None,
+            }
+        })
+    }
+
     fn finalize_in_flight_tool_calls(
         &mut self,
         event_stream: &ThreadEventStream,
         audit_source: &str,
         failure_reason: &str,
+        cx: Option<&App>,
     ) {
         let thread_id = self.id.clone();
 
@@ -3381,6 +3528,7 @@ impl Thread {
             for content in &pending.content {
                 if let AgentMessageContent::ToolUse(tool_use) = content {
                     if !pending.tool_results.contains_key(&tool_use.id) {
+                        crate::task_worktree::sweep_guards_for_tool_use(&thread_id, &tool_use.id);
                         log::info!(
                             "[cancel-audit] thread={} tool_use_id={} tool_name={} source={}",
                             thread_id,
@@ -3388,23 +3536,19 @@ impl Thread {
                             tool_use.name,
                             audit_source
                         );
-                        pending.tool_results.insert(
-                            tool_use.id.clone(),
-                            LanguageModelToolResult {
-                                tool_use_id: tool_use.id.clone(),
-                                tool_name: tool_use.name.clone(),
-                                is_error: true,
-                                content: vec![LanguageModelToolResultContent::Text(
-                                    format!("Tool call failed: {failure_reason}").into(),
-                                )],
-                                output: None,
-                            },
+                        let result = Self::synthetic_canceled_tool_result(
+                            tool_use,
+                            &self.running_subagents,
+                            Some(failure_reason),
+                            cx,
                         );
+                        let meta = Self::spawn_agent_failed_meta(&tool_use.name, &result);
+                        pending.tool_results.insert(tool_use.id.clone(), result);
                         let tool_call_id = scoped_tool_call_id(owning_message_ix, &tool_use.id);
                         event_stream.update_tool_call_fields(
                             &tool_call_id,
                             acp::ToolCallUpdateFields::new().status(acp::ToolCallStatus::Failed),
-                            None,
+                            meta,
                         );
                     }
                 }
@@ -3416,6 +3560,7 @@ impl Thread {
                 for content in &agent_msg.content {
                     if let AgentMessageContent::ToolUse(tool_use) = content {
                         if !agent_msg.tool_results.contains_key(&tool_use.id) {
+                            crate::task_worktree::sweep_guards_for_tool_use(&thread_id, &tool_use.id);
                             log::info!(
                                 "[cancel-audit] thread={} tool_use_id={} tool_name={} source={}",
                                 thread_id,
@@ -3423,23 +3568,19 @@ impl Thread {
                                 tool_use.name,
                                 audit_source
                             );
-                            agent_msg.tool_results.insert(
-                                tool_use.id.clone(),
-                                LanguageModelToolResult {
-                                    tool_use_id: tool_use.id.clone(),
-                                    tool_name: tool_use.name.clone(),
-                                    is_error: true,
-                                    content: vec![LanguageModelToolResultContent::Text(
-                                        format!("Tool call failed: {failure_reason}").into(),
-                                    )],
-                                    output: None,
-                                },
+                            let result = Self::synthetic_canceled_tool_result(
+                                tool_use,
+                                &self.running_subagents,
+                                Some(failure_reason),
+                                cx,
                             );
+                            let meta = Self::spawn_agent_failed_meta(&tool_use.name, &result);
+                            agent_msg.tool_results.insert(tool_use.id.clone(), result);
                             let tool_call_id = scoped_tool_call_id(msg_ix, &tool_use.id);
                             event_stream.update_tool_call_fields(
                                 &tool_call_id,
                                 acp::ToolCallUpdateFields::new().status(acp::ToolCallStatus::Failed),
-                                None,
+                                meta,
                             );
                         }
                     }
@@ -3454,6 +3595,7 @@ impl Thread {
         error: &anyhow::Error,
         cx: &mut Context<Self>,
     ) {
+        crate::task_worktree::sweep_guards_for_thread(&self.id);
         let thread_id = self.id.clone();
         log::info!(
             "[cancel-audit] thread={} source=continuation_failure error={}",
@@ -3465,6 +3607,7 @@ impl Thread {
             event_stream,
             "continuation_failure_tool_finalized",
             &format!("continuation failed: {error}"),
+            Some(cx),
         );
 
         self.flush_pending_message(cx);
@@ -3489,6 +3632,7 @@ impl Thread {
         timeout: Duration,
         cx: &mut Context<Self>,
     ) {
+        crate::task_worktree::sweep_guards_for_thread(&self.id);
         let thread_id = self.id.clone();
         let timeout_secs = timeout.as_secs();
         log::info!(
@@ -3504,6 +3648,7 @@ impl Thread {
             event_stream,
             "watchdog_tool_finalized",
             "turn timed out with no progress",
+            Some(cx),
         );
 
         self.flush_pending_message(cx);
@@ -3544,7 +3689,6 @@ impl Thread {
 
         let (events_tx, events_rx) = mpsc::unbounded::<Result<ThreadEvent>>();
         let event_stream = ThreadEventStream::new(events_tx);
-        let message_ix = self.messages.len().saturating_sub(1);
         self.clear_summary();
         let tools = self.enabled_tools(cx);
         let (cancellation_tx, mut cancellation_rx) = watch::channel(false);
@@ -3629,7 +3773,10 @@ impl Thread {
                 match turn_result {
                     Ok(()) => {
                         log::debug!("Turn execution completed");
-                        _ = this.update(cx, |this, cx| this.flush_pending_message(cx));
+                        _ = this.update(cx, |this, cx| {
+                            this.flush_pending_message(cx);
+                            crate::task_worktree::sweep_guards_for_thread(&this.id);
+                        });
                         event_stream.send_stop(acp::StopReason::EndTurn);
                     }
                     Err(error) => {
@@ -3641,7 +3788,7 @@ impl Thread {
                             event_stream.send_stop(acp::StopReason::Refusal);
                             _ = this.update(cx, |this, cx| {
                                 this.flush_pending_message(cx);
-                                this.messages.truncate(message_ix);
+                                crate::task_worktree::sweep_guards_for_thread(&this.id);
                             });
                         } else {
                             _ = this.update(cx, |this, cx| {
@@ -4821,7 +4968,12 @@ impl Thread {
         cx.spawn(async move |this, cx| {
             let _tool_guard = tool_guard;
             let mut detected_merge_conflicts: Option<Vec<String>> = None;
-            if is_task_complete {
+            let mut detected_commit_error: Option<String> = None;
+            let is_agent_mode = project.read_with(cx, |project, cx| {
+                agent_settings::AgentSettings::get_for_project(project, cx).task_lifecycle_mode
+                    == agent_settings::TaskLifecycleMode::Agent
+            });
+            if is_task_complete && !is_agent_mode {
                 if let Some(task_id_str) = terminal_task_id_for_merge {
                     let task_id = crate::AgentTaskId::from(task_id_str);
                     let project_clone = project.clone();
@@ -4833,24 +4985,12 @@ impl Thread {
                             cx,
                         )
                     });
+                    let mut commit_error_to_record = None;
                     if let Ok(merge_task) = merge_task {
                         match merge_task.await {
                             Ok(details) => {
                                 if let Some(err) = details.commit_error {
-                                    return (
-                                        owning_message_ix,
-                                        LanguageModelToolResult {
-                                            tool_use_id,
-                                            tool_name,
-                                            is_error: true,
-                                            content: vec![LanguageModelToolResultContent::Text(
-                                                Arc::from(format!(
-                                                    "Failed to commit task worktree: {err}"
-                                                )),
-                                            )],
-                                            output: None,
-                                        },
-                                    );
+                                    commit_error_to_record = Some(err);
                                 }
                                 if let Some(conflicts) = details.merge_conflict {
                                     if !conflicts.is_empty() {
@@ -4862,22 +5002,44 @@ impl Thread {
                                 log::warn!(
                                     "Failed to commit and merge task worktree for {task_id}: {e}"
                                 );
-                                return (
-                                    owning_message_ix,
-                                    LanguageModelToolResult {
-                                        tool_use_id,
-                                        tool_name,
-                                        is_error: true,
-                                        content: vec![LanguageModelToolResultContent::Text(
-                                            Arc::from(format!(
-                                                "Failed to commit and merge task worktree: {e}"
-                                            )),
-                                        )],
-                                        output: None,
-                                    },
+                                commit_error_to_record = Some(e.to_string());
+                            }
+                        }
+                    }
+
+                    if let Some(err) = commit_error_to_record {
+                        crate::task_worktree::record_task_worktree_commit_error(
+                            &task_id,
+                            err.clone(),
+                        );
+                        let project_clone = project.clone();
+                        let record_task = this.update(cx, |_this, cx| {
+                            let context_server_store =
+                                project_clone.read(cx).context_server_store();
+                            let server_id = context_server::ContextServerId(
+                                agent_settings::AgentSettings::get_for_project(
+                                    project_clone.read(cx),
+                                    cx,
+                                )
+                                .task_graph_server_id
+                                .clone()
+                                .into(),
+                            );
+                            let provider =
+                                crate::mcp_agent_task_provider::McpAgentTaskProvider::new(
+                                    context_server_store,
+                                    server_id,
+                                );
+                            provider.record_task_error(&task_id, &err, cx)
+                        });
+                        if let Ok(task) = record_task {
+                            if let Err(e) = task.await {
+                                log::warn!(
+                                    "Failed to publish task commit error to TGS for {task_id}: {e}"
                                 );
                             }
                         }
+                        detected_commit_error = Some(err);
                     }
                 }
             }
@@ -4930,6 +5092,21 @@ impl Thread {
                                     other => other,
                                 })
                                 .collect();
+                            if let Some(conflicts) = detected_merge_conflicts {
+                                output.llm_output.push(LanguageModelToolResultContent::Text(Arc::from(
+                                    format!(
+                                        "\nMerge conflict detected merging into goal branch: {:?}. Task marked complete, but manual resolution may be required.",
+                                        conflicts
+                                    ),
+                                )));
+                            }
+                            if let Some(err) = detected_commit_error {
+                                output.llm_output.push(LanguageModelToolResultContent::Text(Arc::from(
+                                    format!(
+                                        "\nCommit error detected for task worktree: {err}. Task marked complete, but worktree was retained for recovery.",
+                                    ),
+                                )));
+                            }
                             (false, output)
                         } else {
                             let output = anyhow::anyhow!(
@@ -4947,6 +5124,13 @@ impl Thread {
                                 ),
                             )));
                         }
+                        if let Some(err) = detected_commit_error {
+                            output.llm_output.push(LanguageModelToolResultContent::Text(Arc::from(
+                                format!(
+                                    "\nCommit error detected for task worktree: {err}. Task marked complete, but worktree was retained for recovery.",
+                                ),
+                            )));
+                        }
                         (false, output)
                     }
                 }
@@ -4956,7 +5140,9 @@ impl Thread {
             if !is_error {
                 if let Some(task_id) = terminal_task_id {
                     let task_id = crate::AgentTaskId::from(task_id);
-                    crate::task_worktree::mark_task_terminal(&task_id);
+                    if !is_agent_mode {
+                        crate::task_worktree::mark_task_terminal(&task_id);
+                    }
                     let project = project.clone();
                     this.update(cx, |_this, cx| {
                         crate::task_worktree::auto_cleanup_task_worktree(project, &task_id, cx)
@@ -4966,17 +5152,19 @@ impl Thread {
                 }
 
                 if let Some(goal_id) = completed_goal_id {
-                    let project = project.clone();
-                    let graduation_task = this.update(cx, |_this, cx| {
-                        crate::task_worktree::prepare_and_publish_goal_graduation(
-                            project, &goal_id, cx,
-                        )
-                    });
-                    if let Ok(task) = graduation_task {
-                        if let Err(e) = task.await {
-                            log::warn!(
-                                "Failed to prepare and publish goal graduation for {goal_id}: {e}"
-                            );
+                    if !is_agent_mode {
+                        let project = project.clone();
+                        let graduation_task = this.update(cx, |_this, cx| {
+                            crate::task_worktree::prepare_and_publish_goal_graduation(
+                                project, &goal_id, cx,
+                            )
+                        });
+                        if let Ok(task) = graduation_task {
+                            if let Err(e) = task.await {
+                                log::warn!(
+                                    "Failed to prepare and publish goal graduation for {goal_id}: {e}"
+                                );
+                            }
                         }
                     }
                 }
@@ -5346,18 +5534,14 @@ impl Thread {
                     tool_use.id,
                     tool_use.name
                 );
-                message.tool_results.insert(
-                    tool_use.id.clone(),
-                    LanguageModelToolResult {
-                        tool_use_id: tool_use.id.clone(),
-                        tool_name: tool_use.name.clone(),
-                        is_error: true,
-                        content: vec![LanguageModelToolResultContent::Text(
-                            TOOL_CANCELED_MESSAGE.into(),
-                        )],
-                        output: None,
-                    },
+                crate::task_worktree::sweep_guards_for_tool_use(&self.id, &tool_use.id);
+                let result = Self::synthetic_canceled_tool_result(
+                    tool_use,
+                    &self.running_subagents,
+                    None,
+                    Some(cx),
                 );
+                message.tool_results.insert(tool_use.id.clone(), result);
             }
         }
 
@@ -6438,12 +6622,27 @@ impl WatchdogHandle {
     }
 }
 
+static RUNNING_TURNS: std::sync::LazyLock<parking_lot::RwLock<HashSet<acp::SessionId>>> =
+    std::sync::LazyLock::new(|| parking_lot::RwLock::new(HashSet::default()));
+
+pub fn is_thread_turn_running(thread_id: &acp::SessionId) -> bool {
+    RUNNING_TURNS.read().contains(thread_id)
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub fn register_running_turn_for_tests(thread_id: acp::SessionId) -> impl Drop {
+    RUNNING_TURNS.write().insert(thread_id.clone());
+    util::defer(move || {
+        RUNNING_TURNS.write().remove(&thread_id);
+    })
+}
+
 struct RunningTurn {
     thread_id: acp::SessionId,
     /// Holds the task that handles agent interaction until the end of the turn.
     /// Survives across multiple requests as the model performs tool calls and
     /// we run tools, report their results.
-    _task: Task<()>,
+    _task: Option<Task<()>>,
     _watchdog_task: Task<()>,
     /// The current event stream for the running turn. Used to report a final
     /// cancellation event if we cancel the turn.
@@ -6470,9 +6669,10 @@ impl RunningTurn {
         watchdog_task: Task<()>,
         watchdog_handle: WatchdogHandle,
     ) -> Self {
+        RUNNING_TURNS.write().insert(thread_id.clone());
         Self {
             thread_id,
-            _task: task,
+            _task: Some(task),
             _watchdog_task: watchdog_task,
             event_stream,
             tools,
@@ -6482,7 +6682,7 @@ impl RunningTurn {
         }
     }
 
-    fn cancel(self) -> Task<()> {
+    fn cancel(mut self) -> Task<()> {
         log::debug!("Cancelling in progress turn");
         log::info!(
             "[cancel-audit] thread={} source=cancellation_tx_signaled",
@@ -6490,7 +6690,14 @@ impl RunningTurn {
         );
         self.cancellation_tx.lock().send(true).ok();
         self.event_stream.send_canceled();
-        self._task
+        self._task.take().unwrap_or_else(|| Task::ready(()))
+    }
+}
+
+impl Drop for RunningTurn {
+    fn drop(&mut self) {
+        RUNNING_TURNS.write().remove(&self.thread_id);
+        crate::task_worktree::sweep_guards_for_thread(&self.thread_id);
     }
 }
 
@@ -7538,6 +7745,17 @@ impl ToolCallEventStream {
             profile_id,
             is_subagent,
         }
+    }
+
+    pub fn thread(&self) -> Option<&WeakEntity<Thread>> {
+        self.thread.as_ref()
+    }
+
+    pub fn session_id(&self, cx: &App) -> Option<acp::SessionId> {
+        self.thread
+            .as_ref()
+            .and_then(|t| t.upgrade())
+            .map(|t| t.read(cx).id().clone())
     }
 
     /// Whether the owning thread is a subagent, so prompts can say "for this
@@ -9520,7 +9738,7 @@ mod tests {
         let (_tx1, cancellation_rx1) = watch::channel(false);
         let tool_input_1 = ToolInput::ready(json!({"task_id": "TASK-INTERCEPT-1"}));
 
-        // 1. With commit_error: TGS call is blocked!
+        // 1. With commit_error: TGS call is NOT blocked! Tool completes and commit error notice is surfaced.
         let run_task = thread.update(cx, |thread, cx| {
             thread.run_tool(
                 tool.clone(),
@@ -9537,20 +9755,33 @@ mod tests {
         });
 
         let (_msg_ix, result) = run_task.await;
-        assert!(result.is_error, "expected tool result to be an error");
+        assert!(!result.is_error, "expected tool result to succeed despite commit error");
         assert!(
-            !run_called.load(std::sync::atomic::Ordering::SeqCst),
-            "tool.run must NOT be called when commit_error is present"
+            run_called.load(std::sync::atomic::Ordering::SeqCst),
+            "tool.run must be called even when commit_error is present"
         );
-        let error_text = result.content[0].clone();
-        if let LanguageModelToolResultContent::Text(text) = error_text {
-            assert!(
-                text.contains("Failed to commit task worktree: simulated commit error on merge"),
-                "error message must contain commit error: {text}"
-            );
-        } else {
-            panic!("expected text content in error result");
-        }
+        let output_text = result
+            .content
+            .iter()
+            .find_map(|c| match c {
+                LanguageModelToolResultContent::Text(t) => Some(t.as_ref()),
+                _ => None,
+            })
+            .expect("expected text output");
+        assert!(
+            result.content.iter().any(|c| match c {
+                LanguageModelToolResultContent::Text(t) => {
+                    t.contains("simulated commit error on merge")
+                }
+                _ => false,
+            }),
+            "model output must contain the commit error notice: {output_text}"
+        );
+        assert_eq!(
+            crate::task_worktree::task_worktree_commit_error(&task_id),
+            Some("simulated commit error on merge".to_string())
+        );
+        assert!(crate::task_worktree::task_worktree_path_for_id(&task_id).is_some());
 
         // 2. Clear commit error / successful merge: TGS call passes!
         crate::task_worktree::reset_registry_for_tests();
@@ -9632,6 +9863,264 @@ mod tests {
                 _ => false,
             }),
             "model output must contain the merge conflict information: {output_text}"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_run_tool_task_complete_interception_publishes_event_to_tgs_and_respects_agent_mode(
+        cx: &mut TestAppContext,
+    ) {
+        crate::task_worktree::reset_registry_for_tests();
+        let (thread, event_stream, _fake) = setup_thread_for_test(cx).await;
+        let project = thread.read_with(cx, |t, _| t.project().clone());
+
+        let fs = thread.read_with(cx, |t, cx| t.project().read(cx).fs().clone());
+        fs.create_dir(std::path::Path::new("/root")).await.unwrap();
+        project
+            .update(cx, |project, cx| {
+                project.create_worktree(std::path::Path::new("/root"), true, cx)
+            })
+            .await
+            .unwrap();
+
+        let server_id_str = project.read_with(cx, |project, cx| {
+            agent_settings::AgentSettings::get_for_project(project, cx)
+                .task_graph_server_id
+                .clone()
+        });
+
+        cx.update(|cx| {
+            let mut settings = project::project_settings::ProjectSettings::get_global(cx).clone();
+            settings.context_servers.insert(
+                server_id_str.clone().into(),
+                project::project_settings::ContextServerSettings::Stdio {
+                    enabled: true,
+                    remote: false,
+                    command: context_server::ContextServerCommand {
+                        path: "mock".into(),
+                        args: Vec::new(),
+                        env: None,
+                        timeout: None,
+                        platforms: Default::default(),
+                    },
+                },
+            );
+            project::project_settings::ProjectSettings::override_global(settings, cx);
+        });
+
+        let (tool_calls_tx, mut tool_calls_rx) = mpsc::unbounded();
+        let server_name = server_id_str.clone();
+        let fake_transport = context_server::test::create_fake_transport(server_id_str.clone(), cx.executor())
+            .on_request::<context_server::types::requests::Initialize, _>(
+                move |_params| {
+                    let server_name = server_name.clone();
+                    async move {
+                        context_server::types::InitializeResponse {
+                            protocol_version: context_server::types::ProtocolVersion(
+                                context_server::types::LATEST_PROTOCOL_VERSION.to_string(),
+                            ),
+                            server_info: context_server::types::Implementation {
+                                name: server_name,
+                                title: None,
+                                version: "1.0.0".to_string(),
+                                description: None,
+                            },
+                            capabilities: context_server::types::ServerCapabilities {
+                                tools: Some(context_server::types::ToolsCapabilities {
+                                    list_changed: Some(true),
+                                }),
+                                ..Default::default()
+                            },
+                            meta: None,
+                        }
+                    }
+                },
+            )
+            .on_request::<context_server::types::requests::CallTool, _>(move |params| {
+                let tool_calls_tx = tool_calls_tx.clone();
+                async move {
+                    tool_calls_tx.unbounded_send(params).ok();
+                    context_server::types::CallToolResponse {
+                        content: vec![context_server::types::ToolResponseContent::Text {
+                            text: "ok".into(),
+                        }],
+                        is_error: None,
+                        meta: None,
+                        structured_content: None,
+                    }
+                }
+            });
+
+        let context_server_store = project.read_with(cx, |p, _| p.context_server_store());
+        context_server_store.update(cx, |store, cx| {
+            store.start_server(
+                Arc::new(context_server::ContextServer::new(
+                    context_server::ContextServerId(server_id_str.into()),
+                    Arc::new(fake_transport),
+                )),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        struct MockTool {
+            run_called: Arc<std::sync::atomic::AtomicBool>,
+        }
+        impl AnyAgentTool for MockTool {
+            fn name(&self) -> SharedString {
+                "mcp__taskgraph__task_complete".into()
+            }
+            fn description(&self) -> SharedString {
+                "Complete task".into()
+            }
+            fn kind(&self) -> acp::ToolKind {
+                acp::ToolKind::Execute
+            }
+            fn initial_title(&self, _input: serde_json::Value, _cx: &mut App) -> SharedString {
+                "Completing task".into()
+            }
+            fn input_schema(&self) -> serde_json::Value {
+                json!({})
+            }
+            fn run(
+                self: Arc<Self>,
+                _input: ToolInput<serde_json::Value>,
+                _event_stream: ToolCallEventStream,
+                _cx: &mut App,
+            ) -> Task<Result<AgentToolOutput, AgentToolOutput>> {
+                self.run_called
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                Task::ready(Ok(AgentToolOutput {
+                    llm_output: vec![LanguageModelToolResultContent::Text("Done".into())],
+                    raw_output: json!({"status": "completed"}),
+                }))
+            }
+            fn replay(
+                &self,
+                _input: serde_json::Value,
+                _output: serde_json::Value,
+                _event_stream: ToolCallEventStream,
+                _cx: &mut App,
+            ) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        let run_called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let tool = Arc::new(MockTool {
+            run_called: run_called.clone(),
+        });
+
+        // 1. Commit failure publishes error event to TGS and does not block tool completion
+        let err_task_id = crate::AgentTaskId::from("TASK-FAIL-COMMIT");
+        crate::task_worktree::register_task_worktree(&err_task_id, PathBuf::from("/root"));
+        crate::task_worktree::record_task_worktree_commit_error(
+            &err_task_id,
+            "git commit failed: hook rejected".to_string(),
+        );
+
+        let (_tx, cancellation_rx) = watch::channel(false);
+        let tool_input = ToolInput::ready(json!({"task_id": "TASK-FAIL-COMMIT"}));
+
+        let run_task = thread.update(cx, |thread, cx| {
+            thread.run_tool(
+                tool.clone(),
+                tool_input,
+                LanguageModelToolUseId::from("call_1"),
+                Arc::from("mcp__taskgraph__task_complete"),
+                Some("TASK-FAIL-COMMIT".to_string()),
+                None,
+                0,
+                &event_stream,
+                cancellation_rx,
+                cx,
+            )
+        });
+
+        let (_msg_ix, result) = run_task.await;
+        assert!(!result.is_error, "task must complete despite commit error");
+        assert!(run_called.load(std::sync::atomic::Ordering::SeqCst));
+
+        // Check that TGS received the error event call
+        let tgs_call = tool_calls_rx.next().await.expect("expected call to TGS");
+        assert_eq!(tgs_call.name, "task_event");
+        let tgs_args = tgs_call.arguments.expect("expected args");
+        assert_eq!(tgs_args.get("task_id").and_then(|v| v.as_str()), Some("TASK-FAIL-COMMIT"));
+        assert_eq!(tgs_args.get("kind").and_then(|v| v.as_str()), Some("error"));
+        assert_eq!(
+            tgs_args.get("message").and_then(|v| v.as_str()),
+            Some("git commit failed: hook rejected")
+        );
+
+        // 2. Clean worktree completes silently (no error event sent to TGS)
+        run_called.store(false, std::sync::atomic::Ordering::SeqCst);
+        let clean_task_id = crate::AgentTaskId::from("TASK-CLEAN");
+
+        let (_tx2, cancellation_rx2) = watch::channel(false);
+        let tool_input2 = ToolInput::ready(json!({"task_id": clean_task_id.to_string()}));
+
+        let run_task2 = thread.update(cx, |thread, cx| {
+            thread.run_tool(
+                tool.clone(),
+                tool_input2,
+                LanguageModelToolUseId::from("call_2"),
+                Arc::from("mcp__taskgraph__task_complete"),
+                Some(clean_task_id.to_string()),
+                None,
+                0,
+                &event_stream,
+                cancellation_rx2,
+                cx,
+            )
+        });
+
+        let (_msg_ix, result2) = run_task2.await;
+        assert!(!result2.is_error, "clean task must complete");
+        assert!(run_called.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(
+            tool_calls_rx.try_recv().is_err(),
+            "no error event should be sent to TGS for clean task"
+        );
+
+        // 3. Agent mode: runtime stays silent, no events sent
+        cx.update(|cx| {
+            let mut settings = agent_settings::AgentSettings::get_global(cx).clone();
+            settings.task_lifecycle_mode = agent_settings::TaskLifecycleMode::Agent;
+            agent_settings::AgentSettings::override_global(settings, cx);
+        });
+
+        run_called.store(false, std::sync::atomic::Ordering::SeqCst);
+        let agent_task_id = crate::AgentTaskId::from("TASK-AGENT-MODE");
+        crate::task_worktree::register_task_worktree(&agent_task_id, PathBuf::from("/root"));
+        crate::task_worktree::record_task_worktree_commit_error(
+            &agent_task_id,
+            "another commit error".to_string(),
+        );
+
+        let (_tx3, cancellation_rx3) = watch::channel(false);
+        let tool_input3 = ToolInput::ready(json!({"task_id": "TASK-AGENT-MODE"}));
+
+        let run_task3 = thread.update(cx, |thread, cx| {
+            thread.run_tool(
+                tool.clone(),
+                tool_input3,
+                LanguageModelToolUseId::from("call_3"),
+                Arc::from("mcp__taskgraph__task_complete"),
+                Some("TASK-AGENT-MODE".to_string()),
+                None,
+                0,
+                &event_stream,
+                cancellation_rx3,
+                cx,
+            )
+        });
+
+        let (_msg_ix, result3) = run_task3.await;
+        assert!(!result3.is_error, "agent mode task must complete");
+        assert!(run_called.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(
+            tool_calls_rx.try_recv().is_err(),
+            "in agent mode runtime must stay silent: no TGS calls"
         );
     }
 
@@ -12609,6 +13098,7 @@ mod tests {
                     &event_stream,
                     "continuation_failure_tool_finalized",
                     "continuation error",
+                    Some(_cx),
                 );
 
                 let messages = &thread.messages;
@@ -12622,6 +13112,183 @@ mod tests {
                 assert!(result.is_error, "unfinalized tool call must be marked as error");
                 assert_eq!(result.tool_use_id, tool_use.id);
             });
+        });
+    }
+
+    #[gpui::test]
+    async fn test_flush_preserves_entries_and_subagent_session_references(
+        cx: &mut TestAppContext,
+    ) {
+        crate::task_worktree::reset_registry_for_tests();
+        let (thread, _, _) = setup_thread_for_test(cx).await;
+
+        let task_id = crate::AgentTaskId::from("TASK-FLUSH-TEST".to_string());
+        crate::task_worktree::register_task_session(&task_id, "child-session-xyz".to_string());
+
+        let tool_use = LanguageModelToolUse {
+            id: "call_spawn_flush".into(),
+            name: "spawn_agent".into(),
+            input: language_model::LanguageModelToolUseInput::Json(serde_json::json!({
+                "label": "subagent-task",
+                "message": "please run",
+                "task_id": "TASK-FLUSH-TEST",
+            })),
+            raw_input: "{}".to_string(),
+            is_input_complete: true,
+            thought_signature: None,
+        };
+
+        cx.update(|cx| {
+            thread.update(cx, |thread, cx| {
+                thread
+                    .pending_message()
+                    .content
+                    .push(AgentMessageContent::ToolUse(tool_use.clone()));
+                thread.flush_pending_message(cx);
+            });
+        });
+
+        thread.read_with(cx, |thread, _| {
+            assert_eq!(
+                thread.messages.len(),
+                1,
+                "flush must preserve the agent message in thread"
+            );
+            let Message::Agent(agent_msg) = &*thread.messages[0] else {
+                panic!("expected agent message");
+            };
+            assert!(
+                agent_msg.tool_results.contains_key(&tool_use.id),
+                "tool_results must contain entry for spawn_agent"
+            );
+            let tool_result = agent_msg.tool_results.get(&tool_use.id).unwrap();
+            assert!(
+                tool_result.is_error,
+                "canceled tool result must be marked error"
+            );
+
+            let output = tool_result.output.as_ref().expect("output must be preserved");
+            let spawn_output: crate::tools::SpawnAgentToolOutput =
+                serde_json::from_value(output.clone()).expect("valid SpawnAgentToolOutput");
+            let crate::tools::SpawnAgentToolOutput::Error {
+                session_id,
+                session_info,
+                error,
+                ..
+            } = spawn_output
+            else {
+                panic!("expected Error variant");
+            };
+            assert_eq!(
+                session_id.as_ref().map(|s| s.to_string()),
+                Some("child-session-xyz".to_string())
+            );
+            let session_info = session_info.expect("session_info must be preserved");
+            assert_eq!(session_info.session_id.to_string(), "child-session-xyz");
+            assert!(
+                error.contains("result not delivered"),
+                "error should mark result not delivered: {error}"
+            );
+        });
+
+        let (events_tx, mut events_rx) =
+            futures::channel::mpsc::unbounded::<Result<ThreadEvent>>();
+        let stream = ThreadEventStream::new(events_tx);
+
+        cx.update(|cx| {
+            thread.update(cx, |thread, cx| {
+                let Message::Agent(agent_msg) = &*thread.messages[0] else {
+                    unreachable!()
+                };
+                thread.replay_tool_call(
+                    &tool_use,
+                    agent_msg.tool_results.get(&tool_use.id),
+                    0,
+                    &stream,
+                    cx,
+                );
+            });
+        });
+
+        let mut received_tool_call = false;
+        let mut received_meta_session_info = false;
+
+        while let Ok(event) = events_rx.try_recv() {
+            let event = event.unwrap();
+            match event {
+                ThreadEvent::ToolCall(call) => {
+                    assert_eq!(call.name.as_deref(), Some("spawn_agent"));
+                    received_tool_call = true;
+                }
+                ThreadEvent::ToolCallUpdate(acp_thread::ToolCallUpdate::UpdateFields(update)) => {
+                    if let Some(meta) = update.meta {
+                        if let Some(info) =
+                            acp_thread::subagent_session_info_from_meta(&Some(meta))
+                        {
+                            assert_eq!(info.session_id.to_string(), "child-session-xyz");
+                            received_meta_session_info = true;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        assert!(
+            received_tool_call,
+            "replay must not drop the canceled spawn_agent tool call"
+        );
+        assert!(
+            received_meta_session_info,
+            "replay must preserve SUBAGENT_SESSION_INFO_META_KEY"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_refusal_preserves_flushed_messages(cx: &mut TestAppContext) {
+        let (thread, _, fake) = setup_thread_for_test(cx).await;
+        let model = fake.model("fake");
+
+        cx.update(|cx| {
+            thread.update(cx, |thread, cx| {
+                thread.set_model(model.clone(), cx);
+            });
+        });
+
+        let _events = cx.update(|cx| {
+            thread.update(cx, |thread, cx| {
+                thread
+                    .send(ClientUserMessageId::new(), ["Hello"], cx)
+                    .unwrap()
+            })
+        });
+
+        cx.run_until_parked();
+
+        fake.send_last_event(
+            &model,
+            LanguageModelCompletionEvent::Text("I cannot assist with that".to_string()),
+        );
+        fake.send_last_event(
+            &model,
+            LanguageModelCompletionEvent::Stop(language_model::StopReason::Refusal),
+        );
+
+        cx.run_until_parked();
+
+        thread.read_with(cx, |thread, _| {
+            assert!(
+                thread.messages.iter().any(|msg| match &**msg {
+                    Message::Agent(agent_msg) => {
+                        agent_msg.content.iter().any(|c| match c {
+                            AgentMessageContent::Text(t) => t.contains("I cannot assist with that"),
+                            _ => false,
+                        })
+                    }
+                    _ => false,
+                }),
+                "refusal must preserve the flushed assistant message and not truncate it"
+            );
         });
     }
 

@@ -271,6 +271,22 @@ where
 }
 
 /// Tool that spawns an agent thread to work on a task.
+fn cancelled_error(
+    stage: &'static str,
+    session_id: Option<acp::SessionId>,
+    session_info: Option<SubagentSessionInfo>,
+    isolation: Option<String>,
+    isolation_details: Option<SubagentIsolationDetails>,
+) -> SpawnAgentToolOutput {
+    SpawnAgentToolOutput::Error {
+        session_id,
+        error: format!("spawn_agent cancelled at {stage}"),
+        session_info,
+        isolation,
+        isolation_details,
+    }
+}
+
 pub struct SpawnAgentTool {
     environment: Rc<dyn ThreadEnvironment>,
     templates: Arc<crate::Templates>,
@@ -323,16 +339,24 @@ impl AgentTool for SpawnAgentTool {
         cx: &mut App,
     ) -> Task<Result<Self::Output, Self::Output>> {
         cx.spawn(async move |mut cx| {
-            let input = input
-                .recv()
-                .await
-                .map_err(|e| SpawnAgentToolOutput::Error {
-                    session_id: None,
-                    error: e.to_string(),
-                    session_info: None,
-                    isolation: None,
-                    isolation_details: None,
-                })?;
+            if event_stream.was_cancelled_by_user() {
+                return Err(cancelled_error("input receive", None, None, None, None));
+            }
+
+            let input = futures::select_biased! {
+                _ = event_stream.cancelled_by_user().fuse() => {
+                    return Err(cancelled_error("input receive", None, None, None, None));
+                }
+                input_res = input.recv().fuse() => {
+                    input_res.map_err(|e| SpawnAgentToolOutput::Error {
+                        session_id: None,
+                        error: e.to_string(),
+                        session_info: None,
+                        isolation: None,
+                        isolation_details: None,
+                    })?
+                }
+            };
 
             if input.session_id.is_some() && input.model.is_some() {
                 return Err(SpawnAgentToolOutput::Error {
@@ -385,14 +409,28 @@ impl AgentTool for SpawnAgentTool {
             }
 
             if let Some(ref session_id) = input.session_id {
-                if let Err(err) = self.environment.ensure_subagent_loaded(session_id, &mut cx).await {
-                    return Err(SpawnAgentToolOutput::Error {
-                        session_id: input.session_id.clone(),
-                        error: format!("Failed to load subagent session: {err}"),
-                        session_info: None,
-                        isolation: None,
-                        isolation_details: None,
-                    });
+                let load_fut = self.environment.ensure_subagent_loaded(session_id, &mut cx);
+                futures::select_biased! {
+                    _ = event_stream.cancelled_by_user().fuse() => {
+                        return Err(cancelled_error(
+                            "input receive",
+                            input.session_id.clone(),
+                            None,
+                            None,
+                            None,
+                        ));
+                    }
+                    load_res = load_fut.fuse() => {
+                        if let Err(err) = load_res {
+                            return Err(SpawnAgentToolOutput::Error {
+                                session_id: input.session_id.clone(),
+                                error: format!("Failed to load subagent session: {err}"),
+                                session_info: None,
+                                isolation: None,
+                                isolation_details: None,
+                            });
+                        }
+                    }
                 }
             }
 
@@ -487,7 +525,20 @@ impl AgentTool for SpawnAgentTool {
             }
 
             let task_detail = if let Some(ref task_id) = task_id {
-                match self.environment.get_task_registered(task_id, &mut cx).await {
+                let get_fut = self.environment.get_task_registered(task_id, &mut cx);
+                let detail_res = futures::select_biased! {
+                    _ = event_stream.cancelled_by_user().fuse() => {
+                        return Err(cancelled_error(
+                            "input receive",
+                            input.session_id.clone(),
+                            None,
+                            None,
+                            None,
+                        ));
+                    }
+                    res = get_fut.fuse() => res,
+                };
+                match detail_res {
                     Ok(detail) => Some(detail),
                     Err(error) => {
                         return Err(SpawnAgentToolOutput::Error {
@@ -505,6 +556,25 @@ impl AgentTool for SpawnAgentTool {
                 None
             };
 
+            let task_status_str = task_detail
+                .as_ref()
+                .map(|d| format!("{:?}", d.summary.status))
+                .unwrap_or_else(|| "-".to_string());
+            let owner_session_id = cx.update(|cx| {
+                event_stream
+                    .session_id(cx)
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| "-".to_string())
+            });
+            let tool_use_id = event_stream.tool_use_id().clone();
+            log::info!(
+                "[cancel-audit] task_id={} owner_session_id={} tool_use_id={} task_status={} source=spawn_start",
+                task_id.as_deref().unwrap_or("-"),
+                owner_session_id,
+                tool_use_id,
+                task_status_str
+            );
+
             let session_guard = if let Some(ref task_id) = task_id {
                 let task_id_typed = crate::AgentTaskId::from(task_id.clone());
                 if crate::task_worktree::has_active_subagent_session(&task_id_typed) {
@@ -518,29 +588,66 @@ impl AgentTool for SpawnAgentTool {
                         isolation_details: None,
                     });
                 }
+                let owner = cx.update(|cx| {
+                    let thread_weak = event_stream.thread().cloned();
+                    let thread_id = event_stream
+                        .session_id(cx)
+                        .unwrap_or_else(|| acp::SessionId::new("standalone"));
+                    let tool_use_id = event_stream.tool_use_id().clone();
+                    let _is_test = thread_weak.is_none();
+                    crate::task_worktree::SubagentSessionOwner {
+                        thread_id,
+                        tool_use_id,
+                        thread: thread_weak,
+                        #[cfg(any(test, feature = "test-support"))]
+                        is_test_live: _is_test,
+                    }
+                });
                 Some(crate::task_worktree::SubagentSessionGuard::new(
                     task_id_typed,
+                    owner,
                 ))
             } else {
                 None
             };
+
+            if event_stream.was_cancelled_by_user() {
+                drop(session_guard);
+                return Err(cancelled_error(
+                    "worktree acquisition",
+                    input.session_id.clone(),
+                    None,
+                    None,
+                    None,
+                ));
+            }
 
             let (worktree_path, isolation) = if task_isolation.is_disabled() {
                 (None, Some("shared:profile-disabled".to_string()))
             } else if let Some(ref task_id) = task_id {
                 let task_id_typed = crate::AgentTaskId::from(task_id.clone());
                 crate::task_worktree::set_task_lsp_suppressed(&task_id_typed, !enable_lsp);
-                match self
-                    .environment
-                    .ensure_subagent_worktree(
-                        task_id,
-                        input.goal_id.clone(),
-                        input.base_branch.clone(),
-                        input.on_branch.clone(),
-                        &mut cx,
-                    )
-                    .await
-                {
+                let worktree_fut = self.environment.ensure_subagent_worktree(
+                    task_id,
+                    input.goal_id.clone(),
+                    input.base_branch.clone(),
+                    input.on_branch.clone(),
+                    &mut cx,
+                );
+                let worktree_res = futures::select_biased! {
+                    _ = event_stream.cancelled_by_user().fuse() => {
+                        drop(session_guard);
+                        return Err(cancelled_error(
+                            "worktree acquisition",
+                            input.session_id.clone(),
+                            None,
+                            None,
+                            None,
+                        ));
+                    }
+                    res = worktree_fut.fuse() => res,
+                };
+                match worktree_res {
                     Ok(path) => {
                         let isolation_str = if let Some(target) = crate::task_worktree::task_worktree_checkout_target(&task_id_typed) {
                             format!("checkout:{target}")
@@ -567,6 +674,7 @@ impl AgentTool for SpawnAgentTool {
                             (None, Some("shared:no-git-repository".to_string()))
                         } else {
                             let err_msg = err.to_string();
+                            drop(session_guard);
                             return Err(SpawnAgentToolOutput::Error {
                                 session_id: input.session_id.clone(),
                                 error: format!(
@@ -582,6 +690,17 @@ impl AgentTool for SpawnAgentTool {
             } else {
                 (None, None)
             };
+
+            if event_stream.was_cancelled_by_user() {
+                drop(session_guard);
+                return Err(cancelled_error(
+                    "subagent creation",
+                    input.session_id.clone(),
+                    None,
+                    isolation,
+                    None,
+                ));
+            }
 
             let explicit_profile_str = input.profile.as_ref().map(|p| p.0.to_string());
             let explicit_model_str = input.model.clone();
@@ -663,9 +782,30 @@ impl AgentTool for SpawnAgentTool {
                 Ok((subagent, session_info, resolved_model))
             })?;
 
+            if event_stream.was_cancelled_by_user() {
+                drop(session_guard);
+                return Err(cancelled_error(
+                    "subagent creation",
+                    Some(session_info.session_id.clone()),
+                    Some(session_info),
+                    isolation,
+                    None,
+                ));
+            }
+
             if let Some(ref task_id) = task_id {
                 let session_id_str = session_info.session_id.to_string();
                 if should_register_metadata {
+                    if event_stream.was_cancelled_by_user() {
+                        drop(session_guard);
+                        return Err(cancelled_error(
+                            "task-graph metadata/status updates",
+                            Some(session_info.session_id.clone()),
+                            Some(session_info),
+                            isolation,
+                            None,
+                        ));
+                    }
                     let update_fut = self.environment.update_task_registered(
                         task_id,
                         resolved_model.as_deref(),
@@ -673,15 +813,27 @@ impl AgentTool for SpawnAgentTool {
                         Some(&session_id_str),
                         &mut cx,
                     );
-                    match timeout_step(
+                    let step_fut = timeout_step(
                         Some(task_id),
                         "task_metadata_update",
                         TGS_STEP_TIMEOUT,
                         &cx,
                         update_fut,
-                    )
-                    .await
-                    {
+                    );
+                    let step_res = futures::select_biased! {
+                        _ = event_stream.cancelled_by_user().fuse() => {
+                            drop(session_guard);
+                            return Err(cancelled_error(
+                                "task-graph metadata/status updates",
+                                Some(session_info.session_id.clone()),
+                                Some(session_info),
+                                isolation,
+                                None,
+                            ));
+                        }
+                        res = step_fut.fuse() => res,
+                    };
+                    match step_res {
                         StepOutcome::Ok(()) => {}
                         StepOutcome::Err(error) => {
                             log::warn!(
@@ -698,20 +850,42 @@ impl AgentTool for SpawnAgentTool {
                 }
 
                 if should_set_task_status {
+                    if event_stream.was_cancelled_by_user() {
+                        drop(session_guard);
+                        return Err(cancelled_error(
+                            "task-graph metadata/status updates",
+                            Some(session_info.session_id.clone()),
+                            Some(session_info),
+                            isolation,
+                            None,
+                        ));
+                    }
                     let status_fut = self.environment.set_task_status_registered(
                         task_id,
                         crate::AgentTaskStatus::Running,
                         &mut cx,
                     );
-                    match timeout_step(
+                    let step_fut = timeout_step(
                         Some(task_id),
                         "status_running",
                         TGS_STEP_TIMEOUT,
                         &cx,
                         status_fut,
-                    )
-                    .await
-                    {
+                    );
+                    let step_res = futures::select_biased! {
+                        _ = event_stream.cancelled_by_user().fuse() => {
+                            drop(session_guard);
+                            return Err(cancelled_error(
+                                "task-graph metadata/status updates",
+                                Some(session_info.session_id.clone()),
+                                Some(session_info),
+                                isolation,
+                                None,
+                            ));
+                        }
+                        res = step_fut.fuse() => res,
+                    };
+                    match step_res {
                         StepOutcome::Ok(()) => {}
                         StepOutcome::Err(error) => {
                             log::warn!(
@@ -758,15 +932,147 @@ impl AgentTool for SpawnAgentTool {
             let start_instant = std::time::Instant::now();
             let start_tokens = cx.update(|cx| subagent.cumulative_token_usage(cx));
 
-            let send_result = {
-                let message = if let Some(ref contract) = contract_block {
-                    format!("{contract}
+            let message = if let Some(ref contract) = contract_block {
+                format!("{contract}\n\n{message}", message = input.message)
+            } else {
+                input.message.clone()
+            };
 
-{message}", message = input.message)
+            let send_fut = subagent.send(message, cx);
+            let (was_cancelled_mid_send, send_result) = futures::select_biased! {
+                _ = event_stream.cancelled_by_user().fuse() => (true, None),
+                res = send_fut.fuse() => (false, Some(res)),
+            };
+
+            if was_cancelled_mid_send {
+                let error_message = "spawn_agent cancelled at subagent.send".to_string();
+                session_info.message_end_index =
+                    cx.update(|cx| Some(subagent.num_entries(cx).saturating_sub(1)));
+
+                let isolation_details = if should_commit {
+                    if let (Some(worktree_path), Some(task_id)) = (&worktree_path, &task_id) {
+                        let commit_fut = self.environment.commit_subagent_worktree(
+                            task_id,
+                            worktree_path,
+                            true,
+                            &mut cx,
+                        );
+                        let details = match timeout_step(
+                            Some(task_id),
+                            "salvage_commit",
+                            COMMIT_STEP_TIMEOUT,
+                            &cx,
+                            commit_fut,
+                        )
+                        .await
+                        {
+                            StepOutcome::Ok(details) => details,
+                            StepOutcome::Err(e) => {
+                                log::warn!("salvage commit failed for task {task_id}: {e:#}");
+                                let task_id_typed = crate::AgentTaskId::from(task_id.clone());
+                                crate::task_worktree::fallback_isolation_details(
+                                    &task_id_typed,
+                                    "worktree",
+                                    Some(e.to_string()),
+                                    None,
+                                )
+                            }
+                            StepOutcome::Timeout => {
+                                log::warn!(
+                                    "salvage commit timed out after {}s for task {task_id}",
+                                    COMMIT_STEP_TIMEOUT.as_secs()
+                                );
+                                let task_id_typed = crate::AgentTaskId::from(task_id.clone());
+                                crate::task_worktree::fallback_isolation_details(
+                                    &task_id_typed,
+                                    "worktree",
+                                    Some(format!(
+                                        "commit timed out after {}s",
+                                        COMMIT_STEP_TIMEOUT.as_secs()
+                                    )),
+                                    None,
+                                )
+                            }
+                        };
+                        if let Some(ref err) = details.commit_error {
+                            crate::task_worktree::record_task_worktree_commit_error(
+                                &crate::AgentTaskId::from(task_id.clone()),
+                                err.clone(),
+                            );
+                        } else {
+                            crate::task_worktree::clear_task_worktree_commit_error(
+                                &crate::AgentTaskId::from(task_id.clone()),
+                            );
+                        }
+                        Some(details)
+                    } else {
+                        None
+                    }
                 } else {
-                    input.message.clone()
+                    None
                 };
-                subagent.send(message, cx).await
+
+                if !is_agent_mode {
+                    if let Some(ref task_id) = task_id {
+                        let fail_fut = self
+                            .environment
+                            .fail_task_registered(task_id, "cancelled", &mut cx);
+                        match timeout_step(
+                            Some(task_id),
+                            "salvage_fail_task",
+                            TGS_STEP_TIMEOUT,
+                            &cx,
+                            fail_fut,
+                        )
+                        .await
+                        {
+                            StepOutcome::Ok(()) => {}
+                            StepOutcome::Err(failure_error) => {
+                                log::warn!(
+                                    "failed to fail task {task_id} in task graph service: {failure_error:#}"
+                                );
+                            }
+                            StepOutcome::Timeout => {
+                                log::warn!(
+                                    "fail task timed out after {}s for task {task_id}",
+                                    TGS_STEP_TIMEOUT.as_secs()
+                                );
+                            }
+                        }
+                    }
+                }
+
+                drop(session_guard);
+
+                let meta = Some(acp::Meta::from_iter([(
+                    SUBAGENT_SESSION_INFO_META_KEY.into(),
+                    serde_json::json!(&session_info),
+                )]));
+                event_stream.update_fields_with_meta(
+                    acp::ToolCallUpdateFields::new().content(vec![error_message.clone().into()]),
+                    meta,
+                );
+
+                return Err(SpawnAgentToolOutput::Error {
+                    session_id: Some(session_info.session_id.clone()),
+                    error: error_message,
+                    session_info: Some(session_info),
+                    isolation,
+                    isolation_details,
+                });
+            }
+
+            let send_result = match send_result {
+                Some(send_result) => send_result,
+                None => {
+                    return Err(cancelled_error(
+                        "subagent.send",
+                        Some(session_info.session_id.clone()),
+                        Some(session_info),
+                        isolation,
+                        None,
+                    ));
+                }
             };
 
             let duration_ms = start_instant.elapsed().as_millis() as u64;
@@ -838,20 +1144,42 @@ impl AgentTool for SpawnAgentTool {
             }
 
             let is_error = send_result.is_err();
+            if event_stream.was_cancelled_by_user() {
+                drop(session_guard);
+                return Err(cancelled_error(
+                    "commit",
+                    Some(session_info.session_id.clone()),
+                    Some(session_info),
+                    isolation,
+                    None,
+                ));
+            }
             let isolation_details = if should_commit {
                 if let (Some(worktree_path), Some(task_id)) = (&worktree_path, &task_id) {
                     let commit_fut = self
                         .environment
                         .commit_subagent_worktree(task_id, worktree_path, is_error, &mut cx);
-                    let details = match timeout_step(
+                    let step_fut = timeout_step(
                         Some(task_id),
                         "commit",
                         COMMIT_STEP_TIMEOUT,
                         &cx,
                         commit_fut,
-                    )
-                    .await
-                    {
+                    );
+                    let step_res = futures::select_biased! {
+                        _ = event_stream.cancelled_by_user().fuse() => {
+                            drop(session_guard);
+                            return Err(cancelled_error(
+                                "commit",
+                                Some(session_info.session_id.clone()),
+                                Some(session_info),
+                                isolation,
+                                None,
+                            ));
+                        }
+                        res = step_fut.fuse() => res,
+                    };
+                    let details = match step_res {
                         StepOutcome::Ok(details) => details,
                         StepOutcome::Err(e) => {
                             log::warn!("commit failed for task {task_id}: {e:#}");
@@ -904,6 +1232,17 @@ impl AgentTool for SpawnAgentTool {
                 None
             };
 
+            if event_stream.was_cancelled_by_user() {
+                drop(session_guard);
+                return Err(cancelled_error(
+                    "turn record",
+                    Some(session_info.session_id.clone()),
+                    Some(session_info),
+                    isolation,
+                    isolation_details,
+                ));
+            }
+
             if let Some(ref task_id) = task_id {
                 let branch_str = isolation_details.as_ref().map(|d| d.branch.as_str());
                 let commit_sha_str = isolation_details.as_ref().and_then(|d| d.head_sha.as_deref());
@@ -923,6 +1262,16 @@ impl AgentTool for SpawnAgentTool {
                         let diff_fut = compute_turn_diff(&base_sha, &worktree_path).fuse();
                         futures::pin_mut!(diff_fut);
                         futures::select_biased! {
+                            _ = event_stream.cancelled_by_user().fuse() => {
+                                drop(session_guard);
+                                return Err(cancelled_error(
+                                    "turn record",
+                                    Some(session_info.session_id.clone()),
+                                    Some(session_info),
+                                    isolation,
+                                    isolation_details,
+                                ));
+                            }
                             diff = diff_fut => diff,
                             _ = timer => {
                                 log::warn!(
@@ -948,15 +1297,27 @@ impl AgentTool for SpawnAgentTool {
                     diff,
                 };
                 let record_fut = self.environment.record_turn(task_id, record, &mut cx);
-                match timeout_step(
+                let step_fut = timeout_step(
                     Some(task_id),
                     "turn_record",
                     TGS_STEP_TIMEOUT,
                     &cx,
                     record_fut,
-                )
-                .await
-                {
+                );
+                let step_res = futures::select_biased! {
+                    _ = event_stream.cancelled_by_user().fuse() => {
+                        drop(session_guard);
+                        return Err(cancelled_error(
+                            "turn record",
+                            Some(session_info.session_id.clone()),
+                            Some(session_info),
+                            isolation,
+                            isolation_details,
+                        ));
+                    }
+                    res = step_fut.fuse() => res,
+                };
+                match step_res {
                     StepOutcome::Ok(_) => {}
                     StepOutcome::Err(err) => {
                         log::warn!("failed to record turn for task {task_id}: {err:#}");
@@ -971,6 +1332,16 @@ impl AgentTool for SpawnAgentTool {
             }
 
             if send_result.is_ok() && should_set_task_status {
+                if event_stream.was_cancelled_by_user() {
+                    drop(session_guard);
+                    return Err(cancelled_error(
+                        "turn record",
+                        Some(session_info.session_id.clone()),
+                        Some(session_info),
+                        isolation,
+                        isolation_details,
+                    ));
+                }
                 if let Some(ref task_id) = task_id {
                     let status_fut = self.environment.set_task_status_registered(
                         task_id,
@@ -1006,8 +1377,17 @@ impl AgentTool for SpawnAgentTool {
             } else if let Some(ref task_id) = task_id {
                 log_lifecycle_step(Some(task_id), "status_completed", 0, "skipped");
             }
-            // Release active session guard after commit is done to close race window
             drop(session_guard);
+
+            if event_stream.was_cancelled_by_user() {
+                return Err(cancelled_error(
+                    "cleanup",
+                    Some(session_info.session_id.clone()),
+                    Some(session_info),
+                    isolation,
+                    isolation_details,
+                ));
+            }
 
             if should_cleanup {
                 if let Some(ref task_id) = task_id {
@@ -1018,15 +1398,26 @@ impl AgentTool for SpawnAgentTool {
                         let cleanup_fut = self
                             .environment
                             .auto_cleanup_subagent_worktree(task_id, &mut cx);
-                        match timeout_step(
+                        let step_fut = timeout_step(
                             Some(task_id),
                             "cleanup",
                             CLEANUP_STEP_TIMEOUT,
                             &cx,
                             cleanup_fut,
-                        )
-                        .await
-                        {
+                        );
+                        let step_res = futures::select_biased! {
+                            _ = event_stream.cancelled_by_user().fuse() => {
+                                return Err(cancelled_error(
+                                    "cleanup",
+                                    Some(session_info.session_id.clone()),
+                                    Some(session_info),
+                                    isolation,
+                                    isolation_details,
+                                ));
+                            }
+                            res = step_fut.fuse() => res,
+                        };
+                        match step_res {
                             StepOutcome::Ok(_) => {}
                             StepOutcome::Err(err) => {
                                 log::error!("auto cleanup failed for subagent task {task_id}: {err:?}");
@@ -1044,6 +1435,16 @@ impl AgentTool for SpawnAgentTool {
                 }
             } else if let Some(ref task_id) = task_id {
                 log_lifecycle_step(Some(task_id), "cleanup", 0, "skipped");
+            }
+
+            if event_stream.was_cancelled_by_user() {
+                return Err(cancelled_error(
+                    "cleanup",
+                    Some(session_info.session_id.clone()),
+                    Some(session_info),
+                    isolation,
+                    isolation_details,
+                ));
             }
             let meta = Some(acp::Meta::from_iter([(
                 SUBAGENT_SESSION_INFO_META_KEY.into(),
@@ -1565,5 +1966,319 @@ Strict Constraints:
         cx.executor().advance_clock(Duration::from_millis(100));
         let outcome = timeout_task.await;
         assert!(matches!(outcome, StepOutcome::Timeout));
+    }
+
+    struct TestSubagentHandle {
+        session_id: acp::SessionId,
+        send_started_tx: Arc<parking_lot::Mutex<Option<futures::channel::oneshot::Sender<()>>>>,
+    }
+
+    impl crate::thread::SubagentHandle for TestSubagentHandle {
+        fn id(&self) -> acp::SessionId {
+            self.session_id.clone()
+        }
+
+        fn num_entries(&self, _cx: &App) -> usize {
+            1
+        }
+
+        fn send(&self, _message: String, cx: &gpui::AsyncApp) -> Task<Result<String>> {
+            if let Some(tx) = self.send_started_tx.lock().take() {
+                tx.send(()).ok();
+            }
+            cx.spawn(async move |_| futures::future::pending::<Result<String>>().await)
+        }
+    }
+
+    struct CancelMockEnvironment {
+        send_started_tx: Arc<parking_lot::Mutex<Option<futures::channel::oneshot::Sender<()>>>>,
+        slot_wait_started_tx: Arc<parking_lot::Mutex<Option<futures::channel::oneshot::Sender<()>>>>,
+        hang_slot_wait: bool,
+        commit_called: Arc<std::sync::atomic::AtomicBool>,
+        commit_is_error: Arc<std::sync::atomic::AtomicBool>,
+        cleanup_called: Arc<std::sync::atomic::AtomicBool>,
+        failed_task_reason: Arc<parking_lot::Mutex<Option<String>>>,
+    }
+
+    impl crate::thread::ThreadEnvironment for CancelMockEnvironment {
+        fn create_terminal(
+            &self,
+            _command: String,
+            _extra_env: Vec<acp::EnvVariable>,
+            _cwd: Option<std::path::PathBuf>,
+            _output_byte_limit: Option<u64>,
+            _sandbox_wrap: Option<acp_thread::SandboxWrap>,
+            _cx: &mut gpui::AsyncApp,
+        ) -> Task<Result<Rc<dyn crate::thread::TerminalHandle>>> {
+            Task::ready(Err(anyhow::anyhow!("not implemented")))
+        }
+
+        fn create_subagent(
+            &self,
+            _label: String,
+            _profile: Option<agent_settings::AgentProfileId>,
+            _model: Option<crate::AgentModelId>,
+            _task_worktree: Option<std::path::PathBuf>,
+            _cx: &mut App,
+        ) -> Result<Rc<dyn crate::thread::SubagentHandle>> {
+            Ok(Rc::new(TestSubagentHandle {
+                session_id: acp::SessionId::new("mock-subagent-session"),
+                send_started_tx: self.send_started_tx.clone(),
+            }))
+        }
+
+        fn ensure_subagent_worktree(
+            &self,
+            _task_id: &str,
+            _goal_id: Option<String>,
+            _base_branch: Option<String>,
+            _on_branch: Option<String>,
+            cx: &mut gpui::AsyncApp,
+        ) -> Task<Result<std::path::PathBuf>> {
+            if self.hang_slot_wait {
+                if let Some(tx) = self.slot_wait_started_tx.lock().take() {
+                    tx.send(()).ok();
+                }
+                return cx.spawn(async move |_| {
+                    futures::future::pending::<Result<std::path::PathBuf>>().await
+                });
+            }
+            Task::ready(Ok(std::path::PathBuf::from("/mock/worktree")))
+        }
+
+        fn get_task_registered(
+            &self,
+            task_id: &str,
+            _cx: &mut gpui::AsyncApp,
+        ) -> Task<Result<crate::AgentTaskDetail>> {
+            Task::ready(Ok(crate::AgentTaskDetail {
+                summary: crate::AgentTaskSummary {
+                    id: crate::AgentTaskId::from(task_id),
+                    title: task_id.to_string(),
+                    status: crate::AgentTaskStatus::Ready,
+                    attempt: 1,
+                    ..Default::default()
+                },
+                description: String::new(),
+                acceptance_criteria: Vec::new(),
+                events_tail: Vec::new(),
+            }))
+        }
+
+        fn commit_subagent_worktree(
+            &self,
+            task_id: &str,
+            _task_worktree: &std::path::Path,
+            is_error: bool,
+            _cx: &mut gpui::AsyncApp,
+        ) -> Task<Result<crate::task_worktree::SubagentIsolationDetails>> {
+            self.commit_called.store(true, std::sync::atomic::Ordering::SeqCst);
+            self.commit_is_error.store(is_error, std::sync::atomic::Ordering::SeqCst);
+            let task_id_typed = crate::AgentTaskId::from(task_id);
+            Task::ready(Ok(crate::task_worktree::fallback_isolation_details(
+                &task_id_typed,
+                "worktree",
+                None,
+                None,
+            )))
+        }
+
+        fn fail_task_registered(
+            &self,
+            _task_id: &str,
+            reason: &str,
+            _cx: &mut gpui::AsyncApp,
+        ) -> Task<Result<()>> {
+            *self.failed_task_reason.lock() = Some(reason.to_string());
+            Task::ready(Ok(()))
+        }
+
+        fn auto_cleanup_subagent_worktree(
+            &self,
+            _task_id: &str,
+            _cx: &mut gpui::AsyncApp,
+        ) -> Task<Result<bool>> {
+            self.cleanup_called.store(true, std::sync::atomic::Ordering::SeqCst);
+            Task::ready(Ok(true))
+        }
+
+        fn update_task_registered(
+            &self,
+            _task_id: &str,
+            _model: Option<&str>,
+            _assignee: Option<&str>,
+            _session_id: Option<&str>,
+            _cx: &mut gpui::AsyncApp,
+        ) -> Task<Result<()>> {
+            Task::ready(Ok(()))
+        }
+
+        fn set_task_status_registered(
+            &self,
+            _task_id: &str,
+            _status: crate::AgentTaskStatus,
+            _cx: &mut gpui::AsyncApp,
+        ) -> Task<Result<()>> {
+            Task::ready(Ok(()))
+        }
+    }
+
+    #[gpui::test]
+    async fn test_cancel_during_send_skips_commit_and_cleanup_and_releases_guard(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        crate::task_worktree::reset_registry_for_tests();
+        cx.update(|cx| {
+            let store = settings::SettingsStore::test(cx);
+            cx.set_global(store);
+        });
+
+        let (send_started_tx, send_started_rx) = futures::channel::oneshot::channel();
+        let env = Rc::new(CancelMockEnvironment {
+            send_started_tx: Arc::new(parking_lot::Mutex::new(Some(send_started_tx))),
+            slot_wait_started_tx: Arc::new(parking_lot::Mutex::new(None)),
+            hang_slot_wait: false,
+            commit_called: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            commit_is_error: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            cleanup_called: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            failed_task_reason: Arc::new(parking_lot::Mutex::new(None)),
+        });
+
+        #[allow(clippy::arc_with_non_send_sync)]
+        let tool = Arc::new(SpawnAgentTool::new(env.clone()));
+        let task_id = "TASK-CANCEL-SEND".to_string();
+        let task_id_typed = crate::AgentTaskId::from(task_id.clone());
+
+        let (event_stream, _rx, mut cancellation_tx) =
+            crate::thread::ToolCallEventStream::test_with_cancellation();
+
+        let run_task = cx.update(|cx| {
+            tool.run(
+                ToolInput::resolved(SpawnAgentToolInput {
+                    label: "subtask".to_string(),
+                    message: "do something".to_string(),
+                    task_id: Some(task_id.clone()),
+                    ..Default::default()
+                }),
+                event_stream,
+                cx,
+            )
+        });
+
+        send_started_rx.await.unwrap();
+
+        assert!(
+            crate::task_worktree::has_active_subagent_session(&task_id_typed),
+            "session guard must be held while subagent.send is running"
+        );
+
+        crate::thread::ToolCallEventStream::signal_cancellation_with_sender(&mut cancellation_tx);
+
+        let result = run_task.await;
+        let Err(SpawnAgentToolOutput::Error {
+            error,
+            session_id,
+            session_info,
+            ..
+        }) = result
+        else {
+            panic!("expected Err(SpawnAgentToolOutput::Error), got {result:?}");
+        };
+
+        assert!(
+            error.contains("spawn_agent cancelled at subagent.send"),
+            "expected cancel error message to name subagent.send stage, got: {error}"
+        );
+        assert_eq!(
+            session_id.as_ref().map(|s| s.to_string()),
+            Some("mock-subagent-session".to_string())
+        );
+        assert!(session_info.is_some(), "session_info must be preserved");
+
+        assert!(
+            env.commit_called.load(std::sync::atomic::Ordering::SeqCst),
+            "salvage commit must run on mid-send cancel"
+        );
+        assert!(
+            env.commit_is_error.load(std::sync::atomic::Ordering::SeqCst),
+            "salvage commit must be error-checkpoint (is_error = true)"
+        );
+        assert_eq!(
+            env.failed_task_reason.lock().as_deref(),
+            Some("cancelled"),
+            "task must be failed in taskgraph with reason cancelled"
+        );
+        assert!(
+            !env.cleanup_called.load(std::sync::atomic::Ordering::SeqCst),
+            "cleanup must be skipped on cancel"
+        );
+        assert!(
+            !crate::task_worktree::has_active_subagent_session(&task_id_typed),
+            "session guard must be released after cancel"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_cancel_during_slot_wait_leaves_no_holder(cx: &mut gpui::TestAppContext) {
+        crate::task_worktree::reset_registry_for_tests();
+        cx.update(|cx| {
+            let store = settings::SettingsStore::test(cx);
+            cx.set_global(store);
+        });
+
+        let (slot_wait_started_tx, slot_wait_started_rx) = futures::channel::oneshot::channel();
+        let env = Rc::new(CancelMockEnvironment {
+            send_started_tx: Arc::new(parking_lot::Mutex::new(None)),
+            slot_wait_started_tx: Arc::new(parking_lot::Mutex::new(Some(slot_wait_started_tx))),
+            hang_slot_wait: true,
+            commit_called: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            commit_is_error: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            cleanup_called: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            failed_task_reason: Arc::new(parking_lot::Mutex::new(None)),
+        });
+
+        #[allow(clippy::arc_with_non_send_sync)]
+        let tool = Arc::new(SpawnAgentTool::new(env.clone()));
+        let task_id = "TASK-CANCEL-SLOT".to_string();
+        let task_id_typed = crate::AgentTaskId::from(task_id.clone());
+
+        let (event_stream, _rx, mut cancellation_tx) =
+            crate::thread::ToolCallEventStream::test_with_cancellation();
+
+        let run_task = cx.update(|cx| {
+            tool.run(
+                ToolInput::resolved(SpawnAgentToolInput {
+                    label: "subtask".to_string(),
+                    message: "do something".to_string(),
+                    task_id: Some(task_id.clone()),
+                    ..Default::default()
+                }),
+                event_stream,
+                cx,
+            )
+        });
+
+        slot_wait_started_rx.await.unwrap();
+
+        assert!(
+            crate::task_worktree::has_active_subagent_session(&task_id_typed),
+            "session guard must be held during worktree slot wait"
+        );
+
+        crate::thread::ToolCallEventStream::signal_cancellation_with_sender(&mut cancellation_tx);
+
+        let result = run_task.await;
+        let Err(SpawnAgentToolOutput::Error { error, .. }) = result else {
+            panic!("expected Err(SpawnAgentToolOutput::Error), got {result:?}");
+        };
+
+        assert!(
+            error.contains("spawn_agent cancelled at worktree acquisition"),
+            "expected error to name worktree acquisition, got: {error}"
+        );
+        assert!(
+            !crate::task_worktree::has_active_subagent_session(&task_id_typed),
+            "session guard must be released so slot wait leaves no holder"
+        );
     }
 }
