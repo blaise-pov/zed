@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+# Warm the cargo cache for the agent crate test targets with streaming output.
+exec "${CARGO:-cargo}" check -p agent --tests "$@"

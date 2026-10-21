@@ -62,6 +62,8 @@ use test_tools::*;
 
 /// Returns the fake provider that serves the registry's default model.
 pub(crate) fn init_test(cx: &mut TestAppContext) -> Arc<FakeLanguageModelProvider> {
+    crate::task_worktree::reset_registry_for_tests();
+    crate::agent_task_store::reset_registry_for_tests();
     cx.update(|cx| {
         let settings_store = SettingsStore::test(cx);
         cx.set_global(settings_store);
