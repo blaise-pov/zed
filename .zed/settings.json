@@ -1843,7 +1843,6 @@
       "e2e_tester": {
         "name": "Live Runtime & Agent E2E Tester",
         "task_isolation": "optional",
-        "system_prompt_template": ".zed/prompts/core/e2e_tester_system_prompt.md",
         "custom_prompt_path": ".zed/prompts/agents/e2e_tester.md",
         "description": "Manual-only black-box runtime verification, agent settings hypothesis testing, and E2E test suite authoring",
         "default_model": {
@@ -2216,6 +2215,7 @@
         },
         "skills": [],
         "context_servers": {
+          "taskgraph": true,
           "agent-bus": {
             "tools": {
               "send_feedback": true
@@ -2249,6 +2249,12 @@
               ]
             },
             "mcp:agent-bus:send_feedback": {
+              "default": "allow"
+            },
+            "mcp:taskgraph:task_graph": {
+              "default": "allow"
+            },
+            "mcp:taskgraph:task_get": {
               "default": "allow"
             }
           }
