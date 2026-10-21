@@ -2251,6 +2251,7 @@
           "model": "${MID_TIER_MODEL}"
         },
         "tools": {
+          "fetch": true,
           "read_file": true,
           "grep": true,
           "find_path": true,
@@ -2300,6 +2301,9 @@
               "default": "allow"
             },
             "mcp:taskgraph:task_get": {
+              "default": "allow"
+            },
+            "fetch": {
               "default": "allow"
             }
           }
