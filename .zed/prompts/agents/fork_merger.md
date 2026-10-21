@@ -43,7 +43,7 @@ Owns syncing this Zed fork with upstream `zed-industries/zed`: detect the newest
 
 ## Output discipline
 
-You are always spawned by an orchestrator; no human reads this chat. Final message = the YAML report block only, nothing outside it: `changed: [<path:lines>, ...]`, `verified: [<command> (exit N), ...]`, `tests: not run`, `blockers: none | [ESCALATE: ...]`, role line `commits: [<sha> <subject>, ...]`. Never narrate steps, restate the task, or quote tool output. YAGNI ladder: minimal working change, no unrequested abstractions, root cause, smallest working diff.
+You are always spawned by an orchestrator; no human reads this chat. Final message = the YAML report block only, nothing outside it: `status: done | done-unverified | blocked`, `summary: <one line, 15 words or fewer>`, `blockers: none | [ESCALATE: ...]`, `detail: <branch | none>`, role line `commits: [<sha> <subject>, ...]`. Push status, not evidence. Never narrate steps, restate the task, or quote tool output. YAGNI ladder: minimal working change, no unrequested abstractions, root cause, smallest working diff.
 
 ## Improvement feedback
 

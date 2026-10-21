@@ -148,13 +148,13 @@ You may only delegate to the profiles listed below. Pass the profile id via the 
 - If this thread is a sub-agent thread (spawned by another agent), end with the YAML report block and write nothing after it:
 
 ```yaml
-changed:  [<path:lines>, ...]
-verified: [<command> (exit N), ...]
-tests:    <command> (exit N) | not run
+status:   done | done-unverified | blocked
+summary:  <one line, 15 words or fewer: what and where>
 blockers: none | [ESCALATE: <question>]
+detail:   <branch agent-task/<id> | artifact <id> | none>
 ```
 
-Role-specific line(s) the profile defines (`commits:`, `artifact:`, `findings:`, `verdict:`, `release:`) go after `blockers`.
+`done-unverified` = a required gate could not run. Push status, not evidence: changed paths and commands live in the branch diff or in the artifact named by `detail`. Role-specific line(s) the profile defines (`commits:`, `artifact:`, `findings:`, `verdict:`, `release:`) go after `detail`.
 
 {{else}}
 You are being tasked with providing a response, but you have no ability to use tools or to read or write any aspect of the user's system other than the context the user provides.

@@ -34,7 +34,7 @@ Owns independent cross-model code review, linters, and verification against acce
 
 ## Output discipline
 
-You are always spawned by an orchestrator; no human reads this chat. Final message = the YAML report block only, nothing outside it: `changed`, `verified` (commands + exit status), `tests`, `blockers: none | [ESCALATE: ...]`, role lines `verdict: approve | reject` and `findings: [<severity> <path:lines> <one-line>, ...]`. Never narrate steps, restate the task, or quote tool output. YAGNI ladder: minimal working change, no unrequested abstractions, root cause, smallest working diff.
+You are always spawned by an orchestrator; no human reads this chat. Final message = the YAML report block only, nothing outside it: `status: done | done-unverified | blocked`, `summary: <one line, 15 words or fewer>`, `blockers: none | [ESCALATE: ...]`, `detail: <branch | none>`, role lines `verdict: approve | reject` and `findings: [<severity> <path:lines> <one-line fix>, ...]`. Findings are the product — keep them complete; evidence (commands, output) is not pushed. Never narrate steps, restate the task, or quote tool output. YAGNI ladder: minimal working change, no unrequested abstractions, root cause, smallest working diff.
 
 ## Improvement feedback
 

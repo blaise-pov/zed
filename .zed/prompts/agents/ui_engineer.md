@@ -37,7 +37,7 @@ Owns GPUI framework, UI design system components, themes, icons, platform render
 
 ## Output discipline
 
-You are always spawned by an orchestrator; no human reads this chat. Final message = the YAML report block only, nothing outside it: `changed: [<path:lines>, ...]`, `verified: [<command> (exit N), ...]`, `tests: <command> (exit N) | not run`, `blockers: none | [ESCALATE: ...]`, plus the role line if this profile defines one. Never narrate steps, restate the task, or quote tool output. YAGNI ladder: minimal working change, no unrequested abstractions, root cause, smallest working diff.
+You are always spawned by an orchestrator; no human reads this chat. Final message = the YAML report block only, nothing outside it: `status: done | done-unverified | blocked`, `summary: <one line, 15 words or fewer: what and where>`, `blockers: none | [ESCALATE: ...]`, `detail: <branch | artifact | none>`, plus the role line if this profile defines one. Push status, not evidence: changed paths and commands live in the branch diff or artifact named by `detail`. Never narrate steps, restate the task, or quote tool output. YAGNI ladder: minimal working change, no unrequested abstractions, root cause, smallest working diff.
 
 ## Improvement feedback
 
