@@ -1340,7 +1340,8 @@ async fn run_terminal_tool(
             .clone();
         let profile = event_stream.profile_settings(cx);
         let effective = effective_terminal_wrapper(global_wrapper.as_deref(), profile.as_ref());
-        let root = project_root_path(project.read(cx), cx);
+        let task_worktree = event_stream.task_worktree(cx);
+        let root = task_worktree.or_else(|| project_root_path(project.read(cx), cx));
         (effective, root)
     });
 
@@ -2001,36 +2002,42 @@ fn working_dir(
     task_worktree: Option<&Path>,
     cx: &mut App,
 ) -> Result<Option<PathBuf>> {
-    if let Some(task_worktree) = task_worktree {
-        if cd == "." || cd.is_empty() {
-            return Ok(Some(task_worktree.to_path_buf()));
-        }
-        let cd_path = Path::new(cd);
-        let resolved = if cd_path.is_absolute() {
-            cd_path.to_path_buf()
-        } else {
-            let worktree_name = task_worktree
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("");
-            if let Ok(rel) = cd_path.strip_prefix(worktree_name) {
-                task_worktree.join(rel)
-            } else {
-                task_worktree.join(cd_path)
-            }
-        };
-        let normalized = util::paths::normalize_lexically(&resolved)?;
-        let normalized_task_worktree = util::paths::normalize_lexically(task_worktree)?;
-        if !normalized.starts_with(&normalized_task_worktree) {
-            anyhow::bail!(
-                "`cd` directory {cd:?} is outside the isolated task worktree {}.",
-                task_worktree.display()
-            );
-        }
-        return Ok(Some(normalized));
-    }
-
     let project = project.read(cx);
+    let path_style = project.path_style(cx);
+    let worktree_roots = project
+        .worktrees(cx)
+        .filter_map(|worktree| {
+            let worktree = worktree.read(cx);
+            // Skip single-file worktrees: a file can't be a working directory.
+            let root_dir = worktree.root_dir()?;
+            Some((worktree.root_name_str(), root_dir.to_path_buf()))
+        })
+        .collect::<Vec<_>>();
+
+    if let Some(task_worktree) = task_worktree {
+        let anchor_path = crate::task_worktree::task_worktree_anchor_path(task_worktree);
+        let matching_roots: Vec<(&str, PathBuf)> = if let Some(anchor) = anchor_path.as_deref() {
+            let matched = worktree_roots
+                .iter()
+                .filter(|(_, abs_path)| {
+                    abs_path == anchor
+                        || util::paths::normalize_lexically(abs_path).ok()
+                            == util::paths::normalize_lexically(anchor).ok()
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            if matched.is_empty() {
+                worktree_roots
+            } else {
+                matched
+            }
+        } else {
+            worktree_roots
+        };
+
+        return resolve_cd_in_task_worktree(cd, path_style, task_worktree, &matching_roots)
+            .map(Some);
+    }
 
     if cd == "." || cd.is_empty() {
         let mut worktrees = project.worktrees(cx);
@@ -2046,23 +2053,105 @@ fn working_dir(
             None => Ok(None),
         }
     } else {
-        let path_style = project.path_style(cx);
-        let worktree_roots = project
-            .worktrees(cx)
-            .filter_map(|worktree| {
-                let worktree = worktree.read(cx);
-                // Skip single-file worktrees: a file can't be a working directory.
-                let root_dir = worktree.root_dir()?;
-                Some((worktree.root_name_str(), root_dir.to_path_buf()))
-            })
-            .collect::<Vec<_>>();
-
         if let Some(dir) = resolve_cd_in_worktrees(cd, path_style, &worktree_roots) {
             return Ok(Some(dir));
         }
 
         anyhow::bail!("`cd` directory {cd:?} was not in any root directory in the project.");
     }
+}
+
+fn resolve_cd_in_task_worktree(
+    cd: &str,
+    path_style: util::paths::PathStyle,
+    task_worktree: &Path,
+    worktree_roots: &[(&str, PathBuf)],
+) -> Result<PathBuf> {
+    let normalized_task_worktree = util::paths::normalize_lexically(task_worktree)?;
+
+    if cd == "." || cd.is_empty() {
+        return Ok(normalized_task_worktree);
+    }
+
+    let cd_norm = path_style.normalize(cd);
+    if cd_norm.is_empty() || cd_norm == "." {
+        return Ok(normalized_task_worktree);
+    }
+
+    let cd_path = Path::new(&cd_norm);
+    let is_absolute = path_style.is_absolute(&cd_norm);
+
+    let task_worktree_subpath = if is_absolute {
+        task_worktree
+            .to_str()
+            .and_then(|str_path| {
+                let prefix = path_style.normalize(str_path);
+                let subpath = path_style.strip_prefix(cd_path, Path::new(&prefix))?;
+                Some(subpath.display(path_style).to_string())
+            })
+            .or_else(|| {
+                normalized_task_worktree.to_str().and_then(|str_path| {
+                    let prefix = path_style.normalize(str_path);
+                    let subpath = path_style.strip_prefix(cd_path, Path::new(&prefix))?;
+                    Some(subpath.display(path_style).to_string())
+                })
+            })
+    } else {
+        task_worktree
+            .file_name()
+            .and_then(|name| name.to_str())
+            .filter(|name| !name.is_empty())
+            .and_then(|name| {
+                let subpath = path_style.strip_prefix(cd_path, Path::new(name))?;
+                Some(subpath.display(path_style).to_string())
+            })
+    };
+
+    let project_worktree_subpath = worktree_roots.iter().find_map(|(root_name, abs_path)| {
+        if is_absolute {
+            abs_path
+                .to_str()
+                .and_then(|str_path| {
+                    let prefix = path_style.normalize(str_path);
+                    let subpath = path_style.strip_prefix(cd_path, Path::new(&prefix))?;
+                    Some(subpath.display(path_style).to_string())
+                })
+                .or_else(|| {
+                    let normalized = util::paths::normalize_lexically(abs_path).ok()?;
+                    let prefix = path_style.normalize(normalized.to_str()?);
+                    let subpath = path_style.strip_prefix(cd_path, Path::new(&prefix))?;
+                    Some(subpath.display(path_style).to_string())
+                })
+        } else {
+            let subpath = path_style.strip_prefix(cd_path, Path::new(root_name))?;
+            Some(subpath.display(path_style).to_string())
+        }
+    });
+
+    let resolved = if let Some(subpath) = task_worktree_subpath.or(project_worktree_subpath) {
+        if subpath.is_empty() {
+            task_worktree.to_path_buf()
+        } else {
+            task_worktree.join(&subpath)
+        }
+    } else if !is_absolute {
+        task_worktree.join(cd_path)
+    } else {
+        cd_path.to_path_buf()
+    };
+
+    let normalized = util::paths::normalize_lexically(&resolved)
+        .ok()
+        .filter(|normalized| normalized.starts_with(&normalized_task_worktree));
+
+    let Some(normalized) = normalized else {
+        anyhow::bail!(
+            "`cd` directory {cd:?} is outside the isolated task worktree {}.",
+            task_worktree.display()
+        );
+    };
+
+    Ok(normalized)
 }
 
 /// Resolves a `cd` argument to an absolute worktree directory. `cd` may be a
@@ -2227,6 +2316,224 @@ mod tests {
             None,
             "a Windows-absolute path that escapes its worktree via `..` is rejected"
         );
+    }
+
+    #[test]
+    fn test_resolve_cd_in_task_worktree() {
+        #[cfg(not(target_os = "windows"))]
+        {
+            use util::paths::PathStyle::Unix;
+            let unix_roots: Vec<(&str, PathBuf)> = vec![
+                ("zed", PathBuf::from("/projects/zed")),
+                ("other", PathBuf::from("/projects/other")),
+            ];
+            let task_worktree = PathBuf::from("/worktrees/zed/agent-task-1");
+
+            assert_eq!(
+                resolve_cd_in_task_worktree(".", Unix, &task_worktree, &unix_roots).unwrap(),
+                PathBuf::from("/worktrees/zed/agent-task-1")
+            );
+            assert_eq!(
+                resolve_cd_in_task_worktree("", Unix, &task_worktree, &unix_roots).unwrap(),
+                PathBuf::from("/worktrees/zed/agent-task-1")
+            );
+            assert_eq!(
+                resolve_cd_in_task_worktree("./", Unix, &task_worktree, &unix_roots).unwrap(),
+                PathBuf::from("/worktrees/zed/agent-task-1")
+            );
+            assert_eq!(
+                resolve_cd_in_task_worktree("zed", Unix, &task_worktree, &unix_roots).unwrap(),
+                PathBuf::from("/worktrees/zed/agent-task-1")
+            );
+            assert_eq!(
+                resolve_cd_in_task_worktree("zed/crates/agent", Unix, &task_worktree, &unix_roots).unwrap(),
+                PathBuf::from("/worktrees/zed/agent-task-1/crates/agent")
+            );
+            assert_eq!(
+                resolve_cd_in_task_worktree("crates/agent", Unix, &task_worktree, &unix_roots).unwrap(),
+                PathBuf::from("/worktrees/zed/agent-task-1/crates/agent")
+            );
+            assert_eq!(
+                resolve_cd_in_task_worktree("./crates/agent", Unix, &task_worktree, &unix_roots).unwrap(),
+                PathBuf::from("/worktrees/zed/agent-task-1/crates/agent")
+            );
+            assert_eq!(
+                resolve_cd_in_task_worktree("/projects/zed", Unix, &task_worktree, &unix_roots).unwrap(),
+                PathBuf::from("/worktrees/zed/agent-task-1")
+            );
+            assert_eq!(
+                resolve_cd_in_task_worktree("/projects/zed/crates/agent", Unix, &task_worktree, &unix_roots).unwrap(),
+                PathBuf::from("/worktrees/zed/agent-task-1/crates/agent")
+            );
+            assert_eq!(
+                resolve_cd_in_task_worktree("agent-task-1", Unix, &task_worktree, &unix_roots).unwrap(),
+                PathBuf::from("/worktrees/zed/agent-task-1")
+            );
+            assert_eq!(
+                resolve_cd_in_task_worktree("agent-task-1/crates/agent", Unix, &task_worktree, &unix_roots).unwrap(),
+                PathBuf::from("/worktrees/zed/agent-task-1/crates/agent")
+            );
+            assert_eq!(
+                resolve_cd_in_task_worktree("/worktrees/zed/agent-task-1", Unix, &task_worktree, &unix_roots).unwrap(),
+                PathBuf::from("/worktrees/zed/agent-task-1")
+            );
+            assert_eq!(
+                resolve_cd_in_task_worktree("/worktrees/zed/agent-task-1/crates/agent", Unix, &task_worktree, &unix_roots).unwrap(),
+                PathBuf::from("/worktrees/zed/agent-task-1/crates/agent")
+            );
+            assert_eq!(
+                resolve_cd_in_task_worktree("zedextra", Unix, &task_worktree, &unix_roots).unwrap(),
+                PathBuf::from("/worktrees/zed/agent-task-1/zedextra")
+            );
+            assert!(resolve_cd_in_task_worktree("../escape", Unix, &task_worktree, &unix_roots).is_err());
+            assert!(resolve_cd_in_task_worktree("zed/../../escape", Unix, &task_worktree, &unix_roots).is_err());
+            assert!(resolve_cd_in_task_worktree("/other/dir", Unix, &task_worktree, &unix_roots).is_err());
+        }
+
+        #[cfg(target_os = "windows")]
+        {
+            use util::paths::PathStyle::Windows;
+
+            let windows_roots: Vec<(&str, PathBuf)> = vec![
+                ("zed", PathBuf::from("C:\\projects\\zed")),
+                ("other", PathBuf::from("C:\\projects\\other")),
+            ];
+            let task_worktree = PathBuf::from("C:\\worktrees\\zed\\agent-task-1");
+
+            assert_eq!(
+                resolve_cd_in_task_worktree(".", Windows, &task_worktree, &windows_roots).unwrap(),
+                PathBuf::from("C:\\worktrees\\zed\\agent-task-1")
+            );
+            assert_eq!(
+                resolve_cd_in_task_worktree("", Windows, &task_worktree, &windows_roots).unwrap(),
+                PathBuf::from("C:\\worktrees\\zed\\agent-task-1")
+            );
+            assert_eq!(
+                resolve_cd_in_task_worktree("./", Windows, &task_worktree, &windows_roots).unwrap(),
+                PathBuf::from("C:\\worktrees\\zed\\agent-task-1")
+            );
+            assert_eq!(
+                resolve_cd_in_task_worktree("zed", Windows, &task_worktree, &windows_roots).unwrap(),
+                PathBuf::from("C:\\worktrees\\zed\\agent-task-1")
+            );
+            assert_eq!(
+                resolve_cd_in_task_worktree("zed/crates/agent", Windows, &task_worktree, &windows_roots).unwrap(),
+                PathBuf::from("C:\\worktrees\\zed\\agent-task-1\\crates\\agent")
+            );
+            assert_eq!(
+                resolve_cd_in_task_worktree("zed\\crates\\agent", Windows, &task_worktree, &windows_roots).unwrap(),
+                PathBuf::from("C:\\worktrees\\zed\\agent-task-1\\crates\\agent")
+            );
+            assert_eq!(
+                resolve_cd_in_task_worktree("crates/agent", Windows, &task_worktree, &windows_roots).unwrap(),
+                PathBuf::from("C:\\worktrees\\zed\\agent-task-1\\crates\\agent")
+            );
+            assert_eq!(
+                resolve_cd_in_task_worktree("crates\\agent", Windows, &task_worktree, &windows_roots).unwrap(),
+                PathBuf::from("C:\\worktrees\\zed\\agent-task-1\\crates\\agent")
+            );
+            assert_eq!(
+                resolve_cd_in_task_worktree("./crates/agent", Windows, &task_worktree, &windows_roots).unwrap(),
+                PathBuf::from("C:\\worktrees\\zed\\agent-task-1\\crates\\agent")
+            );
+            assert_eq!(
+                resolve_cd_in_task_worktree(".\\crates\\agent", Windows, &task_worktree, &windows_roots).unwrap(),
+                PathBuf::from("C:\\worktrees\\zed\\agent-task-1\\crates\\agent")
+            );
+            assert_eq!(
+                resolve_cd_in_task_worktree("C:/projects/zed", Windows, &task_worktree, &windows_roots).unwrap(),
+                PathBuf::from("C:\\worktrees\\zed\\agent-task-1")
+            );
+            assert_eq!(
+                resolve_cd_in_task_worktree("C:\\projects\\zed", Windows, &task_worktree, &windows_roots).unwrap(),
+                PathBuf::from("C:\\worktrees\\zed\\agent-task-1")
+            );
+            assert_eq!(
+                resolve_cd_in_task_worktree("C:/projects/zed/crates/agent", Windows, &task_worktree, &windows_roots).unwrap(),
+                PathBuf::from("C:\\worktrees\\zed\\agent-task-1\\crates\\agent")
+            );
+            assert_eq!(
+                resolve_cd_in_task_worktree("c:\\projects\\zed\\crates\\agent", Windows, &task_worktree, &windows_roots).unwrap(),
+                PathBuf::from("C:\\worktrees\\zed\\agent-task-1\\crates\\agent")
+            );
+            assert_eq!(
+                resolve_cd_in_task_worktree("agent-task-1", Windows, &task_worktree, &windows_roots).unwrap(),
+                PathBuf::from("C:\\worktrees\\zed\\agent-task-1")
+            );
+            assert_eq!(
+                resolve_cd_in_task_worktree("agent-task-1\\crates\\agent", Windows, &task_worktree, &windows_roots).unwrap(),
+                PathBuf::from("C:\\worktrees\\zed\\agent-task-1\\crates\\agent")
+            );
+            assert_eq!(
+                resolve_cd_in_task_worktree("agent-task-1/crates/agent", Windows, &task_worktree, &windows_roots).unwrap(),
+                PathBuf::from("C:\\worktrees\\zed\\agent-task-1\\crates\\agent")
+            );
+            assert_eq!(
+                resolve_cd_in_task_worktree("C:\\worktrees\\zed\\agent-task-1", Windows, &task_worktree, &windows_roots).unwrap(),
+                PathBuf::from("C:\\worktrees\\zed\\agent-task-1")
+            );
+            assert_eq!(
+                resolve_cd_in_task_worktree("C:\\worktrees\\zed\\agent-task-1\\crates\\agent", Windows, &task_worktree, &windows_roots).unwrap(),
+                PathBuf::from("C:\\worktrees\\zed\\agent-task-1\\crates\\agent")
+            );
+            assert_eq!(
+                resolve_cd_in_task_worktree("zedextra", Windows, &task_worktree, &windows_roots).unwrap(),
+                PathBuf::from("C:\\worktrees\\zed\\agent-task-1\\zedextra")
+            );
+            assert!(resolve_cd_in_task_worktree("..\\escape", Windows, &task_worktree, &windows_roots).is_err());
+            assert!(resolve_cd_in_task_worktree("../escape", Windows, &task_worktree, &windows_roots).is_err());
+            assert!(resolve_cd_in_task_worktree("zed/../../escape", Windows, &task_worktree, &windows_roots).is_err());
+            assert!(resolve_cd_in_task_worktree("D:\\other", Windows, &task_worktree, &windows_roots).is_err());
+        }
+    }
+
+    #[gpui::test]
+    async fn test_working_dir_in_task_worktree(cx: &mut gpui::TestAppContext) {
+        crate::tests::init_test(cx);
+
+        let fs = fs::FakeFs::new(cx.executor());
+        let root_path = if cfg!(target_os = "windows") {
+            "C:\\projects\\zed"
+        } else {
+            "/projects/zed"
+        };
+        let task_worktree_path = if cfg!(target_os = "windows") {
+            PathBuf::from("C:\\worktrees\\zed\\agent-task-182")
+        } else {
+            PathBuf::from("/worktrees/zed/agent-task-182")
+        };
+
+        fs.insert_tree(root_path, serde_json::json!({})).await;
+        let project = project::Project::test(fs, [root_path.as_ref()], cx).await;
+
+        cx.update(|cx| {
+            let res_dot = working_dir(".", &project, Some(&task_worktree_path), cx)
+                .expect("cd . should succeed")
+                .expect("should return a path");
+            assert_eq!(res_dot, task_worktree_path);
+
+            let res_root = working_dir("zed", &project, Some(&task_worktree_path), cx)
+                .expect("cd zed should succeed")
+                .expect("should return a path");
+            assert_eq!(res_root, task_worktree_path);
+
+            let res_sub = working_dir("zed/crates/agent", &project, Some(&task_worktree_path), cx)
+                .expect("cd zed/crates/agent should succeed")
+                .expect("should return a path");
+            assert_eq!(res_sub, task_worktree_path.join("crates").join("agent"));
+
+            let res_rel = working_dir("crates/agent", &project, Some(&task_worktree_path), cx)
+                .expect("cd crates/agent should succeed")
+                .expect("should return a path");
+            assert_eq!(res_rel, task_worktree_path.join("crates").join("agent"));
+
+            let res_abs = working_dir(root_path, &project, Some(&task_worktree_path), cx)
+                .expect("cd <root_path> should succeed")
+                .expect("should return a path");
+            assert_eq!(res_abs, task_worktree_path);
+
+            assert!(working_dir("../escape", &project, Some(&task_worktree_path), cx).is_err());
+        });
     }
 
     #[test]

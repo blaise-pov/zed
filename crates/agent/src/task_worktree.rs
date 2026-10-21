@@ -1706,6 +1706,17 @@ pub fn task_worktree_path_for_id(task_id: &AgentTaskId) -> Option<PathBuf> {
         .filter(|p| !p.as_os_str().is_empty())
 }
 
+pub fn task_worktree_anchor_path(task_worktree: &Path) -> Option<PathBuf> {
+    let reg = REGISTRY.read();
+    reg.entries.values().find_map(|state| {
+        if state.worktree_path == task_worktree {
+            state.pool_key.as_ref().map(|key| key.anchor_path.clone())
+        } else {
+            None
+        }
+    })
+}
+
 pub fn register_task_session(task_id: &AgentTaskId, session_id: String) {
     let mut reg = REGISTRY.write();
     reg.task_sessions
@@ -2258,6 +2269,14 @@ pub fn auto_cleanup_task_worktree(
     task_id: &AgentTaskId,
     cx: &mut App,
 ) -> Task<Result<bool>> {
+    let cleanup_enabled = project.read_with(cx, |project, cx| {
+        let s = agent_settings::AgentSettings::get_for_project(project, cx);
+        s.task_lifecycle_mode != agent_settings::TaskLifecycleMode::Agent && s.cleanup
+    });
+    if !cleanup_enabled {
+        return Task::ready(Ok(false));
+    }
+
     if task_worktree_path_for_id(task_id).is_none() {
         return Task::ready(Ok(false));
     }
@@ -2610,6 +2629,22 @@ fn is_path_in_write_scopes(path: &RepoPath, scopes: &[String]) -> bool {
     false
 }
 
+pub const GIT_LOCK_RETRY_DELAY: Duration = Duration::from_millis(500);
+
+pub fn is_git_lock_contention(err: &str) -> bool {
+    let lower = err.to_ascii_lowercase();
+    lower.contains("index.lock")
+        || lower.contains(".lock")
+        || (lower.contains("unable to create") && lower.contains("lock"))
+        || lower.contains("file is locked")
+        || lower.contains("being used by another process")
+        || lower.contains("could not lock")
+        || lower.contains("cannot lock")
+        || lower.contains("failed to lock")
+        || lower.contains("resource temporarily unavailable")
+        || lower.contains("another git process seems to be running")
+}
+
 pub async fn commit_task_worktree(
     fs: Arc<dyn Fs>,
     task_worktree: PathBuf,
@@ -2638,20 +2673,41 @@ pub async fn commit_task_worktree(
 
     let prefix = RepoPath::from_rel_path(&util::rel_path::RelPath::empty());
 
-    let status = match git_repo.status(&[prefix]).await {
+    let status = match git_repo.status(std::slice::from_ref(&prefix)).await {
         Ok(status) => status,
         Err(e) => {
-            let head_sha = git_repo.head_sha().await;
-            return Ok(SubagentIsolationDetails {
-                mode: mode.to_string(),
-                branch,
-                base_branch,
-                head_sha,
-                changed_files: 0,
-                commit_error: Some(e.to_string()),
-                merged_into: None,
-                merge_conflict: None,
-            });
+            let err_str = e.to_string();
+            if is_git_lock_contention(&err_str) {
+                cx.background_executor().timer(GIT_LOCK_RETRY_DELAY).await;
+                match git_repo.status(&[prefix]).await {
+                    Ok(status) => status,
+                    Err(retry_err) => {
+                        let head_sha = git_repo.head_sha().await;
+                        return Ok(SubagentIsolationDetails {
+                            mode: mode.to_string(),
+                            branch,
+                            base_branch,
+                            head_sha,
+                            changed_files: 0,
+                            commit_error: Some(format!("git lock contention: {retry_err}")),
+                            merged_into: None,
+                            merge_conflict: None,
+                        });
+                    }
+                }
+            } else {
+                let head_sha = git_repo.head_sha().await;
+                return Ok(SubagentIsolationDetails {
+                    mode: mode.to_string(),
+                    branch,
+                    base_branch,
+                    head_sha,
+                    changed_files: 0,
+                    commit_error: Some(err_str),
+                    merged_into: None,
+                    merge_conflict: None,
+                });
+            }
         }
     };
 
@@ -2727,20 +2783,29 @@ pub async fn commit_task_worktree(
     }
 
     if let Err(e) = git_repo
-        .stage_paths(paths, Arc::new(HashMap::default()))
+        .stage_paths(paths.clone(), Arc::new(HashMap::default()))
         .await
     {
-        let head_sha = git_repo.head_sha().await;
-        return Ok(SubagentIsolationDetails {
-            mode: mode.to_string(),
-            branch,
-            base_branch,
-            head_sha,
-            changed_files: 0,
-            commit_error: Some(format!("staging failed: {e}")),
-            merged_into: None,
-            merge_conflict: None,
-        });
+        let err_str = e.to_string();
+        let retry_res = if is_git_lock_contention(&err_str) {
+            cx.background_executor().timer(GIT_LOCK_RETRY_DELAY).await;
+            git_repo.stage_paths(paths, Arc::new(HashMap::default())).await
+        } else {
+            Err(e)
+        };
+        if let Err(final_err) = retry_res {
+            let head_sha = git_repo.head_sha().await;
+            return Ok(SubagentIsolationDetails {
+                mode: mode.to_string(),
+                branch,
+                base_branch,
+                head_sha,
+                changed_files: 0,
+                commit_error: Some(format!("staging failed: {final_err}")),
+                merged_into: None,
+                merge_conflict: None,
+            });
+        }
     }
 
     let commit_message = if is_error {
@@ -2754,7 +2819,7 @@ pub async fn commit_task_worktree(
 
     if let Err(e) = git_repo
         .commit(
-            commit_message.into(),
+            commit_message.clone().into(),
             None,
             CommitOptions::default(),
             askpass,
@@ -2762,17 +2827,35 @@ pub async fn commit_task_worktree(
         )
         .await
     {
-        let head_sha = git_repo.head_sha().await;
-        return Ok(SubagentIsolationDetails {
-            mode: mode.to_string(),
-            branch,
-            base_branch,
-            head_sha,
-            changed_files: 0,
-            commit_error: Some(format!("commit failed: {e}")),
-            merged_into: None,
-            merge_conflict: None,
-        });
+        let err_str = e.to_string();
+        let retry_res = if is_git_lock_contention(&err_str) {
+            cx.background_executor().timer(GIT_LOCK_RETRY_DELAY).await;
+            let retry_askpass = AskPassDelegate::new(cx, |_, _, _| {});
+            git_repo
+                .commit(
+                    commit_message.into(),
+                    None,
+                    CommitOptions::default(),
+                    retry_askpass,
+                    Arc::new(HashMap::default()),
+                )
+                .await
+        } else {
+            Err(e)
+        };
+        if let Err(final_err) = retry_res {
+            let head_sha = git_repo.head_sha().await;
+            return Ok(SubagentIsolationDetails {
+                mode: mode.to_string(),
+                branch,
+                base_branch,
+                head_sha,
+                changed_files: 0,
+                commit_error: Some(format!("commit failed: {final_err}")),
+                merged_into: None,
+                merge_conflict: None,
+            });
+        }
     }
 
     let head_sha = git_repo.head_sha().await;
@@ -3241,31 +3324,60 @@ pub fn commit_and_merge_task_worktree(
             } else {
                 let merge_task =
                     cx.update(|cx| merge_task_branch_into_goal(project.clone(), &task_id, cx));
-                match merge_task.await? {
-                    MergeOutcome::NoGoal => {
+                let merge_result = match merge_task.await {
+                    Ok(outcome) => Ok(outcome),
+                    Err(e) => {
+                        let err_str = e.to_string();
+                        if is_git_lock_contention(&err_str) {
+                            cx.background_executor().timer(GIT_LOCK_RETRY_DELAY).await;
+                            let retry_task = cx.update(|cx| {
+                                merge_task_branch_into_goal(project.clone(), &task_id, cx)
+                            });
+                            retry_task.await
+                        } else {
+                            Err(e)
+                        }
+                    }
+                };
+                match merge_result {
+                    Ok(MergeOutcome::NoGoal) => {
                         details.merged_into = None;
                         details.merge_conflict = None;
                     }
-                    MergeOutcome::FastForward { target_ref, sha }
-                    | MergeOutcome::Merged { target_ref, sha } => {
+                    Ok(MergeOutcome::FastForward { target_ref, sha })
+                    | Ok(MergeOutcome::Merged { target_ref, sha }) => {
                         details.merged_into = Some(MergedInto { target_ref, sha });
                         details.merge_conflict = None;
                         clear_task_worktree_merge_conflict(&task_id);
                     }
-                    MergeOutcome::Conflict(conflict) => {
+                    Ok(MergeOutcome::Conflict(conflict)) => {
                         details.merged_into = None;
                         details.merge_conflict = Some(conflict.files.clone());
                         record_task_worktree_merge_conflict(&task_id, conflict.files);
+                    }
+                    Err(err) => {
+                        let err_str = format!("merge failed: {err:#}");
+                        details.merged_into = None;
+                        details.merge_conflict = None;
+                        details.commit_error = Some(err_str.clone());
+                        record_task_worktree_commit_error(&task_id, err_str);
                     }
                 }
             }
         }
 
         record_task_worktree_isolation_details(&task_id, details.clone());
-        let project_clone = project.clone();
-        let publish_task =
-            cx.update(|cx| publish_task_ref_artifact_to_tgs(project_clone, &task_id, &details, cx));
-        publish_task.await.log_err();
+        let should_publish = project.read_with(cx, |project, cx| {
+            let s = agent_settings::AgentSettings::get_for_project(project, cx);
+            s.task_lifecycle_mode != agent_settings::TaskLifecycleMode::Agent
+                && s.publish_ref_artifact
+        });
+        if should_publish {
+            let project_clone = project.clone();
+            let publish_task = cx
+                .update(|cx| publish_task_ref_artifact_to_tgs(project_clone, &task_id, &details, cx));
+            publish_task.await.log_err();
+        }
 
         Ok(details)
     })
@@ -8685,5 +8797,288 @@ mod tests {
             task_worktree_write_scopes(&task_id),
             vec!["crates/".to_string()]
         );
+    }
+
+    #[gpui::test]
+    async fn test_auto_cleanup_gated_by_settings(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            "/root",
+            json!({
+                ".git": {
+                    "HEAD": "ref: refs/heads/main\n"
+                }
+            }),
+        )
+        .await;
+
+        let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
+        let task = AgentTaskSummary {
+            id: AgentTaskId::from("TASK-CLEANUP-GATE"),
+            parent_id: None,
+            goal_id: None,
+            title: "Test".to_string(),
+            status: AgentTaskStatus::Completed,
+            attempt: 1,
+            assignee: None,
+            write_scopes: vec![],
+            created_at: None,
+            assigned_profile: None,
+            model: None,
+            session_id: None,
+            metrics: None,
+        };
+
+        let worktree_path = cx
+            .update(|cx| ensure_task_worktree(project.clone(), &task, cx))
+            .await
+            .unwrap();
+        assert!(fs.is_dir(&worktree_path).await);
+
+        cx.update(|cx| {
+            cx.update_global::<SettingsStore, _>(|store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings.agent.get_or_insert_default().task_lifecycle_mode =
+                        Some(agent_settings::TaskLifecycleMode::Agent);
+                });
+            });
+        });
+
+        let cleaned = cx
+            .update(|cx| auto_cleanup_task_worktree(project.clone(), &task.id, cx))
+            .await
+            .unwrap();
+        assert!(!cleaned);
+        assert!(fs.is_dir(&worktree_path).await);
+
+        cx.update(|cx| {
+            cx.update_global::<SettingsStore, _>(|store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    let agent = settings.agent.get_or_insert_default();
+                    agent.task_lifecycle_mode =
+                        Some(agent_settings::TaskLifecycleMode::Runtime);
+                    agent.cleanup = Some(false);
+                });
+            });
+        });
+
+        let cleaned = cx
+            .update(|cx| auto_cleanup_task_worktree(project.clone(), &task.id, cx))
+            .await
+            .unwrap();
+        assert!(!cleaned);
+        assert!(fs.is_dir(&worktree_path).await);
+
+        cx.update(|cx| {
+            cx.update_global::<SettingsStore, _>(|store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings.agent.get_or_insert_default().cleanup = Some(true);
+                });
+            });
+        });
+
+        let cleaned = cx
+            .update(|cx| auto_cleanup_task_worktree(project.clone(), &task.id, cx))
+            .await
+            .unwrap();
+        assert!(cleaned);
+        assert!(!fs.is_dir(&worktree_path).await);
+    }
+
+    #[gpui::test]
+    async fn test_publish_ref_artifact_gated_by_settings(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/root"),
+            json!({
+                ".git": {
+                    "HEAD": "ref: refs/heads/main\n"
+                },
+                "initial.txt": "initial"
+            }),
+        )
+        .await;
+
+        let (tool_calls_tx, mut tool_calls_rx) = futures::channel::mpsc::unbounded();
+        let fake_transport = context_server::test::create_fake_transport("tgs", cx.executor())
+            .on_request::<context_server::types::requests::Initialize, _>(
+                move |_params| async move {
+                    context_server::types::InitializeResponse {
+                        protocol_version: context_server::types::ProtocolVersion(
+                            context_server::types::LATEST_PROTOCOL_VERSION.to_string(),
+                        ),
+                        server_info: context_server::types::Implementation {
+                            name: "tgs".into(),
+                            title: None,
+                            version: "1.0.0".to_string(),
+                            description: None,
+                        },
+                        capabilities: context_server::types::ServerCapabilities {
+                            tools: Some(context_server::types::ToolsCapabilities {
+                                list_changed: Some(true),
+                            }),
+                            ..Default::default()
+                        },
+                        meta: None,
+                    }
+                },
+            )
+            .on_request::<context_server::types::requests::CallTool, _>(move |params| {
+                let tool_calls_tx = tool_calls_tx.clone();
+                async move {
+                    tool_calls_tx.unbounded_send(params).unwrap();
+                    context_server::types::CallToolResponse {
+                        content: vec![context_server::types::ToolResponseContent::Text {
+                            text: "artifact published ok".into(),
+                        }],
+                        is_error: None,
+                        meta: None,
+                        structured_content: None,
+                    }
+                }
+            });
+
+        cx.update(|cx| {
+            cx.update_global::<SettingsStore, _>(|store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings.project.context_servers.insert(
+                        "tgs".into(),
+                        project::project_settings::ContextServerSettings::Stdio {
+                            enabled: true,
+                            remote: false,
+                            command: context_server::ContextServerCommand {
+                                path: "somebinary".into(),
+                                args: Vec::new(),
+                                env: None,
+                                timeout: None,
+                                platforms: Default::default(),
+                            },
+                        }
+                        .into(),
+                    );
+                    settings.agent.get_or_insert_default().publish_ref_artifact = Some(false);
+                });
+            });
+        });
+
+        let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
+        let context_server_store = project.read_with(cx, |p, _| p.context_server_store());
+        context_server_store.update(cx, |store, cx| {
+            store.start_server(
+                Arc::new(context_server::ContextServer::new(
+                    context_server::ContextServerId("tgs".into()),
+                    Arc::new(fake_transport),
+                )),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        let task = AgentTaskSummary {
+            id: AgentTaskId::from("TASK-NO-REF-PUB"),
+            parent_id: None,
+            goal_id: None,
+            title: "Test".to_string(),
+            status: AgentTaskStatus::Ready,
+            attempt: 1,
+            assignee: None,
+            write_scopes: vec![],
+            created_at: None,
+            assigned_profile: None,
+            model: None,
+            session_id: None,
+            metrics: None,
+        };
+
+        let worktree_path = cx
+            .update(|cx| {
+                ensure_task_worktree_with_policy(
+                    project.clone(),
+                    &task,
+                    Some("GOAL-NO-REF-PUB".to_string()),
+                    None,
+                    None,
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+
+        fs.save(
+            &worktree_path.join("file.txt"),
+            &"change".into(),
+            text::LineEnding::Unix,
+        )
+        .await
+        .unwrap();
+
+        let details = cx
+            .update(|cx| commit_and_merge_task_worktree(project.clone(), &task.id, false, cx))
+            .await
+            .unwrap();
+        assert!(details.merged_into.is_some());
+
+        // With publish_ref_artifact = false, no TGS call should be received.
+        assert!(tool_calls_rx.try_recv().is_err());
+
+        // Now enable publish_ref_artifact and verify that publication occurs.
+        cx.update(|cx| {
+            cx.update_global::<SettingsStore, _>(|store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings.agent.get_or_insert_default().publish_ref_artifact = Some(true);
+                });
+            });
+        });
+
+        let task2 = AgentTaskSummary {
+            id: AgentTaskId::from("TASK-WITH-REF-PUB"),
+            parent_id: None,
+            goal_id: None,
+            title: "Test 2".to_string(),
+            status: AgentTaskStatus::Ready,
+            attempt: 1,
+            assignee: None,
+            write_scopes: vec![],
+            created_at: None,
+            assigned_profile: None,
+            model: None,
+            session_id: None,
+            metrics: None,
+        };
+
+        let worktree_path2 = cx
+            .update(|cx| {
+                ensure_task_worktree_with_policy(
+                    project.clone(),
+                    &task2,
+                    Some("GOAL-NO-REF-PUB".to_string()),
+                    None,
+                    None,
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+
+        fs.save(
+            &worktree_path2.join("file2.txt"),
+            &"change 2".into(),
+            text::LineEnding::Unix,
+        )
+        .await
+        .unwrap();
+
+        let details2 = cx
+            .update(|cx| commit_and_merge_task_worktree(project.clone(), &task2.id, false, cx))
+            .await
+            .unwrap();
+        assert!(details2.merged_into.is_some());
+
+        let call = tool_calls_rx
+            .try_recv()
+            .expect("should receive artifact_publish call when enabled");
+        assert_eq!(call.name, "artifact_publish");
     }
 }

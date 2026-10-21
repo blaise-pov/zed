@@ -96,6 +96,30 @@ pub enum ThinkingBlockDisplay {
     AlwaysCollapsed,
 }
 
+/// The lifecycle management mode for agent tasks.
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    JsonSchema,
+    MergeFrom,
+    strum::VariantArray,
+    strum::VariantNames,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum TaskLifecycleMode {
+    /// Automatic lifecycle actions performed by the agent runtime.
+    #[default]
+    Runtime,
+    /// The runtime performs no automatic task lifecycle actions; the agent manages its own lifecycle.
+    Agent,
+}
+
 /// Threshold at which agent auto-compaction runs. See
 /// [`AutoCompactSettingsContent::threshold`] for the accepted formats.
 ///
@@ -557,6 +581,29 @@ pub struct AgentSettingsContent {
     ///
     /// Default: 102400 (100 KB)
     pub fetch_max_bytes: Option<usize>,
+    /// The task lifecycle management mode.
+    ///
+    /// Values: "runtime", "agent".
+    /// When set to "agent", the runtime performs no automatic task lifecycle actions.
+    ///
+    /// Default: "runtime"
+    pub task_lifecycle_mode: Option<TaskLifecycleMode>,
+    /// Whether to automatically commit task worktrees at session end.
+    ///
+    /// Default: true
+    pub commit_on_session_end: Option<bool>,
+    /// Whether to automatically clean up and evict task worktrees.
+    ///
+    /// Default: true
+    pub cleanup: Option<bool>,
+    /// Whether to automatically register task metadata in the task graph server.
+    ///
+    /// Default: true
+    pub register_metadata: Option<bool>,
+    /// Whether to publish task ref artifacts to the task graph server upon merge.
+    ///
+    /// Default: true
+    pub publish_ref_artifact: Option<bool>,
 }
 
 impl AgentSettingsContent {

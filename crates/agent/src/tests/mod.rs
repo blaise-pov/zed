@@ -283,6 +283,9 @@ pub(crate) struct FakeThreadEnvironment {
     published_artifacts: std::cell::RefCell<Vec<(String, String, String, Option<String>)>>,
     cleanup_subagent_worktree_calls: std::cell::RefCell<Vec<String>>,
     task_details: std::cell::RefCell<std::collections::HashMap<String, crate::AgentTaskDetail>>,
+    hang_record_turn: std::cell::Cell<bool>,
+    hang_commit: std::cell::Cell<bool>,
+    mock_worktree_path: std::cell::RefCell<Option<PathBuf>>,
 }
 
 impl FakeThreadEnvironment {
@@ -380,6 +383,21 @@ impl FakeThreadEnvironment {
     pub(crate) fn subagent_handle(&self) -> Option<Rc<FakeSubagentHandle>> {
         self.subagent_handle.clone()
     }
+
+    pub(crate) fn with_hanging_record_turn(self) -> Self {
+        self.hang_record_turn.set(true);
+        self
+    }
+
+    pub(crate) fn with_hanging_commit(self) -> Self {
+        self.hang_commit.set(true);
+        self
+    }
+
+    pub(crate) fn with_worktree_path(self, path: PathBuf) -> Self {
+        *self.mock_worktree_path.borrow_mut() = Some(path);
+        self
+    }
 }
 
 impl crate::ThreadEnvironment for FakeThreadEnvironment {
@@ -445,6 +463,9 @@ impl crate::ThreadEnvironment for FakeThreadEnvironment {
         self.ensure_worktree_calls
             .borrow_mut()
             .push(task_id.to_string());
+        if let Some(path) = self.mock_worktree_path.borrow().clone() {
+            return Task::ready(Ok(path));
+        }
         Task::ready(Err(anyhow::anyhow!(
             crate::task_worktree::NoGitRepositoryError
         )))
@@ -507,13 +528,38 @@ impl crate::ThreadEnvironment for FakeThreadEnvironment {
         &self,
         task_id: &str,
         record: crate::AgentTurnRecord,
-        _cx: &mut AsyncApp,
+        cx: &mut AsyncApp,
     ) -> Task<Result<u32>> {
+        if self.hang_record_turn.get() {
+            return cx.spawn(async move |_| futures::future::pending::<Result<u32>>().await);
+        }
         self.recorded_turns
             .borrow_mut()
             .push((task_id.to_string(), record));
         let count = self.recorded_turns.borrow().len() as u32;
         Task::ready(Ok(count))
+    }
+
+    fn commit_subagent_worktree(
+        &self,
+        task_id: &str,
+        _task_worktree: &Path,
+        _is_error: bool,
+        cx: &mut AsyncApp,
+    ) -> Task<Result<crate::task_worktree::SubagentIsolationDetails>> {
+        if self.hang_commit.get() {
+            return cx.spawn(async move |_| {
+                futures::future::pending::<Result<crate::task_worktree::SubagentIsolationDetails>>()
+                    .await
+            });
+        }
+        let task_id_typed = crate::AgentTaskId::from(task_id);
+        Task::ready(Ok(crate::task_worktree::fallback_isolation_details(
+            &task_id_typed,
+            "worktree",
+            None,
+            None,
+        )))
     }
 
     fn publish_artifact(
@@ -6449,6 +6495,7 @@ async fn test_send_retry_finishes_tool_calls_on_error(cx: &mut TestAppContext) {
                 content: vec![AgentMessageContent::Text("Done".into())],
                 tool_results: IndexMap::default(),
                 reasoning_details: None,
+                ..Default::default()
             }))
         );
     })
@@ -15853,4 +15900,157 @@ impl SubagentCompactionTest {
         self.thread
             .read_with(cx, |thread, _| assert!(thread.is_turn_complete()));
     }
+}
+
+#[gpui::test]
+async fn test_send_watchdog_resolves_when_thread_complete_but_submission_pending(
+    cx: &mut TestAppContext,
+) {
+    let test = SubagentCompactionTest::new(cx).await;
+    let send = test.send("initial prompt", cx);
+    test.fake
+        .send_last_text(&test.model, "final output from subagent");
+    test.fake.end_last(&test.model);
+    let output = send.await.unwrap();
+    assert_eq!(output, "final output from subagent");
+    test.assert_stopped(cx);
+
+    let connection = Rc::new(NativeAgentConnection(test._agent.clone()));
+    let project = cx.update(|cx| test.parent.read(cx).project().clone());
+    let hanging_acp_thread = cx
+        .update(|cx| connection.new_session(project, PathList::new(&[Path::new("")]), cx))
+        .await
+        .unwrap();
+
+    let watchdog_handle = NativeSubagentHandle::new(
+        acp::SessionId::new("subagent-watchdog-test"),
+        test.thread.clone(),
+        hanging_acp_thread,
+        test.parent.clone(),
+        thread::SubagentSlotGuard::new(Arc::new(thread::SubagentSlotPool::default())),
+    );
+
+    let send_task = cx.update(|cx| {
+        watchdog_handle.send("follow-up prompt".to_string(), &cx.to_async())
+    });
+    cx.run_until_parked();
+
+    cx.executor().advance_clock(Duration::from_secs(31));
+    cx.run_until_parked();
+
+    let resolved = send_task.await.unwrap();
+    assert_eq!(resolved, "final output from subagent");
+}
+
+#[gpui::test]
+async fn test_step_timeout_skipped_and_run_continues(cx: &mut TestAppContext) {
+    init_test(cx);
+
+    let environment = Rc::new(
+        FakeThreadEnvironment::default()
+            .with_task_id("TASK-TIMEOUT-STEP")
+            .with_hanging_record_turn()
+            .with_subagent(FakeSubagentHandle::new(
+                acp::SessionId::new("subagent-id"),
+                Task::ready("subagent task finished".to_string()).shared(),
+                None,
+            )),
+    );
+
+    #[allow(clippy::arc_with_non_send_sync)]
+    let tool = Arc::new(SpawnAgentTool::new(environment.clone()));
+    let (event_stream, _rx) = ToolCallEventStream::test();
+
+    let run_task = cx.update(|cx| {
+        tool.run(
+            ToolInput::resolved(SpawnAgentToolInput {
+                label: "step timeout test".to_string(),
+                message: "run subagent".to_string(),
+                task_id: Some("TASK-TIMEOUT-STEP".to_string()),
+                ..Default::default()
+            }),
+            event_stream,
+            cx,
+        )
+    });
+
+    cx.run_until_parked();
+    cx.executor().advance_clock(Duration::from_secs(125));
+    cx.run_until_parked();
+
+    let result = run_task.await;
+    match result {
+        Ok(SpawnAgentToolOutput::Success { output, .. }) => {
+            assert_eq!(output, "subagent task finished");
+        }
+        other => panic!("expected successful output despite step timeout, got {other:?}"),
+    }
+
+    let transitions = environment.task_status_transitions();
+    assert!(transitions.contains(&(
+        "TASK-TIMEOUT-STEP".to_string(),
+        crate::AgentTaskStatus::Completed
+    )));
+}
+
+#[gpui::test]
+async fn test_commit_timeout_does_not_fail_tool_result_when_send_succeeded(
+    cx: &mut TestAppContext,
+) {
+    init_test(cx);
+
+    let environment = Rc::new(
+        FakeThreadEnvironment::default()
+            .with_task_id("TASK-COMMIT-TIMEOUT")
+            .with_worktree_path(PathBuf::from("/mock/worktree"))
+            .with_hanging_commit()
+            .with_subagent(FakeSubagentHandle::new(
+                acp::SessionId::new("subagent-id"),
+                Task::ready("changes completed successfully".to_string()).shared(),
+                None,
+            )),
+    );
+
+    #[allow(clippy::arc_with_non_send_sync)]
+    let tool = Arc::new(SpawnAgentTool::new(environment.clone()));
+    let (event_stream, _rx) = ToolCallEventStream::test();
+
+    let run_task = cx.update(|cx| {
+        tool.run(
+            ToolInput::resolved(SpawnAgentToolInput {
+                label: "commit timeout test".to_string(),
+                message: "run worktree subagent".to_string(),
+                task_id: Some("TASK-COMMIT-TIMEOUT".to_string()),
+                ..Default::default()
+            }),
+            event_stream,
+            cx,
+        )
+    });
+
+    cx.run_until_parked();
+    cx.executor().advance_clock(Duration::from_secs(305));
+    cx.run_until_parked();
+
+    let result = run_task.await;
+    match result {
+        Ok(SpawnAgentToolOutput::Success {
+            output,
+            isolation_details,
+            ..
+        }) => {
+            assert_eq!(output, "changes completed successfully");
+            let details = isolation_details.expect("isolation details should be present");
+            let commit_error = details
+                .commit_error
+                .expect("commit error should be reported");
+            assert!(
+                commit_error.contains("commit timed out"),
+                "expected commit timed out in commit_error, got: {commit_error}"
+            );
+        }
+        other => panic!("expected success with commit_error, got {other:?}"),
+    }
+
+    assert!(environment.cleanup_subagent_worktree_calls().is_empty());
 }

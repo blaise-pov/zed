@@ -847,8 +847,7 @@
           "allowed": [
             "agent_architect",
             "agent_fleet_planner",
-            "agent_engineer",
-            "e2e_tester"
+            "agent_engineer"
           ],
           "max_depth": 1
         },

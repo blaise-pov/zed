@@ -752,6 +752,11 @@ mod tests {
             task_worktree_limit: agent_settings::DEFAULT_TASK_WORKTREE_LIMIT,
             task_worktree_language_servers: agent_settings::DEFAULT_TASK_WORKTREE_LANGUAGE_SERVERS,
             fetch_max_bytes: agent_settings::DEFAULT_FETCH_MAX_BYTES,
+            task_lifecycle_mode: agent_settings::DEFAULT_TASK_LIFECYCLE_MODE,
+            commit_on_session_end: agent_settings::DEFAULT_COMMIT_ON_SESSION_END,
+            cleanup: agent_settings::DEFAULT_CLEANUP,
+            register_metadata: agent_settings::DEFAULT_REGISTER_METADATA,
+            publish_ref_artifact: agent_settings::DEFAULT_PUBLISH_REF_ARTIFACT,
         }
     }
 

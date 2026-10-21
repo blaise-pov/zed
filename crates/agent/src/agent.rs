@@ -3935,10 +3935,41 @@ impl ThreadEnvironment for NativeThreadEnvironment {
         cx.spawn(async move |cx| {
             let task = cx.update(|cx| {
                 crate::task_worktree::commit_and_merge_task_worktree(
-                    project, &task_id, is_error, cx,
+                    project.clone(), &task_id, is_error, cx,
                 )
             });
-            task.await
+            match task.await {
+                Ok(details) => Ok(details),
+                Err(err) => {
+                    let err_str = err.to_string();
+                    if crate::task_worktree::is_git_lock_contention(&err_str) {
+                        cx.background_executor().timer(crate::task_worktree::GIT_LOCK_RETRY_DELAY).await;
+                        let retry_task = cx.update(|cx| {
+                            crate::task_worktree::commit_and_merge_task_worktree(
+                                project, &task_id, is_error, cx,
+                            )
+                        });
+                        match retry_task.await {
+                            Ok(details) => Ok(details),
+                            Err(retry_err) => {
+                                Ok(crate::task_worktree::fallback_isolation_details(
+                                    &task_id,
+                                    "worktree",
+                                    Some(format!("git lock contention: {retry_err:#}")),
+                                    None,
+                                ))
+                            }
+                        }
+                    } else {
+                        Ok(crate::task_worktree::fallback_isolation_details(
+                            &task_id,
+                            "worktree",
+                            Some(format!("commit failed: {err_str}")),
+                            None,
+                        ))
+                    }
+                }
+            }
         })
     }
 
@@ -4235,17 +4266,17 @@ impl ThreadEnvironment for NativeThreadEnvironment {
 }
 
 pub struct NativeSubagentHandle {
-    session_id: acp_v1::SessionId,
-    parent_thread: WeakEntity<Thread>,
-    subagent_thread: Entity<Thread>,
-    acp_thread: Entity<acp_thread::AcpThread>,
+    pub(crate) session_id: acp_v1::SessionId,
+    pub(crate) parent_thread: WeakEntity<Thread>,
+    pub(crate) subagent_thread: Entity<Thread>,
+    pub(crate) acp_thread: Entity<acp_thread::AcpThread>,
     /// Releases the sub-agent's concurrency slot when this handle is dropped,
     /// i.e. when the spawning tool call finishes or is cancelled.
-    _slot_guard: SubagentSlotGuard,
+    pub(crate) _slot_guard: SubagentSlotGuard,
 }
 
 impl NativeSubagentHandle {
-    fn new(
+    pub(crate) fn new(
         session_id: acp_v1::SessionId,
         subagent_thread: Entity<Thread>,
         acp_thread: Entity<acp_thread::AcpThread>,
@@ -4260,6 +4291,31 @@ impl NativeSubagentHandle {
             _slot_guard: slot_guard,
         }
     }
+}
+
+const WATCHDOG_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const WATCHDOG_TURN_COMPLETE_TIMEOUT: Duration = Duration::from_secs(30);
+
+fn extract_last_agent_message_content(thread: &Thread) -> Result<String> {
+    thread
+        .last_message()
+        .and_then(|message| {
+            let content = message
+                .as_agent_message()?
+                .content
+                .iter()
+                .filter_map(|content| match content {
+                    AgentMessageContent::Text(text) => Some(text.as_str()),
+                    _ => None,
+                })
+                .join("\n\n");
+            if content.is_empty() {
+                None
+            } else {
+                Some(content)
+            }
+        })
+        .context("No response from subagent")
 }
 
 impl SubagentHandle for NativeSubagentHandle {
@@ -4321,87 +4377,121 @@ impl SubagentHandle for NativeSubagentHandle {
             });
 
             let mut task = task.fuse();
-            let response = futures::select_biased! {
-                response = task => response,
-                _ = token_limit_rx.fuse() => {
-                    if thread.read_with(cx, |thread, _| thread.is_turn_complete()) {
-                        task.await
-                    } else {
+            let mut token_limit_rx = token_limit_rx.fuse();
+            let mut turn_complete_timer =
+                futures::future::Either::Left(futures::future::pending::<()>()).fuse();
+            let mut turn_complete_timer_active = false;
+
+            enum SendOutcome {
+                Response(Result<Option<acp_thread::SubmissionResponse>>),
+                WatchdogResolved(Result<String>),
+            }
+
+            let send_outcome: SendOutcome = loop {
+                let mut watchdog_poll =
+                    cx.background_executor().timer(WATCHDOG_POLL_INTERVAL).fuse();
+                futures::select_biased! {
+                    response = task => {
+                        break SendOutcome::Response(response);
+                    }
+                    _ = token_limit_rx => {
+                        if thread.read_with(cx, |thread, _| thread.is_turn_complete()) {
+                            let response = task.await;
+                            break SendOutcome::Response(response);
+                        } else {
+                            log::info!(
+                                "[cancel-audit] session={} source=subagent_token_limit_cancel",
+                                subagent_session_id
+                            );
+                            thread.update(cx, |thread, cx| thread.cancel(cx)).await;
+                            break SendOutcome::Response(Err(anyhow!(
+                                "The agent is nearing the end of its context window and has been \
+                                 stopped. You can prompt the thread again to have the agent wrap up \
+                                 or hand off its work."
+                            )));
+                        }
+                    }
+                    _ = turn_complete_timer => {
                         log::info!(
-                            "[cancel-audit] session={} source=subagent_token_limit_cancel",
-                            subagent_session_id
+                            "[cancel-audit] session={} elapsed_ms={} source=send_watchdog_turn_complete",
+                            subagent_session_id,
+                            start_time.elapsed().as_millis()
                         );
-                        thread.update(cx, |thread, cx| thread.cancel(cx)).await;
-                        Err(anyhow!(
-                            "The agent is nearing the end of its context window and has been \
-                             stopped. You can prompt the thread again to have the agent wrap up \
-                             or hand off its work."
-                        ))
+                        let extracted = thread.read_with(cx, |thread, _cx| {
+                            extract_last_agent_message_content(thread)
+                        });
+                        break SendOutcome::WatchdogResolved(extracted);
+                    }
+                    _ = watchdog_poll => {
+                        let is_complete = thread.read_with(cx, |thread, _| thread.is_turn_complete());
+                        if is_complete {
+                            if !turn_complete_timer_active {
+                                turn_complete_timer = futures::future::Either::Right(
+                                    cx.background_executor().timer(WATCHDOG_TURN_COMPLETE_TIMEOUT),
+                                ).fuse();
+                                turn_complete_timer_active = true;
+                            }
+                        } else if turn_complete_timer_active {
+                            turn_complete_timer = futures::future::Either::Left(
+                                futures::future::pending::<()>(),
+                            ).fuse();
+                            turn_complete_timer_active = false;
+                        }
                     }
                 }
             };
-            let discard_partial_output = matches!(
-                &response,
-                Ok(Some(acp_thread::SubmissionResponse::LegacyCompleted(response))) if response.stop_reason == acp_v1::StopReason::Cancelled
-                    || response.stop_reason == acp_v1::StopReason::Refusal
-            );
-            let result = match response {
-                Ok(Some(acp_thread::SubmissionResponse::LegacyCompleted(response))) => match response.stop_reason {
-                    acp_v1::StopReason::Cancelled => {
-                        let (parent_id, parent_canceling, parent_was_canceled, parent_turn_complete) =
-                            parent_thread
-                                .read_with(cx, |parent, _| {
-                                    (
-                                        parent.id().clone(),
-                                        parent.is_canceling(),
-                                        parent.was_canceled(),
-                                        parent.is_turn_complete(),
-                                    )
-                                })
-                                .unwrap_or_else(|_| (acp_v1::SessionId::from("unknown"), false, false, false));
-                        let subagent_task_id = thread
-                            .read_with(cx, |t, _| t.task_id().unwrap_or("-").to_string());
-                        log::info!(
-                            "[cancel-audit] session={} task_id={} parent_id={} parent_canceling={} parent_was_canceled={} parent_turn_complete={} elapsed_ms={} source=subagent_stop_cancelled",
-                            subagent_session_id,
-                            subagent_task_id,
-                            parent_id,
-                            parent_canceling,
-                            parent_was_canceled,
-                            parent_turn_complete,
-                            start_time.elapsed().as_millis(),
-                        );
-                        Err(anyhow!("User canceled"))
-                    }
-                    acp_v1::StopReason::MaxTokens => Err(anyhow!("The agent reached the maximum number of tokens.")),
-                    acp_v1::StopReason::MaxTurnRequests => Err(anyhow!("The agent reached the maximum number of allowed requests between user turns. Try prompting again.")),
-                    acp_v1::StopReason::Refusal => Err(anyhow!("The agent refused to process that prompt. Try again.")),
-                    _ => thread.read_with(cx, |thread, _cx| {
-                        thread
-                            .last_message()
-                            .and_then(|message| {
-                                let content = message.as_agent_message()?
-                                    .content
-                                    .iter()
-                                    .filter_map(|content| match content {
-                                        AgentMessageContent::Text(text) => Some(text.as_str()),
-                                        _ => None,
-                                    })
-                                    .join("\n\n");
-                                if content.is_empty() {
-                                    None
-                                } else {
-                                    Some(content)
-                                }
-                            })
-                            .context("No response from subagent")
-                    }),
-                },
-                Ok(Some(acp_thread::SubmissionResponse::Accepted(_))) => {
-                    Err(anyhow!("Native subagent returned acceptance instead of turn completion"))
+
+            let (discard_partial_output, result) = match send_outcome {
+                SendOutcome::WatchdogResolved(resolved) => (false, resolved),
+                SendOutcome::Response(response) => {
+                    let discard_partial_output = matches!(
+                        &response,
+                        Ok(Some(acp_thread::SubmissionResponse::LegacyCompleted(response))) if response.stop_reason == acp_v1::StopReason::Cancelled
+                            || response.stop_reason == acp_v1::StopReason::Refusal
+                    );
+                    let result = match response {
+                        Ok(Some(acp_thread::SubmissionResponse::LegacyCompleted(response))) => match response.stop_reason {
+                            acp_v1::StopReason::Cancelled => {
+                                let (parent_id, parent_canceling, parent_was_canceled, parent_turn_complete) =
+                                    parent_thread
+                                        .read_with(cx, |parent, _| {
+                                            (
+                                                parent.id().clone(),
+                                                parent.is_canceling(),
+                                                parent.was_canceled(),
+                                                parent.is_turn_complete(),
+                                            )
+                                        })
+                                        .unwrap_or_else(|_| (acp_v1::SessionId::from("unknown"), false, false, false));
+                                let subagent_task_id = thread
+                                    .read_with(cx, |t, _| t.task_id().unwrap_or("-").to_string());
+                                log::info!(
+                                    "[cancel-audit] session={} task_id={} parent_id={} parent_canceling={} parent_was_canceled={} parent_turn_complete={} elapsed_ms={} source=subagent_stop_cancelled",
+                                    subagent_session_id,
+                                    subagent_task_id,
+                                    parent_id,
+                                    parent_canceling,
+                                    parent_was_canceled,
+                                    parent_turn_complete,
+                                    start_time.elapsed().as_millis(),
+                                );
+                                Err(anyhow!("User canceled"))
+                            }
+                            acp_v1::StopReason::MaxTokens => Err(anyhow!("The agent reached the maximum number of tokens.")),
+                            acp_v1::StopReason::MaxTurnRequests => Err(anyhow!("The agent reached the maximum number of allowed requests between user turns. Try prompting again.")),
+                            acp_v1::StopReason::Refusal => Err(anyhow!("The agent refused to process that prompt. Try again.")),
+                            _ => thread.read_with(cx, |thread, _cx| {
+                                extract_last_agent_message_content(thread)
+                            }),
+                        },
+                        Ok(Some(acp_thread::SubmissionResponse::Accepted(_))) => {
+                            Err(anyhow!("Native subagent returned acceptance instead of turn completion"))
+                        }
+                        Ok(None) => Err(anyhow!("No response from the agent. You can try messaging again.")),
+                        Err(error) => Err(error),
+                    };
+                    (discard_partial_output, result)
                 }
-                Ok(None) => Err(anyhow!("No response from the agent. You can try messaging again.")),
-                Err(error) => Err(error),
             };
 
             parent_thread
@@ -9727,6 +9817,439 @@ mod internal_tests {
         agent.update(cx, |agent, cx| {
             agent.save_thread(thread.clone(), cx);
         });
+    }
+
+    struct TestSubagentHandle {
+        id: acp_v1::SessionId,
+    }
+
+    impl crate::SubagentHandle for TestSubagentHandle {
+        fn id(&self) -> acp_v1::SessionId {
+            self.id.clone()
+        }
+
+        fn num_entries(&self, _cx: &App) -> usize {
+            1
+        }
+
+        fn send(&self, _message: String, _cx: &gpui::AsyncApp) -> Task<anyhow::Result<String>> {
+            Task::ready(Ok("subagent response".to_string()))
+        }
+    }
+
+    struct LifecycleTrackingEnvironment {
+        session_id: acp_v1::SessionId,
+        metadata_calls:
+            std::cell::RefCell<Vec<(String, Option<String>, Option<String>, Option<String>)>>,
+        status_transitions: std::cell::RefCell<Vec<(String, crate::AgentTaskStatus)>>,
+        commit_calls: std::cell::RefCell<Vec<String>>,
+        cleanup_calls: std::cell::RefCell<Vec<String>>,
+        failed_tasks: std::cell::RefCell<Vec<(String, String)>>,
+    }
+
+    impl LifecycleTrackingEnvironment {
+        fn new(session_id: &str) -> Self {
+            Self {
+                session_id: acp_v1::SessionId::new(session_id),
+                metadata_calls: std::cell::RefCell::new(Vec::new()),
+                status_transitions: std::cell::RefCell::new(Vec::new()),
+                commit_calls: std::cell::RefCell::new(Vec::new()),
+                cleanup_calls: std::cell::RefCell::new(Vec::new()),
+                failed_tasks: std::cell::RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    impl ThreadEnvironment for LifecycleTrackingEnvironment {
+        fn create_terminal(
+            &self,
+            _command: String,
+            _extra_env: Vec<acp_v1::EnvVariable>,
+            _cd: Option<std::path::PathBuf>,
+            _output_byte_limit: Option<u64>,
+            _sandbox_wrap: Option<acp_thread::SandboxWrap>,
+            _cx: &mut gpui::AsyncApp,
+        ) -> Task<anyhow::Result<Rc<dyn crate::TerminalHandle>>> {
+            Task::ready(Err(anyhow::anyhow!("not supported")))
+        }
+
+        fn create_subagent(
+            &self,
+            _label: String,
+            _profile: Option<agent_settings::AgentProfileId>,
+            _model: Option<acp_thread::AgentModelId>,
+            _task_worktree: Option<std::path::PathBuf>,
+            _cx: &mut App,
+        ) -> anyhow::Result<Rc<dyn crate::SubagentHandle>> {
+            Ok(Rc::new(TestSubagentHandle {
+                id: self.session_id.clone(),
+            }))
+        }
+
+        fn resume_subagent(
+            &self,
+            _session_id: acp_v1::SessionId,
+            _profile: Option<agent_settings::AgentProfileId>,
+            _task_worktree: Option<std::path::PathBuf>,
+            _cx: &mut App,
+        ) -> anyhow::Result<Rc<dyn crate::SubagentHandle>> {
+            Ok(Rc::new(TestSubagentHandle {
+                id: self.session_id.clone(),
+            }))
+        }
+
+        fn ensure_subagent_worktree(
+            &self,
+            task_id: &str,
+            _goal_id: Option<String>,
+            _base_branch: Option<String>,
+            _on_branch: Option<String>,
+            _cx: &mut gpui::AsyncApp,
+        ) -> Task<anyhow::Result<std::path::PathBuf>> {
+            Task::ready(Ok(std::path::PathBuf::from(format!("/worktree/{}", task_id))))
+        }
+
+        fn commit_subagent_worktree(
+            &self,
+            task_id: &str,
+            _task_worktree: &std::path::Path,
+            _is_error: bool,
+            _cx: &mut gpui::AsyncApp,
+        ) -> Task<anyhow::Result<crate::task_worktree::SubagentIsolationDetails>> {
+            self.commit_calls.borrow_mut().push(task_id.to_string());
+            Task::ready(Ok(crate::task_worktree::SubagentIsolationDetails {
+                mode: "worktree".to_string(),
+                branch: format!("agent-task/{task_id}"),
+                base_branch: None,
+                head_sha: Some("commit-sha".to_string()),
+                changed_files: 1,
+                commit_error: None,
+                merged_into: None,
+                merge_conflict: None,
+            }))
+        }
+
+        fn auto_cleanup_subagent_worktree(
+            &self,
+            task_id: &str,
+            _cx: &mut gpui::AsyncApp,
+        ) -> Task<anyhow::Result<bool>> {
+            self.cleanup_calls.borrow_mut().push(task_id.to_string());
+            Task::ready(Ok(true))
+        }
+
+        fn fail_task_registered(
+            &self,
+            task_id: &str,
+            reason: &str,
+            _cx: &mut gpui::AsyncApp,
+        ) -> Task<anyhow::Result<()>> {
+            self.failed_tasks
+                .borrow_mut()
+                .push((task_id.to_string(), reason.to_string()));
+            Task::ready(Ok(()))
+        }
+
+        fn update_task_registered(
+            &self,
+            task_id: &str,
+            model: Option<&str>,
+            assignee: Option<&str>,
+            session_id: Option<&str>,
+            _cx: &mut gpui::AsyncApp,
+        ) -> Task<anyhow::Result<()>> {
+            self.metadata_calls.borrow_mut().push((
+                task_id.to_string(),
+                model.map(str::to_string),
+                assignee.map(str::to_string),
+                session_id.map(str::to_string),
+            ));
+            Task::ready(Ok(()))
+        }
+
+        fn set_task_status_registered(
+            &self,
+            task_id: &str,
+            status: crate::AgentTaskStatus,
+            _cx: &mut gpui::AsyncApp,
+        ) -> Task<anyhow::Result<()>> {
+            self.status_transitions
+                .borrow_mut()
+                .push((task_id.to_string(), status));
+            Task::ready(Ok(()))
+        }
+
+        fn get_task_registered(
+            &self,
+            task_id: &str,
+            _cx: &mut gpui::AsyncApp,
+        ) -> Task<anyhow::Result<crate::AgentTaskDetail>> {
+            Task::ready(Ok(crate::AgentTaskDetail {
+                summary: crate::AgentTaskSummary {
+                    id: crate::AgentTaskId::from(task_id),
+                    title: task_id.to_string(),
+                    status: crate::AgentTaskStatus::Ready,
+                    attempt: 1,
+                    ..Default::default()
+                },
+                description: String::new(),
+                acceptance_criteria: Vec::new(),
+                events_tail: Vec::new(),
+            }))
+        }
+
+        fn record_turn(
+            &self,
+            _task_id: &str,
+            _record: crate::AgentTurnRecord,
+            _cx: &mut gpui::AsyncApp,
+        ) -> Task<anyhow::Result<u32>> {
+            Task::ready(Ok(1))
+        }
+    }
+
+    #[gpui::test]
+    async fn test_spawn_agent_task_lifecycle_mode_agent_skips_all_automations(
+        cx: &mut TestAppContext,
+    ) {
+        crate::tests::init_test(cx);
+        cx.update(|cx| {
+            cx.update_global::<SettingsStore, _>(|store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings.agent.get_or_insert_default().task_lifecycle_mode =
+                        Some(agent_settings::TaskLifecycleMode::Agent);
+                });
+            });
+        });
+
+        let task_id = "TASK-LIFECYCLE-AGENT";
+        let env = Rc::new(LifecycleTrackingEnvironment::new("subagent-agent-mode"));
+        #[allow(clippy::arc_with_non_send_sync)]
+        let tool = Arc::new(crate::tools::SpawnAgentTool::new(env.clone()));
+        let (event_stream, _rx) = crate::ToolCallEventStream::test();
+
+        let result = cx
+            .update(|cx| {
+                tool.run(
+                    crate::ToolInput::resolved(crate::tools::SpawnAgentToolInput {
+                        label: "agent mode test".to_string(),
+                        message: "do nothing automatically".to_string(),
+                        task_id: Some(task_id.to_string()),
+                        ..Default::default()
+                    }),
+                    event_stream,
+                    cx,
+                )
+            })
+            .await;
+
+        assert!(matches!(
+            result,
+            Ok(crate::tools::SpawnAgentToolOutput::Success { .. })
+        ));
+        assert_eq!(env.status_transitions.borrow().clone(), vec![]);
+        assert_eq!(env.metadata_calls.borrow().clone(), vec![]);
+        assert_eq!(env.commit_calls.borrow().clone(), Vec::<String>::new());
+        assert_eq!(env.cleanup_calls.borrow().clone(), Vec::<String>::new());
+        assert_eq!(env.failed_tasks.borrow().clone(), vec![]);
+    }
+
+    #[gpui::test]
+    async fn test_spawn_agent_task_lifecycle_runtime_mode_and_toggles(cx: &mut TestAppContext) {
+        crate::tests::init_test(cx);
+
+        // 1. Default runtime mode: all automations run
+        {
+            let task_id = "TASK-RUNTIME-DEFAULT";
+            let env = Rc::new(LifecycleTrackingEnvironment::new("subagent-runtime-1"));
+            #[allow(clippy::arc_with_non_send_sync)]
+            let tool = Arc::new(crate::tools::SpawnAgentTool::new(env.clone()));
+            let (event_stream, _rx) = crate::ToolCallEventStream::test();
+
+            let result = cx
+                .update(|cx| {
+                    tool.run(
+                        crate::ToolInput::resolved(crate::tools::SpawnAgentToolInput {
+                            label: "runtime default".to_string(),
+                            message: "run all automations".to_string(),
+                            task_id: Some(task_id.to_string()),
+                            ..Default::default()
+                        }),
+                        event_stream,
+                        cx,
+                    )
+                })
+                .await;
+
+            assert!(matches!(
+                result,
+                Ok(crate::tools::SpawnAgentToolOutput::Success { .. })
+            ));
+            assert_eq!(
+                env.status_transitions.borrow().clone(),
+                vec![
+                    (task_id.to_string(), crate::AgentTaskStatus::Running),
+                    (task_id.to_string(), crate::AgentTaskStatus::Completed),
+                ]
+            );
+            assert_eq!(env.metadata_calls.borrow().len(), 1);
+            assert_eq!(env.commit_calls.borrow().clone(), vec![task_id.to_string()]);
+            assert_eq!(
+                env.cleanup_calls.borrow().clone(),
+                vec![task_id.to_string()]
+            );
+        }
+
+        // 2. Runtime mode with register_metadata = false
+        {
+            cx.update(|cx| {
+                cx.update_global::<SettingsStore, _>(|store, cx| {
+                    store.update_user_settings(cx, |settings| {
+                        settings.agent.get_or_insert_default().register_metadata = Some(false);
+                    });
+                });
+            });
+
+            let task_id = "TASK-NO-METADATA";
+            let env = Rc::new(LifecycleTrackingEnvironment::new("subagent-runtime-2"));
+            #[allow(clippy::arc_with_non_send_sync)]
+            let tool = Arc::new(crate::tools::SpawnAgentTool::new(env.clone()));
+            let (event_stream, _rx) = crate::ToolCallEventStream::test();
+
+            let result = cx
+                .update(|cx| {
+                    tool.run(
+                        crate::ToolInput::resolved(crate::tools::SpawnAgentToolInput {
+                            label: "no metadata".to_string(),
+                            message: "skip metadata".to_string(),
+                            task_id: Some(task_id.to_string()),
+                            ..Default::default()
+                        }),
+                        event_stream,
+                        cx,
+                    )
+                })
+                .await;
+
+            assert!(matches!(
+                result,
+                Ok(crate::tools::SpawnAgentToolOutput::Success { .. })
+            ));
+            assert_eq!(env.metadata_calls.borrow().clone(), vec![]);
+            assert_eq!(
+                env.status_transitions.borrow().clone(),
+                vec![
+                    (task_id.to_string(), crate::AgentTaskStatus::Running),
+                    (task_id.to_string(), crate::AgentTaskStatus::Completed),
+                ]
+            );
+            assert_eq!(env.commit_calls.borrow().clone(), vec![task_id.to_string()]);
+            assert_eq!(
+                env.cleanup_calls.borrow().clone(),
+                vec![task_id.to_string()]
+            );
+        }
+
+        // 3. Runtime mode with commit_on_session_end = false
+        {
+            cx.update(|cx| {
+                cx.update_global::<SettingsStore, _>(|store, cx| {
+                    store.update_user_settings(cx, |settings| {
+                        let agent = settings.agent.get_or_insert_default();
+                        agent.register_metadata = Some(true);
+                        agent.commit_on_session_end = Some(false);
+                    });
+                });
+            });
+
+            let task_id = "TASK-NO-COMMIT";
+            let env = Rc::new(LifecycleTrackingEnvironment::new("subagent-runtime-3"));
+            #[allow(clippy::arc_with_non_send_sync)]
+            let tool = Arc::new(crate::tools::SpawnAgentTool::new(env.clone()));
+            let (event_stream, _rx) = crate::ToolCallEventStream::test();
+
+            let result = cx
+                .update(|cx| {
+                    tool.run(
+                        crate::ToolInput::resolved(crate::tools::SpawnAgentToolInput {
+                            label: "no commit".to_string(),
+                            message: "skip commit".to_string(),
+                            task_id: Some(task_id.to_string()),
+                            ..Default::default()
+                        }),
+                        event_stream,
+                        cx,
+                    )
+                })
+                .await;
+
+            assert!(matches!(
+                result,
+                Ok(crate::tools::SpawnAgentToolOutput::Success { .. })
+            ));
+            assert_eq!(env.commit_calls.borrow().clone(), Vec::<String>::new());
+            assert_eq!(env.metadata_calls.borrow().len(), 1);
+            assert_eq!(
+                env.status_transitions.borrow().clone(),
+                vec![
+                    (task_id.to_string(), crate::AgentTaskStatus::Running),
+                    (task_id.to_string(), crate::AgentTaskStatus::Completed),
+                ]
+            );
+            assert_eq!(
+                env.cleanup_calls.borrow().clone(),
+                vec![task_id.to_string()]
+            );
+        }
+
+        // 4. Runtime mode with cleanup = false
+        {
+            cx.update(|cx| {
+                cx.update_global::<SettingsStore, _>(|store, cx| {
+                    store.update_user_settings(cx, |settings| {
+                        let agent = settings.agent.get_or_insert_default();
+                        agent.commit_on_session_end = Some(true);
+                        agent.cleanup = Some(false);
+                    });
+                });
+            });
+
+            let task_id = "TASK-NO-CLEANUP";
+            let env = Rc::new(LifecycleTrackingEnvironment::new("subagent-runtime-4"));
+            #[allow(clippy::arc_with_non_send_sync)]
+            let tool = Arc::new(crate::tools::SpawnAgentTool::new(env.clone()));
+            let (event_stream, _rx) = crate::ToolCallEventStream::test();
+
+            let result = cx
+                .update(|cx| {
+                    tool.run(
+                        crate::ToolInput::resolved(crate::tools::SpawnAgentToolInput {
+                            label: "no cleanup".to_string(),
+                            message: "skip cleanup".to_string(),
+                            task_id: Some(task_id.to_string()),
+                            ..Default::default()
+                        }),
+                        event_stream,
+                        cx,
+                    )
+                })
+                .await;
+
+            assert!(matches!(
+                result,
+                Ok(crate::tools::SpawnAgentToolOutput::Success { .. })
+            ));
+            assert_eq!(env.cleanup_calls.borrow().clone(), Vec::<String>::new());
+            assert_eq!(env.metadata_calls.borrow().len(), 1);
+            assert_eq!(env.commit_calls.borrow().clone(), vec![task_id.to_string()]);
+            assert_eq!(
+                env.status_transitions.borrow().clone(),
+                vec![
+                    (task_id.to_string(), crate::AgentTaskStatus::Running),
+                    (task_id.to_string(), crate::AgentTaskStatus::Completed),
+                ]
+            );
+        }
     }
 }
 

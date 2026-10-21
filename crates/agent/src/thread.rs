@@ -67,13 +67,14 @@ use std::{
     path::{Path, PathBuf},
     rc::Rc,
     sync::Arc,
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
     time::{Duration, Instant},
 };
 use util::{ResultExt, debug_panic, markdown::MarkdownCodeBlock, paths::PathStyle};
 use uuid::Uuid;
 
 const TOOL_CANCELED_MESSAGE: &str = "Tool canceled by user";
+pub const DEFAULT_WATCHDOG_TIMEOUT: Duration = Duration::from_secs(120);
 const TOOL_CALL_INTERRUPTED_BY_FOLLOW_UP_MESSAGE: &str =
     "Permission denied: user sent a follow-up message instead of approving the tool call.";
 pub(crate) const FOLLOW_UP_PERMISSION_DENIED_OPTION_ID: &str = "follow_up_permission_denied";
@@ -302,7 +303,7 @@ impl RetryStrategy {
     }
 }
 
-#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Message {
     User(UserMessage),
     Agent(AgentMessage),
@@ -310,7 +311,7 @@ pub enum Message {
     Compaction(CompactionInfo),
 }
 
-#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum CompactionInfo {
     Summary(SharedString),
     ProviderNative {
@@ -866,6 +867,8 @@ pub struct AgentMessage {
     pub(crate) content: Vec<AgentMessageContent>,
     pub(crate) tool_results: IndexMap<LanguageModelToolUseId, LanguageModelToolResult>,
     pub(crate) reasoning_details: Option<Arc<serde_json::Value>>,
+    #[serde(default)]
+    pub(crate) is_continuation_failure: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1605,6 +1608,7 @@ pub struct Thread {
     task_id: Option<String>,
     is_canceling: bool,
     was_canceled: bool,
+    pub(crate) watchdog_timeout: Duration,
 }
 
 impl Thread {
@@ -1641,6 +1645,22 @@ impl Thread {
 
     pub fn task_id(&self) -> Option<&str> {
         self.task_id.as_deref()
+    }
+
+    pub fn watchdog_timeout(&self) -> Duration {
+        self.watchdog_timeout
+    }
+
+    pub fn set_watchdog_timeout(&mut self, timeout: Duration) {
+        self.watchdog_timeout = timeout;
+    }
+
+    pub fn is_turn_running(&self) -> bool {
+        self.running_turn.is_some()
+    }
+
+    pub fn active_turn(&self) -> bool {
+        self.running_turn.is_some()
     }
 
     pub fn set_task_id(&mut self, task_id: Option<String>) {
@@ -1871,6 +1891,7 @@ impl Thread {
             task_id: None,
             is_canceling: false,
             was_canceled: false,
+            watchdog_timeout: DEFAULT_WATCHDOG_TIMEOUT,
         }
     }
 
@@ -1880,6 +1901,7 @@ impl Thread {
     /// should be inherited here as well.
     fn inherit_parent_settings(&mut self, parent_thread: &Entity<Thread>, cx: &mut Context<Self>) {
         let parent = parent_thread.read(cx);
+        self.watchdog_timeout = parent.watchdog_timeout;
         self.speed = parent.speed;
         self.thinking_enabled = parent.thinking_enabled;
         self.thinking_effort = parent.thinking_effort.clone();
@@ -2338,6 +2360,7 @@ impl Thread {
             task_id: db_thread.task_id,
             is_canceling: false,
             was_canceled: false,
+            watchdog_timeout: DEFAULT_WATCHDOG_TIMEOUT,
         }
     }
 
@@ -3237,6 +3260,7 @@ impl Thread {
         let (events_tx, events_rx) = mpsc::unbounded::<Result<ThreadEvent>>();
         let event_stream = ThreadEventStream::new(events_tx);
         let (cancellation_tx, mut cancellation_rx) = watch::channel(false);
+        let cancellation_tx = Arc::new(parking_lot::Mutex::new(cancellation_tx));
         let task = cx.spawn({
             let event_stream = event_stream.clone();
             async move |this, cx| {
@@ -3293,12 +3317,15 @@ impl Thread {
                 _ = this.update(cx, |this, _| this.running_turn.take());
             }
         });
+        let (watchdog_handle, _activity_rx) = WatchdogHandle::new();
         self.running_turn = Some(RunningTurn::new(
             self.id.clone(),
             event_stream,
             BTreeMap::default(),
             cancellation_tx,
             task,
+            Task::ready(()),
+            watchdog_handle,
         ));
 
         Ok(events_rx)
@@ -3341,6 +3368,163 @@ impl Thread {
         cx.notify();
     }
 
+    fn finalize_in_flight_tool_calls(
+        &mut self,
+        event_stream: &ThreadEventStream,
+        audit_source: &str,
+        failure_reason: &str,
+    ) {
+        let thread_id = self.id.clone();
+
+        if let Some(pending) = self.pending_message.as_mut() {
+            let owning_message_ix = self.messages.len();
+            for content in &pending.content {
+                if let AgentMessageContent::ToolUse(tool_use) = content {
+                    if !pending.tool_results.contains_key(&tool_use.id) {
+                        log::info!(
+                            "[cancel-audit] thread={} tool_use_id={} tool_name={} source={}",
+                            thread_id,
+                            tool_use.id,
+                            tool_use.name,
+                            audit_source
+                        );
+                        pending.tool_results.insert(
+                            tool_use.id.clone(),
+                            LanguageModelToolResult {
+                                tool_use_id: tool_use.id.clone(),
+                                tool_name: tool_use.name.clone(),
+                                is_error: true,
+                                content: vec![LanguageModelToolResultContent::Text(
+                                    format!("Tool call failed: {failure_reason}").into(),
+                                )],
+                                output: None,
+                            },
+                        );
+                        let tool_call_id = scoped_tool_call_id(owning_message_ix, &tool_use.id);
+                        event_stream.update_tool_call_fields(
+                            &tool_call_id,
+                            acp::ToolCallUpdateFields::new().status(acp::ToolCallStatus::Failed),
+                            None,
+                        );
+                    }
+                }
+            }
+        }
+
+        for (msg_ix, msg) in self.messages.iter_mut().enumerate() {
+            if let Message::Agent(agent_msg) = Arc::make_mut(msg) {
+                for content in &agent_msg.content {
+                    if let AgentMessageContent::ToolUse(tool_use) = content {
+                        if !agent_msg.tool_results.contains_key(&tool_use.id) {
+                            log::info!(
+                                "[cancel-audit] thread={} tool_use_id={} tool_name={} source={}",
+                                thread_id,
+                                tool_use.id,
+                                tool_use.name,
+                                audit_source
+                            );
+                            agent_msg.tool_results.insert(
+                                tool_use.id.clone(),
+                                LanguageModelToolResult {
+                                    tool_use_id: tool_use.id.clone(),
+                                    tool_name: tool_use.name.clone(),
+                                    is_error: true,
+                                    content: vec![LanguageModelToolResultContent::Text(
+                                        format!("Tool call failed: {failure_reason}").into(),
+                                    )],
+                                    output: None,
+                                },
+                            );
+                            let tool_call_id = scoped_tool_call_id(msg_ix, &tool_use.id);
+                            event_stream.update_tool_call_fields(
+                                &tool_call_id,
+                                acp::ToolCallUpdateFields::new().status(acp::ToolCallStatus::Failed),
+                                None,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn finalize_continuation_failure(
+        &mut self,
+        event_stream: &ThreadEventStream,
+        error: &anyhow::Error,
+        cx: &mut Context<Self>,
+    ) {
+        let thread_id = self.id.clone();
+        log::info!(
+            "[cancel-audit] thread={} source=continuation_failure error={}",
+            thread_id,
+            error
+        );
+
+        self.finalize_in_flight_tool_calls(
+            event_stream,
+            "continuation_failure_tool_finalized",
+            &format!("continuation failed: {error}"),
+        );
+
+        self.flush_pending_message(cx);
+
+        let error_message = format!("Error: {error}");
+        self.messages.push(Arc::new(Message::Agent(AgentMessage {
+            content: vec![AgentMessageContent::Text(error_message.clone())],
+            is_continuation_failure: true,
+            ..Default::default()
+        })));
+
+        event_stream.send_text(&error_message);
+        self.updated_at = Utc::now();
+        self.clear_summary();
+        cx.notify();
+    }
+
+    fn force_finalize_stalled_turn(
+        &mut self,
+        event_stream: &ThreadEventStream,
+        cancellation_tx: &Arc<parking_lot::Mutex<watch::Sender<bool>>>,
+        timeout: Duration,
+        cx: &mut Context<Self>,
+    ) {
+        let thread_id = self.id.clone();
+        let timeout_secs = timeout.as_secs();
+        log::info!(
+            "[cancel-audit] thread={} timeout_secs={} source=watchdog_stalled_turn",
+            thread_id,
+            timeout_secs
+        );
+
+        cancellation_tx.lock().send(true).ok();
+        let running_turn = self.running_turn.take();
+
+        self.finalize_in_flight_tool_calls(
+            event_stream,
+            "watchdog_tool_finalized",
+            "turn timed out with no progress",
+        );
+
+        self.flush_pending_message(cx);
+
+        let error_message = format!("Turn timed out after {}s with no progress", timeout_secs);
+        self.messages.push(Arc::new(Message::Agent(AgentMessage {
+            content: vec![AgentMessageContent::Text(error_message.clone())],
+            is_continuation_failure: true,
+            ..Default::default()
+        })));
+
+        event_stream.send_text(&error_message);
+        event_stream.send_stop(acp::StopReason::EndTurn);
+
+        self.updated_at = Utc::now();
+        self.clear_summary();
+        cx.notify();
+
+        drop(running_turn);
+    }
+
     fn run_turn(
         &mut self,
         cx: &mut Context<Self>,
@@ -3364,6 +3548,60 @@ impl Thread {
         self.clear_summary();
         let tools = self.enabled_tools(cx);
         let (cancellation_tx, mut cancellation_rx) = watch::channel(false);
+        let cancellation_tx = Arc::new(parking_lot::Mutex::new(cancellation_tx));
+        let (watchdog_handle, mut activity_rx) = WatchdogHandle::new();
+        event_stream.set_watchdog_handle(watchdog_handle.clone());
+        let timeout = self.watchdog_timeout;
+
+        let watchdog_task = cx.spawn({
+            let watchdog_handle = watchdog_handle.clone();
+            let cancellation_tx = cancellation_tx.clone();
+            let mut cancellation_rx = cancellation_rx.clone();
+            let event_stream = event_stream.clone();
+            async move |this, cx| {
+                loop {
+                    if *cancellation_rx.borrow() {
+                        break;
+                    }
+
+                    let timer = cx.background_executor().timer(timeout);
+                    futures::select! {
+                        _ = timer.fuse() => {
+                            if watchdog_handle.is_stalled() {
+                                let finalized = this.update(cx, |this, cx| {
+                                    if this.running_turn.is_some() {
+                                        this.force_finalize_stalled_turn(
+                                            &event_stream,
+                                            &cancellation_tx,
+                                            timeout,
+                                            cx,
+                                        );
+                                        true
+                                    } else {
+                                        false
+                                    }
+                                }).unwrap_or(false);
+                                if finalized {
+                                    break;
+                                }
+                            }
+                        }
+                        res = activity_rx.changed().fuse() => {
+                            if res.is_err() {
+                                break;
+                            }
+                            continue;
+                        }
+                        res = cancellation_rx.changed().fuse() => {
+                            if res.is_err() || *cancellation_rx.borrow() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
         let task = cx.spawn({
             let event_stream = event_stream.clone();
             async move |this, cx| {
@@ -3388,25 +3626,37 @@ impl Thread {
                     return;
                 }
 
-                _ = this.update(cx, |this, cx| this.flush_pending_message(cx));
-
                 match turn_result {
                     Ok(()) => {
                         log::debug!("Turn execution completed");
+                        _ = this.update(cx, |this, cx| this.flush_pending_message(cx));
                         event_stream.send_stop(acp::StopReason::EndTurn);
                     }
                     Err(error) => {
                         log::error!("Turn execution failed: {:?}", error);
-                        match error.downcast::<CompletionError>() {
-                            Ok(CompletionError::Refusal) => {
-                                event_stream.send_stop(acp::StopReason::Refusal);
-                                _ = this.update(cx, |this, _| this.messages.truncate(message_ix));
-                            }
-                            Ok(CompletionError::MaxTokens) => {
-                                event_stream.send_stop(acp::StopReason::MaxTokens);
-                            }
-                            Ok(CompletionError::Other(error)) | Err(error) => {
-                                event_stream.send_error(error);
+                        let is_refusal = error
+                            .downcast_ref::<CompletionError>()
+                            .is_some_and(|e| matches!(e, CompletionError::Refusal));
+                        if is_refusal {
+                            event_stream.send_stop(acp::StopReason::Refusal);
+                            _ = this.update(cx, |this, cx| {
+                                this.flush_pending_message(cx);
+                                this.messages.truncate(message_ix);
+                            });
+                        } else {
+                            _ = this.update(cx, |this, cx| {
+                                this.finalize_continuation_failure(&event_stream, &error, cx);
+                            });
+                            match error.downcast::<CompletionError>() {
+                                Ok(CompletionError::MaxTokens) => {
+                                    event_stream.send_stop(acp::StopReason::MaxTokens);
+                                }
+                                Ok(CompletionError::Other(error)) | Err(error) => {
+                                    event_stream.send_error(error);
+                                }
+                                Ok(CompletionError::Refusal) => {
+                                    event_stream.send_error(anyhow::anyhow!(CompletionError::Refusal));
+                                }
                             }
                         }
                     }
@@ -3421,6 +3671,8 @@ impl Thread {
             tools,
             cancellation_tx,
             task,
+            watchdog_task,
+            watchdog_handle,
         ));
         Ok(events_rx)
     }
@@ -3558,6 +3810,12 @@ impl Thread {
             );
 
             log::debug!("Calling model.stream_completion, attempt {}", attempt);
+
+            this.update(cx, |this, _| {
+                if let Some(turn) = this.running_turn.as_ref() {
+                    turn.watchdog_handle.set_streaming(true);
+                }
+            })?;
 
             let events = match provider {
                 Ok(provider) => provider.stream_completion(&model, request, cx).await,
@@ -3698,6 +3956,11 @@ impl Thread {
             // tool execution, which could cause deadlocks when tools spawn subagents
             // that need their own permits.
             drop(events);
+            this.update(cx, |this, _| {
+                if let Some(turn) = this.running_turn.as_ref() {
+                    turn.watchdog_handle.set_streaming(false);
+                }
+            })?;
 
             // Drop streaming tool input senders that never received their final input.
             // This prevents deadlock when the LLM stream ends (e.g. because of an error)
@@ -3867,6 +4130,11 @@ impl Thread {
             this.handle_completion_error(error, attempt, user_store.plan(), cx)
         })??;
         let timer = cx.background_executor().timer(retry.duration);
+        this.update(cx, |this, _| {
+            if let Some(turn) = this.running_turn.as_ref() {
+                turn.watchdog_handle.bump_activity();
+            }
+        })?;
         event_stream.send_retry(retry);
         futures::select! {
             _ = timer.fuse() => {}
@@ -4173,6 +4441,9 @@ impl Thread {
         cx: &mut Context<Self>,
     ) -> Result<Option<Task<(usize, LanguageModelToolResult)>>> {
         log::trace!("Handling streamed completion event: {:?}", event);
+        if let Some(turn) = self.running_turn.as_ref() {
+            turn.watchdog_handle.bump_activity();
+        }
         use LanguageModelCompletionEvent::*;
 
         match event {
@@ -4543,7 +4814,12 @@ impl Thread {
         let project = self.project.clone();
         let is_task_complete = tool_name.ends_with("task_complete");
         let terminal_task_id_for_merge = terminal_task_id.clone();
+        let tool_guard = self
+            .running_turn
+            .as_ref()
+            .map(|turn| turn.watchdog_handle.tool_started());
         cx.spawn(async move |this, cx| {
+            let _tool_guard = tool_guard;
             let mut detected_merge_conflicts: Option<Vec<String>> = None;
             if is_task_complete {
                 if let Some(task_id_str) = terminal_task_id_for_merge {
@@ -5890,6 +6166,7 @@ fn subagent_partial_output_from_messages(
                 .rev()
                 .filter_map(|message| message.as_agent_message()),
         )
+        .filter(|message| !message.is_continuation_failure)
         .filter_map(|message| {
             let characters = message
                 .content
@@ -6082,12 +6359,92 @@ enum CompactionInsertion {
     Manual { marker_id: ClientUserMessageId },
 }
 
+#[derive(Clone)]
+pub(crate) struct WatchdogHandle {
+    pending_tool_count: Arc<AtomicUsize>,
+    pending_authorization_count: Arc<AtomicUsize>,
+    is_streaming: Arc<AtomicBool>,
+    activity_tx: Arc<parking_lot::Mutex<watch::Sender<()>>>,
+}
+
+pub(crate) struct ToolActivityGuard {
+    pending_tool_count: Arc<AtomicUsize>,
+    activity_tx: Arc<parking_lot::Mutex<watch::Sender<()>>>,
+}
+
+impl Drop for ToolActivityGuard {
+    fn drop(&mut self) {
+        self.pending_tool_count.fetch_sub(1, Ordering::SeqCst);
+        self.activity_tx.lock().send(()).ok();
+    }
+}
+
+pub(crate) struct AuthorizationActivityGuard {
+    pending_authorization_count: Arc<AtomicUsize>,
+    activity_tx: Arc<parking_lot::Mutex<watch::Sender<()>>>,
+}
+
+impl Drop for AuthorizationActivityGuard {
+    fn drop(&mut self) {
+        self.pending_authorization_count.fetch_sub(1, Ordering::SeqCst);
+        self.activity_tx.lock().send(()).ok();
+    }
+}
+
+impl WatchdogHandle {
+    fn new() -> (Self, watch::Receiver<()>) {
+        let (activity_tx, activity_rx) = watch::channel(());
+        let handle = Self {
+            pending_tool_count: Arc::new(AtomicUsize::new(0)),
+            pending_authorization_count: Arc::new(AtomicUsize::new(0)),
+            is_streaming: Arc::new(AtomicBool::new(false)),
+            activity_tx: Arc::new(parking_lot::Mutex::new(activity_tx)),
+        };
+        (handle, activity_rx)
+    }
+
+    fn bump_activity(&self) {
+        self.activity_tx.lock().send(()).ok();
+    }
+
+    fn tool_started(&self) -> ToolActivityGuard {
+        self.pending_tool_count.fetch_add(1, Ordering::SeqCst);
+        self.bump_activity();
+        ToolActivityGuard {
+            pending_tool_count: self.pending_tool_count.clone(),
+            activity_tx: self.activity_tx.clone(),
+        }
+    }
+
+    fn authorization_started(&self) -> AuthorizationActivityGuard {
+        self.pending_authorization_count.fetch_add(1, Ordering::SeqCst);
+        self.bump_activity();
+        AuthorizationActivityGuard {
+            pending_authorization_count: self.pending_authorization_count.clone(),
+            activity_tx: self.activity_tx.clone(),
+        }
+    }
+
+    fn set_streaming(&self, streaming: bool) {
+        self.is_streaming.store(streaming, Ordering::SeqCst);
+        self.bump_activity();
+    }
+
+    fn is_stalled(&self) -> bool {
+        let tools = self.pending_tool_count.load(Ordering::SeqCst);
+        let auth = self.pending_authorization_count.load(Ordering::SeqCst);
+        let streaming = self.is_streaming.load(Ordering::SeqCst);
+        !streaming && tools == 0 && auth == 0
+    }
+}
+
 struct RunningTurn {
     thread_id: acp::SessionId,
     /// Holds the task that handles agent interaction until the end of the turn.
     /// Survives across multiple requests as the model performs tool calls and
     /// we run tools, report their results.
     _task: Task<()>,
+    _watchdog_task: Task<()>,
     /// The current event stream for the running turn. Used to report a final
     /// cancellation event if we cancel the turn.
     event_stream: ThreadEventStream,
@@ -6096,10 +6453,11 @@ struct RunningTurn {
     tools: BTreeMap<SharedString, Arc<dyn AnyAgentTool>>,
     /// Sender to signal tool cancellation. When cancel is called, this is
     /// set to true so all tools can detect user-initiated cancellation.
-    cancellation_tx: watch::Sender<bool>,
+    cancellation_tx: Arc<parking_lot::Mutex<watch::Sender<bool>>>,
     /// Senders for tools that support input streaming and have already been
     /// started but are still receiving input from the LLM.
     streaming_tool_inputs: HashMap<LanguageModelToolUseId, ToolInputSender>,
+    watchdog_handle: WatchdogHandle,
 }
 
 impl RunningTurn {
@@ -6107,26 +6465,30 @@ impl RunningTurn {
         thread_id: acp::SessionId,
         event_stream: ThreadEventStream,
         tools: BTreeMap<SharedString, Arc<dyn AnyAgentTool>>,
-        cancellation_tx: watch::Sender<bool>,
+        cancellation_tx: Arc<parking_lot::Mutex<watch::Sender<bool>>>,
         task: Task<()>,
+        watchdog_task: Task<()>,
+        watchdog_handle: WatchdogHandle,
     ) -> Self {
         Self {
             thread_id,
             _task: task,
+            _watchdog_task: watchdog_task,
             event_stream,
             tools,
             cancellation_tx,
             streaming_tool_inputs: HashMap::default(),
+            watchdog_handle,
         }
     }
 
-    fn cancel(mut self) -> Task<()> {
+    fn cancel(self) -> Task<()> {
         log::debug!("Cancelling in progress turn");
         log::info!(
             "[cancel-audit] thread={} source=cancellation_tx_signaled",
             self.thread_id
         );
-        self.cancellation_tx.send(true).ok();
+        self.cancellation_tx.lock().send(true).ok();
         self.event_stream.send_canceled();
         self._task
     }
@@ -6828,6 +7190,7 @@ pub(crate) fn scoped_tool_call_id(
 struct ThreadEventStream {
     sender: mpsc::UnboundedSender<Result<ThreadEvent>>,
     active_compaction: Rc<RefCell<Option<acp_thread::ContextCompactionId>>>,
+    watchdog_handle: Rc<RefCell<Option<WatchdogHandle>>>,
 }
 
 impl ThreadEventStream {
@@ -6835,22 +7198,36 @@ impl ThreadEventStream {
         Self {
             sender,
             active_compaction: Rc::default(),
+            watchdog_handle: Rc::default(),
+        }
+    }
+
+    fn set_watchdog_handle(&self, handle: WatchdogHandle) {
+        self.watchdog_handle.replace(Some(handle));
+    }
+
+    fn bump_watchdog(&self) {
+        if let Some(handle) = self.watchdog_handle.borrow().as_ref() {
+            handle.bump_activity();
         }
     }
 
     fn send_user_message(&self, message: &UserMessage) {
+        self.bump_watchdog();
         self.sender
             .unbounded_send(Ok(ThreadEvent::UserMessage(message.clone())))
             .ok();
     }
 
     fn send_text(&self, text: &str) {
+        self.bump_watchdog();
         self.sender
             .unbounded_send(Ok(ThreadEvent::AgentText(text.to_string())))
             .ok();
     }
 
     fn send_thinking(&self, text: &str) {
+        self.bump_watchdog();
         self.sender
             .unbounded_send(Ok(ThreadEvent::AgentThinking(text.to_string())))
             .ok();
@@ -6864,6 +7241,7 @@ impl ThreadEventStream {
         kind: acp::ToolKind,
         input: serde_json::Value,
     ) {
+        self.bump_watchdog();
         self.sender
             .unbounded_send(Ok(ThreadEvent::ToolCall(Self::initial_tool_call(
                 id,
@@ -6894,6 +7272,7 @@ impl ThreadEventStream {
         fields: acp::ToolCallUpdateFields,
         meta: Option<acp::Meta>,
     ) {
+        self.bump_watchdog();
         self.sender
             .unbounded_send(Ok(ThreadEvent::ToolCallUpdate(
                 acp::ToolCallUpdate::new(tool_call_id.clone(), fields)
@@ -6903,11 +7282,22 @@ impl ThreadEventStream {
             .ok();
     }
 
+    fn send_tool_call_authorization(
+        &self,
+        auth: ToolCallAuthorization,
+    ) -> Result<(), anyhow::Error> {
+        self.bump_watchdog();
+        self.sender
+            .unbounded_send(Ok(ThreadEvent::ToolCallAuthorization(auth)))
+            .map_err(|e| anyhow!("{e}"))
+    }
+
     fn resolve_tool_call_authorization(
         &self,
         tool_call_id: &acp::ToolCallId,
         outcome: acp_thread::SelectedPermissionOutcome,
     ) {
+        self.bump_watchdog();
         self.sender
             .unbounded_send(Ok(ThreadEvent::ToolCallAuthorizationResolved {
                 tool_call_id: tool_call_id.clone(),
@@ -6917,6 +7307,7 @@ impl ThreadEventStream {
     }
 
     fn send_retry(&self, status: acp_thread::RetryStatus) {
+        self.bump_watchdog();
         self.sender
             .unbounded_send(Ok(ThreadEvent::Retry(status)))
             .ok();
@@ -6927,6 +7318,7 @@ impl ThreadEventStream {
         id: acp_thread::ContextCompactionId,
         status: acp_thread::ContextCompactionStatus,
     ) {
+        self.bump_watchdog();
         if status == acp_thread::ContextCompactionStatus::InProgress {
             self.active_compaction.replace(Some(id.clone()));
         }
@@ -6947,6 +7339,7 @@ impl ThreadEventStream {
         id: acp_thread::ContextCompactionId,
         summary_delta: &str,
     ) {
+        self.bump_watchdog();
         self.sender
             .unbounded_send(Ok(ThreadEvent::ContextCompactionUpdate(
                 acp_thread::ContextCompactionUpdate {
@@ -6963,6 +7356,7 @@ impl ThreadEventStream {
         id: acp_thread::ContextCompactionId,
         status: acp_thread::ContextCompactionStatus,
     ) {
+        self.bump_watchdog();
         if status != acp_thread::ContextCompactionStatus::InProgress
             && self.active_compaction.borrow().as_ref() == Some(&id)
         {
@@ -7502,30 +7896,35 @@ impl ToolCallEventStream {
             Ok(outcome) => outcome,
             Err(error) => return Task::ready(Err(error)),
         };
+        let auth_guard = self
+            .stream
+            .watchdog_handle
+            .borrow()
+            .as_ref()
+            .map(|h| h.authorization_started());
         cx.spawn(async move |cx| {
+            let _auth_guard = auth_guard;
             let (response_tx, mut response_rx) = oneshot::channel();
             if let Err(error) =
-                stream
-                    .sender
-                    .unbounded_send(Ok(ThreadEvent::ToolCallAuthorization(
-                        ToolCallAuthorization {
-                            tool_call: acp::ToolCallUpdate::new(
-                                tool_call_id.clone(),
-                                // Leave the title untouched so the card keeps
-                                // showing the command (matching the fallback flow).
-                                acp::ToolCallUpdateFields::new(),
-                            )
-                            .meta(
-                                acp_thread::meta_with_sandbox_authorization(
-                                    sandbox_authorization_details,
-                                ),
+                stream.send_tool_call_authorization(
+                    ToolCallAuthorization {
+                        tool_call: acp::ToolCallUpdate::new(
+                            tool_call_id.clone(),
+                            // Leave the title untouched so the card keeps
+                            // showing the command (matching the fallback flow).
+                            acp::ToolCallUpdateFields::new(),
+                        )
+                        .meta(
+                            acp_thread::meta_with_sandbox_authorization(
+                                sandbox_authorization_details,
                             ),
-                            options,
-                            response: response_tx,
-                            context: None,
-                            kind: acp_thread::AuthorizationKind::PermissionGrant,
-                        },
-                    )))
+                        ),
+                        options,
+                        response: response_tx,
+                        context: None,
+                        kind: acp_thread::AuthorizationKind::PermissionGrant,
+                    },
+                )
             {
                 log::error!("Failed to send sandbox authorization: {error}");
                 return Err(anyhow!("Failed to send sandbox authorization: {error}"));
@@ -7637,27 +8036,36 @@ impl ToolCallEventStream {
         // decline.
         let tool_call_id = self.tool_call_id.clone();
         let tool_use_id = self.tool_use_id.clone();
+        let _auto_allow_outcome = match auto_resolve_permission_outcome(&options, true) {
+            Ok(outcome) => outcome,
+            Err(error) => return Task::ready(Err(error)),
+        };
+        let auth_guard = self
+            .stream
+            .watchdog_handle
+            .borrow()
+            .as_ref()
+            .map(|h| h.authorization_started());
         cx.spawn(async move |_cx| {
+            let _auth_guard = auth_guard;
             let (response_tx, response_rx) = oneshot::channel();
             if let Err(error) =
-                stream
-                    .sender
-                    .unbounded_send(Ok(ThreadEvent::ToolCallAuthorization(
-                        ToolCallAuthorization {
-                            tool_call: acp::ToolCallUpdate::new(
-                                tool_call_id.clone(),
-                                // Leave the title untouched so the card keeps
-                                // showing the command (matching the escalation
-                                // flow).
-                                acp::ToolCallUpdateFields::new(),
-                            )
-                            .meta(acp_thread::meta_with_sandbox_authorization(details)),
-                            options,
-                            response: response_tx,
-                            context: None,
-                            kind: acp_thread::AuthorizationKind::PermissionGrant,
-                        },
-                    )))
+                stream.send_tool_call_authorization(
+                    ToolCallAuthorization {
+                        tool_call: acp::ToolCallUpdate::new(
+                            tool_call_id.clone(),
+                            // Leave the title untouched so the card keeps
+                            // showing the command (matching the escalation
+                            // flow).
+                            acp::ToolCallUpdateFields::new(),
+                        )
+                        .meta(acp_thread::meta_with_sandbox_authorization(details)),
+                        options,
+                        response: response_tx,
+                        context: None,
+                        kind: acp_thread::AuthorizationKind::PermissionGrant,
+                    },
+                )
             {
                 log::error!("Failed to send Windows-drive sandbox warning: {error}");
                 return Err(anyhow!(
@@ -7922,29 +8330,32 @@ impl ToolCallEventStream {
         let thread = self.thread.clone();
         cx.spawn(async move |cx| {
             let (response_tx, response_rx) = oneshot::channel();
+            let _auth_guard = stream
+                .watchdog_handle
+                .borrow()
+                .as_ref()
+                .map(|h| h.authorization_started());
             if let Err(error) =
-                stream
-                    .sender
-                    .unbounded_send(Ok(ThreadEvent::ToolCallAuthorization(
-                        ToolCallAuthorization {
-                            // Deliberately leave the tool-call title untouched so
-                            // the card keeps showing the *command* (not the
-                            // failure reason): it's critical the user can see what
-                            // they're approving to run unsandboxed. The reason is
-                            // surfaced separately by the fallback details / warning.
-                            tool_call: acp::ToolCallUpdate::new(
-                                tool_call_id.clone(),
-                                acp::ToolCallUpdateFields::new(),
-                            )
-                            .meta(
-                                acp_thread::meta_with_sandbox_fallback_authorization(details),
-                            ),
-                            options,
-                            response: response_tx,
-                            context: None,
-                            kind: acp_thread::AuthorizationKind::ActionChoice,
-                        },
-                    )))
+                stream.send_tool_call_authorization(
+                    ToolCallAuthorization {
+                        // Deliberately leave the tool-call title untouched so
+                        // the card keeps showing the *command* (not the
+                        // failure reason): it's critical the user can see what
+                        // they're approving to run unsandboxed. The reason is
+                        // surfaced separately by the fallback details / warning.
+                        tool_call: acp::ToolCallUpdate::new(
+                            tool_call_id.clone(),
+                            acp::ToolCallUpdateFields::new(),
+                        )
+                        .meta(
+                            acp_thread::meta_with_sandbox_fallback_authorization(details),
+                        ),
+                        options,
+                        response: response_tx,
+                        context: None,
+                        kind: acp_thread::AuthorizationKind::ActionChoice,
+                    },
+                )
             {
                 log::error!("Failed to send sandbox fallback authorization: {error}");
                 return Err(anyhow!(
@@ -8044,18 +8455,21 @@ impl ToolCallEventStream {
             }
 
             let (response_tx, response_rx) = oneshot::channel();
+            let _auth_guard = stream
+                .watchdog_handle
+                .borrow()
+                .as_ref()
+                .map(|h| h.authorization_started());
             if let Err(error) =
-                stream
-                    .sender
-                    .unbounded_send(Ok(ThreadEvent::ToolCallAuthorization(
-                        ToolCallAuthorization {
-                            tool_call: acp::ToolCallUpdate::new(tool_call_id.clone(), fields),
-                            options,
-                            response: response_tx,
-                            context: None,
-                            kind: acp_thread::AuthorizationKind::ActionChoice,
-                        },
-                    )))
+                stream.send_tool_call_authorization(
+                    ToolCallAuthorization {
+                        tool_call: acp::ToolCallUpdate::new(tool_call_id.clone(), fields),
+                        options,
+                        response: response_tx,
+                        context: None,
+                        kind: acp_thread::AuthorizationKind::ActionChoice,
+                    },
+                )
             {
                 log::error!("Failed to send tool call decision prompt: {error}");
                 return Err(anyhow!("Failed to send tool call decision prompt: {error}"));
@@ -8173,21 +8587,24 @@ impl ToolCallEventStream {
         };
         cx.spawn(async move |cx| {
             let (response_tx, mut response_rx) = oneshot::channel();
+            let _auth_guard = stream
+                .watchdog_handle
+                .borrow()
+                .as_ref()
+                .map(|h| h.authorization_started());
             if let Err(error) =
-                stream
-                    .sender
-                    .unbounded_send(Ok(ThreadEvent::ToolCallAuthorization(
-                        ToolCallAuthorization {
-                            tool_call: acp::ToolCallUpdate::new(
-                                tool_call_id.clone(),
-                                acp::ToolCallUpdateFields::new().title(title),
-                            ),
-                            options,
-                            response: response_tx,
-                            context,
-                            kind: acp_thread::AuthorizationKind::PermissionGrant,
-                        },
-                    )))
+                stream.send_tool_call_authorization(
+                    ToolCallAuthorization {
+                        tool_call: acp::ToolCallUpdate::new(
+                            tool_call_id.clone(),
+                            acp::ToolCallUpdateFields::new().title(title),
+                        ),
+                        options,
+                        response: response_tx,
+                        context,
+                        kind: acp_thread::AuthorizationKind::PermissionGrant,
+                    },
+                )
             {
                 log::error!("Failed to send tool call authorization: {error}");
                 return Err(anyhow!("Failed to send tool call authorization: {error}"));
@@ -8711,6 +9128,7 @@ mod tests {
             ],
             tool_results: IndexMap::default(),
             reasoning_details: None,
+            ..Default::default()
         };
 
         let db_thread = DbThread {
@@ -8798,6 +9216,7 @@ mod tests {
             content: vec![AgentMessageContent::ToolUse(tool_use.clone())],
             tool_results: IndexMap::default(),
             reasoning_details: None,
+            ..Default::default()
         };
 
         let requests = agent_message.to_request();
@@ -9506,6 +9925,24 @@ mod tests {
         let mut messages = messages.to_vec();
         messages.push(user_text_message(ClientUserMessageId::new(), "next task"));
         assert_eq!(subagent_partial_output_from_messages(&messages, None), "");
+    }
+
+    #[test]
+    fn test_subagent_partial_output_excludes_continuation_failure() {
+        let messages = [
+            user_text_message(ClientUserMessageId::new(), "task"),
+            agent_text_message("partial output"),
+            Arc::new(Message::Agent(AgentMessage {
+                content: vec![AgentMessageContent::Text("Error: continuation failed".to_string())],
+                is_continuation_failure: true,
+                ..AgentMessage::default()
+            })),
+        ];
+
+        assert_eq!(
+            subagent_partial_output_from_messages(&messages, None),
+            "partial output"
+        );
     }
 
     #[test]
@@ -11658,6 +12095,7 @@ mod tests {
                     ],
                     tool_results,
                     reasoning_details: None,
+                    ..Default::default()
                 })));
 
                 thread.replay(cx)
@@ -12026,5 +12464,317 @@ mod tests {
         });
 
         drop(authorize_task);
+    }
+
+    struct TestEchoTool;
+
+    impl AgentTool for TestEchoTool {
+        type Input = serde_json::Value;
+        type Output = String;
+
+        const NAME: &'static str = "test_echo_tool";
+
+        fn kind() -> acp::ToolKind {
+            acp::ToolKind::Other
+        }
+
+        fn initial_title(
+            &self,
+            _input: Result<Self::Input, serde_json::Value>,
+            _cx: &mut App,
+        ) -> SharedString {
+            "Test Echo Tool".into()
+        }
+
+        fn run(
+            self: Arc<Self>,
+            input: ToolInput<Self::Input>,
+            _event_stream: ToolCallEventStream,
+            cx: &mut App,
+        ) -> Task<Result<Self::Output, Self::Output>> {
+            cx.spawn(async move |_cx| {
+                let input = input.recv().await.map_err(|e| e.to_string())?;
+                Ok(input.to_string())
+            })
+        }
+    }
+
+    #[gpui::test]
+    async fn test_continuation_failure_finalizes_tool_calls_and_ends_turn(
+        cx: &mut TestAppContext,
+    ) {
+        let (thread, _event_stream, fake) = setup_thread_for_test(cx).await;
+        let model = fake.model("fake");
+
+        cx.update(|cx| {
+            let mut settings = AgentSettings::get_global(cx).clone();
+            if let Some(profile) = settings.profiles.get_mut(&settings.default_profile) {
+                profile.tools.insert(TestEchoTool::NAME.into(), true);
+            }
+            AgentSettings::override_global(settings, cx);
+
+            thread.update(cx, |thread, cx| {
+                thread.set_model(model.clone(), cx);
+                thread.add_tool(TestEchoTool);
+            });
+        });
+
+        let _events = cx.update(|cx| {
+            thread.update(cx, |thread, cx| {
+                thread.send(ClientUserMessageId::new(), ["Run tool"], cx).unwrap()
+            })
+        });
+
+        cx.run_until_parked();
+
+        let tool_use = LanguageModelToolUse {
+            id: "call_echo_1".into(),
+            name: TestEchoTool::NAME.into(),
+            raw_input: json!({"msg": "hello"}).to_string(),
+            input: language_model::LanguageModelToolUseInput::Json(json!({"msg": "hello"})),
+            is_input_complete: true,
+            thought_signature: None,
+        };
+        fake.send_last_event(
+            &model,
+            LanguageModelCompletionEvent::ToolUse(tool_use.clone()),
+        );
+        fake.end_last(&model);
+
+        cx.run_until_parked();
+
+        fake.send_last_error(
+            &model,
+            LanguageModelCompletionError::from_provider_response(
+                language_model::LanguageModelProviderName::new("fake"),
+                Some(http_client::StatusCode::BAD_REQUEST),
+                Some("api_error".to_string()),
+                "Continuation model call failed".to_string(),
+                None,
+                language_model::ProviderErrorCategory::Other,
+            ),
+        );
+        fake.end_last(&model);
+        cx.run_until_parked();
+
+        thread.read_with(cx, |thread, _cx| {
+            assert!(!thread.is_turn_running());
+            assert!(thread.is_turn_complete());
+
+            let messages = &thread.messages;
+            let mut found_tool_result = false;
+            let mut found_visible_error = false;
+            for msg in messages {
+                if let Message::Agent(agent_msg) = &**msg {
+                    if let Some(result) = agent_msg.tool_results.get(&tool_use.id) {
+                        assert!(!result.is_error, "completed tool should have result status, but got: {:?}", result);
+                        found_tool_result = true;
+                    }
+                    for content in &agent_msg.content {
+                        if let AgentMessageContent::Text(text) = content {
+                            if text.contains("Continuation model call failed") {
+                                found_visible_error = true;
+                            }
+                        }
+                    }
+                }
+            }
+            assert!(found_tool_result, "tool result should be present");
+            assert!(found_visible_error, "visible error entry should be present in thread transcript");
+        });
+    }
+
+    #[gpui::test]
+    async fn test_finalize_in_flight_tool_calls_marks_unfinalized_tools_as_failed(
+        cx: &mut TestAppContext,
+    ) {
+        let (thread, event_stream, _) = setup_thread_for_test(cx).await;
+        let tool_use = LanguageModelToolUse {
+            id: "call_unfinalized_1".into(),
+            name: "some_tool".into(),
+            raw_input: "{}".to_string(),
+            input: language_model::LanguageModelToolUseInput::Json(json!({})),
+            is_input_complete: true,
+            thought_signature: None,
+        };
+
+        cx.update(|cx| {
+            thread.update(cx, |thread, _cx| {
+                thread.messages.push(Arc::new(Message::Agent(AgentMessage {
+                    content: vec![AgentMessageContent::ToolUse(tool_use.clone())],
+                    ..Default::default()
+                })));
+
+                thread.finalize_in_flight_tool_calls(
+                    &event_stream,
+                    "continuation_failure_tool_finalized",
+                    "continuation error",
+                );
+
+                let messages = &thread.messages;
+                let Message::Agent(agent_msg) = &*messages[0] else {
+                    panic!("expected agent message");
+                };
+                let result = agent_msg
+                    .tool_results
+                    .get(&tool_use.id)
+                    .expect("expected tool result");
+                assert!(result.is_error, "unfinalized tool call must be marked as error");
+                assert_eq!(result.tool_use_id, tool_use.id);
+            });
+        });
+    }
+
+    #[gpui::test]
+    async fn test_watchdog_finalizes_stalled_turn(cx: &mut TestAppContext) {
+        let (thread, _event_stream, fake) = setup_thread_for_test(cx).await;
+        let model = fake.model("fake");
+
+        cx.update(|cx| {
+            thread.update(cx, |thread, cx| {
+                thread.set_model(model.clone(), cx);
+                thread.set_watchdog_timeout(Duration::from_millis(100));
+            });
+        });
+
+        let _events = cx.update(|cx| {
+            thread.update(cx, |thread, cx| {
+                thread.send(ClientUserMessageId::new(), ["Start turn"], cx).unwrap()
+            })
+        });
+
+        cx.run_until_parked();
+
+        thread.read_with(cx, |thread, _cx| {
+            assert!(thread.is_turn_running());
+            assert!(!thread.is_turn_complete());
+        });
+
+        cx.update(|cx| {
+            thread.update(cx, |thread, _cx| {
+                if let Some(turn) = thread.running_turn.as_mut() {
+                    turn.watchdog_handle.set_streaming(false);
+                }
+            });
+        });
+
+        cx.background_executor.timer(Duration::from_millis(200)).await;
+        cx.run_until_parked();
+
+        thread.read_with(cx, |thread, _cx| {
+            assert!(!thread.is_turn_running());
+            assert!(thread.is_turn_complete());
+
+            let messages = &thread.messages;
+            let last_msg = messages.last().expect("expected at least one message");
+            let Message::Agent(agent_msg) = &**last_msg else {
+                panic!("expected agent message for error entry");
+            };
+            let text = agent_msg.content.iter().find_map(|c| {
+                if let AgentMessageContent::Text(t) = c {
+                    Some(t)
+                } else {
+                    None
+                }
+            }).expect("expected text content");
+            assert!(text.contains("Turn timed out"), "expected timeout error entry: {text}");
+        });
+    }
+
+    #[gpui::test]
+    async fn test_watchdog_does_not_fire_on_active_turn(cx: &mut TestAppContext) {
+        let (thread, _event_stream, fake) = setup_thread_for_test(cx).await;
+        let model = fake.model("fake");
+
+        cx.update(|cx| {
+            thread.update(cx, |thread, cx| {
+                thread.set_model(model.clone(), cx);
+                thread.set_watchdog_timeout(Duration::from_millis(150));
+            });
+        });
+
+        let _events = cx.update(|cx| {
+            thread.update(cx, |thread, cx| {
+                thread.send(ClientUserMessageId::new(), ["Start turn"], cx).unwrap()
+            })
+        });
+
+        cx.run_until_parked();
+        assert!(thread.read_with(cx, |thread, _| thread.is_turn_running()));
+
+        cx.background_executor.timer(Duration::from_millis(75)).await;
+        fake.send_last_text(&model, "Hello");
+        cx.run_until_parked();
+        assert!(thread.read_with(cx, |thread, _| thread.is_turn_running()));
+
+        cx.background_executor.timer(Duration::from_millis(75)).await;
+        fake.send_last_text(&model, " world");
+        cx.run_until_parked();
+        assert!(thread.read_with(cx, |thread, _| thread.is_turn_running()));
+
+        fake.end_last(&model);
+        cx.run_until_parked();
+
+        thread.read_with(cx, |thread, _cx| {
+            assert!(!thread.is_turn_running());
+            assert!(thread.is_turn_complete());
+
+            let messages = &thread.messages;
+            let last_msg = messages.last().expect("expected message");
+            let Message::Agent(agent_msg) = &**last_msg else {
+                panic!("expected agent message");
+            };
+            let text = agent_msg.content.iter().find_map(|c| {
+                if let AgentMessageContent::Text(t) = c {
+                    Some(t)
+                } else {
+                    None
+                }
+            }).expect("expected text content");
+            assert_eq!(text, "Hello world");
+        });
+    }
+
+    #[gpui::test]
+    async fn test_watchdog_does_not_fire_during_silent_stream(cx: &mut TestAppContext) {
+        let (thread, _event_stream, fake) = setup_thread_for_test(cx).await;
+        let model = fake.model("fake");
+
+        cx.update(|cx| {
+            thread.update(cx, |thread, cx| {
+                thread.set_model(model.clone(), cx);
+                thread.set_watchdog_timeout(Duration::from_millis(100));
+            });
+        });
+
+        let _events = cx.update(|cx| {
+            thread.update(cx, |thread, cx| {
+                thread.send(ClientUserMessageId::new(), ["Start turn"], cx).unwrap()
+            })
+        });
+
+        cx.run_until_parked();
+        thread.read_with(cx, |thread, _cx| {
+            assert!(thread.is_turn_running());
+            assert!(!thread.is_turn_complete());
+        });
+
+        // The model stream is active but silent; watchdog must not fire while streaming.
+        cx.background_executor.timer(Duration::from_millis(200)).await;
+        cx.run_until_parked();
+
+        thread.read_with(cx, |thread, _cx| {
+            assert!(thread.is_turn_running(), "turn must not be finalized during silent stream");
+            assert!(!thread.is_turn_complete());
+        });
+
+        fake.send_last_text(&model, "Finished");
+        fake.end_last(&model);
+        cx.run_until_parked();
+
+        thread.read_with(cx, |thread, _cx| {
+            assert!(!thread.is_turn_running());
+            assert!(thread.is_turn_complete());
+        });
     }
 }

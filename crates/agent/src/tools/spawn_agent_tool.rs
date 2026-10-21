@@ -1,6 +1,7 @@
 use acp_thread::{SUBAGENT_SESSION_INFO_META_KEY, SubagentSessionInfo};
 use agent_client_protocol::schema::v1 as acp;
 use anyhow::Result;
+use futures::FutureExt;
 use gpui::{App, SharedString, Task};
 use language_model::LanguageModelToolResultContent;
 use schemars::JsonSchema;
@@ -8,6 +9,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use std::path::Path;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::agent_task::AgentDiffShortstat;
 use crate::task_worktree::SubagentIsolationDetails;
@@ -204,6 +206,70 @@ impl From<SpawnAgentToolOutput> for LanguageModelToolResultContent {
     }
 }
 
+pub(crate) const TGS_STEP_TIMEOUT: Duration = Duration::from_secs(120);
+pub(crate) const COMMIT_STEP_TIMEOUT: Duration = Duration::from_secs(300);
+pub(crate) const CLEANUP_STEP_TIMEOUT: Duration = Duration::from_secs(60);
+pub(crate) const DIFF_STEP_TIMEOUT: Duration = Duration::from_secs(30);
+
+#[derive(Debug)]
+pub(crate) enum StepOutcome<T> {
+    Ok(T),
+    Err(anyhow::Error),
+    Timeout,
+}
+
+pub(crate) fn log_lifecycle_step(
+    task_id: Option<&str>,
+    step: &str,
+    duration_ms: u64,
+    outcome: &str,
+) {
+    log::info!(
+        "[cancel-audit] task_id={} step={} duration_ms={} outcome={}",
+        task_id.unwrap_or("-"),
+        step,
+        duration_ms,
+        outcome
+    );
+}
+
+pub(crate) async fn timeout_step<F, T>(
+    task_id: Option<&str>,
+    step: &str,
+    timeout: Duration,
+    cx: &gpui::AsyncApp,
+    future: F,
+) -> StepOutcome<T>
+where
+    F: std::future::Future<Output = anyhow::Result<T>>,
+{
+    let start = std::time::Instant::now();
+    let timer = cx.background_executor().timer(timeout).fuse();
+    futures::pin_mut!(timer);
+    let future = future.fuse();
+    futures::pin_mut!(future);
+
+    futures::select_biased! {
+        result = future => match result {
+            Ok(value) => {
+                let duration_ms = start.elapsed().as_millis() as u64;
+                log_lifecycle_step(task_id, step, duration_ms, "success");
+                StepOutcome::Ok(value)
+            }
+            Err(err) => {
+                let duration_ms = start.elapsed().as_millis() as u64;
+                log_lifecycle_step(task_id, step, duration_ms, "error");
+                StepOutcome::Err(err)
+            }
+        },
+        _ = timer => {
+            let duration_ms = start.elapsed().as_millis() as u64;
+            log_lifecycle_step(task_id, step, duration_ms, "timeout");
+            StepOutcome::Timeout
+        }
+    }
+}
+
 /// Tool that spawns an agent thread to work on a task.
 pub struct SpawnAgentTool {
     environment: Rc<dyn ThreadEnvironment>,
@@ -338,7 +404,16 @@ impl AgentTool for SpawnAgentTool {
                 None
             };
 
-            let (effective_profile_id, task_isolation, enable_lsp) = cx.update(|cx| {
+            let (
+                effective_profile_id,
+                task_isolation,
+                enable_lsp,
+                is_agent_mode,
+                should_register_metadata,
+                should_set_task_status,
+                should_commit,
+                should_cleanup,
+            ) = cx.update(|cx| {
                 let location = event_stream.settings_location(cx);
                 if let Some(error) = validate_profile(input.profile.as_ref(), location, cx) {
                     return Err(SpawnAgentToolOutput::Error {
@@ -368,7 +443,23 @@ impl AgentTool for SpawnAgentTool {
                     .and_then(|p| p.task_worktree_language_servers)
                     .unwrap_or(settings.task_worktree_language_servers);
 
-                Ok((effective_profile_id, task_isolation, enable_lsp))
+                let is_agent_mode =
+                    settings.task_lifecycle_mode == agent_settings::TaskLifecycleMode::Agent;
+                let should_register_metadata = !is_agent_mode && settings.register_metadata;
+                let should_set_task_status = !is_agent_mode;
+                let should_commit = !is_agent_mode && settings.commit_on_session_end;
+                let should_cleanup = !is_agent_mode && settings.cleanup;
+
+                Ok((
+                    effective_profile_id,
+                    task_isolation,
+                    enable_lsp,
+                    is_agent_mode,
+                    should_register_metadata,
+                    should_set_task_status,
+                    should_commit,
+                    should_cleanup,
+                ))
             })?;
 
             if task_isolation.is_required() && task_id.is_none() {
@@ -574,29 +665,66 @@ impl AgentTool for SpawnAgentTool {
 
             if let Some(ref task_id) = task_id {
                 let session_id_str = session_info.session_id.to_string();
-                if let Err(error) = self
-                    .environment
-                    .update_task_registered(
+                if should_register_metadata {
+                    let update_fut = self.environment.update_task_registered(
                         task_id,
                         resolved_model.as_deref(),
                         explicit_profile_str.as_deref(),
                         Some(&session_id_str),
                         &mut cx,
+                    );
+                    match timeout_step(
+                        Some(task_id),
+                        "task_metadata_update",
+                        TGS_STEP_TIMEOUT,
+                        &cx,
+                        update_fut,
                     )
                     .await
-                {
-                    log::warn!(
-                        "failed to update task {task_id} metadata in task graph service: {error:#}"
-                    );
+                    {
+                        StepOutcome::Ok(()) => {}
+                        StepOutcome::Err(error) => {
+                            log::warn!(
+                                "failed to update task {task_id} metadata in task graph service: {error:#}"
+                            );
+                        }
+                        StepOutcome::Timeout => {
+                            log::warn!(
+                                "task_metadata_update timed out after {}s for task {task_id}",
+                                TGS_STEP_TIMEOUT.as_secs()
+                            );
+                        }
+                    }
                 }
-                if let Err(error) = self
-                    .environment
-                    .set_task_status_registered(task_id, crate::AgentTaskStatus::Running, &mut cx)
-                    .await
-                {
-                    log::warn!(
-                        "failed to set task {task_id} status to running in task graph service: {error:#}"
+
+                if should_set_task_status {
+                    let status_fut = self.environment.set_task_status_registered(
+                        task_id,
+                        crate::AgentTaskStatus::Running,
+                        &mut cx,
                     );
+                    match timeout_step(
+                        Some(task_id),
+                        "status_running",
+                        TGS_STEP_TIMEOUT,
+                        &cx,
+                        status_fut,
+                    )
+                    .await
+                    {
+                        StepOutcome::Ok(()) => {}
+                        StepOutcome::Err(error) => {
+                            log::warn!(
+                                "failed to set task {task_id} status to running in task graph service: {error:#}"
+                            );
+                        }
+                        StepOutcome::Timeout => {
+                            log::warn!(
+                                "status_running timed out after {}s for task {task_id}",
+                                TGS_STEP_TIMEOUT.as_secs()
+                            );
+                        }
+                    }
                 }
             }
 
@@ -675,37 +803,79 @@ impl AgentTool for SpawnAgentTool {
                 cx.update(|cx| Some(subagent.num_entries(cx).saturating_sub(1)));
 
             if let Err(ref error) = send_result {
-                if let Some(ref task_id) = task_id {
-                    let error_message = error.to_string();
-                    if crate::classify_send_error(&error_message) == crate::SendErrorKind::Definitive {
-                        if let Err(failure_error) = self
-                            .environment
-                            .fail_task_registered(task_id, &error_message, &mut cx)
+                if !is_agent_mode {
+                    if let Some(ref task_id) = task_id {
+                        let error_message = error.to_string();
+                        if crate::classify_send_error(&error_message) == crate::SendErrorKind::Definitive {
+                            let fail_fut = self
+                                .environment
+                                .fail_task_registered(task_id, &error_message, &mut cx);
+                            match timeout_step(
+                                Some(task_id),
+                                "status_failed",
+                                TGS_STEP_TIMEOUT,
+                                &cx,
+                                fail_fut,
+                            )
                             .await
-                        {
-                            log::warn!(
-                                "failed to auto-fail task {task_id} in task graph service: {failure_error:#}"
-                            );
+                            {
+                                StepOutcome::Ok(()) => {}
+                                StepOutcome::Err(failure_error) => {
+                                    log::warn!(
+                                        "failed to auto-fail task {task_id} in task graph service: {failure_error:#}"
+                                    );
+                                }
+                                StepOutcome::Timeout => {
+                                    log::warn!(
+                                        "status_failed timed out after {}s for task {task_id}",
+                                        TGS_STEP_TIMEOUT.as_secs()
+                                    );
+                                }
+                            }
                         }
                     }
                 }
             }
 
             let is_error = send_result.is_err();
-            let isolation_details =
+            let isolation_details = if should_commit {
                 if let (Some(worktree_path), Some(task_id)) = (&worktree_path, &task_id) {
-                    let details = match self
+                    let commit_fut = self
                         .environment
-                        .commit_subagent_worktree(task_id, worktree_path, is_error, &mut cx)
-                        .await
+                        .commit_subagent_worktree(task_id, worktree_path, is_error, &mut cx);
+                    let details = match timeout_step(
+                        Some(task_id),
+                        "commit",
+                        COMMIT_STEP_TIMEOUT,
+                        &cx,
+                        commit_fut,
+                    )
+                    .await
                     {
-                        Ok(details) => details,
-                        Err(e) => {
+                        StepOutcome::Ok(details) => details,
+                        StepOutcome::Err(e) => {
+                            log::warn!("commit failed for task {task_id}: {e:#}");
                             let task_id_typed = crate::AgentTaskId::from(task_id.clone());
                             crate::task_worktree::fallback_isolation_details(
                                 &task_id_typed,
                                 "worktree",
                                 Some(e.to_string()),
+                                None,
+                            )
+                        }
+                        StepOutcome::Timeout => {
+                            log::warn!(
+                                "commit timed out after {}s for task {task_id}",
+                                COMMIT_STEP_TIMEOUT.as_secs()
+                            );
+                            let task_id_typed = crate::AgentTaskId::from(task_id.clone());
+                            crate::task_worktree::fallback_isolation_details(
+                                &task_id_typed,
+                                "worktree",
+                                Some(format!(
+                                    "commit timed out after {}s",
+                                    COMMIT_STEP_TIMEOUT.as_secs()
+                                )),
                                 None,
                             )
                         }
@@ -722,8 +892,17 @@ impl AgentTool for SpawnAgentTool {
                     }
                     Some(details)
                 } else {
+                    if let Some(task_id) = task_id.as_deref() {
+                        log_lifecycle_step(Some(task_id), "commit", 0, "skipped");
+                    }
                     None
-                };
+                }
+            } else {
+                if let Some(task_id) = task_id.as_deref() {
+                    log_lifecycle_step(Some(task_id), "commit", 0, "skipped");
+                }
+                None
+            };
 
             if let Some(ref task_id) = task_id {
                 let branch_str = isolation_details.as_ref().map(|d| d.branch.as_str());
@@ -739,7 +918,20 @@ impl AgentTool for SpawnAgentTool {
                     let worktree_path =
                         crate::task_worktree::task_worktree_path_for_id(&task_id_typed);
                     if let (Some(base_sha), Some(worktree_path)) = (base_sha, worktree_path) {
-                        compute_turn_diff(&base_sha, &worktree_path).await
+                        let timer = cx.background_executor().timer(DIFF_STEP_TIMEOUT).fuse();
+                        futures::pin_mut!(timer);
+                        let diff_fut = compute_turn_diff(&base_sha, &worktree_path).fuse();
+                        futures::pin_mut!(diff_fut);
+                        futures::select_biased! {
+                            diff = diff_fut => diff,
+                            _ = timer => {
+                                log::warn!(
+                                    "compute_turn_diff timed out after {}s for task {task_id}",
+                                    DIFF_STEP_TIMEOUT.as_secs()
+                                );
+                                None
+                            }
+                        }
                     } else {
                         None
                     }
@@ -755,52 +947,104 @@ impl AgentTool for SpawnAgentTool {
                     output_summary,
                     diff,
                 };
-                if let Err(err) = self.environment.record_turn(task_id, record, &mut cx).await {
-                    log::warn!("failed to record turn for task {task_id}: {err:#}");
+                let record_fut = self.environment.record_turn(task_id, record, &mut cx);
+                match timeout_step(
+                    Some(task_id),
+                    "turn_record",
+                    TGS_STEP_TIMEOUT,
+                    &cx,
+                    record_fut,
+                )
+                .await
+                {
+                    StepOutcome::Ok(_) => {}
+                    StepOutcome::Err(err) => {
+                        log::warn!("failed to record turn for task {task_id}: {err:#}");
+                    }
+                    StepOutcome::Timeout => {
+                        log::warn!(
+                            "turn_record timed out after {}s for task {task_id}",
+                            TGS_STEP_TIMEOUT.as_secs()
+                        );
+                    }
                 }
             }
 
-            if send_result.is_ok() {
+            if send_result.is_ok() && should_set_task_status {
                 if let Some(ref task_id) = task_id {
-                    match self
-                        .environment
-                        .set_task_status_registered(
-                            task_id,
-                            crate::AgentTaskStatus::Completed,
-                            &mut cx,
-                        )
-                        .await
+                    let status_fut = self.environment.set_task_status_registered(
+                        task_id,
+                        crate::AgentTaskStatus::Completed,
+                        &mut cx,
+                    );
+                    match timeout_step(
+                        Some(task_id),
+                        "status_completed",
+                        TGS_STEP_TIMEOUT,
+                        &cx,
+                        status_fut,
+                    )
+                    .await
                     {
-                        Ok(()) => {
+                        StepOutcome::Ok(()) => {
                             let task_id_typed = crate::AgentTaskId::from(task_id.clone());
                             crate::task_worktree::mark_task_terminal(&task_id_typed);
                         }
-                        Err(error) => {
+                        StepOutcome::Err(error) => {
                             log::warn!(
                                 "failed to set task {task_id} status to completed in task graph service: {error:#}"
                             );
                         }
+                        StepOutcome::Timeout => {
+                            log::warn!(
+                                "status_completed timed out after {}s for task {task_id}",
+                                TGS_STEP_TIMEOUT.as_secs()
+                            );
+                        }
                     }
                 }
+            } else if let Some(ref task_id) = task_id {
+                log_lifecycle_step(Some(task_id), "status_completed", 0, "skipped");
             }
             // Release active session guard after commit is done to close race window
             drop(session_guard);
 
-            if let Some(ref task_id) = task_id {
-                let task_id_typed = crate::AgentTaskId::from(task_id.clone());
-                if crate::task_worktree::task_worktree_commit_error(&task_id_typed).is_none()
-                    && crate::task_worktree::task_worktree_merge_conflict(&task_id_typed).is_none()
-                {
-                    if let Err(err) = self
-                        .environment
-                        .auto_cleanup_subagent_worktree(task_id, &mut cx)
-                        .await
+            if should_cleanup {
+                if let Some(ref task_id) = task_id {
+                    let task_id_typed = crate::AgentTaskId::from(task_id.clone());
+                    if crate::task_worktree::task_worktree_commit_error(&task_id_typed).is_none()
+                        && crate::task_worktree::task_worktree_merge_conflict(&task_id_typed).is_none()
                     {
-                        log::error!("auto cleanup failed for subagent task {task_id}: {err:?}");
+                        let cleanup_fut = self
+                            .environment
+                            .auto_cleanup_subagent_worktree(task_id, &mut cx);
+                        match timeout_step(
+                            Some(task_id),
+                            "cleanup",
+                            CLEANUP_STEP_TIMEOUT,
+                            &cx,
+                            cleanup_fut,
+                        )
+                        .await
+                        {
+                            StepOutcome::Ok(_) => {}
+                            StepOutcome::Err(err) => {
+                                log::error!("auto cleanup failed for subagent task {task_id}: {err:?}");
+                            }
+                            StepOutcome::Timeout => {
+                                log::error!(
+                                    "cleanup timed out after {}s for subagent task {task_id}",
+                                    CLEANUP_STEP_TIMEOUT.as_secs()
+                                );
+                            }
+                        }
+                    } else {
+                        log_lifecycle_step(Some(task_id), "cleanup", 0, "skipped");
                     }
                 }
+            } else if let Some(ref task_id) = task_id {
+                log_lifecycle_step(Some(task_id), "cleanup", 0, "skipped");
             }
-
             let meta = Some(acp::Meta::from_iter([(
                 SUBAGENT_SESSION_INFO_META_KEY.into(),
                 serde_json::json!(&session_info),
@@ -1273,5 +1517,53 @@ Strict Constraints:
 
         let bad_path = compute_turn_diff(&base_sha, std::path::Path::new("/nonexistent")).await;
         assert_eq!(bad_path, None);
+    }
+
+    #[gpui::test]
+    async fn test_timeout_step_outcomes(cx: &mut gpui::TestAppContext) {
+        let async_cx = cx.to_async();
+
+        // 1. Success
+        let outcome = timeout_step(
+            Some("TASK-TEST"),
+            "test_step_success",
+            Duration::from_secs(5),
+            &async_cx,
+            async { Ok("success_val") },
+        )
+        .await;
+        assert!(matches!(outcome, StepOutcome::Ok("success_val")));
+
+        // 2. Error
+        let outcome: StepOutcome<&str> = timeout_step(
+            Some("TASK-TEST"),
+            "test_step_error",
+            Duration::from_secs(5),
+            &async_cx,
+            async { Err(anyhow::anyhow!("fail")) },
+        )
+        .await;
+        assert!(matches!(outcome, StepOutcome::Err(_)));
+
+        // 3. Timeout
+        let timeout_task = cx.spawn(|cx| async move {
+            timeout_step(
+                Some("TASK-TEST"),
+                "test_step_timeout",
+                Duration::from_millis(50),
+                &cx,
+                async {
+                    cx.background_executor()
+                        .timer(Duration::from_millis(500))
+                        .await;
+                    Ok("late")
+                },
+            )
+            .await
+        });
+
+        cx.executor().advance_clock(Duration::from_millis(100));
+        let outcome = timeout_task.await;
+        assert!(matches!(outcome, StepOutcome::Timeout));
     }
 }

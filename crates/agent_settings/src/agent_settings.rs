@@ -30,6 +30,7 @@ use util::ResultExt as _;
 
 pub use crate::agent_profile::*;
 pub use crate::user_agents_md::{UserAgentsMd, UserAgentsMdState, init as init_user_agents_md};
+pub use settings::TaskLifecycleMode;
 
 pub const SUMMARIZE_THREAD_PROMPT: &str = include_str!("prompts/summarize_thread_prompt.txt");
 pub const SUMMARIZE_THREAD_DETAILED_PROMPT: &str =
@@ -305,6 +306,21 @@ pub const DEFAULT_TASK_WORKTREE_LANGUAGE_SERVERS: bool = true;
 /// Default maximum bytes returned by the fetch tool before output is truncated (100 KB).
 pub const DEFAULT_FETCH_MAX_BYTES: usize = 100 * 1024;
 
+/// Default task lifecycle mode: runtime-managed lifecycle actions.
+pub const DEFAULT_TASK_LIFECYCLE_MODE: TaskLifecycleMode = TaskLifecycleMode::Runtime;
+
+/// Default setting for whether to auto-commit task worktree at session end.
+pub const DEFAULT_COMMIT_ON_SESSION_END: bool = true;
+
+/// Default setting for whether to auto-cleanup task worktrees.
+pub const DEFAULT_CLEANUP: bool = true;
+
+/// Default setting for whether to register task metadata with the task graph server.
+pub const DEFAULT_REGISTER_METADATA: bool = true;
+
+/// Default setting for whether to publish task ref artifacts upon merge.
+pub const DEFAULT_PUBLISH_REF_ARTIFACT: bool = true;
+
 /// Clamps a configured `task_worktree_limit`.
 ///
 /// A value of 0 is invalid and will be clamped to the minimum of 1.
@@ -457,6 +473,26 @@ pub struct AgentSettings {
     ///
     /// Default: 102400 (100 KB)
     pub fetch_max_bytes: usize,
+    /// The task lifecycle management mode ("runtime" or "agent").
+    ///
+    /// Default: "runtime"
+    pub task_lifecycle_mode: TaskLifecycleMode,
+    /// Whether to automatically commit task worktrees at session end.
+    ///
+    /// Default: true
+    pub commit_on_session_end: bool,
+    /// Whether to automatically clean up and evict task worktrees.
+    ///
+    /// Default: true
+    pub cleanup: bool,
+    /// Whether to automatically register task metadata in the task graph server.
+    ///
+    /// Default: true
+    pub register_metadata: bool,
+    /// Whether to publish task ref artifacts to the task graph server upon merge.
+    ///
+    /// Default: true
+    pub publish_ref_artifact: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1287,6 +1323,19 @@ impl Settings for AgentSettings {
                 .task_worktree_language_servers
                 .unwrap_or(DEFAULT_TASK_WORKTREE_LANGUAGE_SERVERS),
             fetch_max_bytes: agent.fetch_max_bytes.unwrap_or(DEFAULT_FETCH_MAX_BYTES),
+            task_lifecycle_mode: agent
+                .task_lifecycle_mode
+                .unwrap_or(DEFAULT_TASK_LIFECYCLE_MODE),
+            commit_on_session_end: agent
+                .commit_on_session_end
+                .unwrap_or(DEFAULT_COMMIT_ON_SESSION_END),
+            cleanup: agent.cleanup.unwrap_or(DEFAULT_CLEANUP),
+            register_metadata: agent
+                .register_metadata
+                .unwrap_or(DEFAULT_REGISTER_METADATA),
+            publish_ref_artifact: agent
+                .publish_ref_artifact
+                .unwrap_or(DEFAULT_PUBLISH_REF_ARTIFACT),
         }
     }
 }
@@ -3432,5 +3481,86 @@ mod tests {
             AgentSettings::custom_instructions_for_model(&sonnet, cx),
             None
         );
+    }
+
+    #[test]
+    fn test_task_lifecycle_mode_defaults_and_parsing() {
+        assert_eq!(DEFAULT_TASK_LIFECYCLE_MODE, TaskLifecycleMode::Runtime);
+        assert!(DEFAULT_COMMIT_ON_SESSION_END);
+        assert!(DEFAULT_CLEANUP);
+        assert!(DEFAULT_REGISTER_METADATA);
+        assert!(DEFAULT_PUBLISH_REF_ARTIFACT);
+
+        let omitted: settings::AgentSettingsContent = serde_json::from_str(r#"{}"#).unwrap();
+        assert_eq!(omitted.task_lifecycle_mode, None);
+        assert_eq!(omitted.commit_on_session_end, None);
+        assert_eq!(omitted.cleanup, None);
+        assert_eq!(omitted.register_metadata, None);
+        assert_eq!(omitted.publish_ref_artifact, None);
+
+        let runtime: settings::AgentSettingsContent =
+            serde_json::from_str(r#"{"task_lifecycle_mode": "runtime"}"#).unwrap();
+        assert_eq!(runtime.task_lifecycle_mode, Some(TaskLifecycleMode::Runtime));
+
+        let agent: settings::AgentSettingsContent =
+            serde_json::from_str(r#"{"task_lifecycle_mode": "agent"}"#).unwrap();
+        assert_eq!(agent.task_lifecycle_mode, Some(TaskLifecycleMode::Agent));
+
+        let invalid: Result<settings::AgentSettingsContent, _> =
+            serde_json::from_str(r#"{"task_lifecycle_mode": "invalid"}"#);
+        assert!(invalid.is_err());
+
+        let toggles: settings::AgentSettingsContent = serde_json::from_str(
+            r#"{
+                "commit_on_session_end": false,
+                "cleanup": false,
+                "register_metadata": false,
+                "publish_ref_artifact": false
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(toggles.commit_on_session_end, Some(false));
+        assert_eq!(toggles.cleanup, Some(false));
+        assert_eq!(toggles.register_metadata, Some(false));
+        assert_eq!(toggles.publish_ref_artifact, Some(false));
+    }
+
+    #[gpui::test]
+    fn test_task_lifecycle_settings_store_resolution(cx: &mut gpui::App) {
+        let store = SettingsStore::test(cx);
+        cx.set_global(store);
+        project::DisableAiSettings::register(cx);
+        AgentSettings::register(cx);
+
+        let settings = AgentSettings::get_global(cx);
+        assert_eq!(settings.task_lifecycle_mode, TaskLifecycleMode::Runtime);
+        assert!(settings.commit_on_session_end);
+        assert!(settings.cleanup);
+        assert!(settings.register_metadata);
+        assert!(settings.publish_ref_artifact);
+
+        SettingsStore::update_global(cx, |store, cx| {
+            store
+                .set_user_settings(
+                    r#"{
+                        "agent": {
+                            "task_lifecycle_mode": "agent",
+                            "commit_on_session_end": false,
+                            "cleanup": false,
+                            "register_metadata": false,
+                            "publish_ref_artifact": false
+                        }
+                    }"#,
+                    cx,
+                )
+                .expect("user settings load");
+        });
+
+        let settings = AgentSettings::get_global(cx);
+        assert_eq!(settings.task_lifecycle_mode, TaskLifecycleMode::Agent);
+        assert!(!settings.commit_on_session_end);
+        assert!(!settings.cleanup);
+        assert!(!settings.register_metadata);
+        assert!(!settings.publish_ref_artifact);
     }
 }

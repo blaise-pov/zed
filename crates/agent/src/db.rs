@@ -326,6 +326,7 @@ impl DbThread {
                         content,
                         tool_results,
                         reasoning_details: None,
+                        ..Default::default()
                     })
                 }
                 language_model::Role::System => {
