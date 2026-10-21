@@ -556,6 +556,25 @@ impl AgentTool for SpawnAgentTool {
                 None
             };
 
+            let task_status_str = task_detail
+                .as_ref()
+                .map(|d| format!("{:?}", d.summary.status))
+                .unwrap_or_else(|| "-".to_string());
+            let owner_session_id = cx.update(|cx| {
+                event_stream
+                    .session_id(cx)
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| "-".to_string())
+            });
+            let tool_use_id = event_stream.tool_use_id().clone();
+            log::info!(
+                "[cancel-audit] task_id={} owner_session_id={} tool_use_id={} task_status={} source=spawn_start",
+                task_id.as_deref().unwrap_or("-"),
+                owner_session_id,
+                tool_use_id,
+                task_status_str
+            );
+
             let session_guard = if let Some(ref task_id) = task_id {
                 let task_id_typed = crate::AgentTaskId::from(task_id.clone());
                 if crate::task_worktree::has_active_subagent_session(&task_id_typed) {
@@ -569,8 +588,24 @@ impl AgentTool for SpawnAgentTool {
                         isolation_details: None,
                     });
                 }
+                let owner = cx.update(|cx| {
+                    let thread_weak = event_stream.thread().cloned();
+                    let thread_id = event_stream
+                        .session_id(cx)
+                        .unwrap_or_else(|| acp::SessionId::new("standalone"));
+                    let tool_use_id = event_stream.tool_use_id().clone();
+                    let _is_test = thread_weak.is_none();
+                    crate::task_worktree::SubagentSessionOwner {
+                        thread_id,
+                        tool_use_id,
+                        thread: thread_weak,
+                        #[cfg(any(test, feature = "test-support"))]
+                        is_test_live: _is_test,
+                    }
+                });
                 Some(crate::task_worktree::SubagentSessionGuard::new(
                     task_id_typed,
+                    owner,
                 ))
             } else {
                 None

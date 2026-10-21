@@ -7949,7 +7949,7 @@ async fn test_spawn_agent_one_session_per_task(cx: &mut TestAppContext) {
     let task_id_typed = AgentTaskId::from(task_id.clone());
 
     // Hold a session guard to simulate an actively running session for task_id
-    let guard = task_worktree::SubagentSessionGuard::new(task_id_typed.clone());
+    let guard = task_worktree::SubagentSessionGuard::test_new(task_id_typed.clone());
 
     // A second spawn with the same task_id while guard is alive -> returns Error
     let (event_stream, _rx) = ToolCallEventStream::test();
