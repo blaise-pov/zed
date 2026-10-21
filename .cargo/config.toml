@@ -1,8 +1,6 @@
 [build]
 # Limit jobs to 4 to prevent LLVM OOM during release builds on machines with <= 16GB RAM
 jobs = 4
-rustc-wrapper = "sccache"
-incremental = false
 
 # Убирает тяжелые PDB у всех внешних библиотек в debug-сборке
 [profile.dev.package."*"]
