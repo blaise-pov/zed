@@ -3226,6 +3226,7 @@ mod tests {
     }
 
     fn init_test(cx: &mut TestAppContext) {
+        crate::task_worktree::reset_registry_for_tests();
         cx.update(|cx| {
             let settings_store = SettingsStore::test(cx);
             cx.set_global(settings_store);

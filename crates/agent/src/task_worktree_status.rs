@@ -638,6 +638,7 @@ mod tests {
     use crate::agent_task::{AgentGoalStatus, AgentTaskStatus};
 
     fn init_test(cx: &mut TestAppContext) {
+        crate::task_worktree::reset_registry_for_tests();
         clear_repo_cache();
         cx.update(|cx| {
             let settings_store = SettingsStore::test(cx);
