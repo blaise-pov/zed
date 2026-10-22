@@ -74,7 +74,6 @@ use util::{ResultExt, debug_panic, markdown::MarkdownCodeBlock, paths::PathStyle
 use uuid::Uuid;
 
 const TOOL_CANCELED_MESSAGE: &str = "Tool canceled by user";
-pub const DEFAULT_WATCHDOG_TIMEOUT: Duration = Duration::from_secs(120);
 const TOOL_CALL_INTERRUPTED_BY_FOLLOW_UP_MESSAGE: &str =
     "Permission denied: user sent a follow-up message instead of approving the tool call.";
 pub(crate) const FOLLOW_UP_PERMISSION_DENIED_OPTION_ID: &str = "follow_up_permission_denied";
@@ -13401,7 +13400,10 @@ mod tests {
     async fn test_thread_initializes_watchdog_timeout_from_settings(cx: &mut TestAppContext) {
         let (thread1, _, _) = setup_thread_for_test(cx).await;
         thread1.read_with(cx, |thread, _| {
-            assert_eq!(thread.watchdog_timeout(), Duration::from_secs(120));
+            assert_eq!(
+                thread.watchdog_timeout(),
+                Duration::from_secs(agent_settings::DEFAULT_TURN_WATCHDOG_SECONDS)
+            );
         });
 
         let thread2 = cx.update(|cx| {

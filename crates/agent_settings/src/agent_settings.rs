@@ -362,13 +362,8 @@ pub fn clamp_timeout_seconds(setting_name: &str, value: Option<u64>, default: u6
     match value {
         Some(0) => Duration::ZERO,
         Some(val @ 1..=4) => {
-            let prefix = if setting_name.starts_with("agent.") {
-                ""
-            } else {
-                "agent."
-            };
             log::warn!(
-                "{prefix}{setting_name} of {val}s is below minimum {MIN_TIMEOUT_SECONDS}s; clamping to {MIN_TIMEOUT_SECONDS}s"
+                "agent.{setting_name} of {val}s is below minimum {MIN_TIMEOUT_SECONDS}s; clamping to {MIN_TIMEOUT_SECONDS}s"
             );
             Duration::from_secs(MIN_TIMEOUT_SECONDS)
         }
