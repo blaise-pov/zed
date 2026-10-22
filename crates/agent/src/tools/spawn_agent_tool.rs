@@ -833,7 +833,7 @@ impl AgentTool for SpawnAgentTool {
                         _ = event_stream.cancelled_by_user().fuse() => {
                             drop(session_guard);
                             return Err(cancelled_error(
-                                "task metadata update",
+                                "task-graph metadata/status updates",
                                 Some(session_info.session_id.clone()),
                                 Some(session_info),
                                 isolation,
@@ -885,7 +885,7 @@ impl AgentTool for SpawnAgentTool {
                         _ = event_stream.cancelled_by_user().fuse() => {
                             drop(session_guard);
                             return Err(cancelled_error(
-                                "task status update",
+                                "task-graph metadata/status updates",
                                 Some(session_info.session_id.clone()),
                                 Some(session_info),
                                 isolation,
