@@ -260,6 +260,14 @@
   "agent": {
     "task_graph_server_id": "taskgraph",
     "task_worktree_limit": 18,
+    "spawn_step_timeout_seconds": {
+      "task_graph": 120,
+      "commit": 300,
+      "cleanup": 60,
+      "diff": 30
+    },
+    "send_watchdog_seconds": 30,
+    "turn_watchdog_seconds": 120,
     "tool_permissions": {
       "default": "deny",
       "tools": {
