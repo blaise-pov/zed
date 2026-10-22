@@ -1801,6 +1801,7 @@ impl Thread {
         // Get profile settings before resolving model (to avoid borrow conflicts)
         let profile_settings = settings.profiles.get(&profile_id).cloned();
         let global_default_model = settings.default_model.clone();
+        let turn_watchdog_seconds = settings.turn_watchdog_seconds;
 
         // Resolve model from the requested profile when it differs from the
         // default, falling back to the model passed in by the caller.
@@ -1891,7 +1892,7 @@ impl Thread {
             task_id: None,
             is_canceling: false,
             was_canceled: false,
-            watchdog_timeout: DEFAULT_WATCHDOG_TIMEOUT,
+            watchdog_timeout: turn_watchdog_seconds,
         }
     }
 
@@ -2406,7 +2407,7 @@ impl Thread {
             task_id: db_thread.task_id,
             is_canceling: false,
             was_canceled: false,
-            watchdog_timeout: DEFAULT_WATCHDOG_TIMEOUT,
+            watchdog_timeout: AgentSettings::get(settings_location, cx).turn_watchdog_seconds,
         }
     }
 
@@ -3703,6 +3704,10 @@ impl Thread {
             let mut cancellation_rx = cancellation_rx.clone();
             let event_stream = event_stream.clone();
             async move |this, cx| {
+                if timeout.is_zero() {
+                    return;
+                }
+
                 loop {
                     if *cancellation_rx.borrow() {
                         break;
@@ -13345,6 +13350,84 @@ mod tests {
                 }
             }).expect("expected text content");
             assert!(text.contains("Turn timed out"), "expected timeout error entry: {text}");
+        });
+    }
+
+    #[gpui::test]
+    async fn test_watchdog_disabled_when_zero_timeout(cx: &mut TestAppContext) {
+        let (thread, _event_stream, fake) = setup_thread_for_test(cx).await;
+        let model = fake.model("fake");
+
+        cx.update(|cx| {
+            thread.update(cx, |thread, cx| {
+                thread.set_model(model.clone(), cx);
+                thread.set_watchdog_timeout(Duration::ZERO);
+            });
+        });
+
+        let _events = cx.update(|cx| {
+            thread.update(cx, |thread, cx| {
+                thread.send(ClientUserMessageId::new(), ["Start turn"], cx).unwrap()
+            })
+        });
+
+        cx.run_until_parked();
+
+        thread.read_with(cx, |thread, _cx| {
+            assert!(thread.is_turn_running());
+            assert!(!thread.is_turn_complete());
+        });
+
+        cx.update(|cx| {
+            thread.update(cx, |thread, _cx| {
+                if let Some(turn) = thread.running_turn.as_mut() {
+                    turn.watchdog_handle.set_streaming(false);
+                }
+            });
+        });
+
+        // Advance clock significantly
+        cx.background_executor.timer(Duration::from_secs(5)).await;
+        cx.run_until_parked();
+
+        // Turn must still be running because watchdog was disabled with Duration::ZERO
+        thread.read_with(cx, |thread, _cx| {
+            assert!(thread.is_turn_running());
+            assert!(!thread.is_turn_complete());
+        });
+    }
+
+    #[gpui::test]
+    async fn test_thread_initializes_watchdog_timeout_from_settings(cx: &mut TestAppContext) {
+        let (thread1, _, _) = setup_thread_for_test(cx).await;
+        thread1.read_with(cx, |thread, _| {
+            assert_eq!(thread.watchdog_timeout(), Duration::from_secs(120));
+        });
+
+        let thread2 = cx.update(|cx| {
+            let mut settings = AgentSettings::get_global(cx).clone();
+            settings.turn_watchdog_seconds = Duration::from_secs(42);
+            AgentSettings::override_global(settings, cx);
+
+            let project = thread1.read(cx).project().clone();
+            let project_context = thread1.read(cx).project_context().clone();
+            let context_server_registry = thread1.read(cx).context_server_registry.clone();
+            let templates = thread1.read(cx).templates.clone();
+
+            cx.new(|cx| {
+                Thread::new(
+                    project,
+                    project_context,
+                    context_server_registry,
+                    templates,
+                    None,
+                    cx,
+                )
+            })
+        });
+
+        thread2.read_with(cx, |thread, _| {
+            assert_eq!(thread.watchdog_timeout(), Duration::from_secs(42));
         });
     }
 

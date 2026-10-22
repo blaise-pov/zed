@@ -15945,6 +15945,52 @@ async fn test_send_watchdog_resolves_when_thread_complete_but_submission_pending
 }
 
 #[gpui::test]
+async fn test_send_watchdog_disabled_when_zero_timeout(cx: &mut TestAppContext) {
+    let test = SubagentCompactionTest::new(cx).await;
+    let send = test.send("initial prompt", cx);
+    test.fake
+        .send_last_text(&test.model, "final output from subagent");
+    test.fake.end_last(&test.model);
+    let output = send.await.unwrap();
+    assert_eq!(output, "final output from subagent");
+    test.assert_stopped(cx);
+
+    cx.update(|cx| {
+        let mut settings = agent_settings::AgentSettings::get_global(cx).clone();
+        settings.send_watchdog_seconds = Duration::ZERO;
+        agent_settings::AgentSettings::override_global(settings, cx);
+    });
+
+    let connection = Rc::new(NativeAgentConnection(test._agent.clone()));
+    let project = cx.update(|cx| test.parent.read(cx).project().clone());
+    let hanging_acp_thread = cx
+        .update(|cx| connection.new_session(project, PathList::new(&[Path::new("")]), cx))
+        .await
+        .unwrap();
+
+    let watchdog_handle = NativeSubagentHandle::new(
+        acp::SessionId::new("subagent-watchdog-disabled-test"),
+        test.thread.clone(),
+        hanging_acp_thread,
+        test.parent.clone(),
+        thread::SubagentSlotGuard::new(Arc::new(thread::SubagentSlotPool::default())),
+    );
+
+    let mut send_task = cx.update(|cx| {
+        watchdog_handle.send("follow-up prompt".to_string(), &cx.to_async())
+    });
+    cx.run_until_parked();
+
+    cx.executor().advance_clock(Duration::from_secs(60));
+    cx.run_until_parked();
+
+    assert!(
+        futures::poll!(&mut send_task).is_pending(),
+        "send task must remain pending when send_watchdog_seconds is 0"
+    );
+}
+
+#[gpui::test]
 async fn test_step_timeout_skipped_and_run_continues(cx: &mut TestAppContext) {
     init_test(cx);
 
@@ -15993,6 +16039,58 @@ async fn test_step_timeout_skipped_and_run_continues(cx: &mut TestAppContext) {
         "TASK-TIMEOUT-STEP".to_string(),
         crate::AgentTaskStatus::Completed
     )));
+}
+
+#[gpui::test]
+async fn test_step_timeout_from_settings(cx: &mut TestAppContext) {
+    init_test(cx);
+
+    cx.update(|cx| {
+        let mut settings = agent_settings::AgentSettings::get_global(cx).clone();
+        settings.spawn_step_timeout_seconds.task_graph = Duration::from_secs(10);
+        agent_settings::AgentSettings::override_global(settings, cx);
+    });
+
+    let environment = Rc::new(
+        FakeThreadEnvironment::default()
+            .with_task_id("TASK-TIMEOUT-CUSTOM-STEP")
+            .with_hanging_record_turn()
+            .with_subagent(FakeSubagentHandle::new(
+                acp::SessionId::new("subagent-id"),
+                Task::ready("subagent custom timeout finished".to_string()).shared(),
+                None,
+            )),
+    );
+
+    #[allow(clippy::arc_with_non_send_sync)]
+    let tool = Arc::new(SpawnAgentTool::new(environment.clone()));
+    let (event_stream, _rx) = ToolCallEventStream::test();
+
+    let run_task = cx.update(|cx| {
+        tool.run(
+            ToolInput::resolved(SpawnAgentToolInput {
+                label: "step timeout custom test".to_string(),
+                message: "run subagent".to_string(),
+                task_id: Some("TASK-TIMEOUT-CUSTOM-STEP".to_string()),
+                ..Default::default()
+            }),
+            event_stream,
+            cx,
+        )
+    });
+
+    cx.run_until_parked();
+    // Advance clock past the 10s custom timeout (instead of 120s default)
+    cx.executor().advance_clock(Duration::from_secs(15));
+    cx.run_until_parked();
+
+    let result = run_task.await;
+    match result {
+        Ok(SpawnAgentToolOutput::Success { output, .. }) => {
+            assert_eq!(output, "subagent custom timeout finished");
+        }
+        other => panic!("expected successful output despite step timeout, got {other:?}"),
+    }
 }
 
 #[gpui::test]
