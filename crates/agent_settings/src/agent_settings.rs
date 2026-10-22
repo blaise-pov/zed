@@ -1686,7 +1686,7 @@ mod tests {
     }
 
     #[test]
-    fn test_spawn_step_timeout_settings_from_content() {
+    fn test_spawn_step_timeout_settings_from_content() -> anyhow::Result<()> {
         let default_settings = SpawnStepTimeoutSettings::from_content(None);
         assert_eq!(
             default_settings.task_graph,
@@ -1712,13 +1712,14 @@ mod tests {
                 "cleanup": 3,
                 "diff": 45
             }"#,
-        )
-        .unwrap();
+        )?;
         let custom_settings = SpawnStepTimeoutSettings::from_content(Some(&content));
         assert_eq!(custom_settings.task_graph, Duration::from_secs(150));
         assert_eq!(custom_settings.commit, Duration::ZERO);
         assert_eq!(custom_settings.cleanup, Duration::from_secs(5));
         assert_eq!(custom_settings.diff, Duration::from_secs(45));
+
+        Ok(())
     }
 
     #[gpui::test]

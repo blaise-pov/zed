@@ -228,6 +228,17 @@ pub(crate) fn log_lifecycle_step(
     );
 }
 
+pub(crate) fn maybe_timer(
+    executor: &gpui::BackgroundExecutor,
+    timeout: Duration,
+) -> futures::future::Either<futures::future::Pending<()>, Task<()>> {
+    if timeout.is_zero() {
+        futures::future::Either::Left(futures::future::pending::<()>())
+    } else {
+        futures::future::Either::Right(executor.timer(timeout))
+    }
+}
+
 pub(crate) async fn timeout_step<F, T>(
     task_id: Option<&str>,
     step: &str,
@@ -239,12 +250,7 @@ where
     F: std::future::Future<Output = anyhow::Result<T>>,
 {
     let start = std::time::Instant::now();
-    let timer = if timeout.is_zero() {
-        futures::future::Either::Left(futures::future::pending::<()>())
-    } else {
-        futures::future::Either::Right(cx.background_executor().timer(timeout))
-    }
-    .fuse();
+    let timer = maybe_timer(cx.background_executor(), timeout).fuse();
     futures::pin_mut!(timer);
     let future = future.fuse();
     futures::pin_mut!(future);
@@ -1260,12 +1266,7 @@ impl AgentTool for SpawnAgentTool {
                     let worktree_path =
                         crate::task_worktree::task_worktree_path_for_id(&task_id_typed);
                     if let (Some(base_sha), Some(worktree_path)) = (base_sha, worktree_path) {
-                        let timer = if step_timeouts.diff.is_zero() {
-                            futures::future::Either::Left(futures::future::pending::<()>())
-                        } else {
-                            futures::future::Either::Right(cx.background_executor().timer(step_timeouts.diff))
-                        }
-                        .fuse();
+                        let timer = maybe_timer(cx.background_executor(), step_timeouts.diff).fuse();
                         futures::pin_mut!(timer);
                         let diff_fut = compute_turn_diff(&base_sha, &worktree_path).fuse();
                         futures::pin_mut!(diff_fut);
@@ -1995,6 +1996,12 @@ Strict Constraints:
         cx.executor().advance_clock(Duration::from_millis(600));
         let outcome = disabled_timeout_task.await;
         assert!(matches!(outcome, StepOutcome::Ok("zero_timeout_ok")));
+
+        // 5. maybe_timer helper returns Left for zero timeout, Right for non-zero
+        let zero_timer = maybe_timer(&cx.background_executor, Duration::ZERO);
+        assert!(matches!(zero_timer, futures::future::Either::Left(_)));
+        let non_zero_timer = maybe_timer(&cx.background_executor, Duration::from_secs(1));
+        assert!(matches!(non_zero_timer, futures::future::Either::Right(_)));
     }
 
     struct TestSubagentHandle {
