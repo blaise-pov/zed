@@ -43,8 +43,7 @@ jobs:
           restore-keys: agent-verify-${{ runner.os }}-
       - name: Setup cargo config
         run: |
-          New-Item -ItemType Directory -Path "./../.cargo" -Force
-          Copy-Item -Path "./.cargo/ci-config.toml" -Destination "./../.cargo/config.toml"
+          Copy-Item -Path "./.cargo/ci-config.toml" -Destination "./.cargo/config.toml" -Force
         shell: pwsh
       - name: Clippy
         run: ./script/clippy.ps1
@@ -76,8 +75,7 @@ jobs:
           restore-keys: agent-verify-${{ runner.os }}-
       - name: Setup cargo config
         run: |
-          New-Item -ItemType Directory -Path "./../.cargo" -Force
-          Copy-Item -Path "./.cargo/ci-config.toml" -Destination "./../.cargo/config.toml"
+          Copy-Item -Path "./.cargo/ci-config.toml" -Destination "./.cargo/config.toml" -Force
         shell: pwsh
       - name: Setup Node
         uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e

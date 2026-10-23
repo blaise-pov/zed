@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use settings::Settings;
 use std::{
     io::BufReader,
-    path::{Component, Path, PathBuf},
+    path::{Path, PathBuf},
     rc::Rc,
     sync::Arc,
     time::{Duration, Instant},
@@ -28,7 +28,7 @@ use crate::sandboxing::{
 };
 use crate::tools::terminal_watchdog;
 use crate::tools::tool_permissions::{
-    canonicalize_worktree_roots, is_dot_path, is_path_in_profile_write_scope,
+    canonicalize_worktree_roots, expand_home_prefix, is_dot_path, is_path_in_profile_write_scope,
 };
 use crate::{AgentTool, ThreadEnvironment, ToolCallEventStream, ToolInput};
 
@@ -1351,29 +1351,6 @@ fn update_current_cd(args: &[String], current_cd: &mut PathBuf) {
     if let Ok(normalized) = util::paths::normalize_lexically(current_cd) {
         *current_cd = normalized;
     }
-}
-
-fn expand_home_prefix(path: &Path) -> Option<PathBuf> {
-    if path.is_absolute() {
-        return Some(path.to_path_buf());
-    }
-
-    let mut components = path.components();
-    let first_component = components.next()?;
-    if !matches!(first_component, Component::Normal(component) if component == "~") {
-        return None;
-    }
-
-    let mut expanded = paths::home_dir().clone();
-    for component in components {
-        match component {
-            Component::Normal(component) => expanded.push(component),
-            Component::CurDir => {}
-            Component::ParentDir => expanded.push(".."),
-            Component::Prefix(_) | Component::RootDir => return None,
-        }
-    }
-    Some(expanded)
 }
 
 fn extract_tee_targets(args: &[String], current_cd: &Path, targets: &mut Vec<MutationTarget>) {
@@ -3907,14 +3884,15 @@ mod tests {
             title.contains("(hidden / configuration file)"),
             "expected prompt title to contain '(hidden / configuration file)', got: {title}"
         );
-        auth.response
+        assert!(auth
+            .response
             .send(acp_thread::SelectedPermissionOutcome::new(
                 acp::PermissionOptionId::new("allow"),
                 acp::PermissionOptionKind::AllowOnce,
             ))
-            .ok();
+            .is_ok());
 
-        let _ = task.await;
+        task.await.unwrap();
     }
 
     #[test]
