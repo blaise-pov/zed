@@ -5444,7 +5444,10 @@ mod internal_tests {
                 threshold: agent_settings::AutoCompactThreshold::Percentage(0.5),
             };
             agent_settings::AgentSettings::override_global(settings, cx);
-            thread.update(cx, |thread, cx| thread.set_model(model.clone(), cx));
+            thread.update(cx, |thread, cx| {
+                thread.set_model(model.clone(), cx);
+                thread.set_summarization_model(None, cx);
+            });
         });
 
         let first_prompt = cx.update(|cx| {
@@ -5508,6 +5511,7 @@ mod internal_tests {
         );
         fake.end_stream(&model, &first_compaction_request);
         cx.run_until_parked();
+        cx.executor().advance_clock(Duration::from_secs(70));
 
         let second_compaction_request = fake
             .pending_completions()
