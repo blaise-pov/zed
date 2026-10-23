@@ -2281,7 +2281,7 @@ pub fn register_subagent_session(task_id: &AgentTaskId) {
         #[cfg(any(test, feature = "test-support"))]
         is_test_live: true,
     };
-    std::mem::forget(register_subagent_session_guard(task_id, owner));
+    register_subagent_session_guard(task_id, owner);
 }
 
 pub fn unregister_subagent_session(task_id: &AgentTaskId) {

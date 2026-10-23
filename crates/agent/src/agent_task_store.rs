@@ -1194,7 +1194,7 @@ mod tests {
         });
         cx.run_until_parked();
 
-        crate::task_worktree::register_subagent_session(&task_id);
+        let guard = crate::task_worktree::SubagentSessionGuard::test_new(task_id.clone());
 
         let mut completed_task = task.clone();
         completed_task.status = AgentTaskStatus::Completed;
@@ -1216,7 +1216,7 @@ mod tests {
             "worktree directory should still exist"
         );
 
-        crate::task_worktree::unregister_subagent_session(&task_id);
+        drop(guard);
     }
 
     #[gpui::test]
