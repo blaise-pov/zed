@@ -3933,41 +3933,34 @@ impl ThreadEnvironment for NativeThreadEnvironment {
             (project, task_id)
         });
         cx.spawn(async move |cx| {
-            let task = cx.update(|cx| {
-                crate::task_worktree::commit_and_merge_task_worktree(
-                    project.clone(), &task_id, is_error, cx,
-                )
-            });
-            match task.await {
+            let executor = cx.background_executor().clone();
+            let result = crate::task_worktree::retry_on_git_lock_contention(&executor, || {
+                let task = cx.update(|cx| {
+                    crate::task_worktree::commit_and_merge_task_worktree(
+                        project.clone(),
+                        &task_id,
+                        is_error,
+                        cx,
+                    )
+                });
+                task
+            })
+            .await;
+            match result {
                 Ok(details) => Ok(details),
                 Err(err) => {
                     let err_str = err.to_string();
-                    if crate::task_worktree::is_git_lock_contention(&err_str) {
-                        cx.background_executor().timer(crate::task_worktree::GIT_LOCK_RETRY_DELAY).await;
-                        let retry_task = cx.update(|cx| {
-                            crate::task_worktree::commit_and_merge_task_worktree(
-                                project, &task_id, is_error, cx,
-                            )
-                        });
-                        match retry_task.await {
-                            Ok(details) => Ok(details),
-                            Err(retry_err) => {
-                                Ok(crate::task_worktree::fallback_isolation_details(
-                                    &task_id,
-                                    "worktree",
-                                    Some(format!("git lock contention: {retry_err:#}")),
-                                    None,
-                                ))
-                            }
-                        }
+                    let commit_error = if crate::task_worktree::is_git_lock_contention(&err_str) {
+                        Some(format!("git lock contention: {err:#}"))
                     } else {
-                        Ok(crate::task_worktree::fallback_isolation_details(
-                            &task_id,
-                            "worktree",
-                            Some(format!("commit failed: {err_str}")),
-                            None,
-                        ))
-                    }
+                        Some(format!("commit failed: {err_str}"))
+                    };
+                    Ok(crate::task_worktree::fallback_isolation_details(
+                        &task_id,
+                        "worktree",
+                        commit_error,
+                        None,
+                    ))
                 }
             }
         })

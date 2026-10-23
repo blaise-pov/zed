@@ -12,7 +12,7 @@ use fs::Fs;
 use futures::FutureExt as _;
 use git::repository::{AskPassDelegate, CommitOptions, CreateWorktreeTarget, RepoPath};
 use agent_client_protocol::schema::v1 as acp;
-use gpui::{App, AsyncApp, Entity, Task, WeakEntity};
+use gpui::{App, AsyncApp, BackgroundExecutor, Entity, Task, WeakEntity};
 use language_model::LanguageModelToolUseId;
 use project::{
     Project, git_store::Repository, git_store::worktrees_directory_for_repo,
@@ -2916,6 +2916,7 @@ fn is_path_in_write_scopes(path: &RepoPath, scopes: &[String]) -> bool {
 }
 
 pub const GIT_LOCK_RETRY_DELAY: Duration = Duration::from_millis(500);
+pub const GIT_LOCK_MAX_RETRIES: usize = 3;
 
 pub fn is_git_lock_contention(err: &str) -> bool {
     let lower = err.to_ascii_lowercase();
@@ -2929,6 +2930,31 @@ pub fn is_git_lock_contention(err: &str) -> bool {
         || lower.contains("failed to lock")
         || lower.contains("resource temporarily unavailable")
         || lower.contains("another git process seems to be running")
+}
+
+pub async fn retry_on_git_lock_contention<T, F, Fut>(
+    executor: &BackgroundExecutor,
+    mut op: F,
+) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    let mut delay = GIT_LOCK_RETRY_DELAY;
+    let mut retries_left = GIT_LOCK_MAX_RETRIES;
+    loop {
+        match op().await {
+            Ok(val) => return Ok(val),
+            Err(err) => {
+                if retries_left == 0 || !is_git_lock_contention(&err.to_string()) {
+                    return Err(err);
+                }
+                retries_left -= 1;
+                executor.timer(delay).await;
+                delay = delay.saturating_mul(2);
+            }
+        }
+    }
 }
 
 pub async fn commit_task_worktree(
@@ -2959,41 +2985,30 @@ pub async fn commit_task_worktree(
 
     let prefix = RepoPath::from_rel_path(&util::rel_path::RelPath::empty());
 
-    let status = match git_repo.status(std::slice::from_ref(&prefix)).await {
+    let status = match retry_on_git_lock_contention(cx.background_executor(), || {
+        git_repo.status(std::slice::from_ref(&prefix))
+    })
+    .await
+    {
         Ok(status) => status,
         Err(e) => {
+            let head_sha = git_repo.head_sha().await;
             let err_str = e.to_string();
-            if is_git_lock_contention(&err_str) {
-                cx.background_executor().timer(GIT_LOCK_RETRY_DELAY).await;
-                match git_repo.status(&[prefix]).await {
-                    Ok(status) => status,
-                    Err(retry_err) => {
-                        let head_sha = git_repo.head_sha().await;
-                        return Ok(SubagentIsolationDetails {
-                            mode: mode.to_string(),
-                            branch,
-                            base_branch,
-                            head_sha,
-                            changed_files: 0,
-                            commit_error: Some(format!("git lock contention: {retry_err}")),
-                            merged_into: None,
-                            merge_conflict: None,
-                        });
-                    }
-                }
+            let commit_error = if is_git_lock_contention(&err_str) {
+                format!("git lock contention: {e}")
             } else {
-                let head_sha = git_repo.head_sha().await;
-                return Ok(SubagentIsolationDetails {
-                    mode: mode.to_string(),
-                    branch,
-                    base_branch,
-                    head_sha,
-                    changed_files: 0,
-                    commit_error: Some(err_str),
-                    merged_into: None,
-                    merge_conflict: None,
-                });
-            }
+                err_str
+            };
+            return Ok(SubagentIsolationDetails {
+                mode: mode.to_string(),
+                branch,
+                base_branch,
+                head_sha,
+                changed_files: 0,
+                commit_error: Some(commit_error),
+                merged_into: None,
+                merge_conflict: None,
+            });
         }
     };
 
@@ -3069,36 +3084,28 @@ pub async fn commit_task_worktree(
         }
     }
 
-    if let Err(e) = git_repo
-        .stage_paths(paths.clone(), Arc::new(HashMap::default()))
-        .await
-    {
-        let err_str = e.to_string();
-        let retry_res = if is_git_lock_contention(&err_str) {
-            cx.background_executor().timer(GIT_LOCK_RETRY_DELAY).await;
-            git_repo.stage_paths(paths, Arc::new(HashMap::default())).await
+    let stage_res = retry_on_git_lock_contention(cx.background_executor(), || {
+        git_repo.stage_paths(paths.clone(), Arc::new(HashMap::default()))
+    })
+    .await;
+    if let Err(final_err) = stage_res {
+        let head_sha = git_repo.head_sha().await;
+        let err_trimmed = final_err.to_string();
+        let commit_error = if is_non_empty_error(&err_trimmed) {
+            Some(format!("staging failed: {final_err}"))
         } else {
-            Err(e)
+            None
         };
-        if let Err(final_err) = retry_res {
-            let head_sha = git_repo.head_sha().await;
-            let err_trimmed = final_err.to_string();
-            let commit_error = if is_non_empty_error(&err_trimmed) {
-                Some(format!("staging failed: {final_err}"))
-            } else {
-                None
-            };
-            return Ok(SubagentIsolationDetails {
-                mode: mode.to_string(),
-                branch,
-                base_branch,
-                head_sha,
-                changed_files: 0,
-                commit_error,
-                merged_into: None,
-                merge_conflict: None,
-            });
-        }
+        return Ok(SubagentIsolationDetails {
+            mode: mode.to_string(),
+            branch,
+            base_branch,
+            head_sha,
+            changed_files: 0,
+            commit_error,
+            merged_into: None,
+            merge_conflict: None,
+        });
     }
 
     let commit_message = if is_error {
@@ -3123,53 +3130,36 @@ pub async fn commit_task_worktree(
         }
     };
 
-    let askpass = AskPassDelegate::new(cx, |_, _, _| {});
-
-    if let Err(e) = git_repo
-        .commit(
+    let executor = cx.background_executor().clone();
+    let commit_res = retry_on_git_lock_contention(&executor, || {
+        let askpass = AskPassDelegate::new(cx, |_, _, _| {});
+        git_repo.commit(
             commit_message.clone().into(),
             None,
             CommitOptions::default(),
             askpass,
             Arc::new(HashMap::default()),
         )
-        .await
-    {
-        let err_str = e.to_string();
-        let retry_res = if is_git_lock_contention(&err_str) {
-            cx.background_executor().timer(GIT_LOCK_RETRY_DELAY).await;
-            let retry_askpass = AskPassDelegate::new(cx, |_, _, _| {});
-            git_repo
-                .commit(
-                    commit_message.into(),
-                    None,
-                    CommitOptions::default(),
-                    retry_askpass,
-                    Arc::new(HashMap::default()),
-                )
-                .await
+    })
+    .await;
+    if let Err(final_err) = commit_res {
+        let head_sha = git_repo.head_sha().await;
+        let err_trimmed = final_err.to_string();
+        let commit_error = if is_non_empty_error(&err_trimmed) {
+            Some(format!("commit failed: {final_err}"))
         } else {
-            Err(e)
+            None
         };
-        if let Err(final_err) = retry_res {
-            let head_sha = git_repo.head_sha().await;
-            let err_trimmed = final_err.to_string();
-            let commit_error = if is_non_empty_error(&err_trimmed) {
-                Some(format!("commit failed: {final_err}"))
-            } else {
-                None
-            };
-            return Ok(SubagentIsolationDetails {
-                mode: mode.to_string(),
-                branch,
-                base_branch,
-                head_sha,
-                changed_files: 0,
-                commit_error,
-                merged_into: None,
-                merge_conflict: None,
-            });
-        }
+        return Ok(SubagentIsolationDetails {
+            mode: mode.to_string(),
+            branch,
+            base_branch,
+            head_sha,
+            changed_files: 0,
+            commit_error,
+            merged_into: None,
+            merge_conflict: None,
+        });
     }
 
     let head_sha = git_repo.head_sha().await;
@@ -3636,23 +3626,14 @@ pub fn commit_and_merge_task_worktree(
                 details.merge_conflict = None;
                 clear_task_worktree_merge_conflict(&task_id);
             } else {
-                let merge_task =
-                    cx.update(|cx| merge_task_branch_into_goal(project.clone(), &task_id, cx));
-                let merge_result = match merge_task.await {
-                    Ok(outcome) => Ok(outcome),
-                    Err(e) => {
-                        let err_str = e.to_string();
-                        if is_git_lock_contention(&err_str) {
-                            cx.background_executor().timer(GIT_LOCK_RETRY_DELAY).await;
-                            let retry_task = cx.update(|cx| {
-                                merge_task_branch_into_goal(project.clone(), &task_id, cx)
-                            });
-                            retry_task.await
-                        } else {
-                            Err(e)
-                        }
-                    }
-                };
+                let executor = cx.background_executor().clone();
+                let merge_result = retry_on_git_lock_contention(&executor, || {
+                    let task = cx.update(|cx| {
+                        merge_task_branch_into_goal(project.clone(), &task_id, cx)
+                    });
+                    task
+                })
+                .await;
                 match merge_result {
                     Ok(MergeOutcome::NoGoal) => {
                         details.merged_into = None;
@@ -11259,5 +11240,72 @@ mod tests {
             "task 2 must block because cleanup is disabled and eviction is skipped"
         );
         assert!(fs.is_dir(&path1).await, "task 1 must remain intact");
+    }
+
+    #[gpui::test]
+    async fn retry_on_git_lock_contention_retries_then_succeeds(cx: &mut TestAppContext) {
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let attempts_clone = attempts.clone();
+
+        let result = retry_on_git_lock_contention(&cx.background_executor, || {
+            let attempts = attempts_clone.clone();
+            async move {
+                let count = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if count < 2 {
+                    anyhow::bail!("fatal: Unable to create '.git/index.lock': File exists");
+                } else {
+                    Ok("success")
+                }
+            }
+        })
+        .await;
+
+        let Ok(val) = result else {
+            panic!("expected Ok, got Err");
+        };
+        assert_eq!(val, "success");
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
+    #[gpui::test]
+    async fn retry_on_git_lock_contention_fails_fast_on_non_contention(cx: &mut TestAppContext) {
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let attempts_clone = attempts.clone();
+
+        let result: Result<()> = retry_on_git_lock_contention(&cx.background_executor, || {
+            let attempts = attempts_clone.clone();
+            async move {
+                attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                anyhow::bail!("fatal: branch 'feature' not found");
+            }
+        })
+        .await;
+
+        let Err(err) = result else {
+            panic!("expected Err, got Ok");
+        };
+        assert_eq!(err.to_string(), "fatal: branch 'feature' not found");
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[gpui::test]
+    async fn retry_on_git_lock_contention_fails_after_max_retries(cx: &mut TestAppContext) {
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let attempts_clone = attempts.clone();
+
+        let result: Result<()> = retry_on_git_lock_contention(&cx.background_executor, || {
+            let attempts = attempts_clone.clone();
+            async move {
+                attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                anyhow::bail!("fatal: Unable to create '.git/index.lock': File exists");
+            }
+        })
+        .await;
+
+        let Err(err) = result else {
+            panic!("expected Err, got Ok");
+        };
+        assert!(is_git_lock_contention(&err.to_string()));
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 4);
     }
 }
