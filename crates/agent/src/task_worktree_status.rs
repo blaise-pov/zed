@@ -2,7 +2,6 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-
 use anyhow::{Context as _, Result};
 use fs::Fs;
 use futures::StreamExt;
@@ -16,8 +15,6 @@ use util::ResultExt as _;
 
 use crate::agent_task::{AgentGoalSummary, AgentTaskId, AgentTaskSummary};
 use crate::task_worktree::{system_git_binary, task_worktree_context, task_worktree_path};
-
-
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GoalGitState {
@@ -46,8 +43,6 @@ pub struct TaskGitSnapshot {
     pub tasks: HashMap<AgentTaskId, TaskGitState>,
     pub orphan_worktrees: Vec<OrphanWorktree>,
 }
-
-
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct RepoCacheKey {
@@ -118,8 +113,6 @@ pub fn clear_repo_cache() {
     REPO_CACHE.lock().clear();
     PROJECT_REPO_KEYS.lock().clear();
 }
-
-
 
 pub fn snapshot(
     project: &Entity<Project>,

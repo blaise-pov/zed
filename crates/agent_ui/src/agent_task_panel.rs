@@ -5148,7 +5148,7 @@ mod tests {
         assert!(md.contains("- [ ] Criteria 2: box tree"));
         assert!(md.contains("## Artifacts"));
         assert!(md.contains("### review — art-1\n\nLGTM approved"));
-        assert!(md.contains("- **Events**\n") || md.contains("## Events"));
+        assert!(md.contains("## Events"));
         assert!(md.contains("- `#159` [STATUS] task.created"));
         assert!(md.contains("- `#160` [TOOL] run terminal"));
         assert!(!md.contains("- **Diff:**"));
