@@ -3790,6 +3790,7 @@ mod tests {
             agent_settings::AgentSettings::override_global(settings, cx);
         });
 
+        #[allow(clippy::arc_with_non_send_sync)]
         let tool = std::sync::Arc::new(TerminalTool::new(project, environment));
         let (event_stream, _rx) = ToolCallEventStream::test_with_profile(profile_id);
 
@@ -3862,6 +3863,7 @@ mod tests {
             agent_settings::AgentSettings::override_global(settings, cx);
         });
 
+        #[allow(clippy::arc_with_non_send_sync)]
         let tool = std::sync::Arc::new(TerminalTool::new(project, environment));
         let (event_stream, mut rx) = ToolCallEventStream::test_with_profile(profile_id);
 
