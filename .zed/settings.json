@@ -260,6 +260,7 @@
   "agent": {
     "task_graph_server_id": "taskgraph",
     "task_worktree_limit": 18,
+    "commit_message_instructions": "Include tracking lines when available (Goal: <goal_id>, Task: <task_id>) before the Release Notes section.",
     "spawn_step_timeout_seconds": {
       "task_graph": 120,
       "commit": 300,
