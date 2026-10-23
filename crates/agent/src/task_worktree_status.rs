@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+
 
 use anyhow::{Context as _, Result};
 use fs::Fs;
@@ -17,37 +17,13 @@ use util::ResultExt as _;
 use crate::agent_task::{AgentGoalSummary, AgentTaskId, AgentTaskSummary};
 use crate::task_worktree::{system_git_binary, task_worktree_context, task_worktree_path};
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DiffShortStat {
-    pub files: u32,
-    pub added: u32,
-    pub removed: u32,
-}
 
-impl DiffShortStat {
-    pub fn from_numstat(output: &str) -> Self {
-        let diff_stat = git::status::parse_numstat(output);
-        let files = u32::try_from(diff_stat.entries.len()).unwrap_or(u32::MAX);
-        let mut added = 0u32;
-        let mut removed = 0u32;
-        for (_, stat) in diff_stat.entries.iter() {
-            added = added.saturating_add(stat.added);
-            removed = removed.saturating_add(stat.deleted);
-        }
-        Self {
-            files,
-            added,
-            removed,
-        }
-    }
-}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GoalGitState {
     pub branch: String,
     pub branch_exists: bool,
     pub tip_sha: Option<String>,
-    pub diff: Option<DiffShortStat>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -56,7 +32,6 @@ pub struct TaskGitState {
     pub exists_on_disk: bool,
     pub branch: Option<String>,
     pub branch_exists: bool,
-    pub diff: Option<DiffShortStat>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -72,7 +47,7 @@ pub struct TaskGitSnapshot {
     pub orphan_worktrees: Vec<OrphanWorktree>,
 }
 
-pub type DiffCache = Arc<Mutex<HashMap<(String, String), DiffShortStat>>>;
+
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct RepoCacheKey {
@@ -144,135 +119,7 @@ pub fn clear_repo_cache() {
     PROJECT_REPO_KEYS.lock().clear();
 }
 
-#[allow(dead_code)]
-pub const SPEC_DIFF_CACHE_TTL: Duration = Duration::from_secs(30);
 
-#[allow(dead_code)]
-static TIMED_DIFF_CACHE: std::sync::OnceLock<
-    Mutex<HashMap<(PathBuf, String), (Instant, Option<DiffShortStat>)>>,
-> = std::sync::OnceLock::new();
-
-#[allow(dead_code)]
-fn timed_diff_cache() -> &'static Mutex<HashMap<(PathBuf, String), (Instant, Option<DiffShortStat>)>>
-{
-    TIMED_DIFF_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-#[allow(dead_code)]
-fn get_timed_cached_diff(working_dir: &Path, diff_spec: &str) -> Option<Option<DiffShortStat>> {
-    let key = (working_dir.to_path_buf(), diff_spec.to_string());
-    let cache = timed_diff_cache().lock();
-    if let Some((timestamp, stat)) = cache.get(&key) {
-        if timestamp.elapsed() < SPEC_DIFF_CACHE_TTL {
-            return Some(*stat);
-        }
-    }
-    None
-}
-
-#[allow(dead_code)]
-fn set_timed_cached_diff(working_dir: &Path, diff_spec: &str, stat: Option<DiffShortStat>) {
-    let key = (working_dir.to_path_buf(), diff_spec.to_string());
-    timed_diff_cache()
-        .lock()
-        .insert(key, (Instant::now(), stat));
-}
-
-#[allow(dead_code)]
-static GLOBAL_DIFF_CACHE: std::sync::OnceLock<Mutex<HashMap<(String, String), DiffShortStat>>> =
-    std::sync::OnceLock::new();
-
-#[allow(dead_code)]
-fn global_diff_cache() -> &'static Mutex<HashMap<(String, String), DiffShortStat>> {
-    GLOBAL_DIFF_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-#[allow(dead_code)]
-fn get_cached_diff(
-    cache: Option<&DiffCache>,
-    base_sha: &str,
-    head_sha: &str,
-) -> Option<DiffShortStat> {
-    let key = (base_sha.to_string(), head_sha.to_string());
-    if let Some(cache) = cache {
-        cache.lock().get(&key).copied()
-    } else {
-        global_diff_cache().lock().get(&key).copied()
-    }
-}
-
-#[allow(dead_code)]
-fn set_cached_diff(
-    cache: Option<&DiffCache>,
-    base_sha: String,
-    head_sha: String,
-    stat: DiffShortStat,
-) {
-    let key = (base_sha, head_sha);
-    if let Some(cache) = cache {
-        cache.lock().insert(key, stat);
-    } else {
-        global_diff_cache().lock().insert(key, stat);
-    }
-}
-
-#[allow(dead_code)]
-async fn compute_short_stat_for_diff(
-    working_dir: &Path,
-    diff_spec: &str,
-    base_sha: Option<&str>,
-    head_sha: Option<&str>,
-    cache: Option<&DiffCache>,
-) -> Option<DiffShortStat> {
-    if let (Some(base), Some(head)) = (base_sha, head_sha) {
-        if let Some(cached) = get_cached_diff(cache, base, head) {
-            return Some(cached);
-        }
-    } else if let Some(cached) = get_timed_cached_diff(working_dir, diff_spec) {
-        return cached;
-    }
-
-    if !working_dir.is_dir() {
-        return None;
-    }
-
-    let git_binary = system_git_binary()?;
-    let mut command = util::command::new_command(git_binary);
-    command.args(["diff", "--numstat", "--no-renames", diff_spec]);
-    command.current_dir(working_dir);
-
-    let stat = match command.output().await {
-        Ok(output) if output.status.success() => {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let stat = DiffShortStat::from_numstat(&stdout);
-            if let (Some(base), Some(head)) = (base_sha, head_sha) {
-                set_cached_diff(cache, base.to_string(), head.to_string(), stat);
-            }
-            Some(stat)
-        }
-        Ok(output) => {
-            log::warn!(
-                "git diff {diff_spec} failed in {}: {}",
-                working_dir.display(),
-                String::from_utf8_lossy(&output.stderr)
-            );
-            None
-        }
-        Err(error) => {
-            log::warn!(
-                "failed to execute git diff {diff_spec} in {}: {error}",
-                working_dir.display()
-            );
-            None
-        }
-    };
-
-    if base_sha.is_none() || head_sha.is_none() {
-        set_timed_cached_diff(working_dir, diff_spec, stat);
-    }
-
-    stat
-}
 
 pub fn snapshot(
     project: &Entity<Project>,
@@ -280,14 +127,13 @@ pub fn snapshot(
     goals: &[AgentGoalSummary],
     cx: &mut App,
 ) -> Task<Result<TaskGitSnapshot>> {
-    snapshot_with_cache(project, tasks, goals, None, cx)
+    snapshot_with_cache(project, tasks, goals, cx)
 }
 
 pub fn snapshot_with_cache(
     project: &Entity<Project>,
     tasks: &[AgentTaskSummary],
     goals: &[AgentGoalSummary],
-    _diff_cache: Option<DiffCache>,
     cx: &mut App,
 ) -> Task<Result<TaskGitSnapshot>> {
     let tasks = tasks.to_vec();
@@ -391,7 +237,6 @@ pub fn snapshot_with_cache(
                         branch,
                         branch_exists: true,
                         tip_sha: tip_sha.clone(),
-                        diff: None,
                     },
                 );
             } else {
@@ -401,7 +246,6 @@ pub fn snapshot_with_cache(
                         branch,
                         branch_exists: false,
                         tip_sha: None,
-                        diff: None,
                     },
                 );
             }
@@ -412,7 +256,6 @@ pub fn snapshot_with_cache(
                 branch: branch_name,
                 branch_exists: true,
                 tip_sha,
-                diff: None,
             });
         }
 
@@ -471,7 +314,6 @@ pub fn snapshot_with_cache(
                     exists_on_disk,
                     branch,
                     branch_exists,
-                    diff: None,
                 },
             );
         }
@@ -490,7 +332,6 @@ pub struct TaskWorktreeStatus {
     is_loading: bool,
     last_error: Option<String>,
     current_epoch: u64,
-    diff_cache: DiffCache,
     last_tasks: Option<Vec<AgentTaskSummary>>,
     last_goals: Option<Vec<AgentGoalSummary>>,
 }
@@ -503,14 +344,9 @@ impl TaskWorktreeStatus {
             is_loading: false,
             last_error: None,
             current_epoch: 0,
-            diff_cache: Arc::new(Mutex::new(HashMap::new())),
             last_tasks: None,
             last_goals: None,
         }
-    }
-
-    pub fn diff_cache(&self) -> &DiffCache {
-        &self.diff_cache
     }
 
     pub fn snapshot(&self) -> Option<&TaskGitSnapshot> {
@@ -585,7 +421,6 @@ impl TaskWorktreeStatus {
             &self.project,
             &tasks,
             &goals,
-            Some(self.diff_cache.clone()),
             cx,
         );
         cx.spawn(async move |this, cx| {
@@ -761,14 +596,12 @@ mod tests {
         assert_eq!(goal_1_state.branch, "agent-goal/GOAL-1");
         assert!(goal_1_state.branch_exists);
         assert_eq!(goal_1_state.tip_sha.as_deref(), Some("goal-1-sha-200"));
-        assert_eq!(goal_1_state.diff, None);
 
         // GOAL-2 branch does not exist
         let goal_2_state = snapshot.goals.get("GOAL-2").unwrap();
         assert_eq!(goal_2_state.branch, "agent-goal/GOAL-2");
         assert!(!goal_2_state.branch_exists);
         assert_eq!(goal_2_state.tip_sha, None);
-        assert_eq!(goal_2_state.diff, None);
 
         // TASK-1 exists on disk
         let task_1_state = snapshot.tasks.get(&AgentTaskId::from("TASK-1")).unwrap();
@@ -781,7 +614,6 @@ mod tests {
         );
         assert_eq!(task_1_state.branch, None);
         assert!(!task_1_state.branch_exists);
-        assert_eq!(task_1_state.diff, None);
 
         // TASK-2 does not exist on disk
         let task_2_state = snapshot.tasks.get(&AgentTaskId::from("TASK-2")).unwrap();
@@ -794,7 +626,6 @@ mod tests {
         );
         assert_eq!(task_2_state.branch, None);
         assert!(!task_2_state.branch_exists);
-        assert_eq!(task_2_state.diff, None);
 
         // TASK-ORPHAN is in orphan_worktrees
         assert_eq!(snapshot.orphan_worktrees.len(), 1);
@@ -1003,90 +834,6 @@ mod tests {
         let task_1_state = snapshot.tasks.get(&AgentTaskId::from("TASK-1")).unwrap();
         assert_eq!(task_1_state.branch, Some("agent-task/TASK-1".to_string()));
         assert!(task_1_state.branch_exists);
-        assert_eq!(task_1_state.diff, None);
-    }
-
-    #[test]
-    fn test_diff_short_stat_from_numstat() {
-        let sample = "10\t5\tcrates/agent/src/lib.rs\n\
-                      3\t0\tREADME.md\n\
-                      -\t-\tassets/image.png\n\
-                      0\t12\tsrc/old.rs\n";
-        let stat = DiffShortStat::from_numstat(sample);
-        assert_eq!(stat.files, 3);
-        assert_eq!(stat.added, 13);
-        assert_eq!(stat.removed, 17);
-
-        // Empty output
-        let empty_stat = DiffShortStat::from_numstat("");
-        assert_eq!(empty_stat.files, 0);
-        assert_eq!(empty_stat.added, 0);
-        assert_eq!(empty_stat.removed, 0);
-
-        // Binary files only
-        let binary_stat = DiffShortStat::from_numstat("-\t-\tfoo.png\n-\t-\tbar.jpg\n");
-        assert_eq!(binary_stat.files, 0);
-        assert_eq!(binary_stat.added, 0);
-        assert_eq!(binary_stat.removed, 0);
-    }
-
-    #[test]
-    fn test_diff_cache_lookup_and_insert() {
-        let cache = Arc::new(Mutex::new(HashMap::new()));
-        let base = "sha-base-1";
-        let head = "sha-head-1";
-
-        assert_eq!(get_cached_diff(Some(&cache), base, head), None);
-
-        let stat = DiffShortStat {
-            files: 2,
-            added: 15,
-            removed: 4,
-        };
-        set_cached_diff(Some(&cache), base.to_string(), head.to_string(), stat);
-
-        assert_eq!(get_cached_diff(Some(&cache), base, head), Some(stat));
-    }
-
-    #[gpui::test]
-    async fn test_compute_diff_short_stat_cached() {
-        let cache = Arc::new(Mutex::new(HashMap::new()));
-        let base_sha = "base123";
-        let head_sha = "head456";
-        let expected = DiffShortStat {
-            files: 5,
-            added: 100,
-            removed: 20,
-        };
-        set_cached_diff(
-            Some(&cache),
-            base_sha.to_string(),
-            head_sha.to_string(),
-            expected,
-        );
-
-        let non_existent_dir = std::path::Path::new("/does/not/exist");
-        let result = compute_short_stat_for_diff(
-            non_existent_dir,
-            "base...head",
-            Some(base_sha),
-            Some(head_sha),
-            Some(&cache),
-        )
-        .await;
-
-        assert_eq!(result, Some(expected));
-
-        // When not cached and dir does not exist, returns None
-        let uncached = compute_short_stat_for_diff(
-            non_existent_dir,
-            "base...head",
-            Some("other_base"),
-            Some("other_head"),
-            Some(&cache),
-        )
-        .await;
-        assert_eq!(uncached, None);
     }
 
     #[test]
@@ -1378,23 +1125,6 @@ mod tests {
         assert_eq!(snap3.tasks.len(), 2);
     }
 
-    #[gpui::test]
-    async fn test_compute_diff_short_stat_timed_cache_when_sha_missing() {
-        let test_dir = std::path::Path::new("/test/timed_cache_dir");
-        let diff_spec = "main...feature";
-        let expected = DiffShortStat {
-            files: 3,
-            added: 12,
-            removed: 5,
-        };
-
-        set_timed_cached_diff(test_dir, diff_spec, Some(expected));
-
-        let result =
-            compute_short_stat_for_diff(test_dir, diff_spec, None, Some("head_sha"), None).await;
-
-        assert_eq!(result, Some(expected));
-    }
 
     #[gpui::test]
     async fn test_snapshot_reuses_cached_git_repository_handle(cx: &mut TestAppContext) {

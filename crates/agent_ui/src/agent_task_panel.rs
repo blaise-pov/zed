@@ -30,8 +30,8 @@ use std::sync::Arc;
 
 use agent::{
     AgentGoalStatus, AgentGoalSummary, AgentTaskArtifact, AgentTaskDetail, AgentTaskEventKind,
-    AgentTaskId, AgentTaskMetrics, AgentTaskStatus, AgentTaskStore, AgentTaskSummary,
-    DiffShortStat, GoalGitState, OrphanWorktree, TaskWorktreeStatus,
+    AgentTaskId, AgentTaskMetrics, AgentTaskStatus, AgentTaskStore, AgentTaskSummary, GoalGitState,
+    OrphanWorktree, TaskWorktreeStatus,
 };
 use agent_settings::AgentSettings;
 use editor::Editor;
@@ -3624,12 +3624,6 @@ pub fn render_goal_markdown(goal: &AgentGoalSummary, goal_git: Option<&GoalGitSt
             let short_sha: String = sha.chars().take(7).collect();
             doc.push_str(&format!("- **Tip SHA:** `{short_sha}` ({sha})\n"));
         }
-        if let Some(diff) = &git.diff {
-            doc.push_str(&format!(
-                "- **Diff:** {} file(s) +{} -{}\n",
-                diff.files, diff.added, diff.removed
-            ));
-        }
     }
 
     doc
@@ -3785,7 +3779,7 @@ pub fn render_metrics_markdown(doc: &mut String, metrics: &AgentTaskMetrics) {
 }
 
 #[allow(dead_code)]
-pub fn format_task_meta_line(task: &AgentTaskSummary, _diff: Option<&DiffShortStat>) -> String {
+pub fn format_task_meta_line(task: &AgentTaskSummary) -> String {
     let task_seg = if task.id.starts_with("TASK-") {
         task.id.to_string()
     } else {
@@ -3817,7 +3811,6 @@ pub fn format_goal_meta_line(
     tasks_done: u64,
     tasks_total: u64,
     metrics: Option<&AgentTaskMetrics>,
-    _diff: Option<&DiffShortStat>,
 ) -> String {
     let goal_seg = if goal_id.starts_with("GOAL-") {
         goal_id.to_string()
@@ -5202,11 +5195,6 @@ mod tests {
             branch: "agent-goal/GOAL-UI-1".to_string(),
             branch_exists: true,
             tip_sha: Some("1234567890abcdef".to_string()),
-            diff: Some(agent::DiffShortStat {
-                files: 3,
-                added: 120,
-                removed: 15,
-            }),
         };
 
         let md = render_goal_markdown(&goal_summary, Some(&goal_git));
@@ -5217,7 +5205,6 @@ mod tests {
         assert!(md.contains("- **Tasks:** 1/2 completed"));
         assert!(md.contains("- **Branch:** `agent-goal/GOAL-UI-1`"));
         assert!(md.contains("- **Tip SHA:** `1234567` (1234567890abcdef)"));
-        assert!(md.contains("- **Diff:** 3 file(s) +120 -15"));
     }
 
     #[gpui::test]
@@ -5242,7 +5229,6 @@ mod tests {
                         branch: "agent-goal/GOAL-1".to_string(),
                         branch_exists: true,
                         tip_sha: Some("1234567890abcdef".to_string()),
-                        diff: None,
                     },
                 );
                 snap.goals.insert(
@@ -5251,7 +5237,6 @@ mod tests {
                         branch: "agent-goal/GOAL-2".to_string(),
                         branch_exists: false,
                         tip_sha: None,
-                        diff: None,
                     },
                 );
                 status.set_snapshot_for_test(snap, cx);
@@ -5342,12 +5327,7 @@ mod tests {
             session_id: None,
             metrics: None,
         };
-        let diff = DiffShortStat {
-            files: 2,
-            added: 15,
-            removed: 3,
-        };
-        let meta = format_task_meta_line(&task_full, Some(&diff));
+        let meta = format_task_meta_line(&task_full);
         assert_eq!(meta, "TASK-1 · agent_engineer · claude-3-7-sonnet");
 
         let goal_meta = format_goal_meta_line(
@@ -5357,15 +5337,9 @@ mod tests {
             1,
             3,
             None,
-            Some(&diff),
         );
         assert_eq!(goal_meta, "GOAL-1 · 1 / 3 · P2");
 
-        let single_diff = DiffShortStat {
-            files: 1,
-            added: 4,
-            removed: 0,
-        };
         assert_eq!(
             format_goal_meta_line(
                 "GOAL-1",
@@ -5374,17 +5348,16 @@ mod tests {
                 0,
                 1,
                 None,
-                Some(&single_diff)
             ),
             "GOAL-1 · 0 / 1 · P1"
         );
 
         assert_eq!(
-            format_task_meta_line(&task_full, None),
+            format_task_meta_line(&task_full),
             "TASK-1 · agent_engineer · claude-3-7-sonnet"
         );
         assert_eq!(
-            format_goal_meta_line("GOAL-1", &AgentGoalStatus::Completed, 1, 2, 2, None, None),
+            format_goal_meta_line("GOAL-1", &AgentGoalStatus::Completed, 1, 2, 2, None),
             "GOAL-1 · 2 / 2 · P1"
         );
 
@@ -5401,7 +5374,7 @@ mod tests {
         };
         let mut task_with_metrics = task_full;
         task_with_metrics.metrics = Some(sample_metrics.clone());
-        let task_meta_no_diff = format_task_meta_line(&task_with_metrics, None);
+        let task_meta_no_diff = format_task_meta_line(&task_with_metrics);
         assert_eq!(
             task_meta_no_diff,
             "TASK-1 · agent_engineer · claude-3-7-sonnet · 14s · 5.1k/1.3k/15.1k · 1 · $0.04"
@@ -5415,7 +5388,6 @@ mod tests {
             3,
             3,
             Some(&sample_metrics),
-            None,
         );
         assert_eq!(
             goal_meta_no_diff,
@@ -5430,7 +5402,7 @@ mod tests {
             deletions: 4,
         });
         task_with_metrics.metrics = Some(metrics_with_diff.clone());
-        let task_meta_with_diff = format_task_meta_line(&task_with_metrics, None);
+        let task_meta_with_diff = format_task_meta_line(&task_with_metrics);
         assert_eq!(
             task_meta_with_diff,
             "TASK-1 · agent_engineer · claude-3-7-sonnet · 14s · 5.1k/1.3k/15.1k · 1 · +15 -4 · $0.04"
@@ -5444,7 +5416,6 @@ mod tests {
             3,
             3,
             Some(&metrics_with_diff),
-            None,
         );
         assert_eq!(
             goal_meta_with_diff,
@@ -5471,7 +5442,7 @@ mod tests {
             metrics: None,
         };
         assert_eq!(
-            format_task_meta_line(&task_no_goal, None),
+            format_task_meta_line(&task_no_goal),
             "TASK-2 · code_mechanic · gemini-2.5-pro"
         );
 
@@ -5491,7 +5462,7 @@ mod tests {
             metrics: None,
         };
         assert_eq!(
-            format_task_meta_line(&task_assignee_fallback, None),
+            format_task_meta_line(&task_assignee_fallback),
             "TASK-3 · backend_profile"
         );
 
@@ -5511,7 +5482,7 @@ mod tests {
             metrics: None,
         };
         assert_eq!(
-            format_task_meta_line(&task_no_profile, None),
+            format_task_meta_line(&task_no_profile),
             "TASK-4 · no profile"
         );
 
@@ -5531,7 +5502,7 @@ mod tests {
             metrics: None,
         };
         assert_eq!(
-            format_task_meta_line(&task_both, None),
+            format_task_meta_line(&task_both),
             "TASK-5 · primary_profile"
         );
     }
@@ -6066,7 +6037,6 @@ mod tests {
                         branch: "agent-goal/GOAL-1".to_string(),
                         branch_exists: true,
                         tip_sha: Some("1234567890abcdef".to_string()),
-                        diff: None,
                     },
                 );
                 status.set_snapshot_for_test(snap, cx);
@@ -6137,7 +6107,6 @@ mod tests {
                         branch: "agent-goal/GOAL-1".to_string(),
                         branch_exists: true,
                         tip_sha: Some("1234567890abcdef".to_string()),
-                        diff: None,
                     },
                 );
                 status.set_snapshot_for_test(snap, cx);
@@ -6276,7 +6245,6 @@ mod tests {
                         exists_on_disk: true,
                         branch: Some("agent-task/TASK-1".to_string()),
                         branch_exists: true,
-                        diff: None,
                     },
                 );
                 snap.goals.insert(
@@ -6285,7 +6253,6 @@ mod tests {
                         branch: "agent-goal/GOAL-1".to_string(),
                         branch_exists: true,
                         tip_sha: Some("1234567890abcdef".to_string()),
-                        diff: None,
                     },
                 );
                 status.set_snapshot_for_test(snap, cx);
@@ -6356,7 +6323,6 @@ mod tests {
                         exists_on_disk: true,
                         branch: Some("agent-task/TASK-1".to_string()),
                         branch_exists: true,
-                        diff: None,
                     },
                 );
                 status.set_snapshot_for_test(snap, cx);
@@ -6411,7 +6377,6 @@ mod tests {
             branch: format!("agent-goal/{goal_id}"),
             branch_exists: true,
             tip_sha: Some("1234567890abcdef".to_string()),
-            diff: None,
         };
 
         let detail = AgentTaskDetail {
@@ -7061,7 +7026,6 @@ mod tests {
                         exists_on_disk: false,
                         branch: Some("agent-task/TASK-NO-BRANCH".to_string()),
                         branch_exists: false,
-                        diff: None,
                     },
                 );
                 status.set_snapshot_for_test(snap, cx);
@@ -7179,7 +7143,6 @@ mod tests {
                         exists_on_disk: false,
                         branch: Some("agent-task/TASK-RESTORE".to_string()),
                         branch_exists: true,
-                        diff: None,
                     },
                 );
                 status.set_snapshot_for_test(snap, cx);
@@ -7257,7 +7220,6 @@ mod tests {
                         exists_on_disk: true,
                         branch: Some("agent-task/TASK-DISK".to_string()),
                         branch_exists: true,
-                        diff: None,
                     },
                 );
                 status.set_snapshot_for_test(snap, cx);
@@ -7428,7 +7390,6 @@ mod tests {
                         exists_on_disk: true,
                         branch: Some("agent-task/TASK-1".to_string()),
                         branch_exists: true,
-                        diff: None,
                     },
                 );
                 status.set_snapshot_for_test(snap, cx);
@@ -7463,7 +7424,6 @@ mod tests {
                         exists_on_disk: false,
                         branch: Some("agent-task/TASK-1".to_string()),
                         branch_exists: true,
-                        diff: None,
                     },
                 );
                 status.set_snapshot_for_test(snap, cx);
