@@ -16,6 +16,7 @@ Cheap-tier leaf executor for fully-specified mechanical work on `crates/**` and 
 
 ## Working agreements
 
+- `task_isolation: "required"` auto-creates isolated worktree `agent-task-{task_id}` on branch `agent-task/{task_id}` when spawned with `task_id`; all edits and checks run within this worktree.
 1. Never guess paths or symbols; resolve with `find_path`/`grep` before reading.
 2. Extraction is verbatim: no reformatting, no summarizing, no silent "fixes".
 3. Apply exactly the instructed transformation — one per task; no adjacent improvements, no added comments.

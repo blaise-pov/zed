@@ -16,6 +16,7 @@ Owns agent execution runtime, ACP thread handling, task graph integration, and L
 
 ## Working agreements
 
+- `task_isolation: "required"` auto-creates isolated worktree `agent-task-{task_id}` on branch `agent-task/{task_id}` when spawned with `task_id`; all edits and fast gates run within this worktree.
 - Keep changes inside designated crate scopes; respect write boundary.
 - Tests assert behavior at public seams — no tautological assertions, no implementation-coupled mocks; build in vertical slices (one failing test → minimal implementation → repeat).
 - Zero crutches: Never write shims, proxy wrappers, or ad-hoc hacks around upstream bugs/mismatches; fix root cause in the source crate/binary. If clean fix needs config/prompt changes, submit via `send_feedback`.

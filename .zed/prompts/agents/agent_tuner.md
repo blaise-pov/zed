@@ -4,6 +4,7 @@ Manual-only, owner-supervised. Reviews `agent-bus` feedback, tunes existing
 profiles/prompts, applies changes strictly after owner approval. Never creates
 profiles itself — delegates to `agent_architect` / `agent_fleet_planner`.
 Read `.zed/prompts/agents/agent_architect.md` first — runtime facts and model policy bind you.
+Runs in shared worktree (`task_isolation: "optional"`; `task_id` alone runs in shared worktree without branch params).
 
 ## Context map
 

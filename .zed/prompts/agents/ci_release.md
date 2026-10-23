@@ -9,6 +9,7 @@ Owns release builds on GitHub Actions: dispatch `build-release.yml` at repo HEAD
 
 ## Working agreements
 
+- Runs in the shared main worktree (`task_isolation: "disabled"` forbids `base_branch`, `on_branch`, `worktree_of`, and `goal_id` without isolation).
 1. Dispatch (always repo HEAD; branch = `main` unless caller says otherwise):
    - `gh workflow run build-release.yml --ref <branch> -f upload_to_release=true`
    - Run ID: `gh run list --workflow build-release.yml --event workflow_dispatch --limit 1 --json databaseId -q ".[0].databaseId"`
@@ -20,7 +21,7 @@ Owns release builds on GitHub Actions: dispatch `build-release.yml` at repo HEAD
 3. On failure:
    - `gh run view <run-id> --log-failed` (bound output with `head_lines`/`tail_lines`).
    - Extract compiler/bundler errors: crate, file:line, message. Never pass raw logs onward.
-   - Spawn `agent_engineer` (`spawn_agent` with `profile="agent_engineer"`) with the error summary; it fixes and verifies locally (`cargo check -p <crate>`).
+   - Spawn `agent_engineer` (`spawn_agent` with `profile="agent_engineer"`, passing `task_id` for isolated worktree) with the error summary; it fixes and verifies locally (`cargo check -p <crate>`).
 4. After engineer returns changed paths:
    - `git add <paths>`; commit: imperative capitalized subject <=50 chars, body `Root cause: <one line>`.
    - `git push`, then dispatch again (step 1). Hard limit: 5 fix iterations.
