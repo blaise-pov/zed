@@ -636,6 +636,18 @@ pub struct AgentSettingsContent {
     ///
     /// Default: true
     pub publish_ref_artifact: Option<bool>,
+    /// Whether to delete the goal branch when cleaning up a graduated goal.
+    ///
+    /// Default: true
+    pub delete_goal_branches_on_graduation: Option<bool>,
+    /// Whether to delete task branches when cleaning up a graduated goal.
+    ///
+    /// Default: true
+    pub delete_task_branches_on_graduation: Option<bool>,
+    /// Base branch to target when preparing goal graduation.
+    ///
+    /// Default: null
+    pub goal_graduation_base_branch: Option<String>,
 }
 
 impl AgentSettingsContent {

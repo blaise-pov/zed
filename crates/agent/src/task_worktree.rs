@@ -3742,7 +3742,10 @@ pub fn assert_safe_graduation_ref(ref_or_branch: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn prepare_goal_graduation_summary(goal_id: &str) -> Result<GoalGraduationSummary> {
+pub fn prepare_goal_graduation_summary(
+    goal_id: &str,
+    base_branch: &str,
+) -> Result<GoalGraduationSummary> {
     let goal_id_str = goal_id.to_string();
     let goal_branch = format!("agent-goal/{goal_id_str}");
     assert_safe_graduation_ref(&goal_branch)?;
@@ -3778,10 +3781,10 @@ pub fn prepare_goal_graduation_summary(goal_id: &str) -> Result<GoalGraduationSu
     let title = format!("Graduate goal {goal_id_str}");
     let mut body = String::new();
     body.push_str(&format!(
-        "## Summary\n\nGoal `{goal_id_str}` graduation into `main`.\n\n"
+        "## Summary\n\nGoal `{goal_id_str}` graduation into `{base_branch}`.\n\n"
     ));
     body.push_str(&format!("- Source branch: `{goal_branch}`\n"));
-    body.push_str("- Target branch: `main`\n");
+    body.push_str(&format!("- Target branch: `{base_branch}`\n"));
     if let Some(sha) = &tip_sha {
         let short_sha: String = sha.chars().take(7).collect();
         body.push_str(&format!("- Tip SHA: `{short_sha}` ({sha})\n"));
@@ -3807,7 +3810,8 @@ pub fn prepare_goal_graduation_summary(goal_id: &str) -> Result<GoalGraduationSu
     body.push_str("\nRelease Notes:\n\n- N/A\n");
 
     let pr_cmd = format!(
-        "gh pr create --base main --head {} --title \"{}\" --body \"{}\"",
+        "gh pr create --base {} --head {} --title \"{}\" --body \"{}\"",
+        base_branch,
         goal_branch,
         title,
         body.replace('\"', "\\\"").replace('\n', "\\n")
@@ -3817,19 +3821,19 @@ pub fn prepare_goal_graduation_summary(goal_id: &str) -> Result<GoalGraduationSu
         title,
         body,
         source_branch: goal_branch.clone(),
-        target_branch: "main".to_string(),
+        target_branch: base_branch.to_string(),
         command: pr_cmd,
     };
 
     let summary = GoalGraduationSummary {
         goal_id: goal_id_str,
         goal_branch: goal_branch.clone(),
-        base_branch: "main".to_string(),
+        base_branch: base_branch.to_string(),
         refs: GoalRefs {
             goal_branch: goal_branch.clone(),
             goal_ref: format!("refs/heads/{goal_branch}"),
-            base_branch: "main".to_string(),
-            base_ref: "refs/heads/main".to_string(),
+            base_branch: base_branch.to_string(),
+            base_ref: format!("refs/heads/{base_branch}"),
         },
         tip_sha,
         commits_count,
@@ -3848,6 +3852,11 @@ pub fn prepare_goal_graduation(
     cx: &mut App,
 ) -> Task<Result<GoalGraduationSummary>> {
     let goal_id = goal_id.to_string();
+    let configured_base_branch = project.read_with(cx, |project, cx| {
+        agent_settings::AgentSettings::get_for_project(project, cx)
+            .goal_graduation_base_branch
+            .clone()
+    });
     cx.spawn(async move |cx| {
         let (_repository, anchor_path, _, _, file_system) = project
             .update(cx, |project, cx| {
@@ -3866,7 +3875,15 @@ pub fn prepare_goal_graduation(
             record_goal_tip_sha(&goal_id, sha);
         }
 
-        let summary = prepare_goal_graduation_summary(&goal_id)?;
+        let base_branch = if let Some(base) = configured_base_branch {
+            base
+        } else if let Ok(Some(default_branch)) = git_repo.default_branch(false).await {
+            default_branch.to_string()
+        } else {
+            "main".to_string()
+        };
+
+        let summary = prepare_goal_graduation_summary(&goal_id, &base_branch)?;
         {
             let mut reg = REGISTRY.write();
             reg.goal_graduations
@@ -3988,6 +4005,7 @@ pub struct GoalCleanupResult {
     pub goal_id: String,
     pub deleted_branches: Vec<String>,
     pub failed_branches: Vec<(String, String)>,
+    pub skipped_branches: Vec<String>,
     pub cleaned_tasks: Vec<AgentTaskId>,
 }
 
@@ -4010,6 +4028,13 @@ pub fn cleanup_graduated_goal(
     cx: &mut App,
 ) -> Task<Result<GoalCleanupResult>> {
     let goal_id = goal_id.to_string();
+    let (delete_goal_branch, delete_task_branches) = project.read_with(cx, |project, cx| {
+        let s = agent_settings::AgentSettings::get_for_project(project, cx);
+        (
+            s.delete_goal_branches_on_graduation,
+            s.delete_task_branches_on_graduation,
+        )
+    });
     cx.spawn(async move |cx| {
         let (repository, anchor_path, _, _, file_system) = project
             .update(cx, |project, cx| {
@@ -4024,7 +4049,13 @@ pub fn cleanup_graduated_goal(
         let goal_branch = format!("agent-goal/{}", goal_id);
         assert_safe_graduation_ref(&goal_branch)?;
 
-        let mut branches_to_delete = vec![goal_branch.clone()];
+        let mut branches_to_delete = Vec::new();
+        let mut skipped_branches = Vec::new();
+        if delete_goal_branch {
+            branches_to_delete.push(goal_branch.clone());
+        } else {
+            skipped_branches.push(goal_branch.clone());
+        }
         let mut tasks_to_cleanup = Vec::new();
 
         {
@@ -4058,11 +4089,17 @@ pub fn cleanup_graduated_goal(
         for task_id in &tasks_to_cleanup {
             let task_branch = format!("agent-task/{}", task_id);
             assert_safe_graduation_ref(&task_branch)?;
-            branches_to_delete.push(task_branch);
+            if delete_task_branches {
+                branches_to_delete.push(task_branch);
+            } else {
+                skipped_branches.push(task_branch);
+            }
         }
 
         branches_to_delete.sort();
         branches_to_delete.dedup();
+        skipped_branches.sort();
+        skipped_branches.dedup();
 
         let mut deleted_branches = Vec::new();
         let mut failed_branches = Vec::new();
@@ -4141,6 +4178,7 @@ pub fn cleanup_graduated_goal(
             goal_id,
             deleted_branches,
             failed_branches,
+            skipped_branches,
             cleaned_tasks: tasks_to_cleanup,
         })
     })
@@ -6702,6 +6740,140 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_acceptance_cleanup_graduated_goal_skips_branches_per_settings(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/root"),
+            json!({
+                ".git": {
+                    "HEAD": "ref: refs/heads/main\n"
+                }
+            }),
+        )
+        .await;
+
+        let dot_git = std::path::Path::new(path!("/root/.git"));
+        fs.with_git_state(dot_git, true, |state| {
+            state.refs.insert(
+                "refs/heads/main".into(),
+                "main-sha-preserved-forever".into(),
+            );
+            state
+                .refs
+                .insert("HEAD".into(), "main-sha-preserved-forever".into());
+            state.branches.insert("main".into());
+
+            state.refs.insert(
+                "refs/heads/agent-goal/GOAL-SKIP-CLEANUP".into(),
+                "goal-sha-skip".into(),
+            );
+            state.branches.insert("agent-goal/GOAL-SKIP-CLEANUP".into());
+
+            state.refs.insert(
+                "refs/heads/agent-task/TASK-SKIP-1".into(),
+                "task-skip-1-sha".into(),
+            );
+            state.branches.insert("agent-task/TASK-SKIP-1".into());
+
+            state.refs.insert(
+                "refs/heads/agent-task/TASK-SKIP-2".into(),
+                "task-skip-2-sha".into(),
+            );
+            state.branches.insert("agent-task/TASK-SKIP-2".into());
+        })
+        .unwrap();
+
+        let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
+        let task1 = AgentTaskId::from("TASK-SKIP-1");
+        let task2 = AgentTaskId::from("TASK-SKIP-2");
+
+        register_task_worktree_policy(
+            &task1,
+            PathBuf::from("/fake/skip1"),
+            Some("agent-goal/GOAL-SKIP-CLEANUP".to_string()),
+            None,
+            None,
+            None,
+        );
+        register_task_worktree_policy(
+            &task2,
+            PathBuf::from("/fake/skip2"),
+            Some("agent-goal/GOAL-SKIP-CLEANUP".to_string()),
+            None,
+            None,
+            None,
+        );
+        record_goal_tip_sha("GOAL-SKIP-CLEANUP", "goal-sha-skip".to_string());
+        mark_task_terminal(&task1);
+        mark_task_terminal(&task2);
+
+        let _ = cx
+            .update(|cx| prepare_goal_graduation(project.clone(), "GOAL-SKIP-CLEANUP", cx))
+            .await
+            .unwrap();
+        assert!(get_goal_graduation_summary("GOAL-SKIP-CLEANUP").is_some());
+
+        // Configure both branch deletion settings to false
+        cx.update(|cx| {
+            cx.update_global::<SettingsStore, _>(|store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    let agent = settings.agent.get_or_insert_default();
+                    agent.delete_goal_branches_on_graduation = Some(false);
+                    agent.delete_task_branches_on_graduation = Some(false);
+                });
+            });
+        });
+
+        let cleanup_result = cx
+            .update(|cx| cleanup_graduated_goal(project.clone(), "GOAL-SKIP-CLEANUP", cx))
+            .await
+            .unwrap();
+
+        // 1. Result reports skipped branches and no deleted branches
+        assert!(cleanup_result.deleted_branches.is_empty());
+        assert_eq!(
+            cleanup_result.skipped_branches,
+            vec![
+                "agent-goal/GOAL-SKIP-CLEANUP".to_string(),
+                "agent-task/TASK-SKIP-1".to_string(),
+                "agent-task/TASK-SKIP-2".to_string(),
+            ]
+        );
+
+        // 2. Branches survived in the fake repository
+        let (has_goal, has_t1, has_t2, main_sha, head_sha) = fs
+            .with_git_state(dot_git, false, |state| {
+                let g = state.branches.contains("agent-goal/GOAL-SKIP-CLEANUP")
+                    && state
+                        .refs
+                        .contains_key("refs/heads/agent-goal/GOAL-SKIP-CLEANUP");
+                let t1 = state.branches.contains("agent-task/TASK-SKIP-1")
+                    && state.refs.contains_key("refs/heads/agent-task/TASK-SKIP-1");
+                let t2 = state.branches.contains("agent-task/TASK-SKIP-2")
+                    && state.refs.contains_key("refs/heads/agent-task/TASK-SKIP-2");
+                let m = state.refs.get("refs/heads/main").cloned();
+                let h = state.refs.get("HEAD").cloned();
+                (g, t1, t2, m, h)
+            })
+            .unwrap();
+
+        assert!(has_goal, "goal branch must survive when deletion is disabled");
+        assert!(has_t1, "task 1 branch must survive when deletion is disabled");
+        assert!(has_t2, "task 2 branch must survive when deletion is disabled");
+        assert_eq!(main_sha, Some("main-sha-preserved-forever".to_string()));
+        assert_eq!(head_sha, Some("main-sha-preserved-forever".to_string()));
+
+        // 3. REGISTRY entries are still removed unconditionally
+        assert!(get_goal_graduation_summary("GOAL-SKIP-CLEANUP").is_none());
+        assert!(goal_tip_sha("GOAL-SKIP-CLEANUP").is_none());
+        assert!(goal_branch_summary_for_task(&task1).is_none());
+        assert!(goal_branch_summary_for_task(&task2).is_none());
+    }
+
+    #[gpui::test]
     async fn test_acceptance_cleanup_graduated_goal_blocked_by_active_sibling(
         cx: &mut TestAppContext,
     ) {
@@ -6789,7 +6961,7 @@ mod tests {
         assert!(assert_safe_graduation_ref("master").is_err());
         assert!(assert_safe_graduation_ref("refs/heads/master").is_err());
         // Graduation summary creation forbids targeting main
-        let bad_summary = prepare_goal_graduation_summary("../main");
+        let bad_summary = prepare_goal_graduation_summary("../main", "main");
         assert!(bad_summary.is_err());
     }
 
@@ -8797,7 +8969,7 @@ mod tests {
     fn test_prepare_goal_graduation_summary_multibyte_utf8_sha() {
         reset_registry_for_tests();
         record_goal_tip_sha("GOAL-UTF8", "🦀🦀🦀abc".to_string());
-        let summary = prepare_goal_graduation_summary("GOAL-UTF8")
+        let summary = prepare_goal_graduation_summary("GOAL-UTF8", "main")
             .expect("prepare_goal_graduation_summary should succeed for multibyte UTF-8 SHA");
         assert!(
             summary
@@ -8805,6 +8977,70 @@ mod tests {
                 .body
                 .contains("- Tip SHA: `🦀🦀🦀abc` (🦀🦀🦀abc)")
         );
+    }
+
+    #[gpui::test]
+    async fn test_prepare_goal_graduation_base_branch_resolution(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/root"),
+            json!({
+                ".git": {
+                    "HEAD": "ref: refs/heads/main\n"
+                }
+            }),
+        )
+        .await;
+
+        let dot_git = std::path::Path::new(path!("/root/.git"));
+        fs.with_git_state(dot_git, true, |state| {
+            state.refs.insert("refs/heads/main".into(), "main-sha-base".into());
+            state.refs.insert("HEAD".into(), "main-sha-base".into());
+            state.branches.insert("main".into());
+            state.refs.insert("refs/heads/agent-goal/GOAL-BASE-1".into(), "goal-base-sha-1".into());
+            state.branches.insert("agent-goal/GOAL-BASE-1".into());
+            state.refs.insert("refs/heads/agent-goal/GOAL-BASE-2".into(), "goal-base-sha-2".into());
+            state.branches.insert("agent-goal/GOAL-BASE-2".into());
+        })
+        .unwrap();
+
+        let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
+
+        // Absent setting falls back to git default branch / "main"
+        let summary_fallback = cx
+            .update(|cx| prepare_goal_graduation(project.clone(), "GOAL-BASE-1", cx))
+            .await
+            .unwrap();
+        assert_eq!(summary_fallback.base_branch, "main");
+        assert_eq!(summary_fallback.refs.base_branch, "main");
+        assert_eq!(summary_fallback.refs.base_ref, "refs/heads/main");
+        assert_eq!(summary_fallback.pr_proposal.target_branch, "main");
+        assert!(summary_fallback.pr_proposal.command.contains("--base main"));
+        assert!(summary_fallback.pr_proposal.body.contains("graduation into `main`"));
+        assert!(summary_fallback.pr_proposal.body.contains("- Target branch: `main`"));
+
+        // Explicit setting wins
+        cx.update(|cx| {
+            cx.update_global::<SettingsStore, _>(|store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings.agent.get_or_insert_default().goal_graduation_base_branch =
+                        Some("release/v2.0".to_string());
+                });
+            });
+        });
+
+        let summary_explicit = cx
+            .update(|cx| prepare_goal_graduation(project.clone(), "GOAL-BASE-2", cx))
+            .await
+            .unwrap();
+        assert_eq!(summary_explicit.base_branch, "release/v2.0");
+        assert_eq!(summary_explicit.refs.base_branch, "release/v2.0");
+        assert_eq!(summary_explicit.refs.base_ref, "refs/heads/release/v2.0");
+        assert_eq!(summary_explicit.pr_proposal.target_branch, "release/v2.0");
+        assert!(summary_explicit.pr_proposal.command.contains("--base release/v2.0"));
+        assert!(summary_explicit.pr_proposal.body.contains("graduation into `release/v2.0`"));
+        assert!(summary_explicit.pr_proposal.body.contains("- Target branch: `release/v2.0`"));
     }
 
     #[test]

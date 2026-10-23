@@ -1094,10 +1094,11 @@ impl AgentTaskPanel {
                                 cx.spawn(async move |cx| match cleanup_task.await {
                                     Ok(result) => {
                                         log::info!(
-                                            "Cleaned up goal {}: {} branches deleted, {} failed",
+                                            "Cleaned up goal {}: {} branches deleted, {} failed, {} skipped",
                                             result.goal_id,
                                             result.deleted_branches.len(),
-                                            result.failed_branches.len()
+                                            result.failed_branches.len(),
+                                            result.skipped_branches.len()
                                         );
                                         if let Some(panel) = view.upgrade() {
                                             panel.update(cx, |this, cx| {
@@ -2158,14 +2159,24 @@ impl AgentTaskPanel {
                 .as_ref()
                 .filter(|res| res.goal_id == goal_id)
                 .map(|res| {
-                    let text = if res.failed_branches.is_empty() {
-                        format!("Cleaned ({} deleted)", res.deleted_branches.len())
-                    } else {
-                        format!(
+                    let text = match (res.failed_branches.is_empty(), res.skipped_branches.is_empty()) {
+                        (true, true) => format!("Cleaned ({} deleted)", res.deleted_branches.len()),
+                        (true, false) => format!(
+                            "Cleaned ({} deleted, {} skipped)",
+                            res.deleted_branches.len(),
+                            res.skipped_branches.len()
+                        ),
+                        (false, true) => format!(
                             "Cleaned ({} deleted, {} failed)",
                             res.deleted_branches.len(),
                             res.failed_branches.len()
-                        )
+                        ),
+                        (false, false) => format!(
+                            "Cleaned ({} deleted, {} failed, {} skipped)",
+                            res.deleted_branches.len(),
+                            res.failed_branches.len(),
+                            res.skipped_branches.len()
+                        ),
                     };
                     let color = if res.failed_branches.is_empty() {
                         Color::Success

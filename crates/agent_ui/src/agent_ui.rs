@@ -1140,6 +1140,11 @@ mod tests {
             cleanup: agent_settings::DEFAULT_CLEANUP,
             register_metadata: agent_settings::DEFAULT_REGISTER_METADATA,
             publish_ref_artifact: agent_settings::DEFAULT_PUBLISH_REF_ARTIFACT,
+            delete_goal_branches_on_graduation:
+                agent_settings::DEFAULT_DELETE_GOAL_BRANCHES_ON_GRADUATION,
+            delete_task_branches_on_graduation:
+                agent_settings::DEFAULT_DELETE_TASK_BRANCHES_ON_GRADUATION,
+            goal_graduation_base_branch: None,
         };
 
         cx.update(|cx| {

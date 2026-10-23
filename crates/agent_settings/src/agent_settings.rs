@@ -323,6 +323,12 @@ pub const DEFAULT_REGISTER_METADATA: bool = true;
 /// Default setting for whether to publish task ref artifacts upon merge.
 pub const DEFAULT_PUBLISH_REF_ARTIFACT: bool = true;
 
+/// Default setting for whether to delete goal branches on goal graduation.
+pub const DEFAULT_DELETE_GOAL_BRANCHES_ON_GRADUATION: bool = true;
+
+/// Default setting for whether to delete task branches on goal graduation.
+pub const DEFAULT_DELETE_TASK_BRANCHES_ON_GRADUATION: bool = true;
+
 /// Clamps a configured `task_worktree_limit`.
 ///
 /// A value of 0 is invalid and will be clamped to the minimum of 1.
@@ -581,6 +587,18 @@ pub struct AgentSettings {
     ///
     /// Default: true
     pub publish_ref_artifact: bool,
+    /// Whether to delete the goal branch when cleaning up a graduated goal.
+    ///
+    /// Default: true
+    pub delete_goal_branches_on_graduation: bool,
+    /// Whether to delete task branches when cleaning up a graduated goal.
+    ///
+    /// Default: true
+    pub delete_task_branches_on_graduation: bool,
+    /// Base branch to target when preparing goal graduation.
+    ///
+    /// Default: null
+    pub goal_graduation_base_branch: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1437,6 +1455,15 @@ impl Settings for AgentSettings {
             publish_ref_artifact: agent
                 .publish_ref_artifact
                 .unwrap_or(DEFAULT_PUBLISH_REF_ARTIFACT),
+            delete_goal_branches_on_graduation: agent
+                .delete_goal_branches_on_graduation
+                .unwrap_or(DEFAULT_DELETE_GOAL_BRANCHES_ON_GRADUATION),
+            delete_task_branches_on_graduation: agent
+                .delete_task_branches_on_graduation
+                .unwrap_or(DEFAULT_DELETE_TASK_BRANCHES_ON_GRADUATION),
+            goal_graduation_base_branch: agent
+                .goal_graduation_base_branch
+                .filter(|branch| !branch.trim().is_empty()),
         }
     }
 }
@@ -3732,6 +3759,8 @@ mod tests {
         assert!(DEFAULT_CLEANUP);
         assert!(DEFAULT_REGISTER_METADATA);
         assert!(DEFAULT_PUBLISH_REF_ARTIFACT);
+        assert!(DEFAULT_DELETE_GOAL_BRANCHES_ON_GRADUATION);
+        assert!(DEFAULT_DELETE_TASK_BRANCHES_ON_GRADUATION);
 
         let omitted: settings::AgentSettingsContent = serde_json::from_str(r#"{}"#).unwrap();
         assert_eq!(omitted.task_lifecycle_mode, None);
@@ -3739,6 +3768,9 @@ mod tests {
         assert_eq!(omitted.cleanup, None);
         assert_eq!(omitted.register_metadata, None);
         assert_eq!(omitted.publish_ref_artifact, None);
+        assert_eq!(omitted.delete_goal_branches_on_graduation, None);
+        assert_eq!(omitted.delete_task_branches_on_graduation, None);
+        assert_eq!(omitted.goal_graduation_base_branch, None);
 
         let runtime: settings::AgentSettingsContent =
             serde_json::from_str(r#"{"task_lifecycle_mode": "runtime"}"#).unwrap();
@@ -3757,7 +3789,10 @@ mod tests {
                 "commit_on_session_end": false,
                 "cleanup": false,
                 "register_metadata": false,
-                "publish_ref_artifact": false
+                "publish_ref_artifact": false,
+                "delete_goal_branches_on_graduation": false,
+                "delete_task_branches_on_graduation": false,
+                "goal_graduation_base_branch": "develop"
             }"#,
         )
         .unwrap();
@@ -3765,6 +3800,12 @@ mod tests {
         assert_eq!(toggles.cleanup, Some(false));
         assert_eq!(toggles.register_metadata, Some(false));
         assert_eq!(toggles.publish_ref_artifact, Some(false));
+        assert_eq!(toggles.delete_goal_branches_on_graduation, Some(false));
+        assert_eq!(toggles.delete_task_branches_on_graduation, Some(false));
+        assert_eq!(
+            toggles.goal_graduation_base_branch.as_deref(),
+            Some("develop")
+        );
     }
 
     #[gpui::test]
@@ -3780,6 +3821,9 @@ mod tests {
         assert!(settings.cleanup);
         assert!(settings.register_metadata);
         assert!(settings.publish_ref_artifact);
+        assert!(settings.delete_goal_branches_on_graduation);
+        assert!(settings.delete_task_branches_on_graduation);
+        assert_eq!(settings.goal_graduation_base_branch, None);
 
         SettingsStore::update_global(cx, |store, cx| {
             store
@@ -3790,7 +3834,10 @@ mod tests {
                             "commit_on_session_end": false,
                             "cleanup": false,
                             "register_metadata": false,
-                            "publish_ref_artifact": false
+                            "publish_ref_artifact": false,
+                            "delete_goal_branches_on_graduation": false,
+                            "delete_task_branches_on_graduation": false,
+                            "goal_graduation_base_branch": "develop"
                         }
                     }"#,
                     cx,
@@ -3804,5 +3851,11 @@ mod tests {
         assert!(!settings.cleanup);
         assert!(!settings.register_metadata);
         assert!(!settings.publish_ref_artifact);
+        assert!(!settings.delete_goal_branches_on_graduation);
+        assert!(!settings.delete_task_branches_on_graduation);
+        assert_eq!(
+            settings.goal_graduation_base_branch.as_deref(),
+            Some("develop")
+        );
     }
 }
