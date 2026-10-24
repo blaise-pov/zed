@@ -5153,7 +5153,7 @@ mod tests {
         assert!(md.contains("- `#160` [TOOL] run terminal"));
         assert!(!md.contains("- **Diff:**"));
 
-        let mut detail_with_diff = detail.clone();
+        let mut detail_with_diff = detail;
         detail_with_diff.summary.metrics = Some(AgentTaskMetrics {
             diff: Some(AgentDiffShortstat {
                 files_changed: 4,
@@ -5395,7 +5395,7 @@ mod tests {
         );
         assert!(!goal_meta_no_diff.contains(" ·  · "));
 
-        let mut metrics_with_diff = sample_metrics.clone();
+        let mut metrics_with_diff = sample_metrics;
         metrics_with_diff.diff = Some(AgentDiffShortstat {
             files_changed: 2,
             insertions: 15,
@@ -6743,7 +6743,7 @@ mod tests {
         assert!(!goal_md.contains("- **Diff:**"));
         assert!(!task_md.contains("- **Diff:**"));
 
-        let mut metrics_with_diff = sample_metrics.clone();
+        let mut metrics_with_diff = sample_metrics;
         metrics_with_diff.diff = Some(AgentDiffShortstat {
             files_changed: 3,
             insertions: 42,
