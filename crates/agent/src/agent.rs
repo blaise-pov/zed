@@ -3820,14 +3820,26 @@ impl ThreadEnvironment for NativeThreadEnvironment {
         goal_id: Option<String>,
         base_branch: Option<String>,
         on_branch: Option<String>,
+        worktree_of: Option<String>,
         cx: &mut AsyncApp,
     ) -> Task<Result<PathBuf>> {
+        if let Some(ref host_id) = worktree_of {
+            let host_task_id = crate::AgentTaskId::from(host_id.clone());
+            if let Some(path) = crate::task_worktree::task_worktree_path_for_id(&host_task_id) {
+                return Task::ready(Ok(path));
+            } else {
+                return Task::ready(Err(anyhow!("host task '{host_id}' has no active worktree")));
+            }
+        }
         let Some(parent_thread_entity) = self.thread.upgrade() else {
             return Task::ready(Err(anyhow!("Parent thread no longer exists")));
         };
         let project = cx.update(|cx| parent_thread_entity.read(cx).project().clone());
+        let task_id_typed = crate::AgentTaskId::from(task_id);
+        let on_branch = on_branch.or_else(|| crate::task_worktree::task_worktree_checkout_target(&task_id_typed));
+        let goal_id = goal_id.or_else(|| crate::task_worktree::task_worktree_goal_branch(&task_id_typed));
         let task_summary = crate::AgentTaskSummary {
-            id: crate::AgentTaskId::from(task_id),
+            id: task_id_typed,
             parent_id: None,
             goal_id: goal_id.clone(),
             title: format!("agent-task/{task_id}"),
@@ -3901,6 +3913,22 @@ impl ThreadEnvironment for NativeThreadEnvironment {
             });
             Ok(())
         })
+    }
+
+    fn subagent_profile_id(
+        &self,
+        session_id: &acp_v1::SessionId,
+        cx: &App,
+    ) -> Option<agent_settings::AgentProfileId> {
+        if let Some(agent_entity) = self.agent.upgrade() {
+            let agent = agent_entity.read(cx);
+            if let Some(session) = agent.sessions.get(session_id) {
+                return Some(session.thread.read(cx).profile().clone());
+            }
+        }
+        ThreadsDatabase::from_cx(cx)
+            .and_then(|db| db.load_thread_sync(session_id).ok().flatten())
+            .and_then(|t| t.profile)
     }
 
     fn subagent_task_id(&self, session_id: &acp_v1::SessionId, cx: &App) -> Option<String> {
@@ -9910,6 +9938,7 @@ mod internal_tests {
             _goal_id: Option<String>,
             _base_branch: Option<String>,
             _on_branch: Option<String>,
+            _worktree_of: Option<String>,
             _cx: &mut gpui::AsyncApp,
         ) -> Task<anyhow::Result<std::path::PathBuf>> {
             Task::ready(Ok(std::path::PathBuf::from(format!("/worktree/{}", task_id))))
@@ -10079,6 +10108,7 @@ mod internal_tests {
                             label: "runtime default".to_string(),
                             message: "run all automations".to_string(),
                             task_id: Some(task_id.to_string()),
+                            base_branch: Some("main".to_string()),
                             ..Default::default()
                         }),
                         event_stream,
@@ -10129,6 +10159,7 @@ mod internal_tests {
                             label: "no metadata".to_string(),
                             message: "skip metadata".to_string(),
                             task_id: Some(task_id.to_string()),
+                            base_branch: Some("main".to_string()),
                             ..Default::default()
                         }),
                         event_stream,
@@ -10181,6 +10212,7 @@ mod internal_tests {
                             label: "no commit".to_string(),
                             message: "skip commit".to_string(),
                             task_id: Some(task_id.to_string()),
+                            base_branch: Some("main".to_string()),
                             ..Default::default()
                         }),
                         event_stream,
@@ -10233,6 +10265,7 @@ mod internal_tests {
                             label: "no cleanup".to_string(),
                             message: "skip cleanup".to_string(),
                             task_id: Some(task_id.to_string()),
+                            base_branch: Some("main".to_string()),
                             ..Default::default()
                         }),
                         event_stream,
