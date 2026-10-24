@@ -10369,6 +10369,7 @@ mod tests {
         assert!((&mut ensure_task4).now_or_never().is_none());
 
         drop(guard1);
+        set_task_worktree_retention_timeout(Some(Duration::ZERO));
         mark_task_terminal(&task1.id);
         let cleaned1 = cx
             .update(|cx| auto_cleanup_task_worktree(project.clone(), &task1.id, cx))
@@ -10628,6 +10629,7 @@ mod tests {
             WorktreeReleaseSafety::Safe
         );
 
+        set_task_worktree_retention_timeout(Some(Duration::ZERO));
         mark_task_terminal(&task.id);
         let cleaned = cx
             .update(|cx| auto_cleanup_task_worktree(project.clone(), &task.id, cx))
@@ -11115,6 +11117,7 @@ mod tests {
         assert!(fs.is_dir(&path1).await, "task 1 must remain");
 
         // End the resumed session
+        set_task_worktree_retention_timeout(Some(Duration::ZERO));
         drop(resumed_guard);
         assert!(!has_active_subagent_session(&task1.id));
 

@@ -7350,7 +7350,7 @@ mod tests {
         cx.run_until_parked();
 
         assert!(
-            cx.debug_bounds("task-worktree-icon-TASK-1").is_some(),
+            cx.debug_bounds("task-worktree-icon-TASK-1").is_none(),
             "Worktree icon should disappear when exists_on_disk becomes false"
         );
     }
