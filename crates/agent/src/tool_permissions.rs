@@ -769,6 +769,9 @@ mod tests {
             delete_task_branches_on_graduation:
                 agent_settings::DEFAULT_DELETE_TASK_BRANCHES_ON_GRADUATION,
             goal_graduation_base_branch: None,
+            task_worktree_retention_timeout_seconds: std::time::Duration::from_secs(
+                agent_settings::DEFAULT_TASK_WORKTREE_RETENTION_TIMEOUT_SECONDS,
+            ),
         }
     }
 

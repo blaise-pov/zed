@@ -30,7 +30,7 @@ an `agent_architect` subagent.
 4. Present the blueprint to the owner and wait for approval before
    creating anything.
 5. Create: spawn one `agent_architect` subagent per planned agent,
-   sequentially — `.zed/settings.json` is a shared resource and parallel
+   sequentially (isolation is optional; `task_id` alone runs in shared worktree, omit branch params) — `.zed/settings.json` is a shared resource and parallel
    spawns race on it. Each spawn message is a complete spec: boundary,
    real paths, model tier, scopes, tools, parent wiring.
 6. Verify the fleet (see Verification), then report: fleet table (id,

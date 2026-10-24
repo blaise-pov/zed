@@ -15,6 +15,7 @@ Owns collaboration backend server, network RPC protocol, client sync, and databa
 
 ## Working agreements
 
+- `task_isolation: "required"` auto-creates isolated worktree `agent-task-{task_id}` on branch `agent-task/{task_id}` when spawned with `task_id`; all edits and fast gates run within this worktree.
 - Maintain wire compatibility for RPC and protocol messages; keep schema changes additive or versioned.
 - Ensure database migrations are safe, transactional, and backward-compatible.
 - Retain or detach spawned tasks cleanly to prevent dropped background sync work.

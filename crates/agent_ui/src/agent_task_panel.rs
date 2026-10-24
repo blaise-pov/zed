@@ -37,9 +37,9 @@ use agent_settings::AgentSettings;
 use editor::Editor;
 use fs::Fs;
 use gpui::{
-    Action, App, Context, DismissEvent, Div, ElementId, Entity, EventEmitter, FocusHandle, Focusable,
-    KeyContext, MouseButton, MouseDownEvent, Pixels, Point, Subscription, Task, WeakEntity, Window,
-    actions, anchored, deferred, prelude::*, px,
+    Action, App, Context, DismissEvent, Div, ElementId, Entity, EventEmitter, FocusHandle,
+    Focusable, KeyContext, MouseButton, MouseDownEvent, Pixels, Point, Subscription, Task,
+    WeakEntity, Window, actions, anchored, deferred, prelude::*, px,
 };
 use multi_buffer::MultiBuffer;
 use project::{Project, git_store::Repository};
@@ -2188,7 +2188,10 @@ impl AgentTaskPanel {
                 .as_ref()
                 .filter(|res| res.goal_id == goal_id)
                 .map(|res| {
-                    let text = match (res.failed_branches.is_empty(), res.skipped_branches.is_empty()) {
+                    let text = match (
+                        res.failed_branches.is_empty(),
+                        res.skipped_branches.is_empty(),
+                    ) {
                         (true, true) => format!("Cleaned ({} deleted)", res.deleted_branches.len()),
                         (true, false) => format!(
                             "Cleaned ({} deleted, {} skipped)",
@@ -5370,25 +5373,11 @@ mod tests {
         let meta = format_task_meta_line(&task_full);
         assert_eq!(meta, "TASK-1 · agent_engineer · claude-3-7-sonnet");
 
-        let goal_meta = format_goal_meta_line(
-            "GOAL-1",
-            &AgentGoalStatus::Running,
-            2,
-            1,
-            3,
-            None,
-        );
+        let goal_meta = format_goal_meta_line("GOAL-1", &AgentGoalStatus::Running, 2, 1, 3, None);
         assert_eq!(goal_meta, "GOAL-1 · 1 / 3 · P2");
 
         assert_eq!(
-            format_goal_meta_line(
-                "GOAL-1",
-                &AgentGoalStatus::Running,
-                1,
-                0,
-                1,
-                None,
-            ),
+            format_goal_meta_line("GOAL-1", &AgentGoalStatus::Running, 1, 0, 1, None,),
             "GOAL-1 · 0 / 1 · P1"
         );
 
@@ -6285,6 +6274,7 @@ mod tests {
                         exists_on_disk: true,
                         branch: Some("agent-task/TASK-1".to_string()),
                         branch_exists: true,
+                        retention_reason: None,
                     },
                 );
                 snap.goals.insert(
@@ -6363,6 +6353,7 @@ mod tests {
                         exists_on_disk: true,
                         branch: Some("agent-task/TASK-1".to_string()),
                         branch_exists: true,
+                        retention_reason: None,
                     },
                 );
                 status.set_snapshot_for_test(snap, cx);
@@ -7066,6 +7057,7 @@ mod tests {
                         exists_on_disk: false,
                         branch: Some("agent-task/TASK-NO-BRANCH".to_string()),
                         branch_exists: false,
+                        retention_reason: None,
                     },
                 );
                 status.set_snapshot_for_test(snap, cx);
@@ -7183,6 +7175,7 @@ mod tests {
                         exists_on_disk: false,
                         branch: Some("agent-task/TASK-RESTORE".to_string()),
                         branch_exists: true,
+                        retention_reason: None,
                     },
                 );
                 status.set_snapshot_for_test(snap, cx);
@@ -7260,6 +7253,7 @@ mod tests {
                         exists_on_disk: true,
                         branch: Some("agent-task/TASK-DISK".to_string()),
                         branch_exists: true,
+                        retention_reason: None,
                     },
                 );
                 status.set_snapshot_for_test(snap, cx);
@@ -7430,6 +7424,7 @@ mod tests {
                         exists_on_disk: true,
                         branch: Some("agent-task/TASK-1".to_string()),
                         branch_exists: true,
+                        retention_reason: None,
                     },
                 );
                 status.set_snapshot_for_test(snap, cx);
@@ -7464,6 +7459,7 @@ mod tests {
                         exists_on_disk: false,
                         branch: Some("agent-task/TASK-1".to_string()),
                         branch_exists: true,
+                        retention_reason: None,
                     },
                 );
                 status.set_snapshot_for_test(snap, cx);

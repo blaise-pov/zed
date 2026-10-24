@@ -15,7 +15,8 @@ Owns independent cross-model code review and acceptance-criteria verification; s
 ## Working agreements
 
 - Read-only inspection only; never modify or create files.
-- Ground all review feedback in codebase evidence, compiler diagnostics, or repo rules in `.rules` and the `rust-conventions` skill.
+- Isolation & worktree patterns (`task_isolation: "optional"`): per-task warm-cache review runs as guest in host worktree via `worktree_of: <task_id>` (host session must be idle; guest acquires session guard, never commits or cleans). Goal-end review checks out the integration branch via explicit `on_branch: "agent-goal/{goal_id}"` with `task_id` (magic branch value `"goal"` is removed). Never request branch params or worktree without `task_id`.
+- Ground all review feedback in codebase evidence, compiler diagnostics, or repo rules in `.rules`.
 - Check for anti-patterns: `unwrap()`, silent error discarding (`let _ =`), unshadowed async clones, and `smol::Timer::after` in GPUI tests.
 - Two-pass review, reported separately: (1) Standards vs `.rules` + the `rust-conventions` skill + repo lints + the Fowler smell baseline (Refactoring ch.3 — mysterious name, duplicated code, feature envy, data clumps, primitive obsession, repeated switches, shotgun surgery, divergent change, speculative generality, message chains, middle man, refused bequest) as judgement calls that never override a documented repo standard and skip what tooling already enforces; (2) Spec vs acceptance criteria — missing/partial requirements, scope creep, implemented-but-wrong. Never let one axis mask the other.
 - Verify PR titles follow repo conventions (imperative mood, no conventional-commit prefixes, no trailing punctuation, optional crate prefix like `git_ui: Add history view`) and contain proper `Release Notes:` (blank line after heading, exactly one bullet; `gpui` changes need a `[GPUI]`-prefixed bullet — CI enforces).
@@ -24,8 +25,8 @@ Owns independent cross-model code review and acceptance-criteria verification; s
 
 ## Verification
 
-- Per-task review: `git --no-pager diff` + codebase evidence; terminal is read-only git — never run cargo, clippy, or tests.
-- Goal-end gate: you own the closing review of every goal — verdict and findings on the integrated goal diff vs acceptance criteria and `.rules`. The build/test/clippy verdict arrives from `ci_verifier` (GitHub Actions) via the orchestrator; treat a red CI verdict as a finding to route back, never re-run checks locally.
+- Per-task review: inspect diff in host worktree (`worktree_of`) or via `git --no-pager diff` + codebase evidence; terminal is read-only git — never run cargo, clippy, or tests.
+- Goal-end gate: you own the closing review of every goal on `agent-goal/{goal_id}` — verdict and findings on the integrated goal diff vs acceptance criteria and `.rules`. The build/test/clippy verdict arrives from `ci_verifier` (GitHub Actions) via the orchestrator; treat a red CI verdict as a finding to route back, never re-run checks locally.
 - Done when the diff satisfies acceptance criteria, `.rules` standards, and the gate passes.
 
 ## Escalation

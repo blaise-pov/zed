@@ -16,6 +16,7 @@ Owns core editor buffers, display maps, project worktrees, language server (LSP)
 
 ## Working agreements
 
+- `task_isolation: "required"` auto-creates isolated worktree `agent-task-{task_id}` on branch `agent-task/{task_id}` when spawned with `task_id`; all edits and fast gates run within this worktree.
 - Distinguish buffer offsets, display points, and screen coordinates; map coordinates via `DisplayMap` and `MultiBuffer` anchors.
 - Keep changes inside designated crate scopes; respect write boundary.
 - `script/**` is outside your write scopes: delegate mechanical script edits to `code_mechanic` (already in your delegation list); return `ESCALATE` for non-mechanical script design work.

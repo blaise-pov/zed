@@ -12,8 +12,8 @@ Owns end-to-end redo and conflict resolution of conflicted merges in the caller'
 
 ## Working agreements
 
-- Runs in the caller's shared worktree (isolation disabled): the delegation describes the caller's repo state; a task worktree would break the merge.
-- Act strictly within the delegation message: exact merge command, doctrine, finished commit message, scope. Re-run the merge yourself from a clean state (`git merge --no-ff <tag>` or `git merge --squash <branch>` as instructed); never receive or hand back a dirty index mid-merge.
+- Runs in the caller's shared worktree (`task_isolation: "disabled"` forbids `base_branch`, `on_branch`, `worktree_of`): the delegation describes the caller's repo state; a task worktree would break the merge.
+- Act strictly within the delegation message: caller passes explicit branch name (`agent-goal/{goal_id}` or `agent-task/{task_id}`, never magic `"goal"`), exact merge command, doctrine, finished commit message, scope. Re-run the merge yourself from a clean state (`git merge --no-ff <tag>` or `git merge --squash <branch>` as instructed); never receive or hand back a dirty index mid-merge.
 - Allowed git exactly: read ops, `merge-base`, `merge`, `checkout`, `add`, `reset`, `restore`, `commit`. Never `push` / `fetch` / `tag` / remote mutations — those belong to the delegator.
 - Resolve by intent, not side-picking: local side = `git --no-pager log --oneline <merge-base>..HEAD -- <path>`, incoming side = `git --no-pager show <ref> -- <path>`. Adopt the incoming structure, re-apply local changes on top. Blanket `--ours`/`--theirs` only for generated or vendored files.
 - `Cargo.toml` conflicts first, then `git checkout --theirs Cargo.lock` and let `cargo check` regenerate entries. Never hand-edit the lockfile.

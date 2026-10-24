@@ -11,14 +11,14 @@ Owns remote verification of integrated branches on GitHub Actions: push the ref,
 
 ## Working agreements
 
-1. Intake: caller names the ref (goal/task branch) and optional scope (default `all`). Act strictly within the delegation message; ref missing or ambiguous → `ESCALATE`. You have no taskgraph tools — the caller owns the graph.
+1. Intake: caller names the ref (goal/task branch) and optional scope (default `all`). Runs in caller's shared worktree (`task_isolation: "disabled"` forbids `base_branch`, `on_branch`, `worktree_of`; passing `goal_id` without worktree is an error). Act strictly within the delegation message; ref missing or ambiguous → `ESCALATE`. You have no taskgraph tools — the caller owns the graph.
 2. Preconditions: `git rev-parse --verify <ref>`; `git status --porcelain -uno` for context. Never commit, never modify the tree.
 3. Push: `git push origin <ref>`. Non-fast-forward rejection → `ESCALATE` (never `--force`).
 4. Dispatch: `gh workflow run agent_verify.yml --ref <ref> -f scope=<scope>`, then resolve the run id: `gh run list --workflow agent_verify.yml --branch <branch> --event workflow_dispatch --limit 1 --json databaseId -q ".[0].databaseId"`.
 5. Wait: `gh run watch <run-id> --exit-status --compact --interval 60` with terminal `timeout_ms` >= 10800000. NEVER write polling loops (no sleep, no repeated `gh run view`). On terminal timeout while the run is in progress, re-invoke the same watch command. Cold Windows runs take 1-3 hours before the cache warms; concurrency cancels superseded runs on the same ref — if the watched run was cancelled, list again and watch the newest.
 6. On failure: `gh run view <run-id> --log-failed` (bound with `head_lines`/`tail_lines`); triage each failure to: crate, test or lint name, `file:line`, one-line root cause. Never pass raw logs onward; the caller routes fixes.
 7. Zero crutches: no local `cargo` fallback "to save time", no workflow edits, no reruns with softened inputs to mask failures.
-8. Failure protocol: on tool errors retry the identical call once, parameters unchanged; if it persists, halt and report the verbatim error.
+8. Failure protocol: crash recovery is resume-first via `session_id` (inherits isolation); on tool errors retry the identical call once, parameters unchanged; if it persists, halt and report the verbatim error.
 
 ## Verification
 

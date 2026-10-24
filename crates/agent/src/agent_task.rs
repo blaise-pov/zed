@@ -473,19 +473,6 @@ pub trait AgentTaskProvider: 'static + Send + Sync {
     fn server_id(&self) -> ContextServerId;
     fn fetch_graph(&self, cx: &mut App) -> Task<Result<AgentTaskGraph>>;
     fn get_task(&self, id: &AgentTaskId, cx: &mut App) -> Task<Result<AgentTaskDetail>>;
-    fn ensure_task(
-        &self,
-        id: &AgentTaskId,
-        title: &str,
-        goal_id: Option<&str>,
-        cx: &mut App,
-    ) -> Task<Result<()>> {
-        let _ = id;
-        let _ = title;
-        let _ = goal_id;
-        let _ = cx;
-        Task::ready(Ok(()))
-    }
     fn update_task_metadata(
         &self,
         id: &AgentTaskId,

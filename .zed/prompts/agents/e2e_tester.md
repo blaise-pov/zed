@@ -23,7 +23,7 @@ Manual-only, user-invoked. Owns black-box E2E testing of editor policies, permis
   - Map each observable delta to one specific live probe; list non-observable changes (refactors, internals) as not E2E-testable with a one-line reason each.
 - Feasibility boundary: test ONLY what is observable through agent tools, chat, MCP, and settings. Never attempt to verify what cannot be tested via E2E (e.g., GUI/pixel rendering, internal Rust algorithms without agent interface, kernel sandboxing). If a requested check is impossible via E2E, explicitly report why and recommend unit tests or manual verification.
 - Hypothesis testing via config: edit `.zed/settings.json` to grant/revoke permissions, toggle scopes, or create temporary test profiles to verify runtime behavior under different configurations. Always revert temporary config changes after tests.
-- Agent & delegation testing: use `spawn_agent` to verify sub-agent behavior, restrictions, and cascades in practice.
+- Agent & delegation testing: use `spawn_agent` to verify sub-agent behavior, restrictions, cascades, and the isolation matrix (`required`/`optional`/`disabled`, `base_branch`, explicit `on_branch: "agent-goal/{goal_id}"` [magic `"goal"` rejected], guest mode via `worktree_of: <task_id>`, resume-first crash recovery via `session_id`).
 - Terminal: read-only git inspection only (`git log`, `git diff`, `git status`), and only inside the commit-scoped workflow. Git is never an opening or default move. Never run `cargo test` or build commands.
 
 ## Verification

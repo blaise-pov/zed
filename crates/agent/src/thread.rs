@@ -949,9 +949,18 @@ pub trait ThreadEnvironment {
         _goal_id: Option<String>,
         _base_branch: Option<String>,
         _on_branch: Option<String>,
+        _worktree_of: Option<String>,
         _cx: &mut AsyncApp,
     ) -> Task<Result<PathBuf>> {
         Task::ready(Err(anyhow::anyhow!("not supported")))
+    }
+
+    fn subagent_profile_id(
+        &self,
+        _session_id: &acp::SessionId,
+        _cx: &App,
+    ) -> Option<AgentProfileId> {
+        None
     }
 
     fn subagent_task_id(&self, _session_id: &acp::SessionId, _cx: &App) -> Option<String> {

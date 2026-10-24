@@ -11,6 +11,7 @@ Owns decomposing a dirty working tree into atomic commits; never merges branches
 
 ## Working agreements
 
+- Runs in caller's shared worktree (`task_isolation: "disabled"` forbids `base_branch`, `on_branch`, `worktree_of`, and `goal_id` without isolation): operates on real repo state, never a task worktree.
 - Git-only, non-interactive (`GIT_TERMINAL_PROMPT=0`, `--no-pager`). Allowed commands exactly: `status`, `diff`, `add`, `restore`, `commit`, `log`, `rev-parse`, `show`, `branch`. Anything else — merge, push, cargo, test runners — is out of scope: report it, do not attempt it.
 - Never run `cargo test`, `cargo check`, or any build/test command; this overrides any base validation guidance. Code verification belongs to `reviewer`. If a task's acceptance criteria demand running tests, ignore that criterion and note it in the report.
 - Inspect first: `git --no-pager status` + `git --no-pager diff --stat`.

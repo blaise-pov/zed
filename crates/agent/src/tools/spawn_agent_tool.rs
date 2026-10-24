@@ -55,38 +55,46 @@ pub struct SpawnAgentToolInput {
     /// The prompt for the agent. For new sessions, include full context needed for the task. For follow-ups (with session_id), you can rely on the agent already having the previous message.
     pub message: String,
     /// Session ID of an existing agent session to continue instead of creating a new one. Omit to create a new agent.
+    /// Resumed sessions inherit isolation and fork base from session creation; branch params, worktree_of, and goal_id are forbidden on resume.
     #[serde(default, deserialize_with = "deserialize_session_id")]
     pub session_id: Option<acp::SessionId>,
     /// Optional reference to a task managed in the Task Graph Service (e.g. `TASK-42`).
-    /// The task must be created first via `task_create` before spawning an agent.
-    /// Spawning will fail if the task does not exist in the Task Graph Service.
+    /// Required when task isolation is required by profile, or when base_branch, on_branch, or worktree_of is specified.
+    /// If passed alone with an optional-isolation profile and no branch params, the agent runs in shared mode (isolation: shared:task-linked).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_id: Option<String>,
     /// Optional profile ID to use for this subagent. If not specified, the subagent will use the default profile.
-    /// The profile controls which tools are available and can specify a default model.
+    /// The profile controls which tools are available, default model, and whether task isolation (dedicated git worktree) is required, optional, or disabled.
     #[serde(default)]
     pub profile: Option<agent_settings::AgentProfileId>,
     /// Goal identifier for goal-scoped task coordination (§8.2).
-    /// When specified, the task worktree forks from the goal's integration branch
-    /// `agent-goal/{goal_id}` (created lazily from HEAD of main if absent).
+    /// Requires task isolation (dedicated worktree or guest mode). In dedicated worktree mode, forks from the goal's integration branch
+    /// `agent-goal/{goal_id}` (created lazily from HEAD of main if absent). In guest mode (`worktree_of`), serves as task graph linkage without forking.
     #[serde(default)]
     pub goal_id: Option<String>,
     /// Base branch or ref to fork the task worktree from (§8.2).
+    /// Requires task_id. Mutually exclusive with on_branch and worktree_of.
     /// Overrides goal-tip as the fork base when both are specified. If the ref
     /// matches `agent-goal/*`, it is auto-created lazily if absent; otherwise,
     /// it must exist in the repository.
     #[serde(default)]
     pub base_branch: Option<String>,
     /// Existing branch to check out into the subagent's task worktree (§8.2).
-    /// Used for review, CI, inspection, or conflict resolution without creating a new branch.
+    /// Requires task_id. Used for review, CI, inspection, or conflict resolution without creating a new branch.
     /// The subagent gets its own worktree on this existing branch, and writes are restricted
-    /// to this worktree. Mutually exclusive with `base_branch`. Accepts a branch name or the
-    /// special value "goal", which resolves to `agent-goal/{goal_id}`.
+    /// to this worktree. Mutually exclusive with base_branch and worktree_of. Branch names must be explicit (e.g. `agent-goal/GOAL-21`).
     #[serde(default)]
     pub on_branch: Option<String>,
+    /// Host task ID whose git worktree this subagent will share in guest mode (§8.2).
+    /// Requires task_id. Mutually exclusive with base_branch and on_branch.
+    /// The subagent runs inside the host's existing worktree (borrowing its working directory),
+    /// but cannot commit, merge, or cleanup the host worktree.
+    /// Forbidden if profile task_isolation is required.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree_of: Option<String>,
     /// Optional model override. Pass the exact `models[].id` returned for the
     /// native Zed agent (`is_native: true`) by `list_agents_and_models`.
-    /// Omit to preserve default behavior.
+    /// Omit to preserve default behavior. Cannot be changed when resuming an existing session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
 }
@@ -293,6 +301,24 @@ fn cancelled_error(
     }
 }
 
+struct WorktreeHolderGuard {
+    host: crate::AgentTaskId,
+    session_id: String,
+}
+
+impl WorktreeHolderGuard {
+    fn new(host: crate::AgentTaskId, session_id: String) -> Self {
+        crate::task_worktree::register_worktree_holder(&host, &session_id);
+        Self { host, session_id }
+    }
+}
+
+impl Drop for WorktreeHolderGuard {
+    fn drop(&mut self) {
+        crate::task_worktree::unregister_worktree_holder(&self.host, &self.session_id);
+    }
+}
+
 pub struct SpawnAgentTool {
     environment: Rc<dyn ThreadEnvironment>,
     templates: Arc<crate::Templates>,
@@ -374,6 +400,21 @@ impl AgentTool for SpawnAgentTool {
                 });
             }
 
+            if input.session_id.is_some()
+                && (input.base_branch.is_some()
+                    || input.on_branch.is_some()
+                    || input.worktree_of.is_some()
+                    || input.goal_id.is_some())
+            {
+                return Err(SpawnAgentToolOutput::Error {
+                    session_id: input.session_id.clone(),
+                    error: "isolation and fork base are fixed at session creation".to_string(),
+                    session_info: None,
+                    isolation: None,
+                    isolation_details: None,
+                });
+            }
+
             if input.on_branch.is_some() && input.base_branch.is_some() {
                 return Err(SpawnAgentToolOutput::Error {
                     session_id: input.session_id.clone(),
@@ -384,10 +425,12 @@ impl AgentTool for SpawnAgentTool {
                 });
             }
 
-            if input.on_branch.as_deref() == Some("goal") && input.goal_id.is_none() {
+            if input.worktree_of.is_some()
+                && (input.base_branch.is_some() || input.on_branch.is_some())
+            {
                 return Err(SpawnAgentToolOutput::Error {
                     session_id: input.session_id.clone(),
-                    error: "on_branch 'goal' requires goal_id".to_string(),
+                    error: "worktree_of is mutually exclusive with base_branch and on_branch: guest mode runs in the host worktree".to_string(),
                     session_info: None,
                     isolation: None,
                     isolation_details: None,
@@ -401,13 +444,14 @@ impl AgentTool for SpawnAgentTool {
                 .filter(|s| !s.is_empty())
                 .map(str::to_string);
 
-            if (input.base_branch.is_some() || input.on_branch.is_some())
+            if (input.base_branch.is_some()
+                || input.on_branch.is_some()
+                || input.worktree_of.is_some())
                 && raw_task_id.is_none()
-                && input.session_id.is_none()
             {
                 return Err(SpawnAgentToolOutput::Error {
                     session_id: input.session_id.clone(),
-                    error: "base_branch/on_branch requires task_id: git isolation is task-scoped".to_string(),
+                    error: "base_branch/on_branch/worktree_of requires task_id: git isolation is task-scoped".to_string(),
                     session_info: None,
                     isolation: None,
                     isolation_details: None,
@@ -472,22 +516,49 @@ impl AgentTool for SpawnAgentTool {
 
                 let settings = agent_settings::AgentSettings::get(location, cx);
                 let step_timeouts = settings.spawn_step_timeout_seconds;
-                let effective_profile_id = if let Some(ref profile_id) = input.profile {
-                    profile_id.clone()
-                } else if let Some(caller_profile_id) = event_stream.profile_id(cx) {
-                    caller_profile_id
-                } else {
-                    settings.default_profile.clone()
-                };
+                let (effective_profile_id, task_isolation, enable_lsp) =
+                    if let Some(ref session_id) = input.session_id {
+                        let session_profile_id =
+                            self.environment.subagent_profile_id(session_id, cx);
+                        let session_profile_settings = session_profile_id
+                            .as_ref()
+                            .and_then(|id| settings.profiles.get(id));
+                        let task_isolation = session_profile_settings
+                            .map(|p| p.task_isolation)
+                            .unwrap_or(agent_settings::TaskIsolation::Optional);
 
-                let profile_settings = settings.profiles.get(&effective_profile_id);
-                let task_isolation = profile_settings
-                    .map(|p| p.task_isolation)
-                    .unwrap_or(agent_settings::TaskIsolation::Optional);
+                        let effective_profile_id = input
+                            .profile
+                            .clone()
+                            .or(session_profile_id)
+                            .unwrap_or_else(|| settings.default_profile.clone());
 
-                let enable_lsp = profile_settings
-                    .and_then(|p| p.task_worktree_language_servers)
-                    .unwrap_or(settings.task_worktree_language_servers);
+                        let profile_settings = settings.profiles.get(&effective_profile_id);
+                        let enable_lsp = profile_settings
+                            .and_then(|p| p.task_worktree_language_servers)
+                            .unwrap_or(settings.task_worktree_language_servers);
+
+                        (effective_profile_id, task_isolation, enable_lsp)
+                    } else {
+                        let effective_profile_id = if let Some(ref profile_id) = input.profile {
+                            profile_id.clone()
+                        } else if let Some(caller_profile_id) = event_stream.profile_id(cx) {
+                            caller_profile_id
+                        } else {
+                            settings.default_profile.clone()
+                        };
+
+                        let profile_settings = settings.profiles.get(&effective_profile_id);
+                        let task_isolation = profile_settings
+                            .map(|p| p.task_isolation)
+                            .unwrap_or(agent_settings::TaskIsolation::Optional);
+
+                        let enable_lsp = profile_settings
+                            .and_then(|p| p.task_worktree_language_servers)
+                            .unwrap_or(settings.task_worktree_language_servers);
+
+                        (effective_profile_id, task_isolation, enable_lsp)
+                    };
 
                 let is_agent_mode =
                     settings.task_lifecycle_mode == agent_settings::TaskLifecycleMode::Agent;
@@ -521,12 +592,44 @@ impl AgentTool for SpawnAgentTool {
                 });
             }
 
-            if task_isolation.is_disabled() && (input.base_branch.is_some() || input.on_branch.is_some()) {
+            if task_isolation.is_required() && input.worktree_of.is_some() {
                 return Err(SpawnAgentToolOutput::Error {
                     session_id: input.session_id.clone(),
                     error: format!(
-                        "profile '{effective_profile_id}' has isolation disabled; base_branch/on_branch are not applicable"
+                        "profile '{effective_profile_id}' requires dedicated task isolation; worktree_of guest mode is not allowed"
                     ),
+                    session_info: None,
+                    isolation: None,
+                    isolation_details: None,
+                });
+            }
+
+            if task_isolation.is_disabled()
+                && (input.base_branch.is_some()
+                    || input.on_branch.is_some()
+                    || input.worktree_of.is_some())
+            {
+                return Err(SpawnAgentToolOutput::Error {
+                    session_id: input.session_id.clone(),
+                    error: format!(
+                        "profile '{effective_profile_id}' has isolation disabled; base_branch/on_branch/worktree_of are not applicable"
+                    ),
+                    session_info: None,
+                    isolation: None,
+                    isolation_details: None,
+                });
+            }
+
+            let is_guest = input.worktree_of.is_some();
+            let wants_worktree = task_isolation.is_required()
+                || input.base_branch.is_some()
+                || input.on_branch.is_some();
+            let is_shared = !is_guest && !wants_worktree;
+
+            if input.goal_id.is_some() && is_shared {
+                return Err(SpawnAgentToolOutput::Error {
+                    session_id: input.session_id.clone(),
+                    error: "goal_id requires task isolation".to_string(),
                     session_info: None,
                     isolation: None,
                     isolation_details: None,
@@ -584,7 +687,39 @@ impl AgentTool for SpawnAgentTool {
                 task_status_str
             );
 
-            let session_guard = if let Some(ref task_id) = task_id {
+            let session_guard = if let Some(ref host_task_id_str) = input.worktree_of {
+                let host_task_id = crate::AgentTaskId::from(host_task_id_str.clone());
+                if crate::task_worktree::has_active_subagent_session(&host_task_id) {
+                    return Err(SpawnAgentToolOutput::Error {
+                        session_id: input.session_id.clone(),
+                        error: format!(
+                            "host task '{host_task_id_str}' already has an active session; wait for it to finish"
+                        ),
+                        session_info: None,
+                        isolation: None,
+                        isolation_details: None,
+                    });
+                }
+                let owner = cx.update(|cx| {
+                    let thread_weak = event_stream.thread().cloned();
+                    let thread_id = event_stream
+                        .session_id(cx)
+                        .unwrap_or_else(|| acp::SessionId::new("standalone"));
+                    let tool_use_id = event_stream.tool_use_id().clone();
+                    let _is_test = thread_weak.is_none();
+                    crate::task_worktree::SubagentSessionOwner {
+                        thread_id,
+                        tool_use_id,
+                        thread: thread_weak,
+                        #[cfg(any(test, feature = "test-support"))]
+                        is_test_live: _is_test,
+                    }
+                });
+                Some(crate::task_worktree::SubagentSessionGuard::new(
+                    host_task_id,
+                    owner,
+                ))
+            } else if let Some(ref task_id) = task_id {
                 let task_id_typed = crate::AgentTaskId::from(task_id.clone());
                 if crate::task_worktree::has_active_subagent_session(&task_id_typed) {
                     return Err(SpawnAgentToolOutput::Error {
@@ -633,14 +768,54 @@ impl AgentTool for SpawnAgentTool {
 
             let (worktree_path, isolation) = if task_isolation.is_disabled() {
                 (None, Some("shared:profile-disabled".to_string()))
-            } else if let Some(ref task_id) = task_id {
-                let task_id_typed = crate::AgentTaskId::from(task_id.clone());
-                crate::task_worktree::set_task_lsp_suppressed(&task_id_typed, !enable_lsp);
+            } else if let Some(ref host_id) = input.worktree_of {
                 let worktree_fut = self.environment.ensure_subagent_worktree(
-                    task_id,
+                    task_id.as_deref().unwrap_or(""),
                     input.goal_id.clone(),
                     input.base_branch.clone(),
                     input.on_branch.clone(),
+                    input.worktree_of.clone(),
+                    &mut cx,
+                );
+                let worktree_res = futures::select_biased! {
+                    _ = event_stream.cancelled_by_user().fuse() => {
+                        drop(session_guard);
+                        return Err(cancelled_error(
+                            "worktree acquisition",
+                            input.session_id.clone(),
+                            None,
+                            None,
+                            None,
+                        ));
+                    }
+                    res = worktree_fut.fuse() => res,
+                };
+                match worktree_res {
+                    Ok(path) => (Some(path), Some(format!("guest:{host_id}"))),
+                    Err(err) => {
+                        let err_msg = err.to_string();
+                        drop(session_guard);
+                        return Err(SpawnAgentToolOutput::Error {
+                            session_id: input.session_id.clone(),
+                            error: format!(
+                                "Failed to isolate subagent in git worktree: {err_msg}"
+                            ),
+                            session_info: None,
+                            isolation: None,
+                            isolation_details: None,
+                        });
+                    }
+                }
+            } else if wants_worktree {
+                let task_id_ref = task_id.as_deref().unwrap_or("");
+                let task_id_typed = crate::AgentTaskId::from(task_id_ref);
+                crate::task_worktree::set_task_lsp_suppressed(&task_id_typed, !enable_lsp);
+                let worktree_fut = self.environment.ensure_subagent_worktree(
+                    task_id_ref,
+                    input.goal_id.clone(),
+                    input.base_branch.clone(),
+                    input.on_branch.clone(),
+                    None,
                     &mut cx,
                 );
                 let worktree_res = futures::select_biased! {
@@ -661,14 +836,9 @@ impl AgentTool for SpawnAgentTool {
                         let isolation_str = if let Some(target) = crate::task_worktree::task_worktree_checkout_target(&task_id_typed) {
                             format!("checkout:{target}")
                         } else if let Some(ref on_b) = input.on_branch {
-                            let resolved = if on_b == "goal" {
-                                format!("agent-goal/{}", input.goal_id.as_deref().unwrap_or_default())
-                            } else {
-                                on_b.clone()
-                            };
-                            format!("checkout:{resolved}")
+                            format!("checkout:{on_b}")
                         } else {
-                            format!("worktree:agent-task/{task_id}")
+                            format!("worktree:agent-task/{task_id_ref}")
                         };
                         (Some(path), Some(isolation_str))
                     }
@@ -697,7 +867,14 @@ impl AgentTool for SpawnAgentTool {
                     }
                 }
             } else {
-                (None, None)
+                (
+                    None,
+                    if task_id.is_some() {
+                        Some("shared:task-linked".to_string())
+                    } else {
+                        None
+                    },
+                )
             };
 
             if event_stream.was_cancelled_by_user() {
@@ -765,12 +942,14 @@ impl AgentTool for SpawnAgentTool {
                 if let Some(ref task_id) = task_id {
                     subagent.set_task_id(Some(task_id.clone()), cx);
                     let task_id_typed = crate::AgentTaskId::from(task_id.clone());
-                    if let Some(ref worktree_path) = worktree_path {
-                        if crate::task_worktree::task_worktree_path_for_id(&task_id_typed).is_none() {
-                            crate::task_worktree::register_task_worktree(
-                                &task_id_typed,
-                                worktree_path.clone(),
-                            );
+                    if !is_guest {
+                        if let Some(ref worktree_path) = worktree_path {
+                            if crate::task_worktree::task_worktree_path_for_id(&task_id_typed).is_none() {
+                                crate::task_worktree::register_task_worktree(
+                                    &task_id_typed,
+                                    worktree_path.clone(),
+                                );
+                            }
                         }
                     }
                     crate::task_worktree::register_task_session(
@@ -790,6 +969,13 @@ impl AgentTool for SpawnAgentTool {
 
                 Ok((subagent, session_info, resolved_model))
             })?;
+
+            let _holder_guard = input.worktree_of.as_ref().map(|host| {
+                WorktreeHolderGuard::new(
+                    crate::AgentTaskId::from(host.clone()),
+                    session_info.session_id.to_string(),
+                )
+            });
 
             if event_stream.was_cancelled_by_user() {
                 drop(session_guard);
@@ -958,7 +1144,7 @@ impl AgentTool for SpawnAgentTool {
                 session_info.message_end_index =
                     cx.update(|cx| Some(subagent.num_entries(cx).saturating_sub(1)));
 
-                let isolation_details = if should_commit {
+                let isolation_details = if should_commit && !is_guest {
                     if let (Some(worktree_path), Some(task_id)) = (&worktree_path, &task_id) {
                         let commit_fut = self.environment.commit_subagent_worktree(
                             task_id,
@@ -1163,7 +1349,7 @@ impl AgentTool for SpawnAgentTool {
                     None,
                 ));
             }
-            let isolation_details = if should_commit {
+            let isolation_details = if should_commit && !is_guest {
                 if let (Some(worktree_path), Some(task_id)) = (&worktree_path, &task_id) {
                     let commit_fut = self
                         .environment
@@ -1260,7 +1446,9 @@ impl AgentTool for SpawnAgentTool {
                     .ok()
                     .map(|out| out.lines().take(20).collect::<Vec<_>>().join("\n"))
                     .map(SharedString::from);
-                let diff = {
+                let diff = if is_guest {
+                    None
+                } else {
                     let task_id_typed = crate::AgentTaskId::from(task_id.clone());
                     let base_sha = crate::task_worktree::task_worktree_base_sha(&task_id_typed);
                     let worktree_path =
@@ -1367,8 +1555,10 @@ impl AgentTool for SpawnAgentTool {
                     .await
                     {
                         StepOutcome::Ok(()) => {
-                            let task_id_typed = crate::AgentTaskId::from(task_id.clone());
-                            crate::task_worktree::mark_task_terminal(&task_id_typed);
+                            if !is_guest {
+                                let task_id_typed = crate::AgentTaskId::from(task_id.clone());
+                                crate::task_worktree::mark_task_terminal(&task_id_typed);
+                            }
                         }
                         StepOutcome::Err(error) => {
                             log::warn!(
@@ -1398,7 +1588,7 @@ impl AgentTool for SpawnAgentTool {
                 ));
             }
 
-            if should_cleanup {
+            if should_cleanup && !is_guest {
                 if let Some(ref task_id) = task_id {
                     let task_id_typed = crate::AgentTaskId::from(task_id.clone());
                     if crate::task_worktree::task_worktree_commit_error(&task_id_typed).is_none()
@@ -2028,7 +2218,8 @@ Strict Constraints:
 
     struct CancelMockEnvironment {
         send_started_tx: Arc<parking_lot::Mutex<Option<futures::channel::oneshot::Sender<()>>>>,
-        slot_wait_started_tx: Arc<parking_lot::Mutex<Option<futures::channel::oneshot::Sender<()>>>>,
+        slot_wait_started_tx:
+            Arc<parking_lot::Mutex<Option<futures::channel::oneshot::Sender<()>>>>,
         hang_slot_wait: bool,
         commit_called: Arc<std::sync::atomic::AtomicBool>,
         commit_is_error: Arc<std::sync::atomic::AtomicBool>,
@@ -2069,6 +2260,7 @@ Strict Constraints:
             _goal_id: Option<String>,
             _base_branch: Option<String>,
             _on_branch: Option<String>,
+            _worktree_of: Option<String>,
             cx: &mut gpui::AsyncApp,
         ) -> Task<Result<std::path::PathBuf>> {
             if self.hang_slot_wait {
@@ -2108,8 +2300,10 @@ Strict Constraints:
             is_error: bool,
             _cx: &mut gpui::AsyncApp,
         ) -> Task<Result<crate::task_worktree::SubagentIsolationDetails>> {
-            self.commit_called.store(true, std::sync::atomic::Ordering::SeqCst);
-            self.commit_is_error.store(is_error, std::sync::atomic::Ordering::SeqCst);
+            self.commit_called
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            self.commit_is_error
+                .store(is_error, std::sync::atomic::Ordering::SeqCst);
             let task_id_typed = crate::AgentTaskId::from(task_id);
             Task::ready(Ok(crate::task_worktree::fallback_isolation_details(
                 &task_id_typed,
@@ -2134,7 +2328,8 @@ Strict Constraints:
             _task_id: &str,
             _cx: &mut gpui::AsyncApp,
         ) -> Task<Result<bool>> {
-            self.cleanup_called.store(true, std::sync::atomic::Ordering::SeqCst);
+            self.cleanup_called
+                .store(true, std::sync::atomic::Ordering::SeqCst);
             Task::ready(Ok(true))
         }
 
@@ -2194,6 +2389,7 @@ Strict Constraints:
                     label: "subtask".to_string(),
                     message: "do something".to_string(),
                     task_id: Some(task_id.clone()),
+                    base_branch: Some("main".to_string()),
                     ..Default::default()
                 }),
                 event_stream,
@@ -2236,7 +2432,8 @@ Strict Constraints:
             "salvage commit must run on mid-send cancel"
         );
         assert!(
-            env.commit_is_error.load(std::sync::atomic::Ordering::SeqCst),
+            env.commit_is_error
+                .load(std::sync::atomic::Ordering::SeqCst),
             "salvage commit must be error-checkpoint (is_error = true)"
         );
         assert_eq!(
@@ -2287,6 +2484,7 @@ Strict Constraints:
                     label: "subtask".to_string(),
                     message: "do something".to_string(),
                     task_id: Some(task_id.clone()),
+                    base_branch: Some("main".to_string()),
                     ..Default::default()
                 }),
                 event_stream,

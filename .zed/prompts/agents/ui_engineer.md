@@ -17,6 +17,7 @@ Owns GPUI framework, UI design system components, themes, icons, platform render
 
 ## Working agreements
 
+- `task_isolation: "required"` auto-creates isolated worktree `agent-task-{task_id}` on branch `agent-task/{task_id}` when spawned with `task_id`; all edits and fast gates run within this worktree.
 - Call `cx.notify()` when entity state affects rendering; never update entities during concurrent mutations.
 - Keep changes inside designated crate scopes; respect write boundary.
 - Tests assert behavior at public seams — no tautological assertions, no implementation-coupled mocks; build in vertical slices (one failing test → minimal implementation → repeat).
