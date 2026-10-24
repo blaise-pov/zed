@@ -23,23 +23,16 @@ if ($env:CARGO)
     Write-Error "Could not find cargo in path." -ErrorAction Stop
 }
 
-# Route through rtk (compact output proxy) when it's on PATH; an explicit $env:CARGO bypasses it.
-function Invoke-Clippy
-{
-    if ($script:Cargo -eq "cargo" -and (Get-Command "rtk" -ErrorAction SilentlyContinue))
-    {
-        rtk cargo clippy @args
-    }
-    else
-    {
-        & $script:Cargo clippy @args
-    }
-}
-
+$clippyArgs = @($args)
 if ($needAddWorkspace)
 {
-    Invoke-Clippy @args --workspace --release --all-targets --all-features -- --deny warnings
-} else
-{
-    Invoke-Clippy @args --release --all-targets --all-features -- --deny warnings
+    $clippyArgs += "--workspace"
+}
+$clippyArgs += @("--release", "--all-targets", "--all-features", "--", "--deny", "warnings")
+
+# Route through rtk (compact output proxy) when it's on PATH; an explicit $env:CARGO bypasses it.
+if ($Cargo -eq "cargo" -and (Get-Command "rtk" -ErrorAction SilentlyContinue)) {
+    rtk cargo clippy @clippyArgs
+} else {
+    & $Cargo clippy @clippyArgs
 }
