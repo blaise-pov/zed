@@ -5222,7 +5222,7 @@ async fn test_refusal(cx: &mut TestAppContext) {
         );
     });
 
-    // If the model refuses to continue, the thread should remove all the messages after the last user message.
+    // Refusal preserves flushed messages.
     fake.send_last_event(
         &model,
         LanguageModelCompletionEvent::Stop(StopReason::Refusal),
@@ -5230,7 +5230,18 @@ async fn test_refusal(cx: &mut TestAppContext) {
     let events = events.collect::<Vec<_>>().await;
     assert_eq!(stop_events(events), vec![acp::StopReason::Refusal]);
     thread.read_with(cx, |thread, _| {
-        assert_eq!(thread.to_markdown(), "");
+        assert_eq!(
+            thread.to_markdown(),
+            indoc! {"
+                ## User
+
+                Hello
+
+                ## Assistant
+
+                Hey!
+            "}
+        );
     });
 }
 
@@ -6026,7 +6037,7 @@ async fn test_building_request_with_pending_tools(cx: &mut TestAppContext) {
     fake.send_last_text(&model, "Hi!");
     fake.send_last_event(
         &model,
-        LanguageModelCompletionEvent::ToolUse(permission_tool_use),
+        LanguageModelCompletionEvent::ToolUse(permission_tool_use.clone()),
     );
     fake.send_last_event(
         &model,
@@ -6035,7 +6046,7 @@ async fn test_building_request_with_pending_tools(cx: &mut TestAppContext) {
     fake.end_last(&model);
     cx.run_until_parked();
 
-    // Ensure pending tools are skipped when building a request.
+    // Ensure pending tools are preserved with synthetic interrupted results when building a request.
     let request = thread
         .read_with(cx, |thread, cx| {
             thread.build_completion_request(CompletionIntent::EditFile, cx)
@@ -6054,20 +6065,30 @@ async fn test_building_request_with_pending_tools(cx: &mut TestAppContext) {
                 role: Role::Assistant,
                 content: vec![
                     MessageContent::Text("Hi!".into()),
-                    MessageContent::ToolUse(echo_tool_use.clone())
+                    MessageContent::ToolUse(permission_tool_use.clone()),
+                    MessageContent::ToolUse(echo_tool_use.clone()),
                 ],
                 cache: false,
                 reasoning_details: None,
             },
             LanguageModelRequestMessage {
                 role: Role::User,
-                content: vec![MessageContent::ToolResult(LanguageModelToolResult {
-                    tool_use_id: echo_tool_use.id.clone(),
-                    tool_name: echo_tool_use.name,
-                    is_error: false,
-                    content: vec!["test".into()],
-                    output: Some("test".into())
-                })],
+                content: vec![
+                    MessageContent::ToolResult(LanguageModelToolResult {
+                        tool_use_id: echo_tool_use.id.clone(),
+                        tool_name: echo_tool_use.name,
+                        is_error: false,
+                        content: vec!["test".into()],
+                        output: Some("test".into()),
+                    }),
+                    MessageContent::ToolResult(LanguageModelToolResult {
+                        tool_use_id: permission_tool_use.id.clone(),
+                        tool_name: permission_tool_use.name,
+                        is_error: true,
+                        content: vec!["Tool execution interrupted by application shutdown".into()],
+                        output: None,
+                    }),
+                ],
                 cache: false,
                 reasoning_details: None,
             },
@@ -9890,6 +9911,9 @@ async fn test_subagent_tool_resume_session_after_restart(cx: &mut TestAppContext
     let subagent_profile = cx.update(|cx| enable_default_profile_delegation(cx));
     cx.update(|cx| {
         cx.update_flags(true, vec!["subagents".to_string()]);
+        let mut settings = agent_settings::AgentSettings::get_global(cx).clone();
+        settings.cleanup = false;
+        agent_settings::AgentSettings::override_global(settings, cx);
     });
 
     let fs = FakeFs::new(cx.executor());
@@ -9903,6 +9927,7 @@ async fn test_subagent_tool_resume_session_after_restart(cx: &mut TestAppContext
     )
     .await;
     let project = Project::test(fs.clone(), [path!("/a").as_ref()], cx).await;
+    setup_mock_tgs(&project.read_with(cx, |p, _| p.context_server_store()), cx);
     let thread_store = cx.new(|cx| ThreadStore::new(cx));
     let agent =
         cx.update(|cx| NativeAgent::new(thread_store.clone(), Templates::new(), fs.clone(), cx));
@@ -9929,6 +9954,7 @@ async fn test_subagent_tool_resume_session_after_restart(cx: &mut TestAppContext
     let model = fake.model("thread");
     thread.update(cx, |thread, cx| {
         thread.set_model(model.clone(), cx);
+        thread.set_summarization_model(None, cx);
     });
     cx.run_until_parked();
 
@@ -14075,6 +14101,9 @@ async fn test_spawn_agent_two_tasks_isolated_worktrees(cx: &mut TestAppContext) 
 
     cx.update(|cx| {
         cx.update_flags(true, vec!["subagents".to_string()]);
+        let mut settings = agent_settings::AgentSettings::get_global(cx).clone();
+        settings.cleanup = false;
+        agent_settings::AgentSettings::override_global(settings, cx);
     });
 
     let fs = FakeFs::new(cx.executor());
@@ -14524,6 +14553,9 @@ async fn test_spawn_agent_error_creates_wip_commit(cx: &mut TestAppContext) {
     cx.update(|cx| {
         enable_default_profile_delegation(cx);
         cx.update_flags(true, vec!["subagents".to_string()]);
+        let mut settings = agent_settings::AgentSettings::get_global(cx).clone();
+        settings.cleanup = false;
+        agent_settings::AgentSettings::override_global(settings, cx);
     });
 
     let fs = FakeFs::new(cx.executor());
@@ -15945,6 +15977,52 @@ async fn test_send_watchdog_resolves_when_thread_complete_but_submission_pending
 }
 
 #[gpui::test]
+async fn test_send_watchdog_disabled_when_zero_timeout(cx: &mut TestAppContext) {
+    let test = SubagentCompactionTest::new(cx).await;
+    let send = test.send("initial prompt", cx);
+    test.fake
+        .send_last_text(&test.model, "final output from subagent");
+    test.fake.end_last(&test.model);
+    let output = send.await.unwrap();
+    assert_eq!(output, "final output from subagent");
+    test.assert_stopped(cx);
+
+    cx.update(|cx| {
+        let mut settings = agent_settings::AgentSettings::get_global(cx).clone();
+        settings.send_watchdog_seconds = Duration::ZERO;
+        agent_settings::AgentSettings::override_global(settings, cx);
+    });
+
+    let connection = Rc::new(NativeAgentConnection(test._agent.clone()));
+    let project = cx.update(|cx| test.parent.read(cx).project().clone());
+    let hanging_acp_thread = cx
+        .update(|cx| connection.new_session(project, PathList::new(&[Path::new("")]), cx))
+        .await
+        .unwrap();
+
+    let watchdog_handle = NativeSubagentHandle::new(
+        acp::SessionId::new("subagent-watchdog-disabled-test"),
+        test.thread.clone(),
+        hanging_acp_thread,
+        test.parent.clone(),
+        thread::SubagentSlotGuard::new(Arc::new(thread::SubagentSlotPool::default())),
+    );
+
+    let mut send_task = cx.update(|cx| {
+        watchdog_handle.send("follow-up prompt".to_string(), &cx.to_async())
+    });
+    cx.run_until_parked();
+
+    cx.executor().advance_clock(Duration::from_secs(60));
+    cx.run_until_parked();
+
+    assert!(
+        futures::poll!(&mut send_task).is_pending(),
+        "send task must remain pending when send_watchdog_seconds is 0"
+    );
+}
+
+#[gpui::test]
 async fn test_step_timeout_skipped_and_run_continues(cx: &mut TestAppContext) {
     init_test(cx);
 
@@ -15993,6 +16071,58 @@ async fn test_step_timeout_skipped_and_run_continues(cx: &mut TestAppContext) {
         "TASK-TIMEOUT-STEP".to_string(),
         crate::AgentTaskStatus::Completed
     )));
+}
+
+#[gpui::test]
+async fn test_step_timeout_from_settings(cx: &mut TestAppContext) {
+    init_test(cx);
+
+    cx.update(|cx| {
+        let mut settings = agent_settings::AgentSettings::get_global(cx).clone();
+        settings.spawn_step_timeout_seconds.task_graph = Duration::from_secs(10);
+        agent_settings::AgentSettings::override_global(settings, cx);
+    });
+
+    let environment = Rc::new(
+        FakeThreadEnvironment::default()
+            .with_task_id("TASK-TIMEOUT-CUSTOM-STEP")
+            .with_hanging_record_turn()
+            .with_subagent(FakeSubagentHandle::new(
+                acp::SessionId::new("subagent-id"),
+                Task::ready("subagent custom timeout finished".to_string()).shared(),
+                None,
+            )),
+    );
+
+    #[allow(clippy::arc_with_non_send_sync)]
+    let tool = Arc::new(SpawnAgentTool::new(environment.clone()));
+    let (event_stream, _rx) = ToolCallEventStream::test();
+
+    let run_task = cx.update(|cx| {
+        tool.run(
+            ToolInput::resolved(SpawnAgentToolInput {
+                label: "step timeout custom test".to_string(),
+                message: "run subagent".to_string(),
+                task_id: Some("TASK-TIMEOUT-CUSTOM-STEP".to_string()),
+                ..Default::default()
+            }),
+            event_stream,
+            cx,
+        )
+    });
+
+    cx.run_until_parked();
+    // Advance clock past the 10s custom timeout (instead of 120s default)
+    cx.executor().advance_clock(Duration::from_secs(15));
+    cx.run_until_parked();
+
+    let result = run_task.await;
+    match result {
+        Ok(SpawnAgentToolOutput::Success { output, .. }) => {
+            assert_eq!(output, "subagent custom timeout finished");
+        }
+        other => panic!("expected successful output despite step timeout, got {other:?}"),
+    }
 }
 
 #[gpui::test]

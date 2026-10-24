@@ -30,14 +30,14 @@ use std::sync::Arc;
 
 use agent::{
     AgentGoalStatus, AgentGoalSummary, AgentTaskArtifact, AgentTaskDetail, AgentTaskEventKind,
-    AgentTaskId, AgentTaskMetrics, AgentTaskStatus, AgentTaskStore, AgentTaskSummary,
-    DiffShortStat, GoalGitState, OrphanWorktree, TaskWorktreeStatus,
+    AgentTaskId, AgentTaskMetrics, AgentTaskStatus, AgentTaskStore, AgentTaskSummary, GoalGitState,
+    OrphanWorktree, TaskWorktreeStatus,
 };
 use agent_settings::AgentSettings;
 use editor::Editor;
 use fs::Fs;
 use gpui::{
-    Action, App, Context, DismissEvent, Div, Entity, EventEmitter, FocusHandle, Focusable,
+    Action, App, Context, DismissEvent, Div, ElementId, Entity, EventEmitter, FocusHandle, Focusable,
     KeyContext, MouseButton, MouseDownEvent, Pixels, Point, Subscription, Task, WeakEntity, Window,
     actions, anchored, deferred, prelude::*, px,
 };
@@ -45,7 +45,7 @@ use multi_buffer::MultiBuffer;
 use project::{Project, git_store::Repository};
 use settings::{Settings, SettingsStore};
 use ui::{
-    Color, CommonAnimationExt, ContextMenu, ContextMenuEntry, Icon, IconButton, IconName,
+    Color, CommonAnimationExt, ContextMenu, ContextMenuEntry, DiffStat, Icon, IconButton, IconName,
     IconPosition, IconSize, Label, LabelSize, PopoverMenu, Tooltip, prelude::*,
 };
 use util::ResultExt;
@@ -2353,7 +2353,7 @@ impl AgentTaskPanel {
                                 })
                                 .child({
                                     let goal_label = if goal_id.starts_with("GOAL-") {
-                                        goal_id
+                                        goal_id.clone()
                                     } else {
                                         format!("GOAL-{goal_id}")
                                     };
@@ -2385,8 +2385,11 @@ impl AgentTaskPanel {
                                 .when_some(
                                     group.goal_summary.as_ref().and_then(|g| g.metrics.as_ref()),
                                     |mut this, metrics| {
-                                        for element in render_metrics_elements(Some(metrics), false)
-                                        {
+                                        for element in render_metrics_elements(
+                                            (ElementId::from("diff-stat"), goal_id.clone()).into(),
+                                            Some(metrics),
+                                            false,
+                                        ) {
                                             this = this.child(dot_separator()).child(element);
                                         }
                                         this
@@ -2823,7 +2826,11 @@ impl AgentTaskPanel {
                                 },
                             )
                             .when_some(task.metrics.as_ref(), |mut this, metrics| {
-                                for element in render_metrics_elements(Some(metrics), true) {
+                                for element in render_metrics_elements(
+                                    (ElementId::from("diff-stat"), task.id.to_string()).into(),
+                                    Some(metrics),
+                                    true,
+                                ) {
                                     this = this.child(dot_separator()).child(element);
                                 }
                                 this
@@ -2888,6 +2895,7 @@ pub fn format_cost(cost_usd: f64) -> String {
 }
 
 pub fn render_metrics_elements(
+    id: ElementId,
     metrics: Option<&AgentTaskMetrics>,
     include_turns: bool,
 ) -> Vec<gpui::AnyElement> {
@@ -2936,6 +2944,14 @@ pub fn render_metrics_elements(
         }
     }
 
+    if let Some(diff) = &metrics.diff {
+        elements.push(
+            DiffStat::new(id, diff.insertions as usize, diff.deletions as usize)
+                .tooltip(format!("{} files changed", diff.files_changed))
+                .into_any_element(),
+        );
+    }
+
     if let Some(cost) = metrics.cost_usd {
         let cost_str = format_cost(cost);
         elements.push(
@@ -2981,6 +2997,13 @@ pub fn format_metrics_items(metrics: Option<&AgentTaskMetrics>) -> Vec<Formatted
     if let Some(turns) = metrics.turns_count {
         items.push(FormattedMetricItem {
             text: format_turns(turns),
+            color: Color::Muted,
+        });
+    }
+
+    if let Some(diff) = &metrics.diff {
+        items.push(FormattedMetricItem {
+            text: format!("+{} -{}", diff.insertions, diff.deletions),
             color: Color::Muted,
         });
     }
@@ -3601,12 +3624,6 @@ pub fn render_goal_markdown(goal: &AgentGoalSummary, goal_git: Option<&GoalGitSt
             let short_sha: String = sha.chars().take(7).collect();
             doc.push_str(&format!("- **Tip SHA:** `{short_sha}` ({sha})\n"));
         }
-        if let Some(diff) = &git.diff {
-            doc.push_str(&format!(
-                "- **Diff:** {} file(s) +{} -{}\n",
-                diff.files, diff.added, diff.removed
-            ));
-        }
     }
 
     doc
@@ -3753,10 +3770,16 @@ pub fn render_metrics_markdown(doc: &mut String, metrics: &AgentTaskMetrics) {
     if let Some(cost) = metrics.cost_usd {
         doc.push_str(&format!("- **Cost:** ${cost:.2}\n"));
     }
+    if let Some(diff) = &metrics.diff {
+        doc.push_str(&format!(
+            "- **Diff:** {} file(s) changed (+{}, -{})\n",
+            diff.files_changed, diff.insertions, diff.deletions
+        ));
+    }
 }
 
 #[allow(dead_code)]
-pub fn format_task_meta_line(task: &AgentTaskSummary, _diff: Option<&DiffShortStat>) -> String {
+pub fn format_task_meta_line(task: &AgentTaskSummary) -> String {
     let task_seg = if task.id.starts_with("TASK-") {
         task.id.to_string()
     } else {
@@ -3788,7 +3811,6 @@ pub fn format_goal_meta_line(
     tasks_done: u64,
     tasks_total: u64,
     metrics: Option<&AgentTaskMetrics>,
-    _diff: Option<&DiffShortStat>,
 ) -> String {
     let goal_seg = if goal_id.starts_with("GOAL-") {
         goal_id.to_string()
@@ -4206,8 +4228,8 @@ pub fn build_task_rows(
 mod tests {
     use super::*;
     use agent::{
-        AgentTaskEvent, AgentTaskGraph, AgentTaskProvider, AgentTaskStatus, GoalGitState,
-        OrphanWorktree, TaskGitSnapshot, TaskGitState,
+        AgentDiffShortstat, AgentTaskEvent, AgentTaskGraph, AgentTaskProvider, AgentTaskStatus,
+        GoalGitState, OrphanWorktree, TaskGitSnapshot, TaskGitState,
     };
     use context_server::ContextServerId;
     use fs::FakeFs;
@@ -5129,6 +5151,19 @@ mod tests {
         assert!(md.contains("## Events"));
         assert!(md.contains("- `#159` [STATUS] task.created"));
         assert!(md.contains("- `#160` [TOOL] run terminal"));
+        assert!(!md.contains("- **Diff:**"));
+
+        let mut detail_with_diff = detail;
+        detail_with_diff.summary.metrics = Some(AgentTaskMetrics {
+            diff: Some(AgentDiffShortstat {
+                files_changed: 4,
+                insertions: 25,
+                deletions: 12,
+            }),
+            ..Default::default()
+        });
+        let md_with_diff = render_task_markdown(&detail_with_diff, &artifacts, None, None);
+        assert!(md_with_diff.contains("- **Diff:** 4 file(s) changed (+25, -12)"));
     }
 
     #[test]
@@ -5160,11 +5195,6 @@ mod tests {
             branch: "agent-goal/GOAL-UI-1".to_string(),
             branch_exists: true,
             tip_sha: Some("1234567890abcdef".to_string()),
-            diff: Some(agent::DiffShortStat {
-                files: 3,
-                added: 120,
-                removed: 15,
-            }),
         };
 
         let md = render_goal_markdown(&goal_summary, Some(&goal_git));
@@ -5175,7 +5205,6 @@ mod tests {
         assert!(md.contains("- **Tasks:** 1/2 completed"));
         assert!(md.contains("- **Branch:** `agent-goal/GOAL-UI-1`"));
         assert!(md.contains("- **Tip SHA:** `1234567` (1234567890abcdef)"));
-        assert!(md.contains("- **Diff:** 3 file(s) +120 -15"));
     }
 
     #[gpui::test]
@@ -5200,7 +5229,6 @@ mod tests {
                         branch: "agent-goal/GOAL-1".to_string(),
                         branch_exists: true,
                         tip_sha: Some("1234567890abcdef".to_string()),
-                        diff: None,
                     },
                 );
                 snap.goals.insert(
@@ -5209,7 +5237,6 @@ mod tests {
                         branch: "agent-goal/GOAL-2".to_string(),
                         branch_exists: false,
                         tip_sha: None,
-                        diff: None,
                     },
                 );
                 status.set_snapshot_for_test(snap, cx);
@@ -5300,12 +5327,7 @@ mod tests {
             session_id: None,
             metrics: None,
         };
-        let diff = DiffShortStat {
-            files: 2,
-            added: 15,
-            removed: 3,
-        };
-        let meta = format_task_meta_line(&task_full, Some(&diff));
+        let meta = format_task_meta_line(&task_full);
         assert_eq!(meta, "TASK-1 · agent_engineer · claude-3-7-sonnet");
 
         let goal_meta = format_goal_meta_line(
@@ -5315,15 +5337,9 @@ mod tests {
             1,
             3,
             None,
-            Some(&diff),
         );
         assert_eq!(goal_meta, "GOAL-1 · 1 / 3 · P2");
 
-        let single_diff = DiffShortStat {
-            files: 1,
-            added: 4,
-            removed: 0,
-        };
         assert_eq!(
             format_goal_meta_line(
                 "GOAL-1",
@@ -5332,17 +5348,16 @@ mod tests {
                 0,
                 1,
                 None,
-                Some(&single_diff)
             ),
             "GOAL-1 · 0 / 1 · P1"
         );
 
         assert_eq!(
-            format_task_meta_line(&task_full, None),
+            format_task_meta_line(&task_full),
             "TASK-1 · agent_engineer · claude-3-7-sonnet"
         );
         assert_eq!(
-            format_goal_meta_line("GOAL-1", &AgentGoalStatus::Completed, 1, 2, 2, None, None),
+            format_goal_meta_line("GOAL-1", &AgentGoalStatus::Completed, 1, 2, 2, None),
             "GOAL-1 · 2 / 2 · P1"
         );
 
@@ -5359,22 +5374,54 @@ mod tests {
         };
         let mut task_with_metrics = task_full;
         task_with_metrics.metrics = Some(sample_metrics.clone());
+        let task_meta_no_diff = format_task_meta_line(&task_with_metrics);
         assert_eq!(
-            format_task_meta_line(&task_with_metrics, None),
+            task_meta_no_diff,
             "TASK-1 · agent_engineer · claude-3-7-sonnet · 14s · 5.1k/1.3k/15.1k · 1 · $0.04"
         );
+        assert!(!task_meta_no_diff.contains(" ·  · "));
+
+        let goal_meta_no_diff = format_goal_meta_line(
+            "GOAL-10",
+            &AgentGoalStatus::Running,
+            1,
+            3,
+            3,
+            Some(&sample_metrics),
+        );
         assert_eq!(
-            format_goal_meta_line(
-                "GOAL-10",
-                &AgentGoalStatus::Running,
-                1,
-                3,
-                3,
-                Some(&sample_metrics),
-                None
-            ),
+            goal_meta_no_diff,
             "GOAL-10 · 3 / 3 · P1 · 14s · 5.1k/1.3k/15.1k · 1 · $0.04"
         );
+        assert!(!goal_meta_no_diff.contains(" ·  · "));
+
+        let mut metrics_with_diff = sample_metrics;
+        metrics_with_diff.diff = Some(AgentDiffShortstat {
+            files_changed: 2,
+            insertions: 15,
+            deletions: 4,
+        });
+        task_with_metrics.metrics = Some(metrics_with_diff.clone());
+        let task_meta_with_diff = format_task_meta_line(&task_with_metrics);
+        assert_eq!(
+            task_meta_with_diff,
+            "TASK-1 · agent_engineer · claude-3-7-sonnet · 14s · 5.1k/1.3k/15.1k · 1 · +15 -4 · $0.04"
+        );
+        assert!(!task_meta_with_diff.contains(" ·  · "));
+
+        let goal_meta_with_diff = format_goal_meta_line(
+            "GOAL-10",
+            &AgentGoalStatus::Running,
+            1,
+            3,
+            3,
+            Some(&metrics_with_diff),
+        );
+        assert_eq!(
+            goal_meta_with_diff,
+            "GOAL-10 · 3 / 3 · P1 · 14s · 5.1k/1.3k/15.1k · 1 · +15 -4 · $0.04"
+        );
+        assert!(!goal_meta_with_diff.contains(" ·  · "));
     }
 
     #[test]
@@ -5395,7 +5442,7 @@ mod tests {
             metrics: None,
         };
         assert_eq!(
-            format_task_meta_line(&task_no_goal, None),
+            format_task_meta_line(&task_no_goal),
             "TASK-2 · code_mechanic · gemini-2.5-pro"
         );
 
@@ -5415,7 +5462,7 @@ mod tests {
             metrics: None,
         };
         assert_eq!(
-            format_task_meta_line(&task_assignee_fallback, None),
+            format_task_meta_line(&task_assignee_fallback),
             "TASK-3 · backend_profile"
         );
 
@@ -5435,7 +5482,7 @@ mod tests {
             metrics: None,
         };
         assert_eq!(
-            format_task_meta_line(&task_no_profile, None),
+            format_task_meta_line(&task_no_profile),
             "TASK-4 · no profile"
         );
 
@@ -5455,7 +5502,7 @@ mod tests {
             metrics: None,
         };
         assert_eq!(
-            format_task_meta_line(&task_both, None),
+            format_task_meta_line(&task_both),
             "TASK-5 · primary_profile"
         );
     }
@@ -5990,7 +6037,6 @@ mod tests {
                         branch: "agent-goal/GOAL-1".to_string(),
                         branch_exists: true,
                         tip_sha: Some("1234567890abcdef".to_string()),
-                        diff: None,
                     },
                 );
                 status.set_snapshot_for_test(snap, cx);
@@ -6061,7 +6107,6 @@ mod tests {
                         branch: "agent-goal/GOAL-1".to_string(),
                         branch_exists: true,
                         tip_sha: Some("1234567890abcdef".to_string()),
-                        diff: None,
                     },
                 );
                 status.set_snapshot_for_test(snap, cx);
@@ -6200,7 +6245,6 @@ mod tests {
                         exists_on_disk: true,
                         branch: Some("agent-task/TASK-1".to_string()),
                         branch_exists: true,
-                        diff: None,
                     },
                 );
                 snap.goals.insert(
@@ -6209,7 +6253,6 @@ mod tests {
                         branch: "agent-goal/GOAL-1".to_string(),
                         branch_exists: true,
                         tip_sha: Some("1234567890abcdef".to_string()),
-                        diff: None,
                     },
                 );
                 status.set_snapshot_for_test(snap, cx);
@@ -6280,7 +6323,6 @@ mod tests {
                         exists_on_disk: true,
                         branch: Some("agent-task/TASK-1".to_string()),
                         branch_exists: true,
-                        diff: None,
                     },
                 );
                 status.set_snapshot_for_test(snap, cx);
@@ -6335,7 +6377,6 @@ mod tests {
             branch: format!("agent-goal/{goal_id}"),
             branch_exists: true,
             tip_sha: Some("1234567890abcdef".to_string()),
-            diff: None,
         };
 
         let detail = AgentTaskDetail {
@@ -6685,7 +6726,7 @@ mod tests {
                 assigned_profile: Some("agent_engineer".into()),
                 model: Some("glm-5.3".into()),
                 session_id: None,
-                metrics: Some(sample_metrics),
+                metrics: Some(sample_metrics.clone()),
             },
             description: "Desc".to_string(),
             acceptance_criteria: vec![],
@@ -6699,6 +6740,26 @@ mod tests {
         assert!(task_md.contains("- **Tokens:** 5100 in / 1300 out / 15100 cache"));
         assert!(task_md.contains("- **Turns:** 1"));
         assert!(task_md.contains("- **Cost:** $0.04"));
+        assert!(!goal_md.contains("- **Diff:**"));
+        assert!(!task_md.contains("- **Diff:**"));
+
+        let mut metrics_with_diff = sample_metrics;
+        metrics_with_diff.diff = Some(AgentDiffShortstat {
+            files_changed: 3,
+            insertions: 42,
+            deletions: 7,
+        });
+
+        let mut goal_with_diff = goal;
+        goal_with_diff.metrics = Some(metrics_with_diff.clone());
+        let goal_with_diff_md = render_goal_markdown(&goal_with_diff, None);
+        assert!(goal_with_diff_md.contains("- **Diff:** 3 file(s) changed (+42, -7)"));
+
+        let mut detail_with_diff = detail;
+        detail_with_diff.summary.metrics = Some(metrics_with_diff);
+        let task_with_diff_md =
+            render_task_markdown(&detail_with_diff, &[], Some(&goal_with_diff), None);
+        assert!(task_with_diff_md.contains("- **Diff:** 3 file(s) changed (+42, -7)"));
     }
 
     #[gpui::test]
@@ -6965,7 +7026,6 @@ mod tests {
                         exists_on_disk: false,
                         branch: Some("agent-task/TASK-NO-BRANCH".to_string()),
                         branch_exists: false,
-                        diff: None,
                     },
                 );
                 status.set_snapshot_for_test(snap, cx);
@@ -7083,7 +7143,6 @@ mod tests {
                         exists_on_disk: false,
                         branch: Some("agent-task/TASK-RESTORE".to_string()),
                         branch_exists: true,
-                        diff: None,
                     },
                 );
                 status.set_snapshot_for_test(snap, cx);
@@ -7161,7 +7220,6 @@ mod tests {
                         exists_on_disk: true,
                         branch: Some("agent-task/TASK-DISK".to_string()),
                         branch_exists: true,
-                        diff: None,
                     },
                 );
                 status.set_snapshot_for_test(snap, cx);
@@ -7213,21 +7271,54 @@ mod tests {
             total_tokens: Some(3500),
             cost_usd: Some(0.05),
             turns_count: Some(7),
-            diff: None,
+            diff: Some(AgentDiffShortstat {
+                files_changed: 2,
+                insertions: 15,
+                deletions: 4,
+            }),
         };
 
         // Check render_metrics_elements directly: duration is omitted, turns controlled by flag
-        let goal_elements = render_metrics_elements(Some(&sample_metrics), false);
-        let task_elements = render_metrics_elements(Some(&sample_metrics), true);
+        let goal_elements = render_metrics_elements(
+            (ElementId::from("diff-stat"), "goal-1").into(),
+            Some(&sample_metrics),
+            false,
+        );
+        let task_elements = render_metrics_elements(
+            (ElementId::from("diff-stat"), "task-1").into(),
+            Some(&sample_metrics),
+            true,
+        );
         assert_eq!(
             goal_elements.len(),
-            2,
-            "Goal elements should have tokens and cost, but no duration or turns"
+            3,
+            "Goal elements should have tokens, diff, and cost, but no duration or turns"
         );
         assert_eq!(
             task_elements.len(),
+            4,
+            "Task elements should have tokens, turns, diff, and cost, but no duration"
+        );
+
+        let mut sample_metrics_no_diff = sample_metrics.clone();
+        sample_metrics_no_diff.diff = None;
+        assert_eq!(
+            render_metrics_elements(
+                (ElementId::from("diff-stat"), "goal-no-diff").into(),
+                Some(&sample_metrics_no_diff),
+                false,
+            )
+            .len(),
+            2,
+        );
+        assert_eq!(
+            render_metrics_elements(
+                (ElementId::from("diff-stat"), "task-no-diff").into(),
+                Some(&sample_metrics_no_diff),
+                true,
+            )
+            .len(),
             3,
-            "Task elements should have tokens, turns, and cost, but no duration"
         );
 
         let mut provider_inner = TestProvider::default();
@@ -7299,7 +7390,6 @@ mod tests {
                         exists_on_disk: true,
                         branch: Some("agent-task/TASK-1".to_string()),
                         branch_exists: true,
-                        diff: None,
                     },
                 );
                 status.set_snapshot_for_test(snap, cx);
@@ -7334,7 +7424,6 @@ mod tests {
                         exists_on_disk: false,
                         branch: Some("agent-task/TASK-1".to_string()),
                         branch_exists: true,
-                        diff: None,
                     },
                 );
                 status.set_snapshot_for_test(snap, cx);

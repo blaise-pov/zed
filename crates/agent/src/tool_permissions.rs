@@ -750,6 +750,13 @@ mod tests {
             },
             thinking_display: Default::default(),
             task_worktree_limit: agent_settings::DEFAULT_TASK_WORKTREE_LIMIT,
+            spawn_step_timeout_seconds: Default::default(),
+            send_watchdog_seconds: std::time::Duration::from_secs(
+                agent_settings::DEFAULT_SEND_WATCHDOG_SECONDS,
+            ),
+            turn_watchdog_seconds: std::time::Duration::from_secs(
+                agent_settings::DEFAULT_TURN_WATCHDOG_SECONDS,
+            ),
             task_worktree_language_servers: agent_settings::DEFAULT_TASK_WORKTREE_LANGUAGE_SERVERS,
             fetch_max_bytes: agent_settings::DEFAULT_FETCH_MAX_BYTES,
             task_lifecycle_mode: agent_settings::DEFAULT_TASK_LIFECYCLE_MODE,

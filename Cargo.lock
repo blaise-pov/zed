@@ -255,6 +255,7 @@ dependencies = [
  "anyhow",
  "async-channel 2.5.0",
  "async-io",
+ "brush-parser",
  "chrono",
  "client",
  "clock",

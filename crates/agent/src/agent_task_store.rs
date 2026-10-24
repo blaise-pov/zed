@@ -251,23 +251,6 @@ impl AgentTaskStore {
         })
     }
 
-    pub fn ensure_task(
-        &mut self,
-        id: &AgentTaskId,
-        title: &str,
-        goal_id: Option<&str>,
-        cx: &mut Context<Self>,
-    ) -> Task<Result<()>> {
-        let provider = self.provider.clone();
-        let task = provider.ensure_task(id, title, goal_id, cx);
-        cx.spawn(async move |this, cx| {
-            task.await?;
-            let refresh_task = this.update(cx, |store, cx| store.refresh(cx))?;
-            refresh_task.await?;
-            Ok(())
-        })
-    }
-
     pub fn fail_task(
         &mut self,
         id: &AgentTaskId,
@@ -448,7 +431,6 @@ mod tests {
         archive_calls: Vec<AgentTaskId>,
         unarchive_calls: Vec<AgentTaskId>,
         delete_calls: Vec<AgentTaskId>,
-        ensure_task_calls: Vec<(AgentTaskId, String, Option<String>)>,
         set_task_status_calls: Vec<(AgentTaskId, AgentTaskStatus)>,
         set_goal_status_calls: Vec<(String, AgentGoalStatus)>,
         archive_goal_calls: Vec<String>,
@@ -646,25 +628,6 @@ mod tests {
             Task::ready(Ok(()))
         }
 
-        fn ensure_task(
-            &self,
-            id: &AgentTaskId,
-            title: &str,
-            goal_id: Option<&str>,
-            _cx: &mut App,
-        ) -> Task<Result<()>> {
-            self.calls.lock().unwrap().ensure_task_calls.push((
-                id.clone(),
-                title.to_string(),
-                goal_id.map(str::to_string),
-            ));
-            if self.should_fail {
-                Task::ready(Err(anyhow::anyhow!("offline")))
-            } else {
-                Task::ready(Ok(()))
-            }
-        }
-
         fn fail_task(&self, _id: &AgentTaskId, _reason: &str, _cx: &mut App) -> Task<Result<()>> {
             Task::ready(Ok(()))
         }
@@ -800,38 +763,6 @@ mod tests {
 
         let counts = calls.lock().unwrap();
         assert_eq!(counts.delete_calls, vec![task_id]);
-        assert_eq!(counts.fetch_graph_count, initial_refreshes + 1);
-    }
-
-    #[gpui::test]
-    async fn test_agent_task_store_ensure_task(cx: &mut TestAppContext) {
-        let calls = Arc::new(Mutex::new(CallCounts::default()));
-        let provider = Arc::new(TestProvider {
-            should_fail: false,
-            calls: calls.clone(),
-            ..Default::default()
-        });
-        let store = cx.update(|cx| cx.new(|cx| AgentTaskStore::new(provider, cx)));
-        cx.run_until_parked();
-
-        let initial_refreshes = calls.lock().unwrap().fetch_graph_count;
-        let task_id = AgentTaskId::from("TASK-1");
-        let result = store
-            .update(cx, |store, cx| {
-                store.ensure_task(&task_id, "Test Title", Some("GOAL-1"), cx)
-            })
-            .await;
-        assert!(result.is_ok());
-
-        let counts = calls.lock().unwrap();
-        assert_eq!(
-            counts.ensure_task_calls,
-            vec![(
-                task_id,
-                "Test Title".to_string(),
-                Some("GOAL-1".to_string())
-            )]
-        );
         assert_eq!(counts.fetch_graph_count, initial_refreshes + 1);
     }
 
@@ -1194,7 +1125,7 @@ mod tests {
         });
         cx.run_until_parked();
 
-        crate::task_worktree::register_subagent_session(&task_id);
+        let guard = crate::task_worktree::SubagentSessionGuard::test_new(task_id.clone());
 
         let mut completed_task = task.clone();
         completed_task.status = AgentTaskStatus::Completed;
@@ -1216,7 +1147,7 @@ mod tests {
             "worktree directory should still exist"
         );
 
-        crate::task_worktree::unregister_subagent_session(&task_id);
+        drop(guard);
     }
 
     #[gpui::test]
