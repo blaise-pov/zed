@@ -4272,16 +4272,16 @@ impl Thread {
         attempt: u8,
         cx: &mut AsyncApp,
     ) -> Result<ControlFlow<()>> {
-        let retry = this.update(cx, |this, cx| {
+        let (retry, _retry_guard) = this.update(cx, |this, cx| -> Result<_> {
             let user_store = this.user_store.read(cx);
-            this.handle_completion_error(error, attempt, user_store.plan(), cx)
+            let retry = this.handle_completion_error(error, attempt, user_store.plan(), cx)?;
+            let retry_guard = this
+                .running_turn
+                .as_ref()
+                .map(|turn| turn.watchdog_handle.retry_started());
+            Ok((retry, retry_guard))
         })??;
         let timer = cx.background_executor().timer(retry.duration);
-        this.update(cx, |this, _| {
-            if let Some(turn) = this.running_turn.as_ref() {
-                turn.watchdog_handle.bump_activity();
-            }
-        })?;
         event_stream.send_retry(retry);
         futures::select! {
             _ = timer.fuse() => {}
@@ -6547,6 +6547,7 @@ enum CompactionInsertion {
 pub(crate) struct WatchdogHandle {
     pending_tool_count: Arc<AtomicUsize>,
     pending_authorization_count: Arc<AtomicUsize>,
+    pending_retry_count: Arc<AtomicUsize>,
     is_streaming: Arc<AtomicBool>,
     activity_tx: Arc<parking_lot::Mutex<watch::Sender<()>>>,
 }
@@ -6575,12 +6576,25 @@ impl Drop for AuthorizationActivityGuard {
     }
 }
 
+pub(crate) struct RetryActivityGuard {
+    pending_retry_count: Arc<AtomicUsize>,
+    activity_tx: Arc<parking_lot::Mutex<watch::Sender<()>>>,
+}
+
+impl Drop for RetryActivityGuard {
+    fn drop(&mut self) {
+        self.pending_retry_count.fetch_sub(1, Ordering::SeqCst);
+        self.activity_tx.lock().send(()).ok();
+    }
+}
+
 impl WatchdogHandle {
     fn new() -> (Self, watch::Receiver<()>) {
         let (activity_tx, activity_rx) = watch::channel(());
         let handle = Self {
             pending_tool_count: Arc::new(AtomicUsize::new(0)),
             pending_authorization_count: Arc::new(AtomicUsize::new(0)),
+            pending_retry_count: Arc::new(AtomicUsize::new(0)),
             is_streaming: Arc::new(AtomicBool::new(false)),
             activity_tx: Arc::new(parking_lot::Mutex::new(activity_tx)),
         };
@@ -6609,6 +6623,15 @@ impl WatchdogHandle {
         }
     }
 
+    fn retry_started(&self) -> RetryActivityGuard {
+        self.pending_retry_count.fetch_add(1, Ordering::SeqCst);
+        self.bump_activity();
+        RetryActivityGuard {
+            pending_retry_count: self.pending_retry_count.clone(),
+            activity_tx: self.activity_tx.clone(),
+        }
+    }
+
     fn set_streaming(&self, streaming: bool) {
         self.is_streaming.store(streaming, Ordering::SeqCst);
         self.bump_activity();
@@ -6617,8 +6640,9 @@ impl WatchdogHandle {
     fn is_stalled(&self) -> bool {
         let tools = self.pending_tool_count.load(Ordering::SeqCst);
         let auth = self.pending_authorization_count.load(Ordering::SeqCst);
+        let retries = self.pending_retry_count.load(Ordering::SeqCst);
         let streaming = self.is_streaming.load(Ordering::SeqCst);
-        !streaming && tools == 0 && auth == 0
+        !streaming && tools == 0 && auth == 0 && retries == 0
     }
 }
 
