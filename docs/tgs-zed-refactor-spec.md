@@ -13,7 +13,7 @@
 | 2 | Привязка task→session восстанавливается в новом `refresh` через `register_task_session` из данных `task_graph` (сегодня это делает `merge_items_into_graph`, который удаляется) |
 | 3 | Артефакты остаются MCP-инструментами TGS; включаются точечно в профилях (researcher/github_researcher — publish+get+list; reviewer — get+list). Нативные инструментыpublish/read (вариант C) отклонены |
 | 4 | Генерация `execution_report` переносится на сторону TGS в обработчик `task_record_turn` |
-| 5 | `task_create` получает опциональный `task_id` с ensure-семантикой; `idempotency_key` не вводится |
+| 5 | Отказ от клиентского `task_id` при создании (`task_id` генерирует TGS); `ensure_task` удалён, `idempotency_key` не вводится |
 | 6 | `goal_update` поддерживает полный enum статусов; действия панели не вырезаются |
 | 7 | Оркестратору возвращён `task_get` (итого 6 инструментов); `parent_id` возвращён в schema |
 | 8 | FSM дополнена переходом `failed -> ready`; `blocked` — производный статус |
@@ -46,7 +46,6 @@
 
 ```json
 {
-  "task_id": "string (optional, ensure-семантика, см. ниже)",
   "title": "string (required)",
   "goal_id": "string (optional)",
   "parent_id": "string (optional)",
@@ -67,7 +66,6 @@
   "tasks": [
     {
       "temp_id": "string (required)",
-      "task_id": "string (optional)",
       "title": "string (required)",
       "goal_id": "string (optional)",
       "parent_id": "string (optional, temp_id или task_id)",
@@ -83,11 +81,6 @@
 
 Логика:
 
-- **Ensure-семантика `task_id`**: если задача с таким `task_id` существует —
-  вернуть её ID без изменения данных (ответ как при создании). Уникальность
-  `task_id` — единственный механизм идемпотентности; отдельный
-  `idempotency_key` не вводится. Ошибка возвращается только если существующая
-  задача принадлежит другому `goal_id`.
 - Батч выполняется в единой транзакции SQLite: либо все задачи созданы, либо
   ни одной.
 - Ссылки `depends_on`/`parent_id` принимают `temp_id` из текущего пакета или
@@ -312,7 +305,8 @@ tokens, error, branch, commit_sha), `events`, `artifacts`.
 
 | Поле/механизм | Причина отказа |
 |---|---|
-| `idempotency_key` | Дублируется ensure-семантикой `task_id`; батч атомарен |
+| Клиентский `task_id` при создании (`ensure_task`) | ID генерируются сервером; задачи проверяются рантаймом через `task_get` |
+| `idempotency_key` | Избыточен: батч атомарен, создание задач явное |
 | `contract` (objective/inputs/expected_outputs/constraints), `metadata` | Zed-модель (`AgentTaskDetail`) потребляет только `description` + `acceptance_criteria`; контракт инжектится из них |
 | `dependency_type` у рёбер | Не используется ни Zed, ни текущими оркестраторами |
 | `cost_usd` в метриках | Ценообразование — клиентская забота; TGS хранит только токены/время |
@@ -324,9 +318,8 @@ tokens, error, branch, commit_sha), `events`, `artifacts`.
    `blocked` в `task_update`.
 2. Reopen: `completed -> running` инкрементирует `attempt`, пишет
    `task.reopened`, метрики кумулятивны.
-3. `task_create`: ensure-семантика `task_id`; батч в одной транзакции
-   (откат по сломанной ссылке); цикл отвергается; `temp_id` с префиксом
-   `TASK-` отвергается; лимит 50.
+3. `task_create`: батч в одной транзакции (откат по сломанной ссылке);
+   цикл отвергается; `temp_id` с префиксом `TASK-` отвергается; лимит 50.
 4. `task_record_turn`: `turn_index`, агрегаты, артефакт `execution_report`
    создан (в т.ч. при `error`).
 5. `goal_update`: полный enum, alias `active`.
@@ -373,17 +366,14 @@ tokens, error, branch, commit_sha), `events`, `artifacts`.
    cx.spawn(async move |_cx| { task.await?; Ok(()) })
    ```
 
-2. **`ensure_task`** (L106-157): схема сохраняется (`task_get` -> при
-   отсутствии `task_create`), из аргументов create убрать
-   `idempotency_key`, оставить `task_id`.
-3. **Статусные методы**: `complete_task`, `fail_task` (передаёт
+2. **Статусные методы**: `complete_task`, `fail_task` (передаёт
    `error: reason`), `archive_task`, `unarchive_task`, `set_goal_status`,
    `archive_goal`, `unarchive_goal` — делегируют в `task_update` /
    `goal_update`.
-4. **Телеметрия**: `record_turn` вызывает `task_record_turn` (MCP-эндпоинт,
+3. **Телеметрия**: `record_turn` вызывает `task_record_turn` (MCP-эндпоинт,
    доступный только рантайму; в профилях агентов отключён на уровне
    настроек).
-5. **Удалить** `fetch_items` и разбор `item_list` (L479-505).
+4. **Удалить** `fetch_items` и разбор `item_list` (L479-505).
 
 ## 3. `crates/agent/src/agent_task_store.rs`
 
