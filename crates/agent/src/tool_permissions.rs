@@ -764,6 +764,9 @@ mod tests {
             cleanup: agent_settings::DEFAULT_CLEANUP,
             register_metadata: agent_settings::DEFAULT_REGISTER_METADATA,
             publish_ref_artifact: agent_settings::DEFAULT_PUBLISH_REF_ARTIFACT,
+            task_worktree_retention_timeout_seconds: std::time::Duration::from_secs(
+                agent_settings::DEFAULT_TASK_WORKTREE_RETENTION_TIMEOUT_SECONDS,
+            ),
         }
     }
 

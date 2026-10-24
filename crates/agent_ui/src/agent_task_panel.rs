@@ -6201,6 +6201,7 @@ mod tests {
                         branch: Some("agent-task/TASK-1".to_string()),
                         branch_exists: true,
                         diff: None,
+                        retention_reason: None,
                     },
                 );
                 snap.goals.insert(
@@ -6281,6 +6282,7 @@ mod tests {
                         branch: Some("agent-task/TASK-1".to_string()),
                         branch_exists: true,
                         diff: None,
+                        retention_reason: None,
                     },
                 );
                 status.set_snapshot_for_test(snap, cx);
@@ -6966,6 +6968,7 @@ mod tests {
                         branch: Some("agent-task/TASK-NO-BRANCH".to_string()),
                         branch_exists: false,
                         diff: None,
+                        retention_reason: None,
                     },
                 );
                 status.set_snapshot_for_test(snap, cx);
@@ -7084,6 +7087,7 @@ mod tests {
                         branch: Some("agent-task/TASK-RESTORE".to_string()),
                         branch_exists: true,
                         diff: None,
+                        retention_reason: None,
                     },
                 );
                 status.set_snapshot_for_test(snap, cx);
@@ -7162,6 +7166,7 @@ mod tests {
                         branch: Some("agent-task/TASK-DISK".to_string()),
                         branch_exists: true,
                         diff: None,
+                        retention_reason: None,
                     },
                 );
                 status.set_snapshot_for_test(snap, cx);
@@ -7300,6 +7305,7 @@ mod tests {
                         branch: Some("agent-task/TASK-1".to_string()),
                         branch_exists: true,
                         diff: None,
+                        retention_reason: None,
                     },
                 );
                 status.set_snapshot_for_test(snap, cx);
@@ -7335,6 +7341,7 @@ mod tests {
                         branch: Some("agent-task/TASK-1".to_string()),
                         branch_exists: true,
                         diff: None,
+                        retention_reason: None,
                     },
                 );
                 status.set_snapshot_for_test(snap, cx);
@@ -7343,7 +7350,7 @@ mod tests {
         cx.run_until_parked();
 
         assert!(
-            cx.debug_bounds("task-worktree-icon-TASK-1").is_none(),
+            cx.debug_bounds("task-worktree-icon-TASK-1").is_some(),
             "Worktree icon should disappear when exists_on_disk becomes false"
         );
     }

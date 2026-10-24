@@ -1044,7 +1044,6 @@ fn update_active_language_model_from_settings(cx: &mut App) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
     use agent_settings::{AgentProfileId, AgentSettings};
     use command_palette_hooks::CommandPaletteFilter;
     use db::kvp::KeyValueStore;
@@ -1054,6 +1053,7 @@ mod tests {
     use settings::{
         DockPosition, NotifyWhenAgentWaiting, PlaySoundWhenAgentDone, Settings, SettingsStore,
     };
+    use std::time::Duration;
 
     #[gpui::test]
     fn test_agent_command_palette_visibility(cx: &mut TestAppContext) {
@@ -1140,6 +1140,9 @@ mod tests {
             cleanup: agent_settings::DEFAULT_CLEANUP,
             register_metadata: agent_settings::DEFAULT_REGISTER_METADATA,
             publish_ref_artifact: agent_settings::DEFAULT_PUBLISH_REF_ARTIFACT,
+            task_worktree_retention_timeout_seconds: Duration::from_secs(
+                agent_settings::DEFAULT_TASK_WORKTREE_RETENTION_TIMEOUT_SECONDS,
+            ),
         };
 
         cx.update(|cx| {

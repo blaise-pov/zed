@@ -1,17 +1,17 @@
 #[cfg(any(test, feature = "test-support"))]
 use std::collections::HashSet;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 #[cfg(not(any(test, feature = "test-support")))]
 use std::sync::LazyLock;
 use std::time::Duration;
 
+use agent_client_protocol::schema::v1 as acp;
 use anyhow::{Context as _, Result};
 use fs::Fs;
 use futures::FutureExt as _;
 use git::repository::{AskPassDelegate, CommitOptions, CreateWorktreeTarget, RepoPath};
-use agent_client_protocol::schema::v1 as acp;
 use gpui::{App, AsyncApp, Entity, Task, WeakEntity};
 use language_model::LanguageModelToolUseId;
 use project::{
@@ -24,7 +24,7 @@ use settings::Settings;
 use util::ResultExt;
 use util::paths::PathStyle;
 
-use crate::agent_task::AgentTaskProvider;
+use crate::agent_task::{AgentTaskProvider, AgentTaskStatus};
 use crate::{AgentTaskId, AgentTaskSummary};
 
 #[derive(Debug, thiserror::Error)]
@@ -365,6 +365,13 @@ pub fn ensure_task_worktree_with_options(
                         "cannot release worktree for task {stale_task_id} holding branch {branch_to_claim}: active subagent session running"
                     );
                 }
+                WorktreeReleaseSafety::Retained => {
+                    let reason = task_worktree_retention_reason(&stale_task_id)
+                        .unwrap_or_else(|| "retained".to_string());
+                    anyhow::bail!(
+                        "cannot release worktree for task {stale_task_id} holding branch {branch_to_claim}: worktree is retained ({reason})"
+                    );
+                }
                 WorktreeReleaseSafety::MergeConflict | WorktreeReleaseSafety::Safe => {
                     // Allowed per design B7: merge conflicts are safe to take over at claim-time.
                 }
@@ -603,10 +610,31 @@ pub fn ensure_task_worktree_with_options(
     })
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct DependentTask {
+    pub id: AgentTaskId,
+    pub depends_on: Vec<AgentTaskId>,
+    pub status: AgentTaskStatus,
+}
+
+fn is_ready_or_in_progress(status: &AgentTaskStatus) -> bool {
+    match status {
+        AgentTaskStatus::Ready | AgentTaskStatus::Running => true,
+        AgentTaskStatus::Other(custom) => {
+            let s = custom.as_ref();
+            s == "ready" || s == "running" || s == "in_progress"
+        }
+        _ => false,
+    }
+}
+
 #[derive(Default)]
 struct TaskWorktreeRegistry {
     entries: HashMap<AgentTaskId, TaskWorktreeState>,
     active_guards: HashMap<AgentTaskId, HashMap<SubagentSessionGuardId, SubagentSessionOwner>>,
+    holders: HashMap<AgentTaskId, BTreeSet<String>>,
+    dependent_tasks: Vec<DependentTask>,
+    retention_timeout: Option<Duration>,
     goal_history: HashMap<String, Vec<GoalMergeEntry>>,
     #[cfg(any(test, feature = "test-support"))]
     goal_files: HashMap<String, HashMap<PathBuf, Vec<u8>>>,
@@ -648,6 +676,7 @@ struct TaskWorktreeState {
     commit_error: Option<String>,
     cleanup_error: Option<String>,
     is_terminal: bool,
+    terminal_at: Option<std::time::Instant>,
     goal_branch: Option<String>,
     base_ref: Option<String>,
     base_sha: Option<String>,
@@ -676,6 +705,7 @@ impl TaskWorktreeState {
 /// Semantics:
 /// - `CommitError`: NEVER release or evict; manual inspection is required.
 /// - `ActiveSession`: NEVER release or evict while any subagent session is active.
+/// - `Retained`: NEVER release or evict while active holders, dependent tasks, or retention window exist.
 /// - `MergeConflict`: Claim-time branch takeover is ALLOWED (per design В7: conflict
 ///   state is re-derivable, commits are safe), but startup sweep and LRU pool eviction
 ///   MUST skip it (retained for inspection).
@@ -686,6 +716,7 @@ pub enum WorktreeReleaseSafety {
     ActiveSession,
     CommitError,
     MergeConflict,
+    Retained,
 }
 
 impl WorktreeReleaseSafety {
@@ -695,6 +726,10 @@ impl WorktreeReleaseSafety {
 
     pub fn is_claim_takeover_safe(&self) -> bool {
         matches!(self, Self::Safe | Self::MergeConflict)
+    }
+
+    pub fn is_retained(&self) -> bool {
+        matches!(self, Self::Retained)
     }
 }
 
@@ -710,13 +745,20 @@ fn is_non_empty_error(err: &str) -> bool {
 }
 
 fn worktree_release_safety_for_state(
-    _task_id: &AgentTaskId,
+    task_id: &AgentTaskId,
     state: &TaskWorktreeState,
     active_sessions: usize,
+    reg: &TaskWorktreeRegistry,
 ) -> WorktreeReleaseSafety {
     if active_sessions > 0 || state.is_cleaning {
         WorktreeReleaseSafety::ActiveSession
-    } else if state.commit_error.as_deref().map_or(false, is_non_empty_error) {
+    } else if reg.retention_reason(task_id).is_some() {
+        WorktreeReleaseSafety::Retained
+    } else if state
+        .commit_error
+        .as_deref()
+        .map_or(false, is_non_empty_error)
+    {
         WorktreeReleaseSafety::CommitError
     } else if state.merge_conflict.is_some() {
         WorktreeReleaseSafety::MergeConflict
@@ -747,10 +789,12 @@ pub fn worktree_release_safety(task_id: &AgentTaskId) -> WorktreeReleaseSafety {
     reg.entries.get(task_id).map_or(
         if active_sessions > 0 {
             WorktreeReleaseSafety::ActiveSession
+        } else if reg.retention_reason(task_id).is_some() {
+            WorktreeReleaseSafety::Retained
         } else {
             WorktreeReleaseSafety::Safe
         },
-        |state| worktree_release_safety_for_state(task_id, state, active_sessions),
+        |state| worktree_release_safety_for_state(task_id, state, active_sessions, &reg),
     )
 }
 
@@ -816,6 +860,124 @@ pub fn unregister_task_provider() {
 
 pub fn task_provider() -> Option<Arc<dyn AgentTaskProvider>> {
     TASK_PROVIDER.read().clone()
+}
+
+pub fn set_task_worktree_retention_timeout(timeout: Option<Duration>) {
+    let mut reg = REGISTRY.write();
+    reg.retention_timeout = timeout;
+}
+
+pub fn task_worktree_retention_timeout() -> Duration {
+    let reg = REGISTRY.read();
+    reg.retention_timeout.unwrap_or(Duration::from_secs(
+        agent_settings::DEFAULT_TASK_WORKTREE_RETENTION_TIMEOUT_SECONDS,
+    ))
+}
+
+impl TaskWorktreeRegistry {
+    pub fn retention_reason(&self, task_id: &AgentTaskId) -> Option<String> {
+        if let Some(holders) = self.holders.get(task_id) {
+            if let Some(first_holder) = holders.iter().next() {
+                return Some(format!("holder:{first_holder}"));
+            }
+        }
+
+        if task_provider().is_some() {
+            for dep in &self.dependent_tasks {
+                if dep.depends_on.contains(task_id) && is_ready_or_in_progress(&dep.status) {
+                    return Some(format!("dependent:{}", dep.id));
+                }
+            }
+        }
+
+        if let Some(entry) = self.entries.get(task_id) {
+            if entry.is_terminal {
+                if let Some(terminal_at) = entry.terminal_at {
+                    let timeout = self.retention_timeout.unwrap_or(Duration::from_secs(
+                        agent_settings::DEFAULT_TASK_WORKTREE_RETENTION_TIMEOUT_SECONDS,
+                    ));
+                    if timeout > Duration::ZERO && terminal_at.elapsed() < timeout {
+                        return Some("retention-window".to_string());
+                    }
+                }
+            }
+        }
+
+        None
+    }
+}
+
+pub fn register_worktree_holder(host: &AgentTaskId, holder_session_id: impl Into<String>) {
+    let mut reg = REGISTRY.write();
+    reg.holders
+        .entry(host.clone())
+        .or_default()
+        .insert(holder_session_id.into());
+}
+
+pub fn unregister_worktree_holder(host: &AgentTaskId, holder_session_id: &str) {
+    let mut reg = REGISTRY.write();
+    if let Some(holders) = reg.holders.get_mut(host) {
+        holders.remove(holder_session_id);
+        if holders.is_empty() {
+            reg.holders.remove(host);
+        }
+    }
+}
+
+pub fn worktree_holders(host: &AgentTaskId) -> Vec<String> {
+    let reg = REGISTRY.read();
+    reg.holders
+        .get(host)
+        .map(|holders| holders.iter().cloned().collect())
+        .unwrap_or_default()
+}
+
+pub fn register_task_dependency(
+    dependent: impl Into<AgentTaskId>,
+    depends_on: impl Into<AgentTaskId>,
+    status: AgentTaskStatus,
+) {
+    let mut reg = REGISTRY.write();
+    let dep_id = dependent.into();
+    let host_id = depends_on.into();
+    if let Some(existing) = reg.dependent_tasks.iter_mut().find(|t| t.id == dep_id) {
+        if !existing.depends_on.contains(&host_id) {
+            existing.depends_on.push(host_id);
+        }
+        existing.status = status;
+    } else {
+        reg.dependent_tasks.push(DependentTask {
+            id: dep_id,
+            depends_on: vec![host_id],
+            status,
+        });
+    }
+}
+
+pub fn unregister_task_dependency(dependent: &AgentTaskId, depends_on: &AgentTaskId) {
+    let mut reg = REGISTRY.write();
+    if let Some(entry) = reg.dependent_tasks.iter_mut().find(|t| t.id == *dependent) {
+        entry.depends_on.retain(|id| id != depends_on);
+    }
+    reg.dependent_tasks.retain(|t| !t.depends_on.is_empty());
+}
+
+pub fn set_dependent_task_status(dependent: &AgentTaskId, status: AgentTaskStatus) {
+    let mut reg = REGISTRY.write();
+    if let Some(entry) = reg.dependent_tasks.iter_mut().find(|t| t.id == *dependent) {
+        entry.status = status;
+    }
+}
+
+pub fn clear_dependent_tasks() {
+    let mut reg = REGISTRY.write();
+    reg.dependent_tasks.clear();
+}
+
+pub fn task_worktree_retention_reason(task_id: &AgentTaskId) -> Option<String> {
+    let reg = REGISTRY.read();
+    reg.retention_reason(task_id)
 }
 
 pub fn set_task_lsp_suppressed(task_id: &AgentTaskId, suppressed: bool) {
@@ -1145,6 +1307,11 @@ async fn release_stale_task_worktree(
     cx: &mut AsyncApp,
 ) -> Result<()> {
     if !already_marked_cleaning {
+        if let Some(retention_reason) = task_worktree_retention_reason(stale_task_id) {
+            anyhow::bail!(
+                "cannot release worktree for task {stale_task_id} {reason}: worktree is retained ({retention_reason})"
+            );
+        }
         let mut reg = REGISTRY.write();
         if let Some(entry) = reg.entries.get_mut(stale_task_id) {
             if entry.is_cleaning {
@@ -1158,7 +1325,8 @@ async fn release_stale_task_worktree(
         if !stale_path.as_os_str().is_empty() {
             if file_system.is_dir(stale_path).await {
                 let dot_git = stale_path.join(".git");
-                let has_git = file_system.is_file(&dot_git).await || file_system.is_dir(&dot_git).await;
+                let has_git =
+                    file_system.is_file(&dot_git).await || file_system.is_dir(&dot_git).await;
                 if has_git {
                     let salvage_details = commit_task_worktree(
                         file_system.clone(),
@@ -1264,6 +1432,11 @@ async fn acquire_task_worktree_slot(
     loop {
         let (limit, cleanup_enabled) = project.read_with(cx, |project, cx| {
             let settings = agent_settings::AgentSettings::get_for_project(project, cx);
+            if REGISTRY.read().retention_timeout.is_none() {
+                set_task_worktree_retention_timeout(Some(
+                    settings.task_worktree_retention_timeout_seconds,
+                ));
+            }
             (settings.task_worktree_limit, settings.cleanup)
         });
 
@@ -1285,7 +1458,7 @@ async fn acquire_task_worktree_slot(
                 .map(|(id, state)| {
                     snapshotted_ids.insert(id.clone());
                     let active = reg.live_active_sessions_count(id);
-                    let safety = worktree_release_safety_for_state(id, state, active);
+                    let safety = worktree_release_safety_for_state(id, state, active, &reg);
                     (
                         id.clone(),
                         state.worktree_path.clone(),
@@ -1318,6 +1491,7 @@ async fn acquire_task_worktree_slot(
                     WorktreeReleaseSafety::ActiveSession => "active session",
                     WorktreeReleaseSafety::CommitError => "commit error",
                     WorktreeReleaseSafety::MergeConflict => "merge conflict",
+                    WorktreeReleaseSafety::Retained => "retained",
                     WorktreeReleaseSafety::Safe => "other",
                 };
                 (id.clone(), reason)
@@ -1552,6 +1726,7 @@ fn finish_slot_and_register_policy(
         commit_error: None,
         cleanup_error: None,
         is_terminal: false,
+        terminal_at: None,
         goal_branch,
         base_ref,
         base_sha,
@@ -1626,11 +1801,19 @@ pub fn claim_branch_or_error(
             let occupied = entry.checked_out_branch(other_task_id);
             if occupied == branch {
                 let active = reg.live_active_sessions_count(other_task_id);
-                let safety = worktree_release_safety_for_state(other_task_id, entry, active);
+                let safety = worktree_release_safety_for_state(other_task_id, entry, active, &reg);
                 match safety {
                     WorktreeReleaseSafety::ActiveSession => {
                         anyhow::bail!(
                             "branch {branch} is checked out by task {other_task_id}; serialize or use on_branch after it completes"
+                        );
+                    }
+                    WorktreeReleaseSafety::Retained => {
+                        let reason = reg
+                            .retention_reason(other_task_id)
+                            .unwrap_or_else(|| "retained".to_string());
+                        anyhow::bail!(
+                            "cannot release worktree for task {other_task_id} holding branch {branch}: worktree is retained ({reason})"
                         );
                     }
                     WorktreeReleaseSafety::CommitError => {
@@ -1678,7 +1861,7 @@ fn stale_worktree_tasks_for_branch(
         })
         .map(|(other_id, entry)| {
             let active = reg.live_active_sessions_count(other_id);
-            let safety = worktree_release_safety_for_state(other_id, entry, active);
+            let safety = worktree_release_safety_for_state(other_id, entry, active, &reg);
             (
                 other_id.clone(),
                 entry.worktree_path.clone(),
@@ -2022,16 +2205,29 @@ pub fn task_worktree_cleanup_error(task_id: &AgentTaskId) -> Option<String> {
 
 pub fn mark_task_terminal(task_id: &AgentTaskId) {
     let mut reg = REGISTRY.write();
+    let now = std::time::Instant::now();
     if let Some(entry) = reg.entries.get_mut(task_id) {
         entry.is_terminal = true;
+        if entry.terminal_at.is_none() {
+            entry.terminal_at = Some(now);
+        }
     } else {
         reg.entries.insert(
             task_id.clone(),
             TaskWorktreeState {
                 is_terminal: true,
+                terminal_at: Some(now),
                 ..Default::default()
             },
         );
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub fn set_task_terminal_at(task_id: &AgentTaskId, terminal_at: Option<std::time::Instant>) {
+    let mut reg = REGISTRY.write();
+    if let Some(entry) = reg.entries.get_mut(task_id) {
+        entry.terminal_at = terminal_at;
     }
 }
 
@@ -2123,7 +2319,8 @@ pub fn register_subagent_session_guard(
     task_id: &AgentTaskId,
     owner: SubagentSessionOwner,
 ) -> SubagentSessionGuard {
-    let guard_id = SubagentSessionGuardId(NEXT_GUARD_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+    let guard_id =
+        SubagentSessionGuardId(NEXT_GUARD_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
     let mut reg = REGISTRY.write();
     let guards = reg.active_guards.entry(task_id.clone()).or_default();
     guards.insert(guard_id, owner);
@@ -2137,10 +2334,7 @@ pub fn register_subagent_session_guard(
     }
 }
 
-pub fn unregister_subagent_session_guard(
-    task_id: &AgentTaskId,
-    guard_id: SubagentSessionGuardId,
-) {
+pub fn unregister_subagent_session_guard(task_id: &AgentTaskId, guard_id: SubagentSessionGuardId) {
     let mut reg = REGISTRY.write();
     let mut session_ended = false;
     let mut pool_key = None;
@@ -2225,10 +2419,7 @@ pub fn sweep_guards_for_thread(thread_id: &acp::SessionId) {
     }
 }
 
-pub fn sweep_guards_for_tool_use(
-    thread_id: &acp::SessionId,
-    tool_use_id: &LanguageModelToolUseId,
-) {
+pub fn sweep_guards_for_tool_use(thread_id: &acp::SessionId, tool_use_id: &LanguageModelToolUseId) {
     let mut reg = REGISTRY.write();
     let mut ended_pools = Vec::new();
     let mut tasks_to_clean = Vec::new();
@@ -2236,7 +2427,9 @@ pub fn sweep_guards_for_tool_use(
 
     for (task_id, guards) in reg.active_guards.iter_mut() {
         let before_live = guards.values().filter(|o| is_owner_alive(o)).count();
-        guards.retain(|_, owner| !(owner.thread_id == *thread_id && owner.tool_use_id == *tool_use_id));
+        guards.retain(|_, owner| {
+            !(owner.thread_id == *thread_id && owner.tool_use_id == *tool_use_id)
+        });
         let after_live = guards.values().filter(|o| is_owner_alive(o)).count();
 
         if before_live > 0 && after_live == 0 {
@@ -2344,6 +2537,13 @@ fn remove_task_worktree_internal(
     cx: &mut App,
 ) -> Task<Result<()>> {
     let task_id = task_id.clone();
+    if !force {
+        if let Some(reason) = task_worktree_retention_reason(&task_id) {
+            return Task::ready(Err(anyhow::anyhow!(
+                "cannot remove worktree for task {task_id}: worktree is retained ({reason})"
+            )));
+        }
+    }
     cx.spawn(async move |cx| {
         let (repository, anchor_path, path_style, worktree_setting, file_system) = project
             .update(cx, |project, cx| {
@@ -2404,6 +2604,11 @@ pub fn remove_task_worktree(
     task_id: &AgentTaskId,
     cx: &mut App,
 ) -> Task<Result<()>> {
+    if let Some(reason) = task_worktree_retention_reason(task_id) {
+        return Task::ready(Err(anyhow::anyhow!(
+            "cannot remove worktree for task {task_id}: worktree is retained ({reason})"
+        )));
+    }
     clear_task_worktree_commit_error(task_id);
     clear_task_worktree_cleanup_error(task_id);
     clear_task_worktree_merge_conflict(task_id);
@@ -2546,6 +2751,14 @@ pub fn auto_cleanup_task_worktree(
         return Task::ready(Ok(false));
     }
 
+    if REGISTRY.read().retention_timeout.is_none() {
+        let retention_timeout = project.read_with(cx, |project, cx| {
+            agent_settings::AgentSettings::get_for_project(project, cx)
+                .task_worktree_retention_timeout_seconds
+        });
+        set_task_worktree_retention_timeout(Some(retention_timeout));
+    }
+
     if task_worktree_path_for_id(task_id).is_none() {
         return Task::ready(Ok(false));
     }
@@ -2567,6 +2780,11 @@ pub fn auto_cleanup_task_worktree(
         return Task::ready(Ok(false));
     }
 
+    if let Some(reason) = task_worktree_retention_reason(task_id) {
+        log::info!("Safeguard: retaining worktree for {task_id} due to retention reason: {reason}");
+        return Task::ready(Ok(false));
+    }
+
     {
         let mut reg = REGISTRY.write();
         if let Some(entry) = reg.entries.get_mut(task_id) {
@@ -2583,8 +2801,8 @@ pub fn auto_cleanup_task_worktree(
             .update(cx, |project, cx| {
                 anyhow::Ok(task_worktree_context(project, cx))
             })??;
-        let worktree_path = task_worktree_path_for_id(&task_id_clone)
-            .unwrap_or_else(|| PathBuf::new());
+        let worktree_path =
+            task_worktree_path_for_id(&task_id_clone).unwrap_or_else(|| PathBuf::new());
         if let Err(e) = release_stale_task_worktree(
             &project,
             &repository,
@@ -2686,7 +2904,7 @@ pub fn startup_sweep(
                 })
                 .map(|(id, state)| {
                     let active = reg.live_active_sessions_count(id);
-                    let safety = worktree_release_safety_for_state(id, state, active);
+                    let safety = worktree_release_safety_for_state(id, state, active, &reg);
                     (
                         id.clone(),
                         state.worktree_path.clone(),
@@ -3076,7 +3294,9 @@ pub async fn commit_task_worktree(
         let err_str = e.to_string();
         let retry_res = if is_git_lock_contention(&err_str) {
             cx.background_executor().timer(GIT_LOCK_RETRY_DELAY).await;
-            git_repo.stage_paths(paths, Arc::new(HashMap::default())).await
+            git_repo
+                .stage_paths(paths, Arc::new(HashMap::default()))
+                .await
         } else {
             Err(e)
         };
@@ -3697,8 +3917,9 @@ pub fn commit_and_merge_task_worktree(
         });
         if should_publish {
             let project_clone = project.clone();
-            let publish_task = cx
-                .update(|cx| publish_task_ref_artifact_to_tgs(project_clone, &task_id, &details, cx));
+            let publish_task = cx.update(|cx| {
+                publish_task_ref_artifact_to_tgs(project_clone, &task_id, &details, cx)
+            });
             publish_task.await.log_err();
         }
 
@@ -5190,6 +5411,7 @@ mod tests {
             .unwrap();
         assert_eq!(goal_sha, Some(merged_sha));
 
+        set_task_worktree_retention_timeout(Some(Duration::ZERO));
         mark_task_terminal(&task.id);
         assert!(is_task_terminal(&task.id));
         let cleaned = cx
@@ -5270,6 +5492,7 @@ mod tests {
             .unwrap();
         assert!(details_a.merged_into.is_some());
 
+        set_task_worktree_retention_timeout(Some(Duration::ZERO));
         mark_task_terminal(&task_a.id);
         let cleaned_a = cx
             .update(|cx| auto_cleanup_task_worktree(project.clone(), &task_a.id, cx))
@@ -5407,6 +5630,7 @@ mod tests {
             .unwrap();
         assert!(details_a.merged_into.is_some());
 
+        set_task_worktree_retention_timeout(Some(Duration::ZERO));
         mark_task_terminal(&task_a.id);
         let cleaned_a = cx
             .update(|cx| auto_cleanup_task_worktree(project.clone(), &task_a.id, cx))
@@ -5542,6 +5766,7 @@ mod tests {
             .unwrap();
         assert!(details_x.merged_into.is_some());
 
+        set_task_worktree_retention_timeout(Some(Duration::ZERO));
         mark_task_terminal(&task_x.id);
         let cleaned_x = cx
             .update(|cx| auto_cleanup_task_worktree(project.clone(), &task_x.id, cx))
@@ -5702,6 +5927,7 @@ mod tests {
         drop(guard1);
 
         // Task 1 completes and cleans up
+        set_task_worktree_retention_timeout(Some(Duration::ZERO));
         mark_task_terminal(&task1.id);
         let cleaned1 = cx
             .update(|cx| auto_cleanup_task_worktree(project.clone(), &task1.id, cx))
@@ -6940,6 +7166,7 @@ mod tests {
 
         // Now Task 1 drops session guard and cleans up (freeing a slot)
         drop(guard1);
+        set_task_worktree_retention_timeout(Some(Duration::ZERO));
         mark_task_terminal(&task1.id);
         let cleaned1 = cx
             .update(|cx| auto_cleanup_task_worktree(project.clone(), &task1.id, cx))
@@ -6964,6 +7191,7 @@ mod tests {
 
         // Now Task 2 finishes and cleans up
         drop(guard2);
+        set_task_worktree_retention_timeout(Some(Duration::ZERO));
         mark_task_terminal(&task2.id);
         let cleaned2 = cx
             .update(|cx| auto_cleanup_task_worktree(project.clone(), &task2.id, cx))
@@ -7380,6 +7608,7 @@ mod tests {
         assert!(fs.is_dir(&path1).await, "active task1 must not be evicted");
 
         drop(guard1);
+        set_task_worktree_retention_timeout(Some(Duration::ZERO));
         mark_task_terminal(&task1.id);
         let cleaned1 = cx
             .update(|cx| auto_cleanup_task_worktree(project.clone(), &task1.id, cx))
@@ -8273,7 +8502,9 @@ mod tests {
             state
                 .refs
                 .insert("refs/heads/main".into(), "main-sha-fallback-tgs".into());
-            state.refs.insert("HEAD".into(), "main-sha-fallback-tgs".into());
+            state
+                .refs
+                .insert("HEAD".into(), "main-sha-fallback-tgs".into());
             state.branches.insert("main".into());
         })
         .unwrap();
@@ -8367,7 +8598,9 @@ mod tests {
             state
                 .refs
                 .insert("refs/heads/main".into(), "main-sha-fallback-empty".into());
-            state.refs.insert("HEAD".into(), "main-sha-fallback-empty".into());
+            state
+                .refs
+                .insert("HEAD".into(), "main-sha-fallback-empty".into());
             state.branches.insert("main".into());
         })
         .unwrap();
@@ -8488,9 +8721,7 @@ mod tests {
         assert!(!fs.is_file(&worktree_path.join(".zed/settings.json")).await);
         assert!(!fs.is_dir(&worktree_path.join(".zed")).await);
 
-        let git_repo = fs
-            .open_repo(&worktree_path.join(".git"), None)
-            .unwrap();
+        let git_repo = fs.open_repo(&worktree_path.join(".git"), None).unwrap();
         let prefix = RepoPath::from_rel_path(&util::rel_path::RelPath::empty());
         let status = git_repo
             .status(std::slice::from_ref(&prefix))
@@ -8691,7 +8922,10 @@ mod tests {
             "changes must be committed on task branch"
         );
 
-        assert!(!fs.is_file(std::path::Path::new(path!("/root/task_only_file.txt"))).await);
+        assert!(
+            !fs.is_file(std::path::Path::new(path!("/root/task_only_file.txt")))
+                .await
+        );
     }
 
     #[gpui::test]
@@ -8790,7 +9024,10 @@ mod tests {
             .unwrap();
         assert_eq!(goal_branch_ref, Some(merged_into.sha));
 
-        assert!(!fs.is_file(std::path::Path::new(path!("/root/goal_merged_file.txt"))).await);
+        assert!(
+            !fs.is_file(std::path::Path::new(path!("/root/goal_merged_file.txt")))
+                .await
+        );
     }
 
     #[test]
@@ -9764,8 +10001,7 @@ mod tests {
             cx.update_global::<SettingsStore, _>(|store, cx| {
                 store.update_user_settings(cx, |settings| {
                     let agent = settings.agent.get_or_insert_default();
-                    agent.task_lifecycle_mode =
-                        Some(agent_settings::TaskLifecycleMode::Runtime);
+                    agent.task_lifecycle_mode = Some(agent_settings::TaskLifecycleMode::Runtime);
                     agent.cleanup = Some(false);
                 });
             });
@@ -9778,6 +10014,13 @@ mod tests {
         assert!(!cleaned);
         assert!(fs.is_dir(&worktree_path).await);
 
+        cx.update(|cx| {
+            cx.update_global::<SettingsStore, _>(|store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings.agent.get_or_insert_default().cleanup = Some(true);
+                });
+            });
+        });
         cx.update(|cx| {
             cx.update_global::<SettingsStore, _>(|store, cx| {
                 store.update_user_settings(cx, |settings| {
@@ -10159,9 +10402,7 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_slot_wait_timeout_unregisters_holder_and_session_guard(
-        cx: &mut TestAppContext,
-    ) {
+    async fn test_slot_wait_timeout_unregisters_holder_and_session_guard(cx: &mut TestAppContext) {
         init_test(cx);
         let fs = FakeFs::new(cx.executor());
         fs.insert_tree(
@@ -10329,7 +10570,9 @@ mod tests {
             state
                 .refs
                 .insert("refs/heads/main".into(), "main-sha-empty-err".into());
-            state.refs.insert("HEAD".into(), "main-sha-empty-err".into());
+            state
+                .refs
+                .insert("HEAD".into(), "main-sha-empty-err".into());
             state.branches.insert("main".into());
         })
         .unwrap();
@@ -10359,19 +10602,31 @@ mod tests {
 
         record_task_worktree_commit_error(&task.id, "".to_string());
         assert_eq!(task_worktree_commit_error(&task.id), None);
-        assert_eq!(worktree_release_safety(&task.id), WorktreeReleaseSafety::Safe);
+        assert_eq!(
+            worktree_release_safety(&task.id),
+            WorktreeReleaseSafety::Safe
+        );
 
         record_task_worktree_commit_error(&task.id, "   ".to_string());
         assert_eq!(task_worktree_commit_error(&task.id), None);
-        assert_eq!(worktree_release_safety(&task.id), WorktreeReleaseSafety::Safe);
+        assert_eq!(
+            worktree_release_safety(&task.id),
+            WorktreeReleaseSafety::Safe
+        );
 
         record_task_worktree_commit_error(&task.id, "commit failed: ".to_string());
         assert_eq!(task_worktree_commit_error(&task.id), None);
-        assert_eq!(worktree_release_safety(&task.id), WorktreeReleaseSafety::Safe);
+        assert_eq!(
+            worktree_release_safety(&task.id),
+            WorktreeReleaseSafety::Safe
+        );
 
         record_task_worktree_commit_error(&task.id, "staging failed: ".to_string());
         assert_eq!(task_worktree_commit_error(&task.id), None);
-        assert_eq!(worktree_release_safety(&task.id), WorktreeReleaseSafety::Safe);
+        assert_eq!(
+            worktree_release_safety(&task.id),
+            WorktreeReleaseSafety::Safe
+        );
 
         mark_task_terminal(&task.id);
         let cleaned = cx
@@ -10449,9 +10704,7 @@ mod tests {
         .unwrap();
 
         let details_setup = cx
-            .update(|cx| {
-                commit_and_merge_task_worktree(project.clone(), &task_setup.id, false, cx)
-            })
+            .update(|cx| commit_and_merge_task_worktree(project.clone(), &task_setup.id, false, cx))
             .await
             .unwrap();
         assert!(details_setup.merged_into.is_some());
@@ -10539,7 +10792,9 @@ mod tests {
             state
                 .refs
                 .insert("refs/heads/main".into(), "main-sha-fail-spawn".into());
-            state.refs.insert("HEAD".into(), "main-sha-fail-spawn".into());
+            state
+                .refs
+                .insert("HEAD".into(), "main-sha-fail-spawn".into());
             state.branches.insert("main".into());
         })
         .unwrap();
@@ -10582,7 +10837,10 @@ mod tests {
                 )
             })
             .await;
-        assert!(fail_res.is_err(), "mutually exclusive on_branch and base_branch must fail");
+        assert!(
+            fail_res.is_err(),
+            "mutually exclusive on_branch and base_branch must fail"
+        );
         assert!(!has_active_subagent_session(&failing_task.id));
         assert!(!REGISTRY.read().entries.contains_key(&failing_task.id));
 
@@ -10616,7 +10874,12 @@ mod tests {
             .await;
         assert!(fail_branch_res.is_err(), "missing branch must fail");
         assert!(!has_active_subagent_session(&missing_branch_task.id));
-        assert!(!REGISTRY.read().entries.contains_key(&missing_branch_task.id));
+        assert!(
+            !REGISTRY
+                .read()
+                .entries
+                .contains_key(&missing_branch_task.id)
+        );
 
         let succeeding_task = AgentTaskSummary {
             id: AgentTaskId::from("TASK-SUCCEED-AFTER-FAIL"),
@@ -10725,7 +10988,10 @@ mod tests {
 
         // Stale guard means no active session, and safety is Safe
         assert!(!has_active_subagent_session(&task1.id));
-        assert_eq!(worktree_release_safety(&task1.id), WorktreeReleaseSafety::Safe);
+        assert_eq!(
+            worktree_release_safety(&task1.id),
+            WorktreeReleaseSafety::Safe
+        );
 
         // Task 2 ensures worktree: pool limit is 1, Task 1 is evicted via salvage path
         let path2 = cx
@@ -10733,13 +10999,19 @@ mod tests {
             .await
             .expect("task 2 acquires slot by evicting stale task 1");
 
-        assert!(!fs.is_dir(&path1).await, "stale task 1 worktree must be removed");
+        assert!(
+            !fs.is_dir(&path1).await,
+            "stale task 1 worktree must be removed"
+        );
         assert!(fs.is_dir(&path2).await, "task 2 worktree must exist");
 
         // Verify task 1 uncommitted changes were salvaged to branch
         let branch_name = format!("agent-task/{}", task1.id);
         fs.with_git_state(dot_git, true, |state| {
-            assert!(state.branches.contains(&branch_name), "salvaged branch must exist");
+            assert!(
+                state.branches.contains(&branch_name),
+                "salvaged branch must exist"
+            );
         })
         .expect("git state verification");
     }
@@ -10939,7 +11211,9 @@ mod tests {
             state
                 .refs
                 .insert("refs/heads/main".into(), "main-sha-nocleanup".into());
-            state.refs.insert("HEAD".into(), "main-sha-nocleanup".into());
+            state
+                .refs
+                .insert("HEAD".into(), "main-sha-nocleanup".into());
             state.branches.insert("main".into());
         })
         .expect("git state setup");
@@ -11005,7 +11279,10 @@ mod tests {
         .await
         .expect("commit task 1");
         assert!(commit_res.head_sha.is_some());
-        assert_eq!(worktree_release_safety(&task1.id), WorktreeReleaseSafety::Safe);
+        assert_eq!(
+            worktree_release_safety(&task1.id),
+            WorktreeReleaseSafety::Safe
+        );
 
         // Task 2 attempts to acquire a slot: because cleanup is disabled, Task 1 must NOT be evicted!
         let mut ensure_task2 = cx.spawn({
@@ -11023,5 +11300,330 @@ mod tests {
             "task 2 must block because cleanup is disabled and eviction is skipped"
         );
         assert!(fs.is_dir(&path1).await, "task 1 must remain intact");
+    }
+
+    #[gpui::test]
+    async fn test_dependent_task_retains_worktree(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/root"),
+            json!({
+                ".git": {
+                    "HEAD": "ref: refs/heads/main\n"
+                }
+            }),
+        )
+        .await;
+
+        let dot_git = std::path::Path::new(path!("/root/.git"));
+        fs.with_git_state(dot_git, true, |state| {
+            state
+                .refs
+                .insert("refs/heads/main".into(), "main-sha-dep".into());
+            state.refs.insert("HEAD".into(), "main-sha-dep".into());
+            state.branches.insert("main".into());
+        })
+        .unwrap();
+
+        let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
+
+        let host_task = AgentTaskSummary {
+            id: AgentTaskId::from("TASK-HOST-1"),
+            parent_id: None,
+            goal_id: None,
+            title: "Host Task".to_string(),
+            status: AgentTaskStatus::Running,
+            attempt: 1,
+            assignee: None,
+            write_scopes: vec![],
+            created_at: None,
+            assigned_profile: None,
+            model: None,
+            session_id: None,
+            metrics: None,
+        };
+
+        let path = cx
+            .update(|cx| ensure_task_worktree(project.clone(), &host_task, cx))
+            .await
+            .unwrap();
+        assert!(fs.is_dir(&path).await);
+
+        register_task_dependency("TASK-DEP-1", "TASK-HOST-1", AgentTaskStatus::Ready);
+        mark_task_terminal(&host_task.id);
+        set_task_worktree_retention_timeout(Some(Duration::ZERO));
+        assert_eq!(task_worktree_retention_reason(&host_task.id), None);
+
+        let provider = Arc::new(MockTgsProvider {
+            task_title: None,
+            should_fail: false,
+        });
+        register_task_provider(provider);
+
+        assert_eq!(
+            task_worktree_retention_reason(&host_task.id),
+            Some("dependent:TASK-DEP-1".to_string())
+        );
+        assert_eq!(
+            worktree_release_safety(&host_task.id),
+            WorktreeReleaseSafety::Retained
+        );
+
+        let cleaned = cx
+            .update(|cx| auto_cleanup_task_worktree(project.clone(), &host_task.id, cx))
+            .await
+            .unwrap();
+        assert!(!cleaned);
+        assert!(fs.is_dir(&path).await);
+
+        set_dependent_task_status(&AgentTaskId::from("TASK-DEP-1"), AgentTaskStatus::Completed);
+        assert_eq!(task_worktree_retention_reason(&host_task.id), None);
+        assert_eq!(
+            worktree_release_safety(&host_task.id),
+            WorktreeReleaseSafety::Safe
+        );
+
+        let cleaned = cx
+            .update(|cx| auto_cleanup_task_worktree(project.clone(), &host_task.id, cx))
+            .await
+            .unwrap();
+        assert!(cleaned);
+        assert!(!fs.is_dir(&path).await);
+    }
+
+    #[gpui::test]
+    async fn test_timeout_expiry_allows_cleanup(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/root"),
+            json!({
+                ".git": {
+                    "HEAD": "ref: refs/heads/main\n"
+                }
+            }),
+        )
+        .await;
+
+        let dot_git = std::path::Path::new(path!("/root/.git"));
+        fs.with_git_state(dot_git, true, |state| {
+            state
+                .refs
+                .insert("refs/heads/main".into(), "main-sha-time".into());
+            state.refs.insert("HEAD".into(), "main-sha-time".into());
+            state.branches.insert("main".into());
+        })
+        .unwrap();
+
+        let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
+
+        let task = AgentTaskSummary {
+            id: AgentTaskId::from("TASK-TIME-1"),
+            parent_id: None,
+            goal_id: None,
+            title: "Timing Task".to_string(),
+            status: AgentTaskStatus::Running,
+            attempt: 1,
+            assignee: None,
+            write_scopes: vec![],
+            created_at: None,
+            assigned_profile: None,
+            model: None,
+            session_id: None,
+            metrics: None,
+        };
+
+        let path = cx
+            .update(|cx| ensure_task_worktree(project.clone(), &task, cx))
+            .await
+            .unwrap();
+        assert!(fs.is_dir(&path).await);
+
+        set_task_worktree_retention_timeout(Some(Duration::from_secs(1800)));
+        mark_task_terminal(&task.id);
+
+        assert_eq!(
+            task_worktree_retention_reason(&task.id),
+            Some("retention-window".to_string())
+        );
+        assert_eq!(
+            worktree_release_safety(&task.id),
+            WorktreeReleaseSafety::Retained
+        );
+
+        let cleaned = cx
+            .update(|cx| auto_cleanup_task_worktree(project.clone(), &task.id, cx))
+            .await
+            .unwrap();
+        assert!(!cleaned);
+        assert!(fs.is_dir(&path).await);
+
+        set_task_terminal_at(
+            &task.id,
+            Some(std::time::Instant::now() - Duration::from_secs(1801)),
+        );
+        assert_eq!(task_worktree_retention_reason(&task.id), None);
+        assert_eq!(
+            worktree_release_safety(&task.id),
+            WorktreeReleaseSafety::Safe
+        );
+
+        let cleaned = cx
+            .update(|cx| auto_cleanup_task_worktree(project.clone(), &task.id, cx))
+            .await
+            .unwrap();
+        assert!(cleaned);
+        assert!(!fs.is_dir(&path).await);
+    }
+
+    #[gpui::test]
+    async fn test_active_holder_blocks_eviction_and_cleanup(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/root"),
+            json!({
+                ".git": {
+                    "HEAD": "ref: refs/heads/main\n"
+                }
+            }),
+        )
+        .await;
+
+        let dot_git = std::path::Path::new(path!("/root/.git"));
+        fs.with_git_state(dot_git, true, |state| {
+            state
+                .refs
+                .insert("refs/heads/main".into(), "main-sha-holder".into());
+            state.refs.insert("HEAD".into(), "main-sha-holder".into());
+            state.branches.insert("main".into());
+        })
+        .unwrap();
+
+        let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
+
+        let host_id = AgentTaskId::from("TASK-HOST-HOLDER");
+        let host_task = AgentTaskSummary {
+            id: host_id.clone(),
+            parent_id: None,
+            goal_id: None,
+            title: "Host Holder Task".to_string(),
+            status: AgentTaskStatus::Completed,
+            attempt: 1,
+            assignee: None,
+            write_scopes: vec![],
+            created_at: None,
+            assigned_profile: None,
+            model: None,
+            session_id: None,
+            metrics: None,
+        };
+
+        let path = cx
+            .update(|cx| ensure_task_worktree(project.clone(), &host_task, cx))
+            .await
+            .unwrap();
+        assert!(fs.is_dir(&path).await);
+
+        set_task_worktree_retention_timeout(Some(Duration::ZERO));
+        mark_task_terminal(&host_id);
+
+        register_worktree_holder(&host_id, "session-guest-99");
+        assert_eq!(
+            worktree_holders(&host_id),
+            vec!["session-guest-99".to_string()]
+        );
+        assert_eq!(
+            task_worktree_retention_reason(&host_id),
+            Some("holder:session-guest-99".to_string())
+        );
+        assert_eq!(
+            worktree_release_safety(&host_id),
+            WorktreeReleaseSafety::Retained
+        );
+
+        let cleaned = cx
+            .update(|cx| auto_cleanup_task_worktree(project.clone(), &host_id, cx))
+            .await
+            .unwrap();
+        assert!(!cleaned);
+        assert!(fs.is_dir(&path).await);
+
+        let remove_res = cx
+            .update(|cx| remove_task_worktree(project.clone(), &host_id, cx))
+            .await;
+        assert!(remove_res.is_err());
+        assert!(
+            remove_res
+                .unwrap_err()
+                .to_string()
+                .contains("worktree is retained (holder:session-guest-99)")
+        );
+
+        unregister_worktree_holder(&host_id, "session-guest-99");
+        assert!(worktree_holders(&host_id).is_empty());
+        assert_eq!(task_worktree_retention_reason(&host_id), None);
+        assert_eq!(
+            worktree_release_safety(&host_id),
+            WorktreeReleaseSafety::Safe
+        );
+
+        let cleaned = cx
+            .update(|cx| auto_cleanup_task_worktree(project.clone(), &host_id, cx))
+            .await
+            .unwrap();
+        assert!(cleaned);
+        assert!(!fs.is_dir(&path).await);
+    }
+
+    #[gpui::test]
+    async fn test_retention_reason_exposed_and_prioritized(cx: &mut TestAppContext) {
+        init_test(cx);
+        let task_id = AgentTaskId::from("TASK-REASONS");
+
+        assert_eq!(task_worktree_retention_reason(&task_id), None);
+
+        set_task_worktree_retention_timeout(Some(Duration::from_secs(1800)));
+        mark_task_terminal(&task_id);
+        assert_eq!(
+            task_worktree_retention_reason(&task_id),
+            Some("retention-window".to_string())
+        );
+
+        let provider = Arc::new(MockTgsProvider {
+            task_title: None,
+            should_fail: false,
+        });
+        register_task_provider(provider);
+        register_task_dependency("TASK-DEPENDENT-A", "TASK-REASONS", AgentTaskStatus::Ready);
+        assert_eq!(
+            task_worktree_retention_reason(&task_id),
+            Some("dependent:TASK-DEPENDENT-A".to_string())
+        );
+
+        register_worktree_holder(&task_id, "session-alpha");
+        assert_eq!(
+            task_worktree_retention_reason(&task_id),
+            Some("holder:session-alpha".to_string())
+        );
+
+        unregister_worktree_holder(&task_id, "session-alpha");
+        assert_eq!(
+            task_worktree_retention_reason(&task_id),
+            Some("dependent:TASK-DEPENDENT-A".to_string())
+        );
+
+        clear_dependent_tasks();
+        assert_eq!(
+            task_worktree_retention_reason(&task_id),
+            Some("retention-window".to_string())
+        );
+
+        set_task_terminal_at(
+            &task_id,
+            Some(std::time::Instant::now() - Duration::from_secs(1801)),
+        );
+        assert_eq!(task_worktree_retention_reason(&task_id), None);
     }
 }

@@ -57,6 +57,8 @@ pub struct TaskGitState {
     pub branch: Option<String>,
     pub branch_exists: bool,
     pub diff: Option<DiffShortStat>,
+    #[serde(default)]
+    pub retention_reason: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -464,6 +466,8 @@ pub fn snapshot_with_cache(
                 (None, false)
             };
 
+            let retention_reason = crate::task_worktree::task_worktree_retention_reason(&task.id);
+
             tasks_map.insert(
                 task.id.clone(),
                 TaskGitState {
@@ -472,6 +476,7 @@ pub fn snapshot_with_cache(
                     branch,
                     branch_exists,
                     diff: None,
+                    retention_reason,
                 },
             );
         }
@@ -511,6 +516,14 @@ impl TaskWorktreeStatus {
 
     pub fn diff_cache(&self) -> &DiffCache {
         &self.diff_cache
+    }
+
+    pub fn retention_reason(&self, task_id: &AgentTaskId) -> Option<String> {
+        self.snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.tasks.get(task_id))
+            .and_then(|state| state.retention_reason.clone())
+            .or_else(|| crate::task_worktree::task_worktree_retention_reason(task_id))
     }
 
     pub fn snapshot(&self) -> Option<&TaskGitSnapshot> {
@@ -1537,6 +1550,73 @@ mod tests {
         assert!(
             get_cached_repo(&key_2).is_some(),
             "new repository handle must be cached under new dot_git key"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_task_worktree_status_surfaces_retention_reason(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/root"),
+            json!({
+                ".git": {
+                    "HEAD": "ref: refs/heads/main\n"
+                }
+            }),
+        )
+        .await;
+
+        let dot_git = std::path::Path::new(path!("/root/.git"));
+        fs.with_git_state(dot_git, true, |state| {
+            state
+                .refs
+                .insert("refs/heads/main".into(), "main-sha-status".into());
+            state.refs.insert("HEAD".into(), "main-sha-status".into());
+            state.branches.insert("main".into());
+        })
+        .unwrap();
+
+        let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
+        let host_id = AgentTaskId::from("TASK-STATUS-RET");
+
+        crate::task_worktree::register_worktree_holder(&host_id, "session-viewer-1");
+
+        let tasks = vec![AgentTaskSummary {
+            id: host_id.clone(),
+            parent_id: None,
+            goal_id: None,
+            title: "Status Task".to_string(),
+            status: AgentTaskStatus::Running,
+            attempt: 1,
+            assignee: None,
+            write_scopes: vec![],
+            created_at: None,
+            assigned_profile: None,
+            model: None,
+            session_id: None,
+            metrics: None,
+        }];
+
+        let snapshot = cx
+            .update(|cx| snapshot(&project, &tasks, &[], cx))
+            .await
+            .unwrap();
+
+        let task_state = snapshot.tasks.get(&host_id).unwrap();
+        assert_eq!(
+            task_state.retention_reason,
+            Some("holder:session-viewer-1".to_string())
+        );
+
+        let status_entity =
+            cx.update(|cx| cx.new(|cx| TaskWorktreeStatus::new(project.clone(), cx)));
+        let refresh_task = status_entity.update(cx, |s, cx| s.refresh(tasks, vec![], cx));
+        refresh_task.await.unwrap();
+
+        assert_eq!(
+            status_entity.read_with(cx, |s, _| s.retention_reason(&host_id)),
+            Some("holder:session-viewer-1".to_string())
         );
     }
 }

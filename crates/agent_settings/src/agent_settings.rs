@@ -25,8 +25,8 @@ use settings::{
     NestedSubAgentsSettingsContent, NotifyWhenAgentWaiting, PlaySoundWhenAgentDone,
     RegisterSetting, Settings, SettingsContent, SettingsLocation, SettingsStore,
     SidebarDockPosition, SidebarSide, SpawnStepTimeoutSettingsContent,
-    TerminalWatchdogSettingsContent, ThinkingBlockDisplay,
-    ToolPermissionMode, WorktreeId, update_settings_file, update_settings_file_with_completion,
+    TerminalWatchdogSettingsContent, ThinkingBlockDisplay, ToolPermissionMode, WorktreeId,
+    update_settings_file, update_settings_file_with_completion,
 };
 use util::ResultExt as _;
 
@@ -419,6 +419,29 @@ impl SpawnStepTimeoutSettings {
     }
 }
 
+pub const DEFAULT_TASK_WORKTREE_RETENTION_TIMEOUT_SECONDS: u64 = 1800;
+pub const MIN_TASK_WORKTREE_RETENTION_TIMEOUT_SECONDS: u64 = 60;
+
+/// Clamps a configured task worktree retention timeout in seconds to a `Duration`.
+///
+/// A value of 0 disables the retention window (returns `Duration::ZERO`).
+/// Values between 1 and 59 seconds are below the minimum of 60 seconds and will be clamped to 60 seconds with a warning.
+/// Values 60 seconds and above are preserved.
+/// `None` defaults to `DEFAULT_TASK_WORKTREE_RETENTION_TIMEOUT_SECONDS` (1800 seconds).
+pub fn clamp_task_worktree_retention_timeout_seconds(value: Option<u64>) -> Duration {
+    match value {
+        Some(0) => Duration::ZERO,
+        Some(val) if val < MIN_TASK_WORKTREE_RETENTION_TIMEOUT_SECONDS => {
+            log::warn!(
+                "agent.task_worktree_retention_timeout_seconds of {val}s is below minimum {MIN_TASK_WORKTREE_RETENTION_TIMEOUT_SECONDS}s; clamping to {MIN_TASK_WORKTREE_RETENTION_TIMEOUT_SECONDS}s"
+            );
+            Duration::from_secs(MIN_TASK_WORKTREE_RETENTION_TIMEOUT_SECONDS)
+        }
+        Some(val) => Duration::from_secs(val),
+        None => Duration::from_secs(DEFAULT_TASK_WORKTREE_RETENTION_TIMEOUT_SECONDS),
+    }
+}
+
 pub const DEFAULT_TERMINAL_WATCHDOG_ENABLED: bool = true;
 pub const DEFAULT_TERMINAL_WATCHDOG_IDLE_TIMEOUT_MS: u64 = 300_000;
 pub const DEFAULT_TERMINAL_WATCHDOG_IDLE_CPU_THRESHOLD_PERCENT: f32 = 5.0;
@@ -581,6 +604,13 @@ pub struct AgentSettings {
     ///
     /// Default: true
     pub publish_ref_artifact: bool,
+    /// Timeout window in seconds after host task completion before task worktree can be cleaned up or evicted.
+    ///
+    /// A value of 0 disables the retention window (returns Duration::ZERO).
+    /// Values between 1 and 59 seconds are below the minimum of 60 seconds and will be clamped to 60 seconds.
+    ///
+    /// Default: 1800 (30 minutes)
+    pub task_worktree_retention_timeout_seconds: Duration,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1431,12 +1461,13 @@ impl Settings for AgentSettings {
                 .commit_on_session_end
                 .unwrap_or(DEFAULT_COMMIT_ON_SESSION_END),
             cleanup: agent.cleanup.unwrap_or(DEFAULT_CLEANUP),
-            register_metadata: agent
-                .register_metadata
-                .unwrap_or(DEFAULT_REGISTER_METADATA),
+            register_metadata: agent.register_metadata.unwrap_or(DEFAULT_REGISTER_METADATA),
             publish_ref_artifact: agent
                 .publish_ref_artifact
                 .unwrap_or(DEFAULT_PUBLISH_REF_ARTIFACT),
+            task_worktree_retention_timeout_seconds: Duration::from_secs(
+                DEFAULT_TASK_WORKTREE_RETENTION_TIMEOUT_SECONDS,
+            ),
         }
     }
 }
@@ -1659,10 +1690,7 @@ mod tests {
             Duration::from_secs(60)
         );
 
-        assert_eq!(
-            clamp_timeout_seconds("test", Some(0), 60),
-            Duration::ZERO
-        );
+        assert_eq!(clamp_timeout_seconds("test", Some(0), 60), Duration::ZERO);
 
         for val in 1..=4 {
             assert_eq!(
@@ -1903,6 +1931,36 @@ mod tests {
         let mechanic = AgentProfileSettings::from(mechanic_content.clone());
         assert_eq!(mechanic.task_isolation, TaskIsolation::Required);
         assert_eq!(mechanic.task_worktree_language_servers, Some(false));
+    }
+
+    #[test]
+    fn test_clamp_task_worktree_retention_timeout_seconds() {
+        assert_eq!(
+            clamp_task_worktree_retention_timeout_seconds(None),
+            Duration::from_secs(DEFAULT_TASK_WORKTREE_RETENTION_TIMEOUT_SECONDS)
+        );
+        assert_eq!(
+            clamp_task_worktree_retention_timeout_seconds(Some(0)),
+            Duration::ZERO
+        );
+        for val in 1..=59 {
+            assert_eq!(
+                clamp_task_worktree_retention_timeout_seconds(Some(val)),
+                Duration::from_secs(MIN_TASK_WORKTREE_RETENTION_TIMEOUT_SECONDS)
+            );
+        }
+        assert_eq!(
+            clamp_task_worktree_retention_timeout_seconds(Some(60)),
+            Duration::from_secs(60)
+        );
+        assert_eq!(
+            clamp_task_worktree_retention_timeout_seconds(Some(120)),
+            Duration::from_secs(120)
+        );
+        assert_eq!(
+            clamp_task_worktree_retention_timeout_seconds(Some(3600)),
+            Duration::from_secs(3600)
+        );
     }
 
     #[test]
@@ -3742,7 +3800,10 @@ mod tests {
 
         let runtime: settings::AgentSettingsContent =
             serde_json::from_str(r#"{"task_lifecycle_mode": "runtime"}"#).unwrap();
-        assert_eq!(runtime.task_lifecycle_mode, Some(TaskLifecycleMode::Runtime));
+        assert_eq!(
+            runtime.task_lifecycle_mode,
+            Some(TaskLifecycleMode::Runtime)
+        );
 
         let agent: settings::AgentSettingsContent =
             serde_json::from_str(r#"{"task_lifecycle_mode": "agent"}"#).unwrap();
