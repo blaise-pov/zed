@@ -174,7 +174,7 @@ pub(crate) fn find_repository_for_worktree_path(
         .cloned()
 }
 
-actions!(agent_tasks, [ToggleAgentTaskPanel]);
+actions!(agent, [ToggleAgentTaskPanel]);
 
 pub const AGENT_TASK_PANEL_KEY: &str = "AgentTaskPanel";
 
@@ -1094,10 +1094,11 @@ impl AgentTaskPanel {
                                 cx.spawn(async move |cx| match cleanup_task.await {
                                     Ok(result) => {
                                         log::info!(
-                                            "Cleaned up goal {}: {} branches deleted, {} failed",
+                                            "Cleaned up goal {}: {} branches deleted, {} failed, {} skipped",
                                             result.goal_id,
                                             result.deleted_branches.len(),
-                                            result.failed_branches.len()
+                                            result.failed_branches.len(),
+                                            result.skipped_branches.len()
                                         );
                                         if let Some(panel) = view.upgrade() {
                                             panel.update(cx, |this, cx| {
@@ -1785,7 +1786,7 @@ impl AgentTaskPanel {
     }
 
     fn deploy_task_diff(
-        goal_id: String,
+        _goal_id: String,
         worktree_path: std::path::PathBuf,
         project: Entity<Project>,
         workspace: WeakEntity<Workspace>,
@@ -1793,14 +1794,28 @@ impl AgentTaskPanel {
         window: &mut Window,
         cx: &mut App,
     ) {
-        let base_ref: SharedString = format!("agent-goal/{goal_id}").into();
-
-        if let Some(task_repo) = find_repository_for_worktree_path(&project, &worktree_path, cx) {
+        if let Some(_task_repo) = find_repository_for_worktree_path(&project, &worktree_path, cx) {
+            let worktree_id = project.read(cx).worktrees(cx).find_map(|worktree| {
+                if paths_match(worktree.read(cx).abs_path().as_ref(), &worktree_path) {
+                    Some(worktree.read(cx).id())
+                } else {
+                    None
+                }
+            });
+            if let Some(worktree_id) = worktree_id {
+                let git_store = project.read(cx).git_store().clone();
+                git_store.update(cx, |git_store, cx| {
+                    git_store.set_active_repo_for_worktree(worktree_id, cx);
+                });
+            }
             if let Some(workspace) = workspace.upgrade() {
-                workspace.update(cx, |workspace, cx| {
-                    git_ui::branch_diff::BranchDiff::deploy_branch_diff_with_base_ref(
-                        workspace, project, task_repo, base_ref, None, window, cx,
-                    );
+                workspace.update(cx, |_workspace, cx| {
+                    match cx.build_action("git::DiffBranch", None) {
+                        Ok(action) => window.dispatch_action(action, cx),
+                        Err(error) => {
+                            log::error!("failed to resolve git::DiffBranch action: {error:?}");
+                        }
+                    }
                 });
             }
             return;
@@ -1871,7 +1886,7 @@ impl AgentTaskPanel {
                     })
                     .log_err()
                     .flatten();
-                let Some(task_repo) = task_repo else {
+                let Some(_task_repo) = task_repo else {
                     log::warn!(
                         "could not resolve repository for worktree at {}",
                         worktree_path.display()
@@ -1889,11 +1904,24 @@ impl AgentTaskPanel {
                     .log_err();
                     return;
                 };
+                let worktree_id = cx.update(|_window, cx| worktree.read(cx).id()).log_err();
+                if let Some(worktree_id) = worktree_id {
+                    cx.update(|_window, cx| {
+                        let git_store = project.read(cx).git_store().clone();
+                        git_store.update(cx, |git_store, cx| {
+                            git_store.set_active_repo_for_worktree(worktree_id, cx);
+                        });
+                    })
+                    .log_err();
+                }
                 if let Some(workspace) = workspace.upgrade() {
-                    if let Err(err) = workspace.update_in(cx, |workspace, window, cx| {
-                        git_ui::branch_diff::BranchDiff::deploy_branch_diff_with_base_ref(
-                            workspace, project, task_repo, base_ref, None, window, cx,
-                        );
+                    if let Err(err) = workspace.update_in(cx, |_workspace, window, cx| {
+                        match cx.build_action("git::DiffBranch", None) {
+                            Ok(action) => window.dispatch_action(action, cx),
+                            Err(error) => {
+                                log::error!("failed to resolve git::DiffBranch action: {error:?}");
+                            }
+                        }
                     }) {
                         log::warn!("failed to deploy branch diff in workspace: {err:?}");
                         let humanized = Self::humanize_error(&err);
@@ -1920,16 +1948,18 @@ impl AgentTaskPanel {
         window: &mut Window,
         cx: &mut App,
     ) {
-        let base_ref: SharedString = branch.clone().into();
         let repo = project
             .read(cx)
             .active_repository(cx)
             .or_else(|| project.read(cx).repositories(cx).values().next().cloned());
-        if let (Some(repo), Some(workspace)) = (repo, workspace.upgrade()) {
-            workspace.update(cx, |workspace, cx| {
-                git_ui::branch_diff::BranchDiff::deploy_branch_diff_with_base_ref(
-                    workspace, project, repo, base_ref, None, window, cx,
-                );
+        if let (Some(_repo), Some(workspace)) = (repo, workspace.upgrade()) {
+            workspace.update(cx, |_workspace, cx| {
+                match cx.build_action("git::DiffBranch", None) {
+                    Ok(action) => window.dispatch_action(action, cx),
+                    Err(error) => {
+                        log::error!("failed to resolve git::DiffBranch action: {error:?}");
+                    }
+                }
             });
         } else {
             Self::show_error_toast(
@@ -2158,14 +2188,24 @@ impl AgentTaskPanel {
                 .as_ref()
                 .filter(|res| res.goal_id == goal_id)
                 .map(|res| {
-                    let text = if res.failed_branches.is_empty() {
-                        format!("Cleaned ({} deleted)", res.deleted_branches.len())
-                    } else {
-                        format!(
+                    let text = match (res.failed_branches.is_empty(), res.skipped_branches.is_empty()) {
+                        (true, true) => format!("Cleaned ({} deleted)", res.deleted_branches.len()),
+                        (true, false) => format!(
+                            "Cleaned ({} deleted, {} skipped)",
+                            res.deleted_branches.len(),
+                            res.skipped_branches.len()
+                        ),
+                        (false, true) => format!(
                             "Cleaned ({} deleted, {} failed)",
                             res.deleted_branches.len(),
                             res.failed_branches.len()
-                        )
+                        ),
+                        (false, false) => format!(
+                            "Cleaned ({} deleted, {} failed, {} skipped)",
+                            res.deleted_branches.len(),
+                            res.failed_branches.len(),
+                            res.skipped_branches.len()
+                        ),
                     };
                     let color = if res.failed_branches.is_empty() {
                         Color::Success

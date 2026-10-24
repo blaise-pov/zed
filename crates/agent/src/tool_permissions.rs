@@ -750,6 +750,13 @@ mod tests {
             },
             thinking_display: Default::default(),
             task_worktree_limit: agent_settings::DEFAULT_TASK_WORKTREE_LIMIT,
+            spawn_step_timeout_seconds: Default::default(),
+            send_watchdog_seconds: std::time::Duration::from_secs(
+                agent_settings::DEFAULT_SEND_WATCHDOG_SECONDS,
+            ),
+            turn_watchdog_seconds: std::time::Duration::from_secs(
+                agent_settings::DEFAULT_TURN_WATCHDOG_SECONDS,
+            ),
             task_worktree_language_servers: agent_settings::DEFAULT_TASK_WORKTREE_LANGUAGE_SERVERS,
             fetch_max_bytes: agent_settings::DEFAULT_FETCH_MAX_BYTES,
             task_lifecycle_mode: agent_settings::DEFAULT_TASK_LIFECYCLE_MODE,
@@ -757,6 +764,11 @@ mod tests {
             cleanup: agent_settings::DEFAULT_CLEANUP,
             register_metadata: agent_settings::DEFAULT_REGISTER_METADATA,
             publish_ref_artifact: agent_settings::DEFAULT_PUBLISH_REF_ARTIFACT,
+            delete_goal_branches_on_graduation:
+                agent_settings::DEFAULT_DELETE_GOAL_BRANCHES_ON_GRADUATION,
+            delete_task_branches_on_graduation:
+                agent_settings::DEFAULT_DELETE_TASK_BRANCHES_ON_GRADUATION,
+            goal_graduation_base_branch: None,
         }
     }
 

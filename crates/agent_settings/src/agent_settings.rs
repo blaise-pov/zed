@@ -9,6 +9,7 @@ use std::cmp::Ordering::{Equal, Greater, Less};
 use std::fmt;
 use std::path::{Component, Path};
 use std::sync::{Arc, LazyLock};
+use std::time::Duration;
 
 use anyhow::Context as _;
 use collections::{HashSet, IndexMap};
@@ -23,7 +24,8 @@ use settings::{
     DockPosition, DockSide, IntoGpui, LanguageModelParameters, LanguageModelSelection,
     NestedSubAgentsSettingsContent, NotifyWhenAgentWaiting, PlaySoundWhenAgentDone,
     RegisterSetting, Settings, SettingsContent, SettingsLocation, SettingsStore,
-    SidebarDockPosition, SidebarSide, TerminalWatchdogSettingsContent, ThinkingBlockDisplay,
+    SidebarDockPosition, SidebarSide, SpawnStepTimeoutSettingsContent,
+    TerminalWatchdogSettingsContent, ThinkingBlockDisplay,
     ToolPermissionMode, WorktreeId, update_settings_file, update_settings_file_with_completion,
 };
 use util::ResultExt as _;
@@ -321,6 +323,12 @@ pub const DEFAULT_REGISTER_METADATA: bool = true;
 /// Default setting for whether to publish task ref artifacts upon merge.
 pub const DEFAULT_PUBLISH_REF_ARTIFACT: bool = true;
 
+/// Default setting for whether to delete goal branches on goal graduation.
+pub const DEFAULT_DELETE_GOAL_BRANCHES_ON_GRADUATION: bool = true;
+
+/// Default setting for whether to delete task branches on goal graduation.
+pub const DEFAULT_DELETE_TASK_BRANCHES_ON_GRADUATION: bool = true;
+
 /// Clamps a configured `task_worktree_limit`.
 ///
 /// A value of 0 is invalid and will be clamped to the minimum of 1.
@@ -334,6 +342,86 @@ pub fn clamp_task_worktree_limit(limit: Option<usize>) -> usize {
         }
         Some(limit) => limit.max(MIN_TASK_WORKTREE_LIMIT),
         None => DEFAULT_TASK_WORKTREE_LIMIT,
+    }
+}
+
+pub const MIN_TIMEOUT_SECONDS: u64 = 5;
+pub const DEFAULT_TASK_GRAPH_TIMEOUT_SECONDS: u64 = 120;
+pub const DEFAULT_COMMIT_TIMEOUT_SECONDS: u64 = 300;
+pub const DEFAULT_CLEANUP_TIMEOUT_SECONDS: u64 = 60;
+pub const DEFAULT_DIFF_TIMEOUT_SECONDS: u64 = 30;
+pub const DEFAULT_SEND_WATCHDOG_SECONDS: u64 = 30;
+pub const DEFAULT_TURN_WATCHDOG_SECONDS: u64 = 120;
+
+pub const DEFAULT_SPAWN_STEP_TASK_GRAPH_TIMEOUT_SECONDS: u64 = DEFAULT_TASK_GRAPH_TIMEOUT_SECONDS;
+pub const DEFAULT_SPAWN_STEP_COMMIT_TIMEOUT_SECONDS: u64 = DEFAULT_COMMIT_TIMEOUT_SECONDS;
+pub const DEFAULT_SPAWN_STEP_CLEANUP_TIMEOUT_SECONDS: u64 = DEFAULT_CLEANUP_TIMEOUT_SECONDS;
+pub const DEFAULT_SPAWN_STEP_DIFF_TIMEOUT_SECONDS: u64 = DEFAULT_DIFF_TIMEOUT_SECONDS;
+
+/// Clamps a configured timeout setting in seconds to a `Duration`.
+///
+/// A value of 0 disables the timeout (returns `Duration::ZERO`) without warning.
+/// Values between 1 and 4 seconds are below `MIN_TIMEOUT_SECONDS` (5) and will be clamped to 5 seconds with a warning.
+/// Values 5 seconds and above are preserved.
+/// `None` falls back to the provided `default` seconds.
+pub fn clamp_timeout_seconds(setting_name: &str, value: Option<u64>, default: u64) -> Duration {
+    match value {
+        Some(0) => Duration::ZERO,
+        Some(val @ 1..=4) => {
+            log::warn!(
+                "agent.{setting_name} of {val}s is below minimum {MIN_TIMEOUT_SECONDS}s; clamping to {MIN_TIMEOUT_SECONDS}s"
+            );
+            Duration::from_secs(MIN_TIMEOUT_SECONDS)
+        }
+        Some(val) => Duration::from_secs(val),
+        None => Duration::from_secs(default),
+    }
+}
+
+/// Settings for timeouts of spawn sub-steps.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SpawnStepTimeoutSettings {
+    pub task_graph: Duration,
+    pub commit: Duration,
+    pub cleanup: Duration,
+    pub diff: Duration,
+}
+
+impl Default for SpawnStepTimeoutSettings {
+    fn default() -> Self {
+        Self {
+            task_graph: Duration::from_secs(DEFAULT_TASK_GRAPH_TIMEOUT_SECONDS),
+            commit: Duration::from_secs(DEFAULT_COMMIT_TIMEOUT_SECONDS),
+            cleanup: Duration::from_secs(DEFAULT_CLEANUP_TIMEOUT_SECONDS),
+            diff: Duration::from_secs(DEFAULT_DIFF_TIMEOUT_SECONDS),
+        }
+    }
+}
+
+impl SpawnStepTimeoutSettings {
+    pub fn from_content(content: Option<&SpawnStepTimeoutSettingsContent>) -> Self {
+        Self {
+            task_graph: clamp_timeout_seconds(
+                "spawn_step_timeout_seconds.task_graph",
+                content.and_then(|c| c.task_graph),
+                DEFAULT_TASK_GRAPH_TIMEOUT_SECONDS,
+            ),
+            commit: clamp_timeout_seconds(
+                "spawn_step_timeout_seconds.commit",
+                content.and_then(|c| c.commit),
+                DEFAULT_COMMIT_TIMEOUT_SECONDS,
+            ),
+            cleanup: clamp_timeout_seconds(
+                "spawn_step_timeout_seconds.cleanup",
+                content.and_then(|c| c.cleanup),
+                DEFAULT_CLEANUP_TIMEOUT_SECONDS,
+            ),
+            diff: clamp_timeout_seconds(
+                "spawn_step_timeout_seconds.diff",
+                content.and_then(|c| c.diff),
+                DEFAULT_DIFF_TIMEOUT_SECONDS,
+            ),
+        }
     }
 }
 
@@ -463,6 +551,12 @@ pub struct AgentSettings {
     ///
     /// Default: 3
     pub task_worktree_limit: usize,
+    /// Timeouts for spawn sub-steps.
+    pub spawn_step_timeout_seconds: SpawnStepTimeoutSettings,
+    /// Timeout for sending messages to a subagent before watchdog triggers.
+    pub send_watchdog_seconds: Duration,
+    /// Timeout for a turn before watchdog triggers.
+    pub turn_watchdog_seconds: Duration,
     /// Whether language servers should be started for task worktrees by default.
     ///
     /// Individual profiles can override this via `task_worktree_language_servers`.
@@ -493,6 +587,18 @@ pub struct AgentSettings {
     ///
     /// Default: true
     pub publish_ref_artifact: bool,
+    /// Whether to delete the goal branch when cleaning up a graduated goal.
+    ///
+    /// Default: true
+    pub delete_goal_branches_on_graduation: bool,
+    /// Whether to delete task branches when cleaning up a graduated goal.
+    ///
+    /// Default: true
+    pub delete_task_branches_on_graduation: bool,
+    /// Base branch to target when preparing goal graduation.
+    ///
+    /// Default: null
+    pub goal_graduation_base_branch: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1319,6 +1425,19 @@ impl Settings for AgentSettings {
             tool_permissions: compile_tool_permissions(agent.tool_permissions),
             sandbox_permissions: compile_sandbox_permissions(agent.sandbox_permissions),
             task_worktree_limit: clamp_task_worktree_limit(agent.task_worktree_limit),
+            spawn_step_timeout_seconds: SpawnStepTimeoutSettings::from_content(
+                agent.spawn_step_timeout_seconds.as_ref(),
+            ),
+            send_watchdog_seconds: clamp_timeout_seconds(
+                "send_watchdog_seconds",
+                agent.send_watchdog_seconds,
+                DEFAULT_SEND_WATCHDOG_SECONDS,
+            ),
+            turn_watchdog_seconds: clamp_timeout_seconds(
+                "turn_watchdog_seconds",
+                agent.turn_watchdog_seconds,
+                DEFAULT_TURN_WATCHDOG_SECONDS,
+            ),
             task_worktree_language_servers: agent
                 .task_worktree_language_servers
                 .unwrap_or(DEFAULT_TASK_WORKTREE_LANGUAGE_SERVERS),
@@ -1336,6 +1455,15 @@ impl Settings for AgentSettings {
             publish_ref_artifact: agent
                 .publish_ref_artifact
                 .unwrap_or(DEFAULT_PUBLISH_REF_ARTIFACT),
+            delete_goal_branches_on_graduation: agent
+                .delete_goal_branches_on_graduation
+                .unwrap_or(DEFAULT_DELETE_GOAL_BRANCHES_ON_GRADUATION),
+            delete_task_branches_on_graduation: agent
+                .delete_task_branches_on_graduation
+                .unwrap_or(DEFAULT_DELETE_TASK_BRANCHES_ON_GRADUATION),
+            goal_graduation_base_branch: agent
+                .goal_graduation_base_branch
+                .filter(|branch| !branch.trim().is_empty()),
         }
     }
 }
@@ -1549,6 +1677,147 @@ mod tests {
     fn watchdog_from_json(value: serde_json::Value) -> anyhow::Result<TerminalWatchdogSettings> {
         let content: TerminalWatchdogSettingsContent = serde_json::from_value(value)?;
         Ok(TerminalWatchdogSettings::from_content(Some(&content)))
+    }
+
+    #[test]
+    fn test_clamp_timeout_seconds() {
+        assert_eq!(
+            clamp_timeout_seconds("test", None, 60),
+            Duration::from_secs(60)
+        );
+
+        assert_eq!(
+            clamp_timeout_seconds("test", Some(0), 60),
+            Duration::ZERO
+        );
+
+        for val in 1..=4 {
+            assert_eq!(
+                clamp_timeout_seconds("test", Some(val), 60),
+                Duration::from_secs(5)
+            );
+        }
+
+        assert_eq!(
+            clamp_timeout_seconds("test", Some(5), 60),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            clamp_timeout_seconds("test", Some(10), 60),
+            Duration::from_secs(10)
+        );
+        assert_eq!(
+            clamp_timeout_seconds("test", Some(300), 60),
+            Duration::from_secs(300)
+        );
+    }
+
+    #[test]
+    fn test_spawn_step_timeout_settings_from_content() -> anyhow::Result<()> {
+        let default_settings = SpawnStepTimeoutSettings::from_content(None);
+        assert_eq!(
+            default_settings.task_graph,
+            Duration::from_secs(DEFAULT_TASK_GRAPH_TIMEOUT_SECONDS)
+        );
+        assert_eq!(
+            default_settings.commit,
+            Duration::from_secs(DEFAULT_COMMIT_TIMEOUT_SECONDS)
+        );
+        assert_eq!(
+            default_settings.cleanup,
+            Duration::from_secs(DEFAULT_CLEANUP_TIMEOUT_SECONDS)
+        );
+        assert_eq!(
+            default_settings.diff,
+            Duration::from_secs(DEFAULT_DIFF_TIMEOUT_SECONDS)
+        );
+
+        let content: SpawnStepTimeoutSettingsContent = serde_json::from_str(
+            r#"{
+                "task_graph": 150,
+                "commit": 0,
+                "cleanup": 3,
+                "diff": 45
+            }"#,
+        )?;
+        let custom_settings = SpawnStepTimeoutSettings::from_content(Some(&content));
+        assert_eq!(custom_settings.task_graph, Duration::from_secs(150));
+        assert_eq!(custom_settings.commit, Duration::ZERO);
+        assert_eq!(custom_settings.cleanup, Duration::from_secs(5));
+        assert_eq!(custom_settings.diff, Duration::from_secs(45));
+
+        Ok(())
+    }
+
+    #[gpui::test]
+    fn test_timeout_settings_store_resolution(cx: &mut gpui::App) {
+        let store = SettingsStore::test(cx);
+        cx.set_global(store);
+        project::DisableAiSettings::register(cx);
+        AgentSettings::register(cx);
+
+        let settings = AgentSettings::get_global(cx);
+        assert_eq!(
+            settings.spawn_step_timeout_seconds.task_graph,
+            Duration::from_secs(DEFAULT_TASK_GRAPH_TIMEOUT_SECONDS)
+        );
+        assert_eq!(
+            settings.spawn_step_timeout_seconds.commit,
+            Duration::from_secs(DEFAULT_COMMIT_TIMEOUT_SECONDS)
+        );
+        assert_eq!(
+            settings.spawn_step_timeout_seconds.cleanup,
+            Duration::from_secs(DEFAULT_CLEANUP_TIMEOUT_SECONDS)
+        );
+        assert_eq!(
+            settings.spawn_step_timeout_seconds.diff,
+            Duration::from_secs(DEFAULT_DIFF_TIMEOUT_SECONDS)
+        );
+        assert_eq!(
+            settings.send_watchdog_seconds,
+            Duration::from_secs(DEFAULT_SEND_WATCHDOG_SECONDS)
+        );
+        assert_eq!(
+            settings.turn_watchdog_seconds,
+            Duration::from_secs(DEFAULT_TURN_WATCHDOG_SECONDS)
+        );
+
+        SettingsStore::update_global(cx, |store, cx| {
+            store
+                .set_user_settings(
+                    r#"{
+                        "agent": {
+                            "spawn_step_timeout_seconds": {
+                                "task_graph": 150,
+                                "commit": 0,
+                                "cleanup": 3,
+                                "diff": 45
+                            },
+                            "send_watchdog_seconds": 0,
+                            "turn_watchdog_seconds": 2
+                        }
+                    }"#,
+                    cx,
+                )
+                .expect("user settings load");
+        });
+
+        let settings = AgentSettings::get_global(cx);
+        assert_eq!(
+            settings.spawn_step_timeout_seconds.task_graph,
+            Duration::from_secs(150)
+        );
+        assert_eq!(settings.spawn_step_timeout_seconds.commit, Duration::ZERO);
+        assert_eq!(
+            settings.spawn_step_timeout_seconds.cleanup,
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            settings.spawn_step_timeout_seconds.diff,
+            Duration::from_secs(45)
+        );
+        assert_eq!(settings.send_watchdog_seconds, Duration::ZERO);
+        assert_eq!(settings.turn_watchdog_seconds, Duration::from_secs(5));
     }
 
     #[test]
@@ -3490,6 +3759,8 @@ mod tests {
         assert!(DEFAULT_CLEANUP);
         assert!(DEFAULT_REGISTER_METADATA);
         assert!(DEFAULT_PUBLISH_REF_ARTIFACT);
+        assert!(DEFAULT_DELETE_GOAL_BRANCHES_ON_GRADUATION);
+        assert!(DEFAULT_DELETE_TASK_BRANCHES_ON_GRADUATION);
 
         let omitted: settings::AgentSettingsContent = serde_json::from_str(r#"{}"#).unwrap();
         assert_eq!(omitted.task_lifecycle_mode, None);
@@ -3497,6 +3768,9 @@ mod tests {
         assert_eq!(omitted.cleanup, None);
         assert_eq!(omitted.register_metadata, None);
         assert_eq!(omitted.publish_ref_artifact, None);
+        assert_eq!(omitted.delete_goal_branches_on_graduation, None);
+        assert_eq!(omitted.delete_task_branches_on_graduation, None);
+        assert_eq!(omitted.goal_graduation_base_branch, None);
 
         let runtime: settings::AgentSettingsContent =
             serde_json::from_str(r#"{"task_lifecycle_mode": "runtime"}"#).unwrap();
@@ -3515,7 +3789,10 @@ mod tests {
                 "commit_on_session_end": false,
                 "cleanup": false,
                 "register_metadata": false,
-                "publish_ref_artifact": false
+                "publish_ref_artifact": false,
+                "delete_goal_branches_on_graduation": false,
+                "delete_task_branches_on_graduation": false,
+                "goal_graduation_base_branch": "develop"
             }"#,
         )
         .unwrap();
@@ -3523,6 +3800,12 @@ mod tests {
         assert_eq!(toggles.cleanup, Some(false));
         assert_eq!(toggles.register_metadata, Some(false));
         assert_eq!(toggles.publish_ref_artifact, Some(false));
+        assert_eq!(toggles.delete_goal_branches_on_graduation, Some(false));
+        assert_eq!(toggles.delete_task_branches_on_graduation, Some(false));
+        assert_eq!(
+            toggles.goal_graduation_base_branch.as_deref(),
+            Some("develop")
+        );
     }
 
     #[gpui::test]
@@ -3538,6 +3821,9 @@ mod tests {
         assert!(settings.cleanup);
         assert!(settings.register_metadata);
         assert!(settings.publish_ref_artifact);
+        assert!(settings.delete_goal_branches_on_graduation);
+        assert!(settings.delete_task_branches_on_graduation);
+        assert_eq!(settings.goal_graduation_base_branch, None);
 
         SettingsStore::update_global(cx, |store, cx| {
             store
@@ -3548,7 +3834,10 @@ mod tests {
                             "commit_on_session_end": false,
                             "cleanup": false,
                             "register_metadata": false,
-                            "publish_ref_artifact": false
+                            "publish_ref_artifact": false,
+                            "delete_goal_branches_on_graduation": false,
+                            "delete_task_branches_on_graduation": false,
+                            "goal_graduation_base_branch": "develop"
                         }
                     }"#,
                     cx,
@@ -3562,5 +3851,11 @@ mod tests {
         assert!(!settings.cleanup);
         assert!(!settings.register_metadata);
         assert!(!settings.publish_ref_artifact);
+        assert!(!settings.delete_goal_branches_on_graduation);
+        assert!(!settings.delete_task_branches_on_graduation);
+        assert_eq!(
+            settings.goal_graduation_base_branch.as_deref(),
+            Some("develop")
+        );
     }
 }

@@ -206,11 +206,6 @@ impl From<SpawnAgentToolOutput> for LanguageModelToolResultContent {
     }
 }
 
-pub(crate) const TGS_STEP_TIMEOUT: Duration = Duration::from_secs(120);
-pub(crate) const COMMIT_STEP_TIMEOUT: Duration = Duration::from_secs(300);
-pub(crate) const CLEANUP_STEP_TIMEOUT: Duration = Duration::from_secs(60);
-pub(crate) const DIFF_STEP_TIMEOUT: Duration = Duration::from_secs(30);
-
 #[derive(Debug)]
 pub(crate) enum StepOutcome<T> {
     Ok(T),
@@ -233,6 +228,17 @@ pub(crate) fn log_lifecycle_step(
     );
 }
 
+pub(crate) fn maybe_timer(
+    executor: &gpui::BackgroundExecutor,
+    timeout: Duration,
+) -> futures::future::Either<futures::future::Pending<()>, Task<()>> {
+    if timeout.is_zero() {
+        futures::future::Either::Left(futures::future::pending::<()>())
+    } else {
+        futures::future::Either::Right(executor.timer(timeout))
+    }
+}
+
 pub(crate) async fn timeout_step<F, T>(
     task_id: Option<&str>,
     step: &str,
@@ -244,7 +250,7 @@ where
     F: std::future::Future<Output = anyhow::Result<T>>,
 {
     let start = std::time::Instant::now();
-    let timer = cx.background_executor().timer(timeout).fuse();
+    let timer = maybe_timer(cx.background_executor(), timeout).fuse();
     futures::pin_mut!(timer);
     let future = future.fuse();
     futures::pin_mut!(future);
@@ -451,6 +457,7 @@ impl AgentTool for SpawnAgentTool {
                 should_set_task_status,
                 should_commit,
                 should_cleanup,
+                step_timeouts,
             ) = cx.update(|cx| {
                 let location = event_stream.settings_location(cx);
                 if let Some(error) = validate_profile(input.profile.as_ref(), location, cx) {
@@ -464,6 +471,7 @@ impl AgentTool for SpawnAgentTool {
                 }
 
                 let settings = agent_settings::AgentSettings::get(location, cx);
+                let step_timeouts = settings.spawn_step_timeout_seconds;
                 let effective_profile_id = if let Some(ref profile_id) = input.profile {
                     profile_id.clone()
                 } else if let Some(caller_profile_id) = event_stream.profile_id(cx) {
@@ -497,6 +505,7 @@ impl AgentTool for SpawnAgentTool {
                     should_set_task_status,
                     should_commit,
                     should_cleanup,
+                    step_timeouts,
                 ))
             })?;
 
@@ -816,7 +825,7 @@ impl AgentTool for SpawnAgentTool {
                     let step_fut = timeout_step(
                         Some(task_id),
                         "task_metadata_update",
-                        TGS_STEP_TIMEOUT,
+                        step_timeouts.task_graph,
                         &cx,
                         update_fut,
                     );
@@ -843,7 +852,7 @@ impl AgentTool for SpawnAgentTool {
                         StepOutcome::Timeout => {
                             log::warn!(
                                 "task_metadata_update timed out after {}s for task {task_id}",
-                                TGS_STEP_TIMEOUT.as_secs()
+                                step_timeouts.task_graph.as_secs()
                             );
                         }
                     }
@@ -868,7 +877,7 @@ impl AgentTool for SpawnAgentTool {
                     let step_fut = timeout_step(
                         Some(task_id),
                         "status_running",
-                        TGS_STEP_TIMEOUT,
+                        step_timeouts.task_graph,
                         &cx,
                         status_fut,
                     );
@@ -895,7 +904,7 @@ impl AgentTool for SpawnAgentTool {
                         StepOutcome::Timeout => {
                             log::warn!(
                                 "status_running timed out after {}s for task {task_id}",
-                                TGS_STEP_TIMEOUT.as_secs()
+                                step_timeouts.task_graph.as_secs()
                             );
                         }
                     }
@@ -960,7 +969,7 @@ impl AgentTool for SpawnAgentTool {
                         let details = match timeout_step(
                             Some(task_id),
                             "salvage_commit",
-                            COMMIT_STEP_TIMEOUT,
+                            step_timeouts.commit,
                             &cx,
                             commit_fut,
                         )
@@ -980,7 +989,7 @@ impl AgentTool for SpawnAgentTool {
                             StepOutcome::Timeout => {
                                 log::warn!(
                                     "salvage commit timed out after {}s for task {task_id}",
-                                    COMMIT_STEP_TIMEOUT.as_secs()
+                                    step_timeouts.commit.as_secs()
                                 );
                                 let task_id_typed = crate::AgentTaskId::from(task_id.clone());
                                 crate::task_worktree::fallback_isolation_details(
@@ -988,7 +997,7 @@ impl AgentTool for SpawnAgentTool {
                                     "worktree",
                                     Some(format!(
                                         "commit timed out after {}s",
-                                        COMMIT_STEP_TIMEOUT.as_secs()
+                                        step_timeouts.commit.as_secs()
                                     )),
                                     None,
                                 )
@@ -1020,7 +1029,7 @@ impl AgentTool for SpawnAgentTool {
                         match timeout_step(
                             Some(task_id),
                             "salvage_fail_task",
-                            TGS_STEP_TIMEOUT,
+                            step_timeouts.task_graph,
                             &cx,
                             fail_fut,
                         )
@@ -1035,7 +1044,7 @@ impl AgentTool for SpawnAgentTool {
                             StepOutcome::Timeout => {
                                 log::warn!(
                                     "fail task timed out after {}s for task {task_id}",
-                                    TGS_STEP_TIMEOUT.as_secs()
+                                    step_timeouts.task_graph.as_secs()
                                 );
                             }
                         }
@@ -1119,7 +1128,7 @@ impl AgentTool for SpawnAgentTool {
                             match timeout_step(
                                 Some(task_id),
                                 "status_failed",
-                                TGS_STEP_TIMEOUT,
+                                step_timeouts.task_graph,
                                 &cx,
                                 fail_fut,
                             )
@@ -1134,7 +1143,7 @@ impl AgentTool for SpawnAgentTool {
                                 StepOutcome::Timeout => {
                                     log::warn!(
                                         "status_failed timed out after {}s for task {task_id}",
-                                        TGS_STEP_TIMEOUT.as_secs()
+                                        step_timeouts.task_graph.as_secs()
                                     );
                                 }
                             }
@@ -1162,7 +1171,7 @@ impl AgentTool for SpawnAgentTool {
                     let step_fut = timeout_step(
                         Some(task_id),
                         "commit",
-                        COMMIT_STEP_TIMEOUT,
+                        step_timeouts.commit,
                         &cx,
                         commit_fut,
                     );
@@ -1194,7 +1203,7 @@ impl AgentTool for SpawnAgentTool {
                         StepOutcome::Timeout => {
                             log::warn!(
                                 "commit timed out after {}s for task {task_id}",
-                                COMMIT_STEP_TIMEOUT.as_secs()
+                                step_timeouts.commit.as_secs()
                             );
                             let task_id_typed = crate::AgentTaskId::from(task_id.clone());
                             crate::task_worktree::fallback_isolation_details(
@@ -1202,7 +1211,7 @@ impl AgentTool for SpawnAgentTool {
                                 "worktree",
                                 Some(format!(
                                     "commit timed out after {}s",
-                                    COMMIT_STEP_TIMEOUT.as_secs()
+                                    step_timeouts.commit.as_secs()
                                 )),
                                 None,
                             )
@@ -1257,7 +1266,7 @@ impl AgentTool for SpawnAgentTool {
                     let worktree_path =
                         crate::task_worktree::task_worktree_path_for_id(&task_id_typed);
                     if let (Some(base_sha), Some(worktree_path)) = (base_sha, worktree_path) {
-                        let timer = cx.background_executor().timer(DIFF_STEP_TIMEOUT).fuse();
+                        let timer = maybe_timer(cx.background_executor(), step_timeouts.diff).fuse();
                         futures::pin_mut!(timer);
                         let diff_fut = compute_turn_diff(&base_sha, &worktree_path).fuse();
                         futures::pin_mut!(diff_fut);
@@ -1276,7 +1285,7 @@ impl AgentTool for SpawnAgentTool {
                             _ = timer => {
                                 log::warn!(
                                     "compute_turn_diff timed out after {}s for task {task_id}",
-                                    DIFF_STEP_TIMEOUT.as_secs()
+                                    step_timeouts.diff.as_secs()
                                 );
                                 None
                             }
@@ -1300,7 +1309,7 @@ impl AgentTool for SpawnAgentTool {
                 let step_fut = timeout_step(
                     Some(task_id),
                     "turn_record",
-                    TGS_STEP_TIMEOUT,
+                    step_timeouts.task_graph,
                     &cx,
                     record_fut,
                 );
@@ -1325,7 +1334,7 @@ impl AgentTool for SpawnAgentTool {
                     StepOutcome::Timeout => {
                         log::warn!(
                             "turn_record timed out after {}s for task {task_id}",
-                            TGS_STEP_TIMEOUT.as_secs()
+                            step_timeouts.task_graph.as_secs()
                         );
                     }
                 }
@@ -1351,7 +1360,7 @@ impl AgentTool for SpawnAgentTool {
                     match timeout_step(
                         Some(task_id),
                         "status_completed",
-                        TGS_STEP_TIMEOUT,
+                        step_timeouts.task_graph,
                         &cx,
                         status_fut,
                     )
@@ -1369,7 +1378,7 @@ impl AgentTool for SpawnAgentTool {
                         StepOutcome::Timeout => {
                             log::warn!(
                                 "status_completed timed out after {}s for task {task_id}",
-                                TGS_STEP_TIMEOUT.as_secs()
+                                step_timeouts.task_graph.as_secs()
                             );
                         }
                     }
@@ -1401,7 +1410,7 @@ impl AgentTool for SpawnAgentTool {
                         let step_fut = timeout_step(
                             Some(task_id),
                             "cleanup",
-                            CLEANUP_STEP_TIMEOUT,
+                            step_timeouts.cleanup,
                             &cx,
                             cleanup_fut,
                         );
@@ -1425,7 +1434,7 @@ impl AgentTool for SpawnAgentTool {
                             StepOutcome::Timeout => {
                                 log::error!(
                                     "cleanup timed out after {}s for subagent task {task_id}",
-                                    CLEANUP_STEP_TIMEOUT.as_secs()
+                                    step_timeouts.cleanup.as_secs()
                                 );
                             }
                         }
@@ -1966,6 +1975,33 @@ Strict Constraints:
         cx.executor().advance_clock(Duration::from_millis(100));
         let outcome = timeout_task.await;
         assert!(matches!(outcome, StepOutcome::Timeout));
+
+        // 4. Timeout Duration::ZERO (disabled timer, waits for future without timing out)
+        let disabled_timeout_task = cx.spawn(|cx| async move {
+            timeout_step(
+                Some("TASK-TEST"),
+                "test_step_zero_timeout",
+                Duration::ZERO,
+                &cx,
+                async {
+                    cx.background_executor()
+                        .timer(Duration::from_millis(500))
+                        .await;
+                    Ok("zero_timeout_ok")
+                },
+            )
+            .await
+        });
+
+        cx.executor().advance_clock(Duration::from_millis(600));
+        let outcome = disabled_timeout_task.await;
+        assert!(matches!(outcome, StepOutcome::Ok("zero_timeout_ok")));
+
+        // 5. maybe_timer helper returns Left for zero timeout, Right for non-zero
+        let zero_timer = maybe_timer(&cx.background_executor, Duration::ZERO);
+        assert!(matches!(zero_timer, futures::future::Either::Left(_)));
+        let non_zero_timer = maybe_timer(&cx.background_executor, Duration::from_secs(1));
+        assert!(matches!(non_zero_timer, futures::future::Either::Right(_)));
     }
 
     struct TestSubagentHandle {

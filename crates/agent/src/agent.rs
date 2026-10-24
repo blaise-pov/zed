@@ -3933,41 +3933,34 @@ impl ThreadEnvironment for NativeThreadEnvironment {
             (project, task_id)
         });
         cx.spawn(async move |cx| {
-            let task = cx.update(|cx| {
-                crate::task_worktree::commit_and_merge_task_worktree(
-                    project.clone(), &task_id, is_error, cx,
-                )
-            });
-            match task.await {
+            let executor = cx.background_executor().clone();
+            let result = crate::task_worktree::retry_on_git_lock_contention(&executor, || {
+                let task = cx.update(|cx| {
+                    crate::task_worktree::commit_and_merge_task_worktree(
+                        project.clone(),
+                        &task_id,
+                        is_error,
+                        cx,
+                    )
+                });
+                task
+            })
+            .await;
+            match result {
                 Ok(details) => Ok(details),
                 Err(err) => {
                     let err_str = err.to_string();
-                    if crate::task_worktree::is_git_lock_contention(&err_str) {
-                        cx.background_executor().timer(crate::task_worktree::GIT_LOCK_RETRY_DELAY).await;
-                        let retry_task = cx.update(|cx| {
-                            crate::task_worktree::commit_and_merge_task_worktree(
-                                project, &task_id, is_error, cx,
-                            )
-                        });
-                        match retry_task.await {
-                            Ok(details) => Ok(details),
-                            Err(retry_err) => {
-                                Ok(crate::task_worktree::fallback_isolation_details(
-                                    &task_id,
-                                    "worktree",
-                                    Some(format!("git lock contention: {retry_err:#}")),
-                                    None,
-                                ))
-                            }
-                        }
+                    let commit_error = if crate::task_worktree::is_git_lock_contention(&err_str) {
+                        Some(format!("git lock contention: {err:#}"))
                     } else {
-                        Ok(crate::task_worktree::fallback_isolation_details(
-                            &task_id,
-                            "worktree",
-                            Some(format!("commit failed: {err_str}")),
-                            None,
-                        ))
-                    }
+                        Some(format!("commit failed: {err_str}"))
+                    };
+                    Ok(crate::task_worktree::fallback_isolation_details(
+                        &task_id,
+                        "worktree",
+                        commit_error,
+                        None,
+                    ))
                 }
             }
         })
@@ -4294,7 +4287,6 @@ impl NativeSubagentHandle {
 }
 
 const WATCHDOG_POLL_INTERVAL: Duration = Duration::from_millis(250);
-const WATCHDOG_TURN_COMPLETE_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn extract_last_agent_message_content(thread: &Thread) -> Result<String> {
     thread
@@ -4346,12 +4338,15 @@ impl SubagentHandle for NativeSubagentHandle {
 
         cx.spawn(async move |cx| {
             let start_time = std::time::Instant::now();
-            let (task, token_limit_rx, _subscription) = cx.update(|cx| {
+            let (task, token_limit_rx, _subscription, send_watchdog_timeout) = cx.update(|cx| {
                 parent_thread
                     .update(cx, |parent_thread, _cx| {
                         parent_thread.register_running_subagent(thread.downgrade())
                     })
                     .ok();
+
+                let send_watchdog_timeout =
+                    thread.read(cx).agent_settings(cx).send_watchdog_seconds;
 
                 let ratio_before_prompt = thread
                     .read(cx)
@@ -4373,7 +4368,7 @@ impl SubagentHandle for NativeSubagentHandle {
                 let task = acp_thread.update(cx, |acp_thread, cx| {
                     acp_thread.send(vec![message.into()], cx)
                 });
-                (task, token_limit_rx, subscription)
+                (task, token_limit_rx, subscription, send_watchdog_timeout)
             });
 
             let mut task = task.fuse();
@@ -4425,9 +4420,9 @@ impl SubagentHandle for NativeSubagentHandle {
                     _ = watchdog_poll => {
                         let is_complete = thread.read_with(cx, |thread, _| thread.is_turn_complete());
                         if is_complete {
-                            if !turn_complete_timer_active {
+                            if !turn_complete_timer_active && !send_watchdog_timeout.is_zero() {
                                 turn_complete_timer = futures::future::Either::Right(
-                                    cx.background_executor().timer(WATCHDOG_TURN_COMPLETE_TIMEOUT),
+                                    cx.background_executor().timer(send_watchdog_timeout),
                                 ).fuse();
                                 turn_complete_timer_active = true;
                             }
@@ -5442,7 +5437,10 @@ mod internal_tests {
                 threshold: agent_settings::AutoCompactThreshold::Percentage(0.5),
             };
             agent_settings::AgentSettings::override_global(settings, cx);
-            thread.update(cx, |thread, cx| thread.set_model(model.clone(), cx));
+            thread.update(cx, |thread, cx| {
+                thread.set_model(model.clone(), cx);
+                thread.set_summarization_model(None, cx);
+            });
         });
 
         let first_prompt = cx.update(|cx| {
@@ -5506,6 +5504,7 @@ mod internal_tests {
         );
         fake.end_stream(&model, &first_compaction_request);
         cx.run_until_parked();
+        cx.executor().advance_clock(Duration::from_secs(70));
 
         let second_compaction_request = fake
             .pending_completions()

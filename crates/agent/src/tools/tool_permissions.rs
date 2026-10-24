@@ -193,7 +193,7 @@ async fn is_in_linked_global_skill_dir(
             .await
 }
 
-fn expand_home_prefix(path: &Path) -> Option<PathBuf> {
+pub(crate) fn expand_home_prefix(path: &Path) -> Option<PathBuf> {
     if path.is_absolute() {
         return Some(path.to_path_buf());
     }
