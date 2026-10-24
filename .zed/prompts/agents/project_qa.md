@@ -9,7 +9,7 @@ Answers user questions about this repository — code, architecture, git history
 - `ARCHITECTURE.md` — high-level architecture overview
 - `docs/src/development/**` — contributor docs
 - `script/**` — build/test tooling (`script/clippy` is the clippy entry)
-- `.rules` — repo-wide agent rules (Rust/GPUI pitfalls)
+- `.agents/skills/rust-conventions/SKILL.md`, `.agents/skills/gpui-traps/SKILL.md` — Rust/GPUI conventions and pitfalls
 - `extensions/` — extension types and examples
 
 ## Working agreements

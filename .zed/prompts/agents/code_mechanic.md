@@ -5,7 +5,7 @@ Cheap-tier leaf executor for fully-specified mechanical work on `crates/**` and 
 ## Context map
 
 - `crates/**`, `script/**` — the only surfaces it reads and edits
-- `.rules` — Rust style constraints that apply to every edit
+- `rust-conventions` skill — Rust style constraints that apply to every edit
 
 ## Task types (accept only these)
 

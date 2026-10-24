@@ -6,7 +6,7 @@ Owns syncing this Zed fork with upstream `zed-industries/zed`: detect the newest
 
 - `Cargo.toml` / `Cargo.lock` — workspace root manifest and lockfile.
 - `corgi.toml` / `corgi-patches/` — fork build config.
-- `.rules`, `AGENTS.md` — commit and PR conventions (read-only).
+- `AGENTS.md` — commit conventions; `rust-conventions` skill — Rust standards; `.rules` — rules hygiene (read-only).
 - `script/clippy` — clippy entrypoint (merge_resolver's gate).
 
 ## Working agreements

@@ -260,6 +260,15 @@
   "agent": {
     "task_graph_server_id": "taskgraph",
     "task_worktree_limit": 18,
+    "commit_message_instructions": "Include tracking lines when available (Goal: <goal_id>, Task: <task_id>) before the Release Notes section.",
+    "spawn_step_timeout_seconds": {
+      "task_graph": 120,
+      "commit": 300,
+      "cleanup": 60,
+      "diff": 30
+    },
+    "send_watchdog_seconds": 30,
+    "turn_watchdog_seconds": 120,
     "tool_permissions": {
       "default": "deny",
       "tools": {
@@ -874,6 +883,8 @@
                 ".zed/prompts/**",
                 ".zed/mcp/**",
                 ".agents/skills/**",
+                ".rules",
+                ".factory/**",
                 "README.md",
                 "docs/*",
                 "docs/**"
@@ -886,6 +897,8 @@
                 ".zed/prompts/**",
                 ".zed/mcp/**",
                 ".agents/skills/**",
+                ".rules",
+                ".factory/**",
                 "README.md",
                 "docs/**"
               ]
@@ -1051,7 +1064,8 @@
           "max_depth": 1
         },
         "skills": [
-          "gpui-test"
+          "gpui-test",
+          "rust-conventions"
         ],
         "context_servers": {
           "agent-bus": {
@@ -1160,7 +1174,9 @@
         },
         "skills": [
           "gpui-test",
-          "gpui-bench"
+          "gpui-bench",
+          "rust-conventions",
+          "gpui-traps"
         ],
         "context_servers": {
           "agent-bus": {
@@ -1258,7 +1274,9 @@
         "skills": [
           "gpui-test",
           "gpui-bench",
-          "lint-creator"
+          "lint-creator",
+          "rust-conventions",
+          "gpui-traps"
         ],
         "context_servers": {
           "agent-bus": {
@@ -1351,7 +1369,9 @@
           ],
           "max_depth": 1
         },
-        "skills": [],
+        "skills": [
+          "rust-conventions"
+        ],
         "context_servers": {
           "agent-bus": {
             "tools": {
@@ -1428,7 +1448,8 @@
         },
         "skills": [
           "lint-creator",
-          "gpui-test"
+          "gpui-test",
+          "rust-conventions"
         ],
         "context_servers": {
           "agent-bus": {
@@ -1622,7 +1643,9 @@
           "terminal": true,
           "diagnostics": true
         },
-        "skills": [],
+        "skills": [
+          "rust-conventions"
+        ],
         "context_servers": {
           "agent-bus": {
             "tools": {
@@ -1733,7 +1756,9 @@
           "fetch": true,
           "spawn_agent": true
         },
-        "skills": [],
+        "skills": [
+          "rust-conventions"
+        ],
         "context_servers": {
           "agent-bus": {
             "tools": {
@@ -1905,7 +1930,8 @@
           "spawn_agent": true
         },
         "skills": [
-          "blackbox-github-researcher"
+          "blackbox-github-researcher",
+          "rust-conventions"
         ],
         "context_servers": {
           "agent-bus": {
@@ -2195,7 +2221,9 @@
           "write_file": true,
           "diagnostics": true
         },
-        "skills": [],
+        "skills": [
+          "rust-conventions"
+        ],
         "context_servers": {
           "agent-bus": {
             "tools": {
