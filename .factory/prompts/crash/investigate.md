@@ -20,6 +20,8 @@ script/sentry-fetch <issue-id>
 
 This reads authentication from `~/.sentryclirc` (set up via `sentry-cli login`) or the `SENTRY_AUTH_TOKEN` environment variable.
 
+**Shortcut:** `script/crash-to-prompt <issue-id>` generates a ready-made investigation prompt from a Sentry issue.
+
 **Option C: Crash report provided directly**
 If the crash report was provided inline or as a file, read it carefully before proceeding.
 
