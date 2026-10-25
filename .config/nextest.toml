@@ -47,11 +47,15 @@ slow-timeout = { period = "300s", terminate-after = 1 }
 filter =  'package(editor) and test(test_random_blocks)'
 slow-timeout = { period = "300s", terminate-after = 1 }
 
-# Extended timeouts for randomized tests on slow fork runners
+# Extended timeouts for randomized tests on slow fork runners (floating flake set)
 [[profile.default.overrides]]
-filter = 'package(worktree) and test(test_random_worktree_changes)'
+filter = 'package(editor) and test(test_random_)'
 slow-timeout = { period = "300s", terminate-after = 1 }
 
 [[profile.default.overrides]]
-filter = 'package(collab) and (test(random_project_collaboration_tests) or test(random_channel_buffer_tests))'
+filter = 'package(worktree) and test(test_random_)'
+slow-timeout = { period = "300s", terminate-after = 1 }
+
+[[profile.default.overrides]]
+filter = 'package(collab) and test(test_random_)'
 slow-timeout = { period = "300s", terminate-after = 1 }
