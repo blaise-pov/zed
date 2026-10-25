@@ -993,6 +993,10 @@ pub trait ThreadEnvironment {
         Task::ready(Ok(false))
     }
 
+    fn flush_diff_stats(&self, _cx: &mut AsyncApp) -> Task<Result<()>> {
+        Task::ready(Ok(()))
+    }
+
     fn fail_task_registered(
         &self,
         _task_id: &str,
