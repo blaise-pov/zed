@@ -780,7 +780,7 @@ async fn test_sidebar_action_hover_contrasts_with_row(cx: &mut TestAppContext) {
             window
                 .painted_quads()
                 .into_iter()
-                .find(|quad| quad.border_color == cx.theme().colors().panel_focused_border)
+                .find(|quad| quad.border_color == cx.theme().colors().border_focused)
                 .expect("selected Thread History row")
                 .bounds
                 .map(|value| px(value.as_f32() / window.scale_factor()))
