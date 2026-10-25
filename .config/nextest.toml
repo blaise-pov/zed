@@ -63,3 +63,7 @@ slow-timeout = { period = "300s", terminate-after = 1 }
 [[profile.default.overrides]]
 filter = 'package(collab) and test(test_random_)'
 slow-timeout = { period = "300s", terminate-after = 1 }
+
+[[profile.default.overrides]]
+filter = 'package(multi_buffer) and test(test_random_)'
+slow-timeout = { period = "300s", terminate-after = 1 }
