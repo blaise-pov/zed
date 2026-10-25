@@ -1667,6 +1667,15 @@ impl Thread {
         self.running_turn.is_some()
     }
 
+    pub fn retry_waiting(&self) -> bool {
+        if let Some(running_turn) = &self.running_turn {
+            running_turn.retry_now_tx.lock().send(()).ok();
+            true
+        } else {
+            false
+        }
+    }
+
     pub fn active_turn(&self) -> bool {
         self.running_turn.is_some()
     }
@@ -3317,6 +3326,8 @@ impl Thread {
         let event_stream = ThreadEventStream::new(events_tx);
         let (cancellation_tx, mut cancellation_rx) = watch::channel(false);
         let cancellation_tx = Arc::new(parking_lot::Mutex::new(cancellation_tx));
+        let (retry_now_tx, _) = watch::channel(());
+        let retry_now_tx = Arc::new(parking_lot::Mutex::new(retry_now_tx));
         let task = cx.spawn({
             let event_stream = event_stream.clone();
             async move |this, cx| {
@@ -3379,6 +3390,7 @@ impl Thread {
             event_stream,
             BTreeMap::default(),
             cancellation_tx,
+            retry_now_tx,
             task,
             Task::ready(()),
             watchdog_handle,
@@ -3702,6 +3714,8 @@ impl Thread {
         let tools = self.enabled_tools(cx);
         let (cancellation_tx, mut cancellation_rx) = watch::channel(false);
         let cancellation_tx = Arc::new(parking_lot::Mutex::new(cancellation_tx));
+        let (retry_now_tx, retry_now_rx) = watch::channel(());
+        let retry_now_tx = Arc::new(parking_lot::Mutex::new(retry_now_tx));
         let (watchdog_handle, mut activity_rx) = WatchdogHandle::new();
         event_stream.set_watchdog_handle(watchdog_handle.clone());
         let timeout = self.watchdog_timeout;
@@ -3765,7 +3779,7 @@ impl Thread {
                 log::debug!("Starting agent turn execution");
 
                 let turn_result =
-                    Self::run_turn_internal(&this, &event_stream, cancellation_rx.clone(), cx)
+                    Self::run_turn_internal(&this, &event_stream, cancellation_rx.clone(), retry_now_rx, cx)
                         .await;
 
                 // Check if we were cancelled - if so, cancel() already took running_turn
@@ -3830,6 +3844,7 @@ impl Thread {
             event_stream,
             tools,
             cancellation_tx,
+            retry_now_tx,
             task,
             watchdog_task,
             watchdog_handle,
@@ -3841,6 +3856,7 @@ impl Thread {
         this: &WeakEntity<Self>,
         event_stream: &ThreadEventStream,
         mut cancellation_rx: watch::Receiver<bool>,
+        mut retry_now_rx: watch::Receiver<()>,
         cx: &mut AsyncApp,
     ) -> Result<()> {
         let mut attempt = 0;
@@ -3884,6 +3900,7 @@ impl Thread {
                                 this,
                                 event_stream,
                                 &mut cancellation_rx,
+                                &mut retry_now_rx,
                                 error,
                                 attempt,
                                 cx,
@@ -4231,6 +4248,7 @@ impl Thread {
                     this,
                     event_stream,
                     &mut cancellation_rx,
+                    &mut retry_now_rx,
                     error,
                     attempt,
                     cx,
@@ -4281,6 +4299,7 @@ impl Thread {
         this: &WeakEntity<Self>,
         event_stream: &ThreadEventStream,
         cancellation_rx: &mut watch::Receiver<bool>,
+        retry_now_rx: &mut watch::Receiver<()>,
         error: LanguageModelCompletionError,
         attempt: u8,
         cx: &mut AsyncApp,
@@ -4296,6 +4315,7 @@ impl Thread {
         })??;
         let timer = cx.background_executor().timer(retry.duration);
         event_stream.send_retry(retry);
+        let _ = retry_now_rx.borrow();
         futures::select! {
             _ = timer.fuse() => {}
             _ = cancellation_rx.changed().fuse() => {
@@ -4310,6 +4330,11 @@ impl Thread {
                     }
                     log::debug!("Turn cancelled during retry delay, exiting");
                     return Ok(ControlFlow::Break(()));
+                }
+            }
+            res = retry_now_rx.changed().fuse() => {
+                if res.is_ok() {
+                    return Ok(ControlFlow::Continue(()));
                 }
             }
         }
@@ -6690,6 +6715,7 @@ struct RunningTurn {
     /// Sender to signal tool cancellation. When cancel is called, this is
     /// set to true so all tools can detect user-initiated cancellation.
     cancellation_tx: Arc<parking_lot::Mutex<watch::Sender<bool>>>,
+    retry_now_tx: Arc<parking_lot::Mutex<watch::Sender<()>>>,
     /// Senders for tools that support input streaming and have already been
     /// started but are still receiving input from the LLM.
     streaming_tool_inputs: HashMap<LanguageModelToolUseId, ToolInputSender>,
@@ -6702,6 +6728,7 @@ impl RunningTurn {
         event_stream: ThreadEventStream,
         tools: BTreeMap<SharedString, Arc<dyn AnyAgentTool>>,
         cancellation_tx: Arc<parking_lot::Mutex<watch::Sender<bool>>>,
+        retry_now_tx: Arc<parking_lot::Mutex<watch::Sender<()>>>,
         task: Task<()>,
         watchdog_task: Task<()>,
         watchdog_handle: WatchdogHandle,
@@ -6714,6 +6741,7 @@ impl RunningTurn {
             event_stream,
             tools,
             cancellation_tx,
+            retry_now_tx,
             streaming_tool_inputs: HashMap::default(),
             watchdog_handle,
         }

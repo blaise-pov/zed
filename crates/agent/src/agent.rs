@@ -2978,6 +2978,13 @@ impl acp_thread::AgentConnection for NativeAgentConnection {
         }) as _)
     }
 
+    fn retry_waiting(&self, session_id: &acp_v1::SessionId, cx: &mut App) -> bool {
+        let Some(thread) = self.thread(session_id, cx) else {
+            return false;
+        };
+        thread.read(cx).retry_waiting()
+    }
+
     fn cancel(&self, session_id: &acp_v1::SessionId, cx: &mut App) {
         log::info!("[cancel-audit] session={} source=user_stop", session_id);
         log::info!("Cancelling on session: {}", session_id);
