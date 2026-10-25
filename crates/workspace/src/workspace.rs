@@ -5263,7 +5263,11 @@ impl Workspace {
             path_from_base
                 .as_deref()
                 .and_then(|base_path| project.find_project_path(base_path, cx))
-                .or_else(|| project.find_project_path(path, cx))
+                .or_else(|| {
+                    let project_path = project.find_project_path(path, cx)?;
+                    project.entry_for_path(&project_path, cx)?;
+                    Some(project_path)
+                })
         });
         if let Some(project_path) = project_path {
             let url_or_path = url_or_path.to_owned();
