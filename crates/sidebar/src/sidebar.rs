@@ -1636,6 +1636,7 @@ impl Sidebar {
                         // pass below downgrades them to `Empty` if no draft
                         // label can be derived.
                         let draft = row.is_draft().then_some(DraftKind::WithContent);
+                        let diff_stats = row.diff_stats.unwrap_or_default();
                         Arc::new(ThreadEntry {
                             agent_label: row.agent_label.clone(),
                             model: row.model.clone(),
@@ -1650,7 +1651,7 @@ impl Sidebar {
                             draft,
                             highlight_positions: Vec::new(),
                             worktrees,
-                            diff_stats: row.diff_stats.unwrap_or_default(),
+                            diff_stats,
                         })
                     };
 
