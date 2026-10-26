@@ -34,7 +34,9 @@ use worktree::{
     WorktreeId,
 };
 
-use crate::{ProjectPath, trusted_worktrees::TrustedWorktrees};
+use crate::{
+    ProjectPath, environment::ProjectEnvironment, trusted_worktrees::TrustedWorktrees,
+};
 
 /// The current paths for a project's worktrees. Each folder path has a corresponding
 /// main worktree path at the same position. The two lists are always the
@@ -217,6 +219,7 @@ pub struct WorktreeStore {
         HashMap<Arc<SanitizedPath>, Shared<Task<Result<Entity<Worktree>, Arc<anyhow::Error>>>>>,
     initial_scan_complete: (watch::Sender<bool>, watch::Receiver<bool>),
     state: WorktreeStoreState,
+    environment: Option<WeakEntity<ProjectEnvironment>>,
 }
 
 #[derive(Debug)]
@@ -249,6 +252,14 @@ impl WorktreeStore {
         client.add_entity_request_handler(Self::handle_allocate_worktree_id);
     }
 
+    pub fn set_environment(&mut self, env: WeakEntity<ProjectEnvironment>) {
+        self.environment = Some(env);
+    }
+
+    pub fn environment(&self) -> Option<WeakEntity<ProjectEnvironment>> {
+        self.environment.clone()
+    }
+
     pub fn local(
         retain_worktrees: bool,
         fs: Arc<dyn Fs>,
@@ -264,6 +275,7 @@ impl WorktreeStore {
             retain_worktrees,
             initial_scan_complete: watch::channel_with(true),
             state: WorktreeStoreState::Local { fs },
+            environment: None,
         }
     }
 
@@ -288,6 +300,7 @@ impl WorktreeStore {
                 upstream_project_id,
                 path_style,
             },
+            environment: None,
         }
     }
 
@@ -939,17 +952,21 @@ impl WorktreeStore {
             if fs.is_file(&dot_env_path).await {
                 match fs.load(&dot_env_path).await {
                     Ok(content) => {
-                        util::load_env(&content);
-                        // Re-expand `${VAR}` references in already-parsed
-                        // settings (e.g. model ids) now that the environment
-                        // has been seeded from the project's `.env` file.
-                        cx.update(|cx| {
+                        let parsed_env: collections::HashMap<String, String> =
+                            util::parse_env(&content).into_iter().collect();
+                        this.update(cx, |this, cx| {
+                            if let Some(env) = this.environment.as_ref().and_then(|e| e.upgrade()) {
+                                env.update(cx, |env, _| {
+                                    env.set_worktree_dot_env(worktree_id, parsed_env);
+                                });
+                            }
                             if cx.has_global::<SettingsStore>() {
                                 cx.update_global::<SettingsStore, _>(|store, cx| {
                                     store.reload(cx);
                                 });
                             }
-                        });
+                        })
+                        .ok();
                     }
                     Err(error) => {
                         log::warn!("failed to load {}: {error}", dot_env_path.display());
@@ -1026,6 +1043,11 @@ impl WorktreeStore {
         })
         .detach();
         cx.observe_release(worktree, move |this, worktree, cx| {
+            if let Some(env) = this.environment.as_ref().and_then(|e| e.upgrade()) {
+                env.update(cx, |env, _| {
+                    env.remove_worktree_dot_env(worktree.id());
+                });
+            }
             cx.emit(WorktreeStoreEvent::WorktreeReleased(
                 handle_id,
                 worktree.id(),
@@ -1040,9 +1062,15 @@ impl WorktreeStore {
     }
 
     pub fn remove_worktree(&mut self, id_to_remove: WorktreeId, cx: &mut Context<Self>) {
+        let this_env = self.environment.clone();
         self.worktrees.retain(|worktree| {
             if let Some(worktree) = worktree.upgrade() {
                 if worktree.read(cx).id() == id_to_remove {
+                    if let Some(env) = this_env.as_ref().and_then(|e| e.upgrade()) {
+                        env.update(cx, |env, _| {
+                            env.remove_worktree_dot_env(id_to_remove);
+                        });
+                    }
                     cx.emit(WorktreeStoreEvent::WorktreeRemoved(
                         worktree.entity_id(),
                         id_to_remove,

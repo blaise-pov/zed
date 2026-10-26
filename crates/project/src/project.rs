@@ -1258,6 +1258,9 @@ impl Project {
             let environment = cx.new(|cx| {
                 ProjectEnvironment::new(env, worktree_store.downgrade(), None, false, cx)
             });
+            worktree_store.update(cx, |worktree_store, _| {
+                worktree_store.set_environment(environment.downgrade());
+            });
             let manifest_tree = ManifestTree::new(worktree_store.clone(), cx);
             let toolchain_store = cx.new(|cx| {
                 ToolchainStore::local(
@@ -1331,13 +1334,15 @@ impl Project {
             });
 
             let settings_observer = cx.new(|cx| {
-                SettingsObserver::new_local(
+                let mut observer = SettingsObserver::new_local(
                     fs.clone(),
                     worktree_store.clone(),
                     task_store.clone(),
                     flags.watch_global_configs,
                     cx,
-                )
+                );
+                observer.set_environment(environment.downgrade());
+                observer
             });
             cx.subscribe(&settings_observer, Self::on_settings_observer_event)
                 .detach();
@@ -1516,6 +1521,9 @@ impl Project {
                     cx,
                 )
             });
+            worktree_store.update(cx, |worktree_store, _| {
+                worktree_store.set_environment(environment.downgrade());
+            });
 
             let lsp_store = cx.new(|cx| {
                 LspStore::new_remote(
@@ -1578,14 +1586,16 @@ impl Project {
             });
 
             let settings_observer = cx.new(|cx| {
-                SettingsObserver::new_remote(
+                let mut observer = SettingsObserver::new_remote(
                     fs.clone(),
                     worktree_store.clone(),
                     task_store.clone(),
                     Some(remote_proto.clone()),
                     false,
                     cx,
-                )
+                );
+                observer.set_environment(environment.downgrade());
+                observer
             });
             cx.subscribe(&settings_observer, Self::on_settings_observer_event)
                 .detach();
@@ -1794,6 +1804,9 @@ impl Project {
 
         let environment =
             cx.new(|cx| ProjectEnvironment::new(None, worktree_store.downgrade(), None, true, cx));
+        worktree_store.update(&mut cx, |worktree_store, _| {
+            worktree_store.set_environment(environment.downgrade());
+        });
 
         let bookmark_store =
             cx.new(|cx| BookmarkStore::new(worktree_store.clone(), buffer_store.clone(), cx));
@@ -1856,14 +1869,16 @@ impl Project {
         });
 
         let settings_observer = cx.new(|cx| {
-            SettingsObserver::new_remote(
+            let mut observer = SettingsObserver::new_remote(
                 fs.clone(),
                 worktree_store.clone(),
                 task_store.clone(),
                 None,
                 true,
                 cx,
-            )
+            );
+            observer.set_environment(environment.downgrade());
+            observer
         });
 
         let agent_server_store = cx.new(|_cx| AgentServerStore::collab());
