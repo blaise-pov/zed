@@ -17874,8 +17874,8 @@ pub(crate) mod tests {
             setup_conversation_view(StubAgentServer::new(connection), cx).await;
         let thread_view = active_thread(&conversation_view, cx);
 
-        cx.update(|cx| {
-            let callout = thread_view.read(cx).render_thread_retry_status_callout(cx);
+        thread_view.update(cx, |view, cx| {
+            let callout = view.render_thread_retry_status_callout(cx);
             assert!(callout.is_none());
         });
 
