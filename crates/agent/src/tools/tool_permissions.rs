@@ -572,6 +572,173 @@ pub fn resolve_project_path(
     Ok(ResolvedProjectPath::Safe(project_path))
 }
 
+/// Returns true if `path` is inside `task_worktree` (or equal to it).
+pub fn is_inside_task_worktree(path: &Path, task_worktree: &Path) -> bool {
+    let norm_path = util::paths::normalize_lexically(path)
+        .unwrap_or_else(|_| normalize_path(path));
+    let norm_task = util::paths::normalize_lexically(task_worktree)
+        .unwrap_or_else(|_| normalize_path(task_worktree));
+
+    #[cfg(windows)]
+    {
+        if norm_path.starts_with(&norm_task) {
+            return true;
+        }
+        let path_str = norm_path.to_string_lossy();
+        let task_str = norm_task.to_string_lossy();
+        if path_str.eq_ignore_ascii_case(&task_str) {
+            return true;
+        }
+        let task_has_trailing_sep = task_str.ends_with('\\') || task_str.ends_with('/');
+        if path_str.len() > task_str.len()
+            && path_str[..task_str.len()].eq_ignore_ascii_case(&task_str)
+        {
+            if task_has_trailing_sep {
+                return true;
+            }
+            let next_byte = path_str.as_bytes()[task_str.len()];
+            if next_byte == b'\\' || next_byte == b'/' {
+                return true;
+            }
+        }
+        false
+    }
+    #[cfg(not(windows))]
+    {
+        norm_path.starts_with(&norm_task)
+    }
+}
+
+/// Rebases a path onto the task worktree when running in an isolated subagent thread.
+/// Bare relative paths or paths prefixed with the task worktree directory name are rebased
+/// onto the task worktree absolute path.
+pub fn rebase_task_worktree_path(task_worktree: &Path, path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        return path.to_path_buf();
+    }
+
+    let worktree_name = task_worktree
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+
+    if !worktree_name.is_empty() {
+        if let Ok(stripped) = path.strip_prefix(worktree_name) {
+            return task_worktree.join(stripped);
+        }
+        #[cfg(windows)]
+        {
+            let mut components = path.components();
+            if let Some(Component::Normal(first)) = components.next() {
+                if first.to_string_lossy().eq_ignore_ascii_case(worktree_name) {
+                    return task_worktree.join(components.as_path());
+                }
+            }
+        }
+    }
+
+    task_worktree.join(path)
+}
+
+/// Resolves a path for an agent tool, applying strict read confinement when `task_worktree` is `Some`.
+///
+/// Semantics when `task_worktree` is `Some`:
+/// - Bare relative path, or path prefixed with the worktree dir name -> rebase onto task worktree abs path
+/// - Absolute path inside the task worktree -> allowed as-is
+/// - Anything resolving OUTSIDE the task worktree -> hard deny naming the allowed root
+///
+/// Non-isolated threads (`task_worktree` is `None`): behavior byte-identical to `resolve_project_path`.
+pub fn resolve_tool_path(
+    project: &Project,
+    task_worktree: Option<&Path>,
+    path: impl AsRef<Path>,
+    canonical_worktree_roots: &[PathBuf],
+    cx: &App,
+) -> Result<ResolvedProjectPath> {
+    let path = path.as_ref();
+    let Some(task_worktree) = task_worktree else {
+        return resolve_project_path(project, path, canonical_worktree_roots, cx);
+    };
+
+    let effective_path = rebase_task_worktree_path(task_worktree, path);
+    if !is_inside_task_worktree(&effective_path, task_worktree) {
+        bail!(
+            "Path '{}' is outside the isolated task worktree '{}'",
+            path.display(),
+            task_worktree.display()
+        );
+    }
+
+    let resolved = resolve_project_path(project, &effective_path, canonical_worktree_roots, cx)?;
+    match &resolved {
+        ResolvedProjectPath::Safe(project_path) => {
+            let worktree = project
+                .worktree_for_id(project_path.worktree_id, cx)
+                .ok_or_else(|| anyhow!("Could not resolve path {}", path.display()))?;
+            let worktree_abs = worktree.read(cx).abs_path();
+            if !is_inside_task_worktree(worktree_abs.as_ref(), task_worktree) {
+                bail!(
+                    "Path '{}' is outside the isolated task worktree '{}'",
+                    path.display(),
+                    task_worktree.display()
+                );
+            }
+
+            let snapshot = worktree.read(cx);
+            if let Some(entry) = snapshot.entry_for_path(&project_path.path) {
+                if let Some(canonical) = &entry.canonical_path {
+                    if !is_inside_task_worktree(canonical.as_ref(), task_worktree) {
+                        bail!(
+                            "Path '{}' is outside the isolated task worktree '{}'",
+                            path.display(),
+                            task_worktree.display()
+                        );
+                    }
+                }
+            }
+
+            for ancestor in project_path.path.ancestors() {
+                let Some(ancestor_entry) = snapshot.entry_for_path(ancestor) else {
+                    continue;
+                };
+                let Some(canonical_ancestor) = ancestor_entry.canonical_path.as_ref() else {
+                    continue;
+                };
+                let suffix = project_path
+                    .path
+                    .strip_prefix(ancestor)
+                    .unwrap_or(RelPath::empty());
+                let target = if suffix.is_empty() {
+                    canonical_ancestor.to_path_buf()
+                } else {
+                    canonical_ancestor.join(suffix.as_std_path())
+                };
+                if !is_inside_task_worktree(&target, task_worktree) {
+                    bail!(
+                        "Path '{}' is outside the isolated task worktree '{}'",
+                        path.display(),
+                        task_worktree.display()
+                    );
+                }
+            }
+
+            Ok(resolved)
+        }
+        ResolvedProjectPath::SymlinkEscape {
+            canonical_target, ..
+        } => {
+            if !is_inside_task_worktree(canonical_target, task_worktree) {
+                bail!(
+                    "Path '{}' is outside the isolated task worktree '{}'",
+                    path.display(),
+                    task_worktree.display()
+                );
+            }
+            Ok(resolved)
+        }
+    }
+}
+
 /// Prompts the user for permission when a path resolves through a symlink to a
 /// location outside the project. This check is an additional gate after
 /// settings-based deny decisions: even if a tool is configured as "always allow,"
@@ -776,38 +943,10 @@ pub fn check_profile_write_scope(
         let in_task_worktree = match resolved {
             Ok(ResolvedProjectPath::Safe(project_path)) => project_ref
                 .worktree_for_id(project_path.worktree_id, cx)
-                .map(|w| {
-                    let w_abs = w.read(cx).abs_path();
-                    let norm_w = util::paths::normalize_lexically(w_abs.as_ref())
-                        .unwrap_or_else(|_| normalize_path(w_abs.as_ref()));
-                    let norm_task = util::paths::normalize_lexically(task_worktree)
-                        .unwrap_or_else(|_| normalize_path(task_worktree));
-                    #[cfg(windows)]
-                    {
-                        norm_w == norm_task
-                            || norm_w
-                                .to_string_lossy()
-                                .eq_ignore_ascii_case(&norm_task.to_string_lossy())
-                    }
-                    #[cfg(not(windows))]
-                    {
-                        norm_w == norm_task
-                    }
-                })
+                .map(|w| is_inside_task_worktree(w.read(cx).abs_path().as_ref(), task_worktree))
                 .unwrap_or(false),
             Ok(ResolvedProjectPath::SymlinkEscape { .. }) => false,
-            Err(_) => {
-                if let Ok(normalized_path) = util::paths::normalize_lexically(path) {
-                    if let Ok(normalized_worktree) = util::paths::normalize_lexically(task_worktree)
-                    {
-                        normalized_path.starts_with(&normalized_worktree)
-                    } else {
-                        normalized_path.starts_with(task_worktree)
-                    }
-                } else {
-                    false
-                }
-            }
+            Err(_) => is_inside_task_worktree(path, task_worktree),
         };
 
         if !in_task_worktree {
@@ -2612,5 +2751,88 @@ mod tests {
             sensitive_settings_kind(Path::new("root/link_dir/ci.yml"), &roots, fs_arc.as_ref())
                 .await;
         assert_eq!(kind, Some(SensitiveSettingsKind::Hidden));
+    }
+
+    #[gpui::test]
+    async fn test_resolve_tool_path_task_worktree_confinement(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let host_root = path!("/root");
+        let task_worktree_path = path!("/worktrees/agent-task-99");
+
+        fs.insert_tree(
+            host_root,
+            json!({
+                "host_file.rs": "fn host() {}",
+            }),
+        )
+        .await;
+
+        fs.insert_tree(
+            task_worktree_path,
+            json!({
+                "task_file.rs": "fn task() {}",
+                "nested": {
+                    "sub.rs": ""
+                }
+            }),
+        )
+        .await;
+
+        let (project, _thread) = setup_thread_and_project(fs.clone(), cx).await;
+        let (tree, _) = project
+            .update(cx, |project, cx| {
+                project.find_or_create_worktree(Path::new(task_worktree_path), false, cx)
+            })
+            .await
+            .unwrap();
+        tree.read_with(cx, |tree, _| tree.as_local().unwrap().scan_complete())
+            .await;
+        cx.run_until_parked();
+
+        let fs_arc: Arc<dyn Fs> = fs;
+        let roots = canonicalize_worktree_roots(&project, &fs_arc, cx).await;
+
+        cx.read(|cx| {
+            let project = project.read(cx);
+            let task_path = Path::new(task_worktree_path);
+
+            // 1. Bare relative path rebases onto task worktree
+            let res = resolve_tool_path(project, Some(task_path), "task_file.rs", &roots, cx)
+                .expect("relative path should resolve in task worktree");
+            assert!(matches!(res, ResolvedProjectPath::Safe(_)));
+
+            // 2. Worktree-name-prefixed relative path rebases onto task worktree
+            let res = resolve_tool_path(
+                project,
+                Some(task_path),
+                "agent-task-99/task_file.rs",
+                &roots,
+                cx,
+            )
+            .expect("prefixed path should resolve in task worktree");
+            assert!(matches!(res, ResolvedProjectPath::Safe(_)));
+
+            // 3. Absolute path inside task worktree allowed as-is
+            let abs_task_file = Path::new(task_worktree_path).join("nested").join("sub.rs");
+            let res = resolve_tool_path(project, Some(task_path), &abs_task_file, &roots, cx)
+                .expect("abs path inside task worktree should resolve");
+            assert!(matches!(res, ResolvedProjectPath::Safe(_)));
+
+            // 4. Absolute path outside task worktree denied with clear message
+            let abs_host_file = Path::new(host_root).join("host_file.rs");
+            let err = resolve_tool_path(project, Some(task_path), &abs_host_file, &roots, cx)
+                .unwrap_err();
+            let err_msg = err.to_string();
+            assert!(
+                err_msg.contains("is outside the isolated task worktree"),
+                "error should name allowed root: {err_msg}"
+            );
+
+            // 5. Non-isolated thread (task_worktree is None) allows host file
+            let res = resolve_tool_path(project, None, &abs_host_file, &roots, cx)
+                .expect("non-isolated thread should resolve host file");
+            assert!(matches!(res, ResolvedProjectPath::Safe(_)));
+        });
     }
 }

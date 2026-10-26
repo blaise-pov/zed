@@ -7685,6 +7685,13 @@ impl ToolCallEventStream {
     }
 
     #[cfg(any(test, feature = "test-support"))]
+    pub fn test_with_thread(thread: &Entity<Thread>) -> (Self, ToolCallEventStreamReceiver) {
+        let (mut stream, receiver) = Self::test();
+        stream.thread = Some(thread.downgrade());
+        (stream, receiver)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
     pub fn test_with_profile(
         profile_id: agent_settings::AgentProfileId,
     ) -> (Self, ToolCallEventStreamReceiver) {

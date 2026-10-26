@@ -1,12 +1,14 @@
+use crate::tools::tool_permissions::{
+    ResolvedProjectPath, canonicalize_worktree_roots, is_inside_task_worktree, resolve_tool_path,
+};
 use crate::{AgentTool, ToolCallEventStream, ToolInput};
 use agent_client_protocol::schema::v1 as acp;
 use futures::{Future, FutureExt as _};
 use gpui::{App, AsyncApp, Entity, Task};
 use language::{DiagnosticSeverity, OffsetRangeExt};
-use project::Project;
+use project::{Project, ProjectPath};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use std::path::Path;
 use std::{fmt::Write, sync::Arc};
 use ui::SharedString;
 use util::markdown::MarkdownInlineCode;
@@ -91,18 +93,15 @@ fn freshness_message(refreshed: bool) -> &'static str {
 /// read cached diagnostics), or `Err` if cancelled by the user.
 async fn pull_diagnostics(
     project: &Entity<Project>,
-    path: Option<&Path>,
+    project_path: Option<ProjectPath>,
     event_stream: &ToolCallEventStream,
     cx: &mut AsyncApp,
 ) -> Result<bool, String> {
-    match path {
-        Some(path) => {
+    match project_path {
+        Some(project_path) => {
             let open_buffer_task = project.update(cx, |project, cx| {
-                let Some(project_path) = project.find_project_path(path, cx) else {
-                    return Err(format!("Could not find path {} in project", path.display()));
-                };
-                Ok(project.open_buffer(project_path, cx))
-            })?;
+                project.open_buffer(project_path, cx)
+            });
 
             let buffer = with_cancellation(open_buffer_task, event_stream)
                 .await?
@@ -166,19 +165,37 @@ impl AgentTool for DiagnosticsTool {
         let project = self.project.clone();
         cx.spawn(async move |cx| {
             let input = input.recv().await.map_err(|e| e.to_string())?;
+            let task_worktree = cx.update(|cx| event_stream.task_worktree(cx));
 
             match input.path {
                 Some(ref path) if !path.is_empty() => {
+                    let fs = project.read_with(cx, |project, _cx| project.fs().clone());
+                    let canonical_roots = canonicalize_worktree_roots(&project, &fs, cx).await;
+                    let project_path = project
+                        .read_with(cx, |project, cx| {
+                            let resolved = resolve_tool_path(
+                                project,
+                                task_worktree.as_deref(),
+                                path,
+                                &canonical_roots,
+                                cx,
+                            )?;
+                            Ok(match resolved {
+                                ResolvedProjectPath::Safe(p) => p,
+                                ResolvedProjectPath::SymlinkEscape {
+                                    project_path, ..
+                                } => project_path,
+                            })
+                        })
+                        .map_err(|e: anyhow::Error| e.to_string())?;
+
                     let refreshed =
-                        pull_diagnostics(&project, Some(Path::new(path)), &event_stream, cx)
+                        pull_diagnostics(&project, Some(project_path.clone()), &event_stream, cx)
                             .await?;
 
                     let open_buffer_task = project.update(cx, |project, cx| {
-                        let Some(project_path) = project.find_project_path(path, cx) else {
-                            return Err(format!("Could not find path {path} in project"));
-                        };
-                        Ok(project.open_buffer(project_path, cx))
-                    })?;
+                        project.open_buffer(project_path, cx)
+                    });
 
                     let buffer = with_cancellation(open_buffer_task, &event_stream)
                         .await?
@@ -229,6 +246,15 @@ impl AgentTool for DiagnosticsTool {
                                 else {
                                     continue;
                                 };
+
+                                if let Some(ref task_worktree) = task_worktree {
+                                    if !is_inside_task_worktree(
+                                        worktree.read(cx).abs_path().as_ref(),
+                                        task_worktree,
+                                    ) {
+                                        continue;
+                                    }
+                                }
 
                                 has_diagnostics = true;
                                 output.push_str(&format!(
