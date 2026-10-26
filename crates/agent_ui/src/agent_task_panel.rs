@@ -3005,7 +3005,7 @@ pub fn render_metrics_elements(
     };
 
     if let Some(cost_str) = cost_label {
-        let mut cost_element = div().id((id, "cost")).child(
+        let mut cost_element = div().id((id.clone(), "cost")).child(
             Label::new(cost_str)
                 .size(LabelSize::Small)
                 .color(Color::Success),
