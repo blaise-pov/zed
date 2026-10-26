@@ -29,6 +29,7 @@ pub mod test;
 pub mod time;
 
 use anyhow::Result;
+use collections::HashMap;
 use itertools::Either;
 use regex::Regex;
 use std::path::PathBuf;
@@ -1079,28 +1080,19 @@ pub fn parse_env(content: &str) -> Vec<(String, String)> {
 
 /// Loads environment variables from a `.env` file content into the current process environment.
 ///
-/// Critical system environment variables (such as PATH or HOME) will not be overwritten
-/// if they are already present in the environment.
-pub fn load_env(content: &str) {
-    for (key, value) in parse_env(content) {
-        if matches!(
-            key.to_uppercase().as_str(),
-            "PATH" | "HOME" | "USER" | "USERNAME" | "SHELL" | "SYSTEMROOT"
-        ) && std::env::var(&key).is_ok()
-        {
-            continue;
-        }
-        unsafe {
-            std::env::set_var(&key, &value);
-        }
-    }
-}
+/// Process-level environment mutation via `std::env::set_var` is unsafe in
+/// multi-threaded contexts and has been removed. Callers should parse environment
+/// variables using [`parse_env`] and resolve them with [`expand_env_vars_with`].
+pub fn load_env(_content: &str) {}
 
-/// Expands `${VAR}` and `${VAR:-default}` references in a string using the current process environment.
+/// Expands `${VAR}` and `${VAR:-default}` references in a string using a lookup map
+/// with fallback to the current process environment.
 ///
-/// If a referenced variable is not set and no default is provided, logs a warning
-/// and leaves the `${VAR}` token untouched.
-pub fn expand_env_vars(value: &str) -> String {
+/// Variables are first resolved from `lookup`. If absent from `lookup`, they are
+/// resolved from [`std::env::var`]. If not found in either and a default is provided
+/// via `${VAR:-default}`, the default is used. If absent and no default is provided,
+/// logs a warning and leaves the `${VAR}` token untouched.
+pub fn expand_env_vars_with(value: &str, lookup: &collections::HashMap<String, String>) -> String {
     let mut expanded = String::with_capacity(value.len());
     let mut rest = value;
     while let Some(start) = rest.find("${") {
@@ -1115,8 +1107,10 @@ pub fn expand_env_vars(value: &str) -> String {
             Some((name, default)) => (name.trim(), Some(default)),
             None => (expr.trim(), None),
         };
-        if let Ok(value) = std::env::var(name) {
-            expanded.push_str(&value);
+        if let Some(val) = lookup.get(name) {
+            expanded.push_str(val);
+        } else if let Ok(val) = std::env::var(name) {
+            expanded.push_str(&val);
         } else if let Some(default) = default {
             expanded.push_str(default);
         } else {
@@ -1127,6 +1121,14 @@ pub fn expand_env_vars(value: &str) -> String {
     }
     expanded.push_str(rest);
     expanded
+}
+
+/// Expands `${VAR}` and `${VAR:-default}` references in a string using the current process environment.
+///
+/// If a referenced variable is not set and no default is provided, logs a warning
+/// and leaves the `${VAR}` token untouched.
+pub fn expand_env_vars(value: &str) -> String {
+    expand_env_vars_with(value, &HashMap::default())
 }
 
 #[cfg(test)]
@@ -1195,6 +1197,72 @@ QUOTED_WITH_HASH="kept # hash"
         assert_eq!(expand_env_vars("test ${UNCLOSED"), "test ${UNCLOSED");
         // No variables
         assert_eq!(expand_env_vars("plain text"), "plain text");
+    }
+
+    #[test]
+    fn test_expand_env_vars_with() {
+        unsafe {
+            std::env::set_var("ZED_TEST_ENV_FALLBACK_VAR", "from_env");
+            std::env::set_var("ZED_TEST_ENV_OVERRIDDEN_VAR", "env_value");
+        }
+
+        let mut lookup = collections::HashMap::default();
+        lookup.insert("LOOKUP_ONLY".to_string(), "from_lookup".to_string());
+        lookup.insert(
+            "ZED_TEST_ENV_OVERRIDDEN_VAR".to_string(),
+            "lookup_value".to_string(),
+        );
+
+        // Lookup: present in lookup, absent from env
+        assert_eq!(
+            expand_env_vars_with("${LOOKUP_ONLY}", &lookup),
+            "from_lookup"
+        );
+
+        // Override: present in lookup AND env -> lookup takes precedence
+        assert_eq!(
+            expand_env_vars_with("${ZED_TEST_ENV_OVERRIDDEN_VAR}", &lookup),
+            "lookup_value"
+        );
+
+        // Fallback: absent from lookup, present in env -> falls back to env
+        assert_eq!(
+            expand_env_vars_with("${ZED_TEST_ENV_FALLBACK_VAR}", &lookup),
+            "from_env"
+        );
+
+        // Default syntax when absent from both lookup and env
+        assert_eq!(
+            expand_env_vars_with("${ABSENT_EVERYWHERE:-default_val}", &lookup),
+            "default_val"
+        );
+
+        // Default syntax ignored when present in lookup
+        assert_eq!(
+            expand_env_vars_with("${LOOKUP_ONLY:-ignored_default}", &lookup),
+            "from_lookup"
+        );
+
+        // Default syntax ignored when present in env fallback
+        assert_eq!(
+            expand_env_vars_with("${ZED_TEST_ENV_FALLBACK_VAR:-ignored_default}", &lookup),
+            "from_env"
+        );
+
+        // Absent from both lookup and env with no default preserves token
+        assert_eq!(
+            expand_env_vars_with("${ABSENT_EVERYWHERE}", &lookup),
+            "${ABSENT_EVERYWHERE}"
+        );
+
+        // Mixed text expansion with lookup and fallback
+        assert_eq!(
+            expand_env_vars_with(
+                "prefix ${LOOKUP_ONLY} and ${ZED_TEST_ENV_FALLBACK_VAR} suffix",
+                &lookup
+            ),
+            "prefix from_lookup and from_env suffix"
+        );
     }
 
     #[test]
