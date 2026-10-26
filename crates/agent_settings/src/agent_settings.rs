@@ -1150,10 +1150,7 @@ pub fn normalize_path(raw: &str) -> String {
     }
 }
 
-pub fn expand_model_selection(mut selection: LanguageModelSelection) -> LanguageModelSelection {
-    selection.provider =
-        settings::LanguageModelProviderSetting(util::expand_env_vars(&selection.provider.0));
-    selection.model = util::expand_env_vars(&selection.model);
+pub fn expand_model_selection(selection: LanguageModelSelection) -> LanguageModelSelection {
     selection
 }
 
