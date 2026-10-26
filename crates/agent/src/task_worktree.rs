@@ -18,6 +18,7 @@ use project::{
     Project, git_store::Repository, git_store::worktrees_directory_for_repo,
     project_settings::ProjectSettings,
 };
+use prompt_store::WorktreeContext;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use settings::Settings;
@@ -841,6 +842,44 @@ task_worktree_static!(
 );
 
 task_worktree_static!(
+    TASK_WORKTREE_CONTEXTS: parking_lot::RwLock<HashMap<PathBuf, WorktreeContext>> =
+        parking_lot::RwLock::new(HashMap::default())
+);
+
+pub fn cached_task_worktree_context(path: &Path) -> Option<WorktreeContext> {
+    TASK_WORKTREE_CONTEXTS.read().get(path).cloned()
+}
+
+pub fn cache_task_worktree_context(path: PathBuf, context: WorktreeContext) {
+    TASK_WORKTREE_CONTEXTS.write().insert(path, context);
+}
+
+pub fn task_worktree_entity_for_id(
+    project_id: gpui::EntityId,
+    task_id: &AgentTaskId,
+) -> Option<Entity<project::Worktree>> {
+    PROJECT_TASK_WORKTREES
+        .read()
+        .get(&project_id)
+        .and_then(|tasks| tasks.get(task_id).cloned())
+}
+
+pub fn task_worktree_entity_for_path(
+    project_id: gpui::EntityId,
+    path: &Path,
+    cx: &App,
+) -> Option<Entity<project::Worktree>> {
+    let map = PROJECT_TASK_WORKTREES.read();
+    let tasks = map.get(&project_id)?;
+    tasks.values().find(|wt| {
+        let abs = wt.read(cx).abs_path();
+        abs.as_ref() == path
+            || util::paths::normalize_lexically(abs.as_ref()).ok().as_deref()
+                == util::paths::normalize_lexically(path).ok().as_deref()
+    }).cloned()
+}
+
+task_worktree_static!(
     TASK_LSP_SUPPRESSION: parking_lot::RwLock<HashMap<AgentTaskId, bool>> =
         parking_lot::RwLock::new(HashMap::default())
 );
@@ -1019,6 +1058,8 @@ pub fn reset_registry_for_tests() {
     locks.clear();
     let mut project_worktrees = PROJECT_TASK_WORKTREES.write();
     project_worktrees.clear();
+    let mut contexts = TASK_WORKTREE_CONTEXTS.write();
+    contexts.clear();
     let mut in_flight = IN_FLIGHT_CREATIONS.lock();
     in_flight.clear();
     let mut waiters = TASK_WORKTREE_WAITING_CREATIONS.lock();
@@ -2127,6 +2168,10 @@ pub fn unregister_task_worktree(task_id: &AgentTaskId) {
     }
     drop(reg);
     drop(project_worktrees);
+    {
+        let mut contexts = TASK_WORKTREE_CONTEXTS.write();
+        contexts.retain(|path, _| !path.to_string_lossy().contains(task_id.as_str()));
+    }
     if let Some(pool_key) = entry.and_then(|e| e.pool_key) {
         let already_in_flight = {
             let notified = NOTIFIED_WAITERS.lock();
