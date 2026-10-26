@@ -5,7 +5,9 @@ use dap::adapters::DebugAdapterName;
 use fs::Fs;
 use futures::StreamExt as _;
 use git::repository::DEFAULT_WORKTREE_DIRECTORY;
-use gpui::{AsyncApp, BorrowAppContext, Context, Entity, EventEmitter, Subscription, Task};
+use gpui::{
+    AsyncApp, BorrowAppContext, Context, Entity, EventEmitter, Subscription, Task, WeakEntity,
+};
 use lsp::{DEFAULT_LSP_REQUEST_TIMEOUT_SECS, LanguageServerName};
 use paths::{
     EDITORCONFIG_NAME, debug_task_file_name, local_debug_file_relative_path,
@@ -38,6 +40,7 @@ use util::{ResultExt, rel_path::RelPath, serde::default_true};
 use worktree::{PathChange, UpdatedEntriesSet, Worktree, WorktreeId};
 
 use crate::{
+    environment::ProjectEnvironment,
     task_store::{TaskSettingsLocation, TaskStore},
     trusted_worktrees::{PathTrust, TrustedWorktrees, TrustedWorktreesEvent},
     worktree_store::{WorktreeStore, WorktreeStoreEvent},
@@ -846,6 +849,8 @@ pub struct SettingsObserver {
     worktree_store: Entity<WorktreeStore>,
     project_id: u64,
     task_store: Entity<TaskStore>,
+    environment: Option<WeakEntity<ProjectEnvironment>>,
+    raw_local_settings: HashMap<WorktreeId, HashMap<LocalSettingsPath, String>>,
     pending_local_settings:
         HashMap<PathTrust, BTreeMap<(WorktreeId, Arc<RelPath>), Option<String>>>,
     _trusted_worktrees_watcher: Option<Subscription>,
@@ -864,6 +869,16 @@ impl SettingsObserver {
     pub fn init(client: &AnyProtoClient) {
         client.add_entity_message_handler(Self::handle_update_worktree_settings);
         client.add_entity_message_handler(Self::handle_update_user_settings);
+    }
+
+    pub fn set_environment(&mut self, environment: WeakEntity<ProjectEnvironment>) {
+        self.environment = Some(environment);
+    }
+
+    fn environment(&self, cx: &gpui::App) -> Option<WeakEntity<ProjectEnvironment>> {
+        self.environment
+            .clone()
+            .or_else(|| self.worktree_store.read(cx).environment())
     }
 
     pub fn new_local(
@@ -892,7 +907,7 @@ impl SettingsObserver {
                                     {
                                         let path =
                                             LocalSettingsPath::InWorktree(directory_path.clone());
-                                        apply_local_settings(
+                                        settings_observer.apply_local_settings(
                                             worktree_id,
                                             path.clone(),
                                             LocalSettingsKind::Settings,
@@ -960,6 +975,8 @@ impl SettingsObserver {
         Self {
             worktree_store,
             task_store,
+            environment: None,
+            raw_local_settings: HashMap::default(),
             mode: SettingsObserverMode::Local(fs.clone()),
             downstream_client: None,
             _trusted_worktrees_watcher,
@@ -1023,6 +1040,8 @@ impl SettingsObserver {
         Self {
             worktree_store,
             task_store,
+            environment: None,
+            raw_local_settings: HashMap::default(),
             mode: SettingsObserverMode::Remote { via_collab },
             downstream_client: None,
             project_id: REMOTE_SERVER_PROJECT_ID,
@@ -1170,6 +1189,12 @@ impl SettingsObserver {
                 })
                 .detach(),
             WorktreeStoreEvent::WorktreeRemoved(_, worktree_id) => {
+                self.raw_local_settings.remove(worktree_id);
+                if let Some(environment) = self.environment(cx).and_then(|e| e.upgrade()) {
+                    environment.update(cx, |env, _| {
+                        env.remove_worktree_dot_env(*worktree_id);
+                    });
+                }
                 cx.update_global::<SettingsStore, _>(|store, cx| {
                     store.clear_local_settings(*worktree_id, cx).log_err();
                 });
@@ -1184,24 +1209,40 @@ impl SettingsObserver {
         changes: &UpdatedEntriesSet,
         cx: &mut Context<Self>,
     ) {
-        let SettingsObserverMode::Local(fs) = &self.mode else {
-            return;
+        let fs = match &self.mode {
+            SettingsObserverMode::Local(fs) => fs.clone(),
+            _ => return,
         };
 
         let mut settings_contents = Vec::new();
         for (path, _, change) in changes.iter() {
             if path.as_std_path() == Path::new(".env") {
-                if change != &PathChange::Removed {
+                let worktree_id = worktree.read(cx).id();
+                if change == &PathChange::Removed {
+                    if let Some(environment) = self.environment(cx).and_then(|e| e.upgrade()) {
+                        environment.update(cx, |env, _| {
+                            env.remove_worktree_dot_env(worktree_id);
+                        });
+                    }
+                    self.reapply_local_settings(worktree_id, cx);
+                } else {
                     let abs_path = worktree.read(cx).absolutize(path);
                     let fs = fs.clone();
-                    cx.spawn(async move |_this, cx| match fs.load(&abs_path).await {
+                    cx.spawn(async move |this, cx| match fs.load(&abs_path).await {
                         Ok(content) => {
-                            util::load_env(&content);
-                            cx.update(|cx| {
-                                cx.update_global::<SettingsStore, _>(|store, cx| {
-                                    store.reload(cx);
-                                });
-                            });
+                            let parsed_env: collections::HashMap<String, String> =
+                                util::parse_env(&content).into_iter().collect();
+                            this.update(cx, |this, cx| {
+                                if let Some(environment) =
+                                    this.environment(cx).and_then(|e| e.upgrade())
+                                {
+                                    environment.update(cx, |env, _| {
+                                        env.set_worktree_dot_env(worktree_id, parsed_env);
+                                    });
+                                }
+                                this.reapply_local_settings(worktree_id, cx);
+                            })
+                            .ok();
                         }
                         Err(error) => {
                             log::warn!("failed to load {}: {error}", abs_path.display());
@@ -1409,7 +1450,7 @@ impl SettingsObserver {
                             true
                         }
                     }) {
-                        apply_local_settings(
+                        self.apply_local_settings(
                             worktree_id,
                             LocalSettingsPath::InWorktree(directory.clone()),
                             kind,
@@ -1485,7 +1526,7 @@ impl SettingsObserver {
                     }
                 }
                 (directory, LocalSettingsKind::Editorconfig) => {
-                    apply_local_settings(worktree_id, directory.clone(), kind, &file_content, cx);
+                    self.apply_local_settings(worktree_id, directory.clone(), kind, &file_content, cx);
                 }
                 (LocalSettingsPath::OutsideWorktree(path), kind) => {
                     log::error!(
@@ -1595,40 +1636,103 @@ impl SettingsObserver {
             }
         })
     }
-}
 
-fn apply_local_settings(
-    worktree_id: WorktreeId,
-    path: LocalSettingsPath,
-    kind: LocalSettingsKind,
-    file_content: &Option<String>,
-    cx: &mut Context<'_, SettingsObserver>,
-) {
-    cx.update_global::<SettingsStore, _>(|store, cx| {
-        let result =
-            store.set_local_settings(worktree_id, path.clone(), kind, file_content.as_deref(), cx);
-
-        match result {
-            Err(InvalidSettingsError::LocalSettings { path, message }) => {
-                log::error!("Failed to set local settings in {path:?}: {message}");
-                cx.emit(SettingsObserverEvent::LocalSettingsUpdated(Err(
-                    InvalidSettingsError::LocalSettings { path, message },
-                )));
-            }
-            Err(e) => log::error!("Failed to set local settings: {e}"),
-            Ok(()) => {
-                let settings_path = match &path {
-                    LocalSettingsPath::InWorktree(rel_path) => rel_path
-                        .as_std_path()
-                        .join(local_settings_file_relative_path().as_std_path()),
-                    LocalSettingsPath::OutsideWorktree(abs_path) => abs_path.to_path_buf(),
-                };
-                cx.emit(SettingsObserverEvent::LocalSettingsUpdated(Ok(
-                    settings_path,
-                )))
+    fn reapply_local_settings(&mut self, worktree_id: WorktreeId, cx: &mut Context<Self>) {
+        if let Some(settings) = self.raw_local_settings.get(&worktree_id).cloned() {
+            for (path, content) in settings {
+                self.apply_local_settings(
+                    worktree_id,
+                    path.clone(),
+                    LocalSettingsKind::Settings,
+                    &Some(content.clone()),
+                    cx,
+                );
+                if let Some(downstream_client) = &self.downstream_client {
+                    downstream_client
+                        .send(proto::UpdateWorktreeSettings {
+                            project_id: self.project_id,
+                            worktree_id: worktree_id.to_proto(),
+                            path: path.to_proto(),
+                            content: Some(content),
+                            kind: Some(
+                                local_settings_kind_to_proto(LocalSettingsKind::Settings).into(),
+                            ),
+                            outside_worktree: Some(path.is_outside_worktree()),
+                        })
+                        .log_err();
+                }
             }
         }
-    })
+    }
+
+    fn apply_local_settings(
+        &mut self,
+        worktree_id: WorktreeId,
+        path: LocalSettingsPath,
+        kind: LocalSettingsKind,
+        file_content: &Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let content_to_set = match kind {
+            LocalSettingsKind::Settings => {
+                if let Some(content) = file_content {
+                    self.raw_local_settings
+                        .entry(worktree_id)
+                        .or_default()
+                        .insert(path.clone(), content.clone());
+
+                    let default_env = collections::HashMap::default();
+                    let dot_env = self
+                        .environment(cx)
+                        .and_then(|env| env.upgrade())
+                        .map(|env| env.read(cx));
+                    let lookup = dot_env
+                        .as_ref()
+                        .and_then(|env| env.get_worktree_dot_env(worktree_id))
+                        .unwrap_or(&default_env);
+
+                    Some(util::expand_env_vars_with(content, lookup))
+                } else {
+                    if let Some(settings) = self.raw_local_settings.get_mut(&worktree_id) {
+                        settings.remove(&path);
+                    }
+                    None
+                }
+            }
+            _ => file_content.clone(),
+        };
+
+        cx.update_global::<SettingsStore, _>(|store, cx| {
+            let result = store.set_local_settings(
+                worktree_id,
+                path.clone(),
+                kind,
+                content_to_set.as_deref(),
+                cx,
+            );
+
+            match result {
+                Err(InvalidSettingsError::LocalSettings { path, message }) => {
+                    log::error!("Failed to set local settings in {path:?}: {message}");
+                    cx.emit(SettingsObserverEvent::LocalSettingsUpdated(Err(
+                        InvalidSettingsError::LocalSettings { path, message },
+                    )));
+                }
+                Err(e) => log::error!("Failed to set local settings: {e}"),
+                Ok(()) => {
+                    let settings_path = match &path {
+                        LocalSettingsPath::InWorktree(rel_path) => rel_path
+                            .as_std_path()
+                            .join(local_settings_file_relative_path().as_std_path()),
+                        LocalSettingsPath::OutsideWorktree(abs_path) => abs_path.to_path_buf(),
+                    };
+                    cx.emit(SettingsObserverEvent::LocalSettingsUpdated(Ok(
+                        settings_path,
+                    )))
+                }
+            }
+        })
+    }
 }
 
 pub fn local_settings_kind_from_proto(kind: proto::LocalSettingsKind) -> LocalSettingsKind {
@@ -1672,4 +1776,288 @@ impl From<DapSettingsContent> for DapSettings {
 pub enum DapBinary {
     Default,
     Custom(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::WorktreeIdCounter;
+    use fs::FakeFs;
+    use gpui::{AppContext as _, TestAppContext};
+    use settings::SettingsStore;
+
+    #[gpui::test]
+    async fn test_local_settings_env_var_expansion(cx: &mut TestAppContext) {
+        let store = cx.update(SettingsStore::test);
+        cx.set_global(store);
+
+        let fs = FakeFs::new(cx.executor());
+        let worktree_store = cx.update(|cx| {
+            cx.new(|_| WorktreeStore::local(false, fs.clone(), WorktreeIdCounter::default()))
+        });
+        let task_store = cx.update(|cx| cx.new(|_| TaskStore::Noop));
+        let project_env = cx.update(|cx| {
+            cx.new(|cx| {
+                ProjectEnvironment::new(
+                    None,
+                    worktree_store.downgrade(),
+                    None,
+                    false,
+                    cx,
+                )
+            })
+        });
+
+        let observer = cx.update(|cx| {
+            cx.new(|cx| {
+                let mut observer = SettingsObserver::new_local(
+                    fs.clone(),
+                    worktree_store.clone(),
+                    task_store.clone(),
+                    false,
+                    cx,
+                );
+                observer.set_environment(project_env.downgrade());
+                observer
+            })
+        });
+
+        let worktree_id = WorktreeId::from_usize(1);
+        let mut dot_env = collections::HashMap::default();
+        dot_env.insert("SERVER_NAME".to_string(), "rust-analyzer".to_string());
+        project_env.update(cx, |env, _| {
+            env.set_worktree_dot_env(worktree_id, dot_env);
+        });
+
+        let raw_settings = r#"{
+            "lsp": {
+                "${SERVER_NAME}": {
+                    "binary": { "path": "ra" }
+                }
+            }
+        }"#;
+
+        let path = LocalSettingsPath::InWorktree(RelPath::empty_arc());
+
+        observer.update(cx, |obs, cx| {
+            obs.apply_local_settings(
+                worktree_id,
+                path.clone(),
+                LocalSettingsKind::Settings,
+                &Some(raw_settings.to_string()),
+                cx,
+            );
+        });
+
+        // Verify that raw_local_settings cached the raw string
+        observer.update(cx, |obs, _| {
+            let cached = obs
+                .raw_local_settings
+                .get(&worktree_id)
+                .unwrap()
+                .get(&path)
+                .unwrap();
+            assert_eq!(cached, raw_settings);
+        });
+
+        // Verify that SettingsStore has the expanded settings
+        cx.update(|cx| {
+            let settings_store = cx.global::<SettingsStore>();
+            let mut local_settings = settings_store.local_settings(worktree_id);
+            let (_, project_settings) = local_settings.next().expect("local settings exist");
+            assert!(project_settings.lsp.0.contains_key("rust-analyzer"));
+            assert!(!project_settings.lsp.0.contains_key("${SERVER_NAME}"));
+        });
+
+        // Now modify the worktree dot_env and reapply
+        let mut updated_dot_env = collections::HashMap::default();
+        updated_dot_env.insert("SERVER_NAME".to_string(), "gopls".to_string());
+        project_env.update(cx, |env, _| {
+            env.set_worktree_dot_env(worktree_id, updated_dot_env);
+        });
+
+        observer.update(cx, |obs, cx| {
+            obs.reapply_local_settings(worktree_id, cx);
+        });
+
+        cx.update(|cx| {
+            let settings_store = cx.global::<SettingsStore>();
+            let mut local_settings = settings_store.local_settings(worktree_id);
+            let (_, project_settings) = local_settings.next().expect("local settings exist");
+            assert!(project_settings.lsp.0.contains_key("gopls"));
+            assert!(!project_settings.lsp.0.contains_key("rust-analyzer"));
+        });
+
+        // Now remove the worktree dot_env and reapply
+        project_env.update(cx, |env, _| {
+            env.remove_worktree_dot_env(worktree_id);
+        });
+
+        observer.update(cx, |obs, cx| {
+            obs.reapply_local_settings(worktree_id, cx);
+        });
+
+        cx.update(|cx| {
+            let settings_store = cx.global::<SettingsStore>();
+            let mut local_settings = settings_store.local_settings(worktree_id);
+            let (_, project_settings) = local_settings.next().expect("local settings exist");
+            assert!(project_settings.lsp.0.contains_key("${SERVER_NAME}"));
+            assert!(!project_settings.lsp.0.contains_key("gopls"));
+        });
+    }
+
+    #[gpui::test]
+    async fn test_update_local_worktree_settings_reactivity(cx: &mut TestAppContext) {
+        let store = cx.update(SettingsStore::test);
+        cx.set_global(store);
+
+        let fs = FakeFs::new(cx.executor());
+        let root = Path::new("/root");
+        fs.create_dir(root).await.unwrap();
+        fs.save(
+            &root.join(".env"),
+            &"MY_VAR=initial_val\n".to_string().into(),
+            text::LineEnding::Unix,
+        )
+        .await
+        .unwrap();
+
+        let worktree_store = cx.update(|cx| {
+            cx.new(|_| WorktreeStore::local(false, fs.clone(), WorktreeIdCounter::default()))
+        });
+        let task_store = cx.update(|cx| cx.new(|_| TaskStore::Noop));
+        let project_env = cx.update(|cx| {
+            cx.new(|cx| {
+                ProjectEnvironment::new(
+                    None,
+                    worktree_store.downgrade(),
+                    None,
+                    false,
+                    cx,
+                )
+            })
+        });
+
+        let observer = cx.update(|cx| {
+            cx.new(|cx| {
+                let mut observer = SettingsObserver::new_local(
+                    fs.clone(),
+                    worktree_store.clone(),
+                    task_store.clone(),
+                    false,
+                    cx,
+                );
+                observer.set_environment(project_env.downgrade());
+                observer
+            })
+        });
+
+        let worktree = worktree_store
+            .update(cx, |ws, cx| ws.create_worktree(root, true, cx))
+            .await
+            .unwrap();
+
+        cx.run_until_parked();
+
+        let worktree_id = worktree.read_with(cx, |w, _| w.id());
+
+        // Verify initial .env was loaded into ProjectEnvironment during create_local_worktree
+        project_env.update(cx, |env, _| {
+            let dot_env = env.get_worktree_dot_env(worktree_id).unwrap();
+            assert_eq!(dot_env.get("MY_VAR").unwrap(), "initial_val");
+        });
+
+        // Apply raw local settings with ${MY_VAR}
+        let raw_settings = r#"{
+            "lsp": {
+                "${MY_VAR}": {
+                    "binary": { "path": "test" }
+                }
+            }
+        }"#;
+        let path = LocalSettingsPath::InWorktree(RelPath::empty_arc());
+        observer.update(cx, |obs, cx| {
+            obs.apply_local_settings(
+                worktree_id,
+                path.clone(),
+                LocalSettingsKind::Settings,
+                &Some(raw_settings.to_string()),
+                cx,
+            );
+        });
+
+        cx.update(|cx| {
+            let settings_store = cx.global::<SettingsStore>();
+            let mut local_settings = settings_store.local_settings(worktree_id);
+            let (_, project_settings) = local_settings.next().expect("local settings exist");
+            assert!(project_settings.lsp.0.contains_key("initial_val"));
+        });
+
+        // Update .env file on fs and trigger update_local_worktree_settings
+        fs.save(
+            &root.join(".env"),
+            &"MY_VAR=updated_val\n".to_string().into(),
+            text::LineEnding::Unix,
+        )
+        .await
+        .unwrap();
+
+        let dot_env_rel_path: Arc<RelPath> =
+            RelPath::new(Path::new(".env"), path::PathStyle::local())
+                .unwrap()
+                .into();
+        let changes: UpdatedEntriesSet = Arc::new([(
+            dot_env_rel_path.clone(),
+            worktree::ProjectEntryId::from_proto(0),
+            PathChange::Updated,
+        )]);
+
+        observer.update(cx, |obs, cx| {
+            obs.update_local_worktree_settings(&worktree, &changes, cx);
+        });
+
+        cx.run_until_parked();
+
+        // Check ProjectEnvironment has updated_val
+        project_env.update(cx, |env, _| {
+            let dot_env = env.get_worktree_dot_env(worktree_id).unwrap();
+            assert_eq!(dot_env.get("MY_VAR").unwrap(), "updated_val");
+        });
+
+        // Check SettingsStore has updated_val
+        cx.update(|cx| {
+            let settings_store = cx.global::<SettingsStore>();
+            let mut local_settings = settings_store.local_settings(worktree_id);
+            let (_, project_settings) = local_settings.next().expect("local settings exist");
+            assert!(project_settings.lsp.0.contains_key("updated_val"));
+            assert!(!project_settings.lsp.0.contains_key("initial_val"));
+        });
+
+        // Remove .env file and trigger update_local_worktree_settings
+        let remove_changes: UpdatedEntriesSet = Arc::new([(
+            dot_env_rel_path,
+            worktree::ProjectEntryId::from_proto(0),
+            PathChange::Removed,
+        )]);
+
+        observer.update(cx, |obs, cx| {
+            obs.update_local_worktree_settings(&worktree, &remove_changes, cx);
+        });
+
+        cx.run_until_parked();
+
+        // Check ProjectEnvironment no longer has dot_env
+        project_env.update(cx, |env, _| {
+            assert!(env.get_worktree_dot_env(worktree_id).is_none());
+        });
+
+        // Check SettingsStore has unexpanded ${MY_VAR}
+        cx.update(|cx| {
+            let settings_store = cx.global::<SettingsStore>();
+            let mut local_settings = settings_store.local_settings(worktree_id);
+            let (_, project_settings) = local_settings.next().expect("local settings exist");
+            assert!(project_settings.lsp.0.contains_key("${MY_VAR}"));
+            assert!(!project_settings.lsp.0.contains_key("updated_val"));
+        });
+    }
 }
