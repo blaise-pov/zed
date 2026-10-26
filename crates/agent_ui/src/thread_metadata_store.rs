@@ -144,6 +144,7 @@ fn migrate_thread_metadata(cx: &mut App) -> Task<anyhow::Result<()>> {
                         archived: true,
                         model: None,
                         agent_label: None,
+                        diff_stats: None,
                     })
                 })
                 .collect::<Vec<_>>()
@@ -327,6 +328,7 @@ pub struct ThreadMetadata {
     pub archived: bool,
     pub model: Option<SharedString>,
     pub agent_label: Option<SharedString>,
+    pub diff_stats: Option<action_log::DiffStats>,
 }
 
 impl ThreadMetadata {
@@ -1350,6 +1352,13 @@ impl ThreadMetadataStore {
         let agent_label =
             fresh_agent_label.or_else(|| existing_thread.and_then(|t| t.agent_label.clone()));
 
+        let current_diff_stats = thread_ref.action_log().read(cx).diff_stats(cx);
+        let diff_stats = if current_diff_stats != action_log::DiffStats::default() {
+            Some(current_diff_stats)
+        } else {
+            existing_thread.and_then(|t| t.diff_stats)
+        };
+
         let metadata = ThreadMetadata {
             thread_id,
             session_id,
@@ -1364,6 +1373,7 @@ impl ThreadMetadataStore {
             archived,
             model,
             agent_label,
+            diff_stats,
         };
 
         self.save(metadata, cx);
@@ -1482,6 +1492,15 @@ impl Domain for ThreadMetadataDb {
         sql!(
             ALTER TABLE sidebar_threads ADD COLUMN agent_label TEXT;
         ),
+        sql!(
+            ALTER TABLE sidebar_threads ADD COLUMN files_changed INTEGER;
+        ),
+        sql!(
+            ALTER TABLE sidebar_threads ADD COLUMN lines_added INTEGER;
+        ),
+        sql!(
+            ALTER TABLE sidebar_threads ADD COLUMN lines_removed INTEGER;
+        ),
     ];
 }
 
@@ -1498,7 +1517,8 @@ impl ThreadMetadataDb {
 
     const LIST_QUERY: &str = "SELECT thread_id, session_id, agent_id, title, updated_at, \
         created_at, interacted_at, folder_paths, folder_paths_order, archived, main_worktree_paths, \
-        main_worktree_paths_order, remote_connection, title_override, model, agent_label \
+        main_worktree_paths_order, remote_connection, title_override, model, agent_label, \
+        files_changed, lines_added, lines_removed \
         FROM sidebar_threads \
         ORDER BY updated_at DESC";
 
@@ -1551,12 +1571,15 @@ impl ThreadMetadataDb {
         let title_override = row.title_override.as_ref().map(|t| t.to_string());
         let model = row.model.as_ref().map(|m| m.to_string());
         let agent_label = row.agent_label.as_ref().map(|a| a.to_string());
+        let files_changed = row.diff_stats.map(|s| s.files_changed);
+        let lines_added = row.diff_stats.map(|s| s.lines_added);
+        let lines_removed = row.diff_stats.map(|s| s.lines_removed);
         let thread_id = row.thread_id;
         let archived = row.archived;
 
         self.write(move |conn| {
-            let sql = "INSERT INTO sidebar_threads(thread_id, session_id, agent_id, title, updated_at, created_at, interacted_at, folder_paths, folder_paths_order, archived, main_worktree_paths, main_worktree_paths_order, remote_connection, title_override, model, agent_label) \
-                       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16) \
+            let sql = "INSERT INTO sidebar_threads(thread_id, session_id, agent_id, title, updated_at, created_at, interacted_at, folder_paths, folder_paths_order, archived, main_worktree_paths, main_worktree_paths_order, remote_connection, title_override, model, agent_label, files_changed, lines_added, lines_removed) \
+                       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19) \
                        ON CONFLICT(thread_id) DO UPDATE SET \
                            session_id = excluded.session_id, \
                            agent_id = excluded.agent_id, \
@@ -1572,7 +1595,10 @@ impl ThreadMetadataDb {
                            remote_connection = excluded.remote_connection, \
                            title_override = excluded.title_override, \
                            model = excluded.model, \
-                           agent_label = excluded.agent_label";
+                           agent_label = excluded.agent_label, \
+                           files_changed = excluded.files_changed, \
+                           lines_added = excluded.lines_added, \
+                           lines_removed = excluded.lines_removed";
             let mut stmt = Statement::prepare(conn, sql)?;
             let mut i = stmt.bind(&thread_id, 1)?;
             i = stmt.bind(&session_id, i)?;
@@ -1589,7 +1615,10 @@ impl ThreadMetadataDb {
             i = stmt.bind(&remote_connection, i)?;
             i = stmt.bind(&title_override, i)?;
             i = stmt.bind(&model, i)?;
-            stmt.bind(&agent_label, i)?;
+            i = stmt.bind(&agent_label, i)?;
+            i = stmt.bind(&files_changed, i)?;
+            i = stmt.bind(&lines_added, i)?;
+            stmt.bind(&lines_removed, i)?;
             stmt.exec()
         })
         .await
@@ -1728,6 +1757,9 @@ impl Column for ThreadMetadata {
         let (title_override, next): (Option<String>, i32) = Column::column(statement, next)?;
         let (model, next): (Option<String>, i32) = Column::column(statement, next)?;
         let (agent_label, next): (Option<String>, i32) = Column::column(statement, next)?;
+        let (files_changed, next): (Option<u32>, i32) = Column::column(statement, next)?;
+        let (lines_added, next): (Option<u32>, i32) = Column::column(statement, next)?;
+        let (lines_removed, next): (Option<u32>, i32) = Column::column(statement, next)?;
 
         let agent_id = agent_id
             .map(|id| AgentId::new(id))
@@ -1773,6 +1805,17 @@ impl Column for ThreadMetadata {
         let worktree_paths = WorktreePaths::from_path_lists(main_worktree_paths, folder_paths)
             .unwrap_or_else(|_| WorktreePaths::default());
 
+        let diff_stats = match (files_changed, lines_added, lines_removed) {
+            (Some(files_changed), Some(lines_added), Some(lines_removed)) => {
+                Some(action_log::DiffStats {
+                    files_changed,
+                    lines_added,
+                    lines_removed,
+                })
+            }
+            _ => None,
+        };
+
         let thread_id = ThreadId(thread_id_uuid);
 
         Ok((
@@ -1798,6 +1841,7 @@ impl Column for ThreadMetadata {
                 agent_label: agent_label
                     .filter(|a| !a.is_empty())
                     .map(SharedString::from),
+                diff_stats,
             },
             next,
         ))
@@ -1891,6 +1935,7 @@ mod tests {
             remote_connection: None,
             model: None,
             agent_label: None,
+            diff_stats: None,
         }
     }
 
@@ -2063,6 +2108,69 @@ mod tests {
             assert_eq!(empty_entry.model, None);
             assert_eq!(empty_entry.agent_label, None);
         });
+    }
+
+    #[gpui::test]
+    async fn test_database_round_trips_diff_stats(_cx: &mut TestAppContext) {
+        let now = Utc::now();
+        let mut metadata_with_stats = make_metadata(
+            "session-with-stats",
+            "Thread with Stats",
+            now,
+            PathList::new(&[Path::new("/project-a")]),
+        );
+        let expected_stats = action_log::DiffStats {
+            files_changed: 3,
+            lines_added: 42,
+            lines_removed: 15,
+        };
+        metadata_with_stats.diff_stats = Some(expected_stats);
+
+        let metadata_without_stats = make_metadata(
+            "session-without-stats",
+            "Thread without Stats",
+            now,
+            PathList::new(&[Path::new("/project-b")]),
+        );
+
+        let thread = std::thread::current();
+        let test_name = thread.name().unwrap_or("unknown_test");
+        let db_name = format!("THREAD_METADATA_DB_{}", test_name);
+        let db = ThreadMetadataDb(gpui::block_on(db::open_test_db::<ThreadMetadataDb>(
+            &db_name,
+        )));
+
+        db.save(metadata_with_stats.clone()).await.unwrap();
+        db.save(metadata_without_stats.clone()).await.unwrap();
+
+        let rows = db.list().unwrap();
+        let row_with_stats = rows
+            .iter()
+            .find(|r| r.thread_id == metadata_with_stats.thread_id)
+            .expect("metadata_with_stats should exist");
+        assert_eq!(row_with_stats.diff_stats, Some(expected_stats));
+
+        let row_without_stats = rows
+            .iter()
+            .find(|r| r.thread_id == metadata_without_stats.thread_id)
+            .expect("metadata_without_stats should exist");
+        assert_eq!(row_without_stats.diff_stats, None);
+
+        // Update on conflict
+        let updated_stats = action_log::DiffStats {
+            files_changed: 5,
+            lines_added: 100,
+            lines_removed: 20,
+        };
+        metadata_with_stats.diff_stats = Some(updated_stats);
+        db.save(metadata_with_stats.clone()).await.unwrap();
+
+        let rows = db.list().unwrap();
+        let row_updated = rows
+            .iter()
+            .find(|r| r.thread_id == metadata_with_stats.thread_id)
+            .expect("metadata_with_stats should exist");
+        assert_eq!(row_updated.diff_stats, Some(updated_stats));
     }
 
     #[gpui::test]
@@ -2265,6 +2373,7 @@ mod tests {
             archived: false,
             model: None,
             agent_label: None,
+            diff_stats: None,
         };
 
         cx.update(|cx| {
@@ -2352,6 +2461,7 @@ mod tests {
             archived: false,
             model: None,
             agent_label: None,
+            diff_stats: None,
         };
 
         cx.update(|cx| {
@@ -2480,6 +2590,7 @@ mod tests {
             archived: false,
             model: None,
             agent_label: None,
+            diff_stats: None,
         };
 
         cx.update(|cx| {
@@ -3226,6 +3337,7 @@ mod tests {
             remote_connection: None,
             model: None,
             agent_label: None,
+            diff_stats: None,
         };
 
         let remote_linked_thread = ThreadMetadata {
@@ -3242,6 +3354,7 @@ mod tests {
             remote_connection: Some(remote_a.clone()),
             model: None,
             agent_label: None,
+            diff_stats: None,
         };
 
         cx.update(|cx| {

@@ -8509,6 +8509,7 @@ mod tests {
                         archived: false,
                         model: None,
                         agent_label: None,
+                        diff_stats: None,
                     },
                     cx,
                 );
