@@ -49,7 +49,7 @@ use language_model::{
     StopReason, TokenUsage, ZED_CLOUD_PROVIDER_ID, is_upstream_network_failure,
 };
 use project::{Project, trusted_worktrees::TrustedWorktrees};
-use prompt_store::{ProjectContext, WorktreeContext};
+use prompt_store::ProjectContext;
 
 use schemars::{JsonSchema, Schema};
 use serde::de::DeserializeOwned;
@@ -1717,39 +1717,15 @@ impl Thread {
                 .read(cx)
                 .skills()
                 .to_vec();
-            let cached = crate::task_worktree::cached_task_worktree_context(worktree_path);
-            let worktree_context = cached.unwrap_or_else(|| {
-                let (root_name, abs_path) = project
-                    .read(cx)
-                    .worktrees(cx)
-                    .find(|w| {
-                        let abs = w.read(cx).abs_path();
-                        abs.as_ref() == worktree_path.as_path()
-                            || util::paths::normalize_lexically(abs.as_ref())
-                                .ok()
-                                .as_deref()
-                                == util::paths::normalize_lexically(worktree_path.as_path())
-                                    .ok()
-                                    .as_deref()
-                    })
-                    .map(|w| {
-                        let tree = w.read(cx);
-                        (tree.root_name_str().to_string(), tree.abs_path())
-                    })
-                    .unwrap_or_else(|| {
-                        let file_name = worktree_path
-                            .file_name()
-                            .map(|n| n.to_string_lossy().to_string())
-                            .unwrap_or_else(|| worktree_path.to_string_lossy().to_string());
-                        (file_name, Arc::from(worktree_path.as_path()))
-                    });
-                WorktreeContext {
-                    root_name,
-                    abs_path,
-                    rules_file: None,
-                }
-            });
-            cx.new(|_| ProjectContext::new(vec![worktree_context]).with_skills(parent_skills))
+            let (worktree_context, _) = crate::initial_task_worktree_context(
+                &project,
+                None,
+                worktree_path,
+                cx,
+            );
+            cx.new(|_| {
+                ProjectContext::new(vec![worktree_context]).with_skills(parent_skills)
+            })
         } else {
             parent_thread.read(cx).project_context.clone()
         };

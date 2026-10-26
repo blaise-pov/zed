@@ -1993,6 +1993,21 @@ pub fn task_session_id_for_id(task_id: &AgentTaskId) -> Option<String> {
         .or_else(|| reg.task_sessions.get(task_id).cloned())
 }
 
+pub fn task_id_for_session_id(session_id: &str) -> Option<AgentTaskId> {
+    let reg = REGISTRY.read();
+    for (task_id, entry) in &reg.entries {
+        if entry.session_id.as_deref() == Some(session_id) {
+            return Some(task_id.clone());
+        }
+    }
+    for (task_id, sess) in &reg.task_sessions {
+        if sess == session_id {
+            return Some(task_id.clone());
+        }
+    }
+    None
+}
+
 pub fn record_task_worktree_changed_files(task_id: &AgentTaskId, files: Vec<String>) {
     let mut reg = REGISTRY.write();
     if let Some(entry) = reg.entries.get_mut(task_id) {

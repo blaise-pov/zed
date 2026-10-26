@@ -3656,9 +3656,21 @@ impl NativeThreadEnvironment {
             });
         }
 
-        let effective_task_worktree = task_worktree.or_else(|| {
-            subagent_thread.read(cx).task_worktree().map(|p| p.to_path_buf())
-        });
+        let effective_task_worktree = task_worktree
+            .or_else(|| subagent_thread.read(cx).task_worktree().map(|p| p.to_path_buf()))
+            .or_else(|| {
+                let found_task_id = subagent_thread
+                    .read(cx)
+                    .task_id()
+                    .map(|tid| crate::AgentTaskId::from(tid.to_string()))
+                    .or_else(|| crate::task_worktree::task_id_for_session_id(&session_id.to_string()));
+                if let Some(ref tid) = found_task_id {
+                    if subagent_thread.read(cx).task_id().is_none() {
+                        subagent_thread.update(cx, |t, _| t.set_task_id(Some(tid.to_string())));
+                    }
+                }
+                found_task_id.and_then(|tid| crate::task_worktree::task_worktree_path_for_id(&tid))
+            });
         if let Some(task_worktree) = effective_task_worktree {
             subagent_thread.update(cx, |thread, _cx| {
                 thread.set_task_worktree(Some(task_worktree.clone()));
@@ -3703,38 +3715,13 @@ impl NativeThreadEnvironment {
             .skills()
             .to_vec();
 
-        let worktree_entity = crate::task_worktree::task_worktree_entity_for_path(
-            project.entity_id(),
-            task_worktree,
-            cx,
-        )
-        .or_else(|| {
-            project.read(cx).worktrees(cx).find(|w| {
-                let abs = w.read(cx).abs_path();
-                abs.as_ref() == task_worktree
-                    || util::paths::normalize_lexically(abs.as_ref()).ok().as_deref()
-                        == util::paths::normalize_lexically(task_worktree).ok().as_deref()
-            })
-        });
+        let task_id = subagent_thread
+            .read(cx)
+            .task_id()
+            .map(|tid| crate::AgentTaskId::from(tid.to_string()));
 
-        let cached = crate::task_worktree::cached_task_worktree_context(task_worktree);
-        let initial_worktree_context = cached.unwrap_or_else(|| {
-            let (root_name, abs_path) = if let Some(ref worktree_entity) = worktree_entity {
-                let tree = worktree_entity.read(cx);
-                (tree.root_name_str().to_string(), tree.abs_path())
-            } else {
-                let name = task_worktree
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_else(|| task_worktree.to_string_lossy().to_string());
-                (name, Arc::from(task_worktree))
-            };
-            WorktreeContext {
-                root_name,
-                abs_path,
-                rules_file: None,
-            }
-        });
+        let (initial_worktree_context, worktree_entity) =
+            initial_task_worktree_context(&project, task_id.as_ref(), task_worktree, cx);
 
         let project_context = cx.new(|_| {
             ProjectContext::new(vec![initial_worktree_context]).with_skills(skills)
@@ -3784,6 +3771,56 @@ impl NativeThreadEnvironment {
         )) as _)
     }
 }
+
+pub(crate) fn find_task_worktree_entity(
+    project: &Entity<Project>,
+    task_id: Option<&crate::AgentTaskId>,
+    path: &Path,
+    cx: &App,
+) -> Option<Entity<Worktree>> {
+    task_id
+        .and_then(|tid| crate::task_worktree::task_worktree_entity_for_id(project.entity_id(), tid))
+        .or_else(|| {
+            crate::task_worktree::task_worktree_entity_for_path(project.entity_id(), path, cx)
+        })
+        .or_else(|| {
+            project.read(cx).worktrees(cx).find(|w| {
+                let abs = w.read(cx).abs_path();
+                abs.as_ref() == path
+                    || util::paths::normalize_lexically(abs.as_ref()).ok().as_deref()
+                        == util::paths::normalize_lexically(path).ok().as_deref()
+            })
+        })
+}
+
+pub(crate) fn initial_task_worktree_context(
+    project: &Entity<Project>,
+    task_id: Option<&crate::AgentTaskId>,
+    path: &Path,
+    cx: &App,
+) -> (WorktreeContext, Option<Entity<Worktree>>) {
+    let worktree_entity = find_task_worktree_entity(project, task_id, path, cx);
+    let cached = crate::task_worktree::cached_task_worktree_context(path);
+    let worktree_context = cached.unwrap_or_else(|| {
+        let (root_name, abs_path) = if let Some(ref worktree_entity) = worktree_entity {
+            let tree = worktree_entity.read(cx);
+            (tree.root_name_str().to_string(), tree.abs_path())
+        } else {
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| path.to_string_lossy().to_string());
+            (name, Arc::from(path))
+        };
+        WorktreeContext {
+            root_name,
+            abs_path,
+            rules_file: None,
+        }
+    });
+    (worktree_context, worktree_entity)
+}
+
 
 impl ThreadEnvironment for NativeThreadEnvironment {
     fn create_terminal(
@@ -3928,18 +3965,12 @@ impl ThreadEnvironment for NativeThreadEnvironment {
             if let Some(path) = crate::task_worktree::task_worktree_path_for_id(&host_task_id) {
                 let project = cx.update(|cx| parent_thread_entity.read(cx).project().clone());
                 let info_task = cx.update(|cx| {
-                    let worktree_entity = crate::task_worktree::task_worktree_entity_for_path(
-                        project.entity_id(),
+                    let worktree_entity = find_task_worktree_entity(
+                        &project,
+                        Some(&host_task_id),
                         &path,
                         cx,
-                    ).or_else(|| {
-                        project.read(cx).worktrees(cx).find(|w| {
-                            let abs = w.read(cx).abs_path();
-                            abs.as_ref() == path.as_path()
-                                || util::paths::normalize_lexically(abs.as_ref()).ok().as_deref()
-                                    == util::paths::normalize_lexically(path.as_path()).ok().as_deref()
-                        })
-                    });
+                    );
                     worktree_entity.map(|we| {
                         NativeAgent::load_worktree_info_for_system_prompt(we, project.clone(), cx)
                     })
@@ -3960,7 +3991,7 @@ impl ThreadEnvironment for NativeThreadEnvironment {
         let on_branch = on_branch.or_else(|| crate::task_worktree::task_worktree_checkout_target(&task_id_typed));
         let goal_id = goal_id.or_else(|| crate::task_worktree::task_worktree_goal_branch(&task_id_typed));
         let task_summary = crate::AgentTaskSummary {
-            id: task_id_typed,
+            id: task_id_typed.clone(),
             parent_id: None,
             goal_id: goal_id.clone(),
             title: format!("agent-task/{task_id}"),
@@ -3987,18 +4018,12 @@ impl ThreadEnvironment for NativeThreadEnvironment {
             });
             let worktree_path = ensure_task.await?;
             let info_task = cx.update(|cx| {
-                let worktree_entity = crate::task_worktree::task_worktree_entity_for_path(
-                    project.entity_id(),
+                let worktree_entity = find_task_worktree_entity(
+                    &project,
+                    Some(&task_id_typed),
                     &worktree_path,
                     cx,
-                ).or_else(|| {
-                    project.read(cx).worktrees(cx).find(|w| {
-                        let abs = w.read(cx).abs_path();
-                        abs.as_ref() == worktree_path.as_path()
-                            || util::paths::normalize_lexically(abs.as_ref()).ok().as_deref()
-                                == util::paths::normalize_lexically(worktree_path.as_path()).ok().as_deref()
-                    })
-                });
+                );
                 worktree_entity.map(|we| {
                     NativeAgent::load_worktree_info_for_system_prompt(we, project.clone(), cx)
                 })
@@ -10607,6 +10632,140 @@ mod internal_tests {
             assert!(resumed_prompt.contains(&*worktree_path_str));
             assert!(resumed_prompt.contains("ISOLATED BRANCH RULES"));
             assert!(!resumed_prompt.contains("HOST RULES"));
+        }
+        #[gpui::test]
+        async fn test_isolated_subagent_cold_resume_confines_to_worktree(cx: &mut TestAppContext) {
+            init_test(cx);
+            let fs = FakeFs::new(cx.executor());
+            fs.insert_tree(
+                path!("/host"),
+                json!({
+                    ".git": {},
+                    ".rules": "HOST RULES"
+                }),
+            )
+            .await;
+
+            let project = Project::test(fs.clone(), [path!("/host").as_ref()], cx).await;
+            let thread_store = cx.new(|cx| ThreadStore::new(cx));
+            let agent = cx.update(|cx| NativeAgent::new(thread_store, Templates::new(), fs.clone(), cx));
+            let connection = Rc::new(NativeAgentConnection(agent.clone()));
+            let provider = Arc::new(FakeLanguageModelProvider::new(
+                LanguageModelProviderId::from("fake-corp".to_string()),
+                LanguageModelProviderName::from("Fake Corp".to_string()),
+            ));
+            let model = provider.update_model("test-model", |model| {
+                model.name = LanguageModelName::from("Test Model".to_string());
+            });
+            cx.update(|cx| {
+                LanguageModelRegistry::global(cx).update(cx, |registry, cx| {
+                    registry.register_provider(provider, cx);
+                    registry.set_default_model(Some(model), cx);
+                });
+            });
+
+            cx.run_until_parked();
+
+            let acp_thread = cx
+                .update(|cx| connection.new_session(project.clone(), PathList::new(&[Path::new("")]), cx))
+                .await
+                .unwrap();
+            let parent_session_id = acp_thread.read_with(cx, |thread, _| thread.session_id().clone());
+            let parent_thread = cx.update(|cx| native_thread_for_session(&agent, &parent_session_id, cx));
+            let environment = NativeThreadEnvironment {
+                agent: agent.downgrade(),
+                thread: parent_thread.downgrade(),
+                acp_thread: acp_thread.downgrade(),
+            };
+
+            let task_id = "TASK-COLD-RESUME";
+            let worktree_path = environment
+                .ensure_subagent_worktree(task_id, None, None, None, None, &mut cx.to_async())
+                .await
+                .expect("ensuring task worktree should succeed");
+
+            fs.insert_file(
+                worktree_path.join(".rules"),
+                "COLD RESUME ISOLATED RULES".as_bytes().to_vec(),
+            )
+            .await;
+            cx.run_until_parked();
+
+            // Create the isolated subagent thread with task_worktree.
+            let subagent_handle = cx
+                .update(|cx| {
+                    environment.create_subagent_thread(
+                        "isolated-worker".to_string(),
+                        None,
+                        None,
+                        Some(worktree_path.clone()),
+                        cx,
+                    )
+                })
+                .expect("creating isolated subagent should succeed");
+            cx.run_until_parked();
+
+            let subagent_thread = agent.read_with(cx, |agent, _| {
+                agent.sessions.get(&subagent_handle.id()).unwrap().thread.clone()
+            });
+
+            // Simulate cold resume from DB: task_worktree is None, task_id is preserved
+            subagent_thread.update(cx, |thread, _cx| {
+                thread.set_task_worktree(None);
+                thread.set_task_id(Some(task_id.to_string()));
+            });
+
+            // Registry knows the task and its session
+            let task_id_typed = crate::AgentTaskId::from(task_id);
+            crate::task_worktree::register_task_session(&task_id_typed, subagent_handle.id().to_string());
+
+            // Cold resume: caller passes task_worktree: None
+            let resumed_handle = cx
+                .update(|cx| {
+                    environment.resume_subagent_thread(
+                        subagent_handle.id(),
+                        None,
+                        None,
+                        cx,
+                    )
+                })
+                .expect("cold-resuming isolated subagent should succeed");
+            cx.run_until_parked();
+
+            let resumed_thread = agent.read_with(cx, |agent, _| {
+                agent.sessions.get(&resumed_handle.id()).unwrap().thread.clone()
+            });
+
+            // Verify confinement: worktree_root_path returns task worktree, NOT host
+            let root_path = resumed_thread.read_with(cx, |t, cx| t.worktree_root_path(cx));
+            assert_eq!(
+                root_path.as_deref(),
+                Some(worktree_path.as_path()),
+                "cold-resumed thread must confine reads to the task worktree"
+            );
+
+            // Verify system prompt: lists ONLY task worktree root and branch rules, not host
+            let resumed_messages = resumed_thread.read_with(cx, |thread, cx| {
+                thread.build_request_messages(Vec::new(), cx)
+            });
+            let resumed_prompt = resumed_messages[0].string_contents();
+            let worktree_path_str = worktree_path.to_string_lossy();
+            assert!(
+                resumed_prompt.contains(&*worktree_path_str),
+                "cold-resumed thread system prompt must list task worktree root"
+            );
+            assert!(
+                !resumed_prompt.contains(r"`\host`") && !resumed_prompt.contains("`/host`"),
+                "cold-resumed thread system prompt must NOT contain host root"
+            );
+            assert!(
+                resumed_prompt.contains("COLD RESUME ISOLATED RULES"),
+                "cold-resumed thread system prompt must contain branch rules"
+            );
+            assert!(
+                !resumed_prompt.contains("HOST RULES"),
+                "cold-resumed thread system prompt must NOT contain host rules"
+            );
         }
 }
 
