@@ -1725,7 +1725,9 @@ impl Thread {
                     .find(|w| {
                         let abs = w.read(cx).abs_path();
                         abs.as_ref() == worktree_path.as_path()
-                            || util::paths::normalize_lexically(abs.as_ref()).ok().as_deref()
+                            || util::paths::normalize_lexically(abs.as_ref())
+                                .ok()
+                                .as_deref()
                                 == util::paths::normalize_lexically(worktree_path.as_path())
                                     .ok()
                                     .as_deref()
@@ -1747,9 +1749,7 @@ impl Thread {
                     rules_file: None,
                 }
             });
-            cx.new(|_| {
-                ProjectContext::new(vec![worktree_context]).with_skills(parent_skills)
-            })
+            cx.new(|_| ProjectContext::new(vec![worktree_context]).with_skills(parent_skills))
         } else {
             parent_thread.read(cx).project_context.clone()
         };
@@ -2107,7 +2107,9 @@ impl Thread {
         stream: &ThreadEventStream,
         cx: &mut Context<Self>,
     ) {
-        if tool_result.is_some_and(Self::is_canceled_tool_result) && tool_use.name.as_ref() != "spawn_agent" {
+        if tool_result.is_some_and(Self::is_canceled_tool_result)
+            && tool_use.name.as_ref() != "spawn_agent"
+        {
             return;
         }
 
@@ -2148,19 +2150,26 @@ impl Thread {
         let meta = if tool_use.name.as_ref() == "spawn_agent" {
             let session_info = output
                 .as_ref()
-                .and_then(|out| serde_json::from_value::<crate::tools::SpawnAgentToolOutput>(out.clone()).ok())
+                .and_then(|out| {
+                    serde_json::from_value::<crate::tools::SpawnAgentToolOutput>(out.clone()).ok()
+                })
                 .and_then(|spawn_out| match spawn_out {
-                    crate::tools::SpawnAgentToolOutput::Success { session_info, .. } => Some(session_info),
+                    crate::tools::SpawnAgentToolOutput::Success { session_info, .. } => {
+                        Some(session_info)
+                    }
                     crate::tools::SpawnAgentToolOutput::Error { session_info, .. } => session_info,
                 })
                 .or_else(|| {
                     let json = tool_use.input.clone().into_json().ok()?;
-                    let parsed_input = serde_json::from_value::<crate::tools::SpawnAgentToolInput>(json).ok()?;
+                    let parsed_input =
+                        serde_json::from_value::<crate::tools::SpawnAgentToolInput>(json).ok()?;
                     let task_id = parsed_input.task_id.clone();
                     let session_id = parsed_input.session_id.or_else(|| {
                         task_id.as_ref().and_then(|tid| {
-                            crate::task_worktree::task_session_id_for_id(&crate::AgentTaskId::from(tid.clone()))
-                                .map(acp::SessionId::new)
+                            crate::task_worktree::task_session_id_for_id(&crate::AgentTaskId::from(
+                                tid.clone(),
+                            ))
+                            .map(acp::SessionId::new)
                         })
                     })?;
                     Some(acp_thread::SubagentSessionInfo {
@@ -2238,13 +2247,11 @@ impl Thread {
         if tool_use.name.as_ref() == "spawn_agent" && output.is_none() {
             stream.update_tool_call_fields(
                 &tool_call_id,
-                acp::ToolCallUpdateFields::new().content(vec![
-                    acp::ToolCallContent::Content(acp::Content::new(
-                        acp::ContentBlock::Text(acp::TextContent::new(
-                            "spawn_agent canceled: result not delivered".to_string(),
-                        )),
-                    )),
-                ]),
+                acp::ToolCallUpdateFields::new().content(vec![acp::ToolCallContent::Content(
+                    acp::Content::new(acp::ContentBlock::Text(acp::TextContent::new(
+                        "spawn_agent canceled: result not delivered".to_string(),
+                    ))),
+                )]),
                 meta.clone(),
             );
         }
@@ -3477,31 +3484,26 @@ impl Thread {
         cx: Option<&App>,
     ) -> LanguageModelToolResult {
         if tool_use.name.as_ref() == "spawn_agent" {
-            let parsed_input = tool_use
-                .input
-                .clone()
-                .into_json()
-                .ok()
-                .and_then(|json| {
-                    serde_json::from_value::<crate::tools::SpawnAgentToolInput>(json).ok()
-                });
+            let parsed_input = tool_use.input.clone().into_json().ok().and_then(|json| {
+                serde_json::from_value::<crate::tools::SpawnAgentToolInput>(json).ok()
+            });
             let task_id = parsed_input.as_ref().and_then(|i| i.task_id.clone());
             let session_id = parsed_input
                 .as_ref()
                 .and_then(|i| i.session_id.clone())
                 .or_else(|| {
                     task_id.as_ref().and_then(|tid| {
-                        crate::task_worktree::task_session_id_for_id(
-                            &crate::AgentTaskId::from(tid.clone()),
-                        )
+                        crate::task_worktree::task_session_id_for_id(&crate::AgentTaskId::from(
+                            tid.clone(),
+                        ))
                         .map(acp::SessionId::new)
                     })
                 })
                 .or_else(|| {
                     let cx = cx?;
-                    running_subagents.iter().find_map(|sub| {
-                        sub.upgrade().map(|s| s.read(cx).id.clone())
-                    })
+                    running_subagents
+                        .iter()
+                        .find_map(|sub| sub.upgrade().map(|s| s.read(cx).id.clone()))
                 });
 
             let session_info = session_id.map(|sid| acp_thread::SubagentSessionInfo {
@@ -3615,7 +3617,10 @@ impl Thread {
                 for content in &agent_msg.content {
                     if let AgentMessageContent::ToolUse(tool_use) = content {
                         if !agent_msg.tool_results.contains_key(&tool_use.id) {
-                            crate::task_worktree::sweep_guards_for_tool_use(&thread_id, &tool_use.id);
+                            crate::task_worktree::sweep_guards_for_tool_use(
+                                &thread_id,
+                                &tool_use.id,
+                            );
                             log::info!(
                                 "[cancel-audit] thread={} tool_use_id={} tool_name={} source={}",
                                 thread_id,
@@ -3634,7 +3639,8 @@ impl Thread {
                             let tool_call_id = scoped_tool_call_id(msg_ix, &tool_use.id);
                             event_stream.update_tool_call_fields(
                                 &tool_call_id,
-                                acp::ToolCallUpdateFields::new().status(acp::ToolCallStatus::Failed),
+                                acp::ToolCallUpdateFields::new()
+                                    .status(acp::ToolCallStatus::Failed),
                                 meta,
                             );
                         }
@@ -3861,7 +3867,8 @@ impl Thread {
                                     event_stream.send_error(error);
                                 }
                                 Ok(CompletionError::Refusal) => {
-                                    event_stream.send_error(anyhow::anyhow!(CompletionError::Refusal));
+                                    event_stream
+                                        .send_error(anyhow::anyhow!(CompletionError::Refusal));
                                 }
                             }
                         }
@@ -6630,7 +6637,8 @@ pub(crate) struct AuthorizationActivityGuard {
 
 impl Drop for AuthorizationActivityGuard {
     fn drop(&mut self) {
-        self.pending_authorization_count.fetch_sub(1, Ordering::SeqCst);
+        self.pending_authorization_count
+            .fetch_sub(1, Ordering::SeqCst);
         self.activity_tx.lock().send(()).ok();
     }
 }
@@ -6674,7 +6682,8 @@ impl WatchdogHandle {
     }
 
     fn authorization_started(&self) -> AuthorizationActivityGuard {
-        self.pending_authorization_count.fetch_add(1, Ordering::SeqCst);
+        self.pending_authorization_count
+            .fetch_add(1, Ordering::SeqCst);
         self.bump_activity();
         AuthorizationActivityGuard {
             pending_authorization_count: self.pending_authorization_count.clone(),
@@ -7721,6 +7730,8 @@ pub struct ToolCallEventStream {
     project: Option<Entity<Project>>,
     profile_id: Option<agent_settings::AgentProfileId>,
     is_subagent: bool,
+    #[cfg(any(test, feature = "test-support"))]
+    test_task_worktree: Option<PathBuf>,
 }
 
 impl ToolCallEventStream {
@@ -7734,6 +7745,13 @@ impl ToolCallEventStream {
     pub fn test_with_thread(thread: &Entity<Thread>) -> (Self, ToolCallEventStreamReceiver) {
         let (mut stream, receiver) = Self::test();
         stream.thread = Some(thread.downgrade());
+        (stream, receiver)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn test_with_task_worktree(task_worktree: PathBuf) -> (Self, ToolCallEventStreamReceiver) {
+        let (mut stream, receiver) = Self::test();
+        stream.test_task_worktree = Some(task_worktree);
         (stream, receiver)
     }
 
@@ -7834,6 +7852,8 @@ impl ToolCallEventStream {
             project,
             profile_id,
             is_subagent,
+            #[cfg(any(test, feature = "test-support"))]
+            test_task_worktree: None,
         }
     }
 
@@ -7880,6 +7900,11 @@ impl ToolCallEventStream {
     }
 
     pub fn task_worktree(&self, cx: &App) -> Option<PathBuf> {
+        #[cfg(any(test, feature = "test-support"))]
+        if let Some(task_worktree) = &self.test_task_worktree {
+            return Some(task_worktree.clone());
+        }
+
         self.thread
             .as_ref()
             .and_then(|t| t.upgrade())
@@ -9845,7 +9870,10 @@ mod tests {
         });
 
         let (_msg_ix, result) = run_task.await;
-        assert!(!result.is_error, "expected tool result to succeed despite commit error");
+        assert!(
+            !result.is_error,
+            "expected tool result to succeed despite commit error"
+        );
         assert!(
             run_called.load(std::sync::atomic::Ordering::SeqCst),
             "tool.run must be called even when commit_error is present"
@@ -10000,9 +10028,9 @@ mod tests {
 
         let (tool_calls_tx, mut tool_calls_rx) = mpsc::unbounded();
         let server_name = server_id_str.clone();
-        let fake_transport = context_server::test::create_fake_transport(server_id_str.clone(), cx.executor())
-            .on_request::<context_server::types::requests::Initialize, _>(
-                move |_params| {
+        let fake_transport =
+            context_server::test::create_fake_transport(server_id_str.clone(), cx.executor())
+                .on_request::<context_server::types::requests::Initialize, _>(move |_params| {
                     let server_name = server_name.clone();
                     async move {
                         context_server::types::InitializeResponse {
@@ -10024,22 +10052,21 @@ mod tests {
                             meta: None,
                         }
                     }
-                },
-            )
-            .on_request::<context_server::types::requests::CallTool, _>(move |params| {
-                let tool_calls_tx = tool_calls_tx.clone();
-                async move {
-                    tool_calls_tx.unbounded_send(params).ok();
-                    context_server::types::CallToolResponse {
-                        content: vec![context_server::types::ToolResponseContent::Text {
-                            text: "ok".into(),
-                        }],
-                        is_error: None,
-                        meta: None,
-                        structured_content: None,
+                })
+                .on_request::<context_server::types::requests::CallTool, _>(move |params| {
+                    let tool_calls_tx = tool_calls_tx.clone();
+                    async move {
+                        tool_calls_tx.unbounded_send(params).ok();
+                        context_server::types::CallToolResponse {
+                            content: vec![context_server::types::ToolResponseContent::Text {
+                                text: "ok".into(),
+                            }],
+                            is_error: None,
+                            meta: None,
+                            structured_content: None,
+                        }
                     }
-                }
-            });
+                });
 
         let context_server_store = project.read_with(cx, |p, _| p.context_server_store());
         context_server_store.update(cx, |store, cx| {
@@ -10135,7 +10162,10 @@ mod tests {
         let tgs_call = tool_calls_rx.next().await.expect("expected call to TGS");
         assert_eq!(tgs_call.name, "task_event");
         let tgs_args = tgs_call.arguments.expect("expected args");
-        assert_eq!(tgs_args.get("task_id").and_then(|v| v.as_str()), Some("TASK-FAIL-COMMIT"));
+        assert_eq!(
+            tgs_args.get("task_id").and_then(|v| v.as_str()),
+            Some("TASK-FAIL-COMMIT")
+        );
         assert_eq!(tgs_args.get("kind").and_then(|v| v.as_str()), Some("error"));
         assert_eq!(
             tgs_args.get("message").and_then(|v| v.as_str()),
@@ -10512,7 +10542,9 @@ mod tests {
             user_text_message(ClientUserMessageId::new(), "task"),
             agent_text_message("partial output"),
             Arc::new(Message::Agent(AgentMessage {
-                content: vec![AgentMessageContent::Text("Error: continuation failed".to_string())],
+                content: vec![AgentMessageContent::Text(
+                    "Error: continuation failed".to_string(),
+                )],
                 is_continuation_failure: true,
                 ..AgentMessage::default()
             })),
@@ -13079,9 +13111,7 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_continuation_failure_finalizes_tool_calls_and_ends_turn(
-        cx: &mut TestAppContext,
-    ) {
+    async fn test_continuation_failure_finalizes_tool_calls_and_ends_turn(cx: &mut TestAppContext) {
         let (thread, _event_stream, fake) = setup_thread_for_test(cx).await;
         let model = fake.model("fake");
 
@@ -13100,7 +13130,9 @@ mod tests {
 
         let _events = cx.update(|cx| {
             thread.update(cx, |thread, cx| {
-                thread.send(ClientUserMessageId::new(), ["Run tool"], cx).unwrap()
+                thread
+                    .send(ClientUserMessageId::new(), ["Run tool"], cx)
+                    .unwrap()
             })
         });
 
@@ -13146,7 +13178,11 @@ mod tests {
             for msg in messages {
                 if let Message::Agent(agent_msg) = &**msg {
                     if let Some(result) = agent_msg.tool_results.get(&tool_use.id) {
-                        assert!(!result.is_error, "completed tool should have result status, but got: {:?}", result);
+                        assert!(
+                            !result.is_error,
+                            "completed tool should have result status, but got: {:?}",
+                            result
+                        );
                         found_tool_result = true;
                     }
                     for content in &agent_msg.content {
@@ -13159,7 +13195,10 @@ mod tests {
                 }
             }
             assert!(found_tool_result, "tool result should be present");
-            assert!(found_visible_error, "visible error entry should be present in thread transcript");
+            assert!(
+                found_visible_error,
+                "visible error entry should be present in thread transcript"
+            );
         });
     }
 
@@ -13199,16 +13238,17 @@ mod tests {
                     .tool_results
                     .get(&tool_use.id)
                     .expect("expected tool result");
-                assert!(result.is_error, "unfinalized tool call must be marked as error");
+                assert!(
+                    result.is_error,
+                    "unfinalized tool call must be marked as error"
+                );
                 assert_eq!(result.tool_use_id, tool_use.id);
             });
         });
     }
 
     #[gpui::test]
-    async fn test_flush_preserves_entries_and_subagent_session_references(
-        cx: &mut TestAppContext,
-    ) {
+    async fn test_flush_preserves_entries_and_subagent_session_references(cx: &mut TestAppContext) {
         crate::task_worktree::reset_registry_for_tests();
         let (thread, _, _) = setup_thread_for_test(cx).await;
 
@@ -13257,7 +13297,10 @@ mod tests {
                 "canceled tool result must be marked error"
             );
 
-            let output = tool_result.output.as_ref().expect("output must be preserved");
+            let output = tool_result
+                .output
+                .as_ref()
+                .expect("output must be preserved");
             let spawn_output: crate::tools::SpawnAgentToolOutput =
                 serde_json::from_value(output.clone()).expect("valid SpawnAgentToolOutput");
             let crate::tools::SpawnAgentToolOutput::Error {
@@ -13281,8 +13324,7 @@ mod tests {
             );
         });
 
-        let (events_tx, mut events_rx) =
-            futures::channel::mpsc::unbounded::<Result<ThreadEvent>>();
+        let (events_tx, mut events_rx) = futures::channel::mpsc::unbounded::<Result<ThreadEvent>>();
         let stream = ThreadEventStream::new(events_tx);
 
         cx.update(|cx| {
@@ -13312,8 +13354,7 @@ mod tests {
                 }
                 ThreadEvent::ToolCallUpdate(acp_thread::ToolCallUpdate::UpdateFields(update)) => {
                     if let Some(meta) = update.meta {
-                        if let Some(info) =
-                            acp_thread::subagent_session_info_from_meta(&Some(meta))
+                        if let Some(info) = acp_thread::subagent_session_info_from_meta(&Some(meta))
                         {
                             assert_eq!(info.session_id.to_string(), "child-session-xyz");
                             received_meta_session_info = true;
@@ -13396,7 +13437,9 @@ mod tests {
 
         let _events = cx.update(|cx| {
             thread.update(cx, |thread, cx| {
-                thread.send(ClientUserMessageId::new(), ["Start turn"], cx).unwrap()
+                thread
+                    .send(ClientUserMessageId::new(), ["Start turn"], cx)
+                    .unwrap()
             })
         });
 
@@ -13415,7 +13458,9 @@ mod tests {
             });
         });
 
-        cx.background_executor.timer(Duration::from_millis(200)).await;
+        cx.background_executor
+            .timer(Duration::from_millis(200))
+            .await;
         cx.run_until_parked();
 
         thread.read_with(cx, |thread, _cx| {
@@ -13427,14 +13472,21 @@ mod tests {
             let Message::Agent(agent_msg) = &**last_msg else {
                 panic!("expected agent message for error entry");
             };
-            let text = agent_msg.content.iter().find_map(|c| {
-                if let AgentMessageContent::Text(t) = c {
-                    Some(t)
-                } else {
-                    None
-                }
-            }).expect("expected text content");
-            assert!(text.contains("Turn timed out"), "expected timeout error entry: {text}");
+            let text = agent_msg
+                .content
+                .iter()
+                .find_map(|c| {
+                    if let AgentMessageContent::Text(t) = c {
+                        Some(t)
+                    } else {
+                        None
+                    }
+                })
+                .expect("expected text content");
+            assert!(
+                text.contains("Turn timed out"),
+                "expected timeout error entry: {text}"
+            );
         });
     }
 
@@ -13452,7 +13504,9 @@ mod tests {
 
         let _events = cx.update(|cx| {
             thread.update(cx, |thread, cx| {
-                thread.send(ClientUserMessageId::new(), ["Start turn"], cx).unwrap()
+                thread
+                    .send(ClientUserMessageId::new(), ["Start turn"], cx)
+                    .unwrap()
             })
         });
 
@@ -13533,19 +13587,25 @@ mod tests {
 
         let _events = cx.update(|cx| {
             thread.update(cx, |thread, cx| {
-                thread.send(ClientUserMessageId::new(), ["Start turn"], cx).unwrap()
+                thread
+                    .send(ClientUserMessageId::new(), ["Start turn"], cx)
+                    .unwrap()
             })
         });
 
         cx.run_until_parked();
         assert!(thread.read_with(cx, |thread, _| thread.is_turn_running()));
 
-        cx.background_executor.timer(Duration::from_millis(75)).await;
+        cx.background_executor
+            .timer(Duration::from_millis(75))
+            .await;
         fake.send_last_text(&model, "Hello");
         cx.run_until_parked();
         assert!(thread.read_with(cx, |thread, _| thread.is_turn_running()));
 
-        cx.background_executor.timer(Duration::from_millis(75)).await;
+        cx.background_executor
+            .timer(Duration::from_millis(75))
+            .await;
         fake.send_last_text(&model, " world");
         cx.run_until_parked();
         assert!(thread.read_with(cx, |thread, _| thread.is_turn_running()));
@@ -13562,13 +13622,17 @@ mod tests {
             let Message::Agent(agent_msg) = &**last_msg else {
                 panic!("expected agent message");
             };
-            let text = agent_msg.content.iter().find_map(|c| {
-                if let AgentMessageContent::Text(t) = c {
-                    Some(t)
-                } else {
-                    None
-                }
-            }).expect("expected text content");
+            let text = agent_msg
+                .content
+                .iter()
+                .find_map(|c| {
+                    if let AgentMessageContent::Text(t) = c {
+                        Some(t)
+                    } else {
+                        None
+                    }
+                })
+                .expect("expected text content");
             assert_eq!(text, "Hello world");
         });
     }
@@ -13587,7 +13651,9 @@ mod tests {
 
         let _events = cx.update(|cx| {
             thread.update(cx, |thread, cx| {
-                thread.send(ClientUserMessageId::new(), ["Start turn"], cx).unwrap()
+                thread
+                    .send(ClientUserMessageId::new(), ["Start turn"], cx)
+                    .unwrap()
             })
         });
 
@@ -13598,11 +13664,16 @@ mod tests {
         });
 
         // The model stream is active but silent; watchdog must not fire while streaming.
-        cx.background_executor.timer(Duration::from_millis(200)).await;
+        cx.background_executor
+            .timer(Duration::from_millis(200))
+            .await;
         cx.run_until_parked();
 
         thread.read_with(cx, |thread, _cx| {
-            assert!(thread.is_turn_running(), "turn must not be finalized during silent stream");
+            assert!(
+                thread.is_turn_running(),
+                "turn must not be finalized during silent stream"
+            );
             assert!(!thread.is_turn_complete());
         });
 

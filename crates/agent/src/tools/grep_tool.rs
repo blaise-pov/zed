@@ -144,7 +144,19 @@ impl AgentTool for GrepTool {
                 .await
                 .map_err(|e| e.to_string())?;
 
-            let results = cx.update(|cx| {
+            let (results, scoped_worktree_id) = cx.update(|cx| {
+                let scoped_worktree_id = if let Some(task_worktree) = event_stream.task_worktree(cx) {
+                    let (worktree, _) = project
+                        .read(cx)
+                        .find_worktree(&task_worktree, cx)
+                        .ok_or_else(|| {
+                            format!("task worktree not found: {}", task_worktree.display())
+                        })?;
+                    Some(worktree.read(cx).id())
+                } else {
+                    None
+                };
+
                 let path_style = project.read(cx).path_style(cx);
 
                 let include_matcher = PathMatcher::new(
@@ -182,9 +194,15 @@ impl AgentTool for GrepTool {
                 )
                 .map_err(|error| error.to_string())?;
 
-                Ok::<_, String>(
-                    project.update(cx, |project, cx| project.search(query, cx)),
-                )
+                let results = if let Some(worktree_id) = scoped_worktree_id {
+                    project.update(cx, |project, cx| {
+                        project.search_in_worktree(query, worktree_id, cx)
+                    })
+                } else {
+                    project.update(cx, |project, cx| project.search(query, cx))
+                };
+
+                Ok::<_, String>((results, scoped_worktree_id))
             })?;
 
             let project = project.downgrade();
@@ -239,6 +257,12 @@ impl AgentTool for GrepTool {
                 else {
                     continue;
                 };
+
+                if let Some(scoped_id) = scoped_worktree_id {
+                    if project_path.worktree_id != scoped_id {
+                        continue;
+                    }
+                }
 
                 // Check if this file should be excluded based on its worktree settings
                 if cx.update(|cx| {
@@ -1107,21 +1131,30 @@ mod tests {
         }
     }
 
-    async fn run_grep_tool(
+    async fn run_grep_tool_fallible(
         input: GrepToolInput,
         project: Entity<Project>,
+        event_stream: ToolCallEventStream,
         cx: &mut TestAppContext,
-    ) -> String {
+    ) -> Result<String, String> {
         let tool = Arc::new(GrepTool { project });
         let task = cx.update(|cx| {
             tool.run(
                 ToolInput::resolved(input),
-                ToolCallEventStream::test().0,
+                event_stream,
                 cx,
             )
         });
+        task.await
+    }
 
-        match task.await {
+    async fn run_grep_tool_with_stream(
+        input: GrepToolInput,
+        project: Entity<Project>,
+        event_stream: ToolCallEventStream,
+        cx: &mut TestAppContext,
+    ) -> String {
+        match run_grep_tool_fallible(input, project, event_stream, cx).await {
             Ok(result) => {
                 if cfg!(windows) {
                     result.replace("root\\", "root/")
@@ -1133,6 +1166,13 @@ mod tests {
         }
     }
 
+    async fn run_grep_tool(
+        input: GrepToolInput,
+        project: Entity<Project>,
+        cx: &mut TestAppContext,
+    ) -> String {
+        run_grep_tool_with_stream(input, project, ToolCallEventStream::test().0, cx).await
+    }
     fn init_test(cx: &mut TestAppContext) {
         cx.update(|cx| {
             let settings_store = SettingsStore::test(cx);
@@ -1552,4 +1592,170 @@ mod tests {
             })
             .collect()
     }
+
+    #[gpui::test]
+    async fn test_grep_tool_isolated_task_worktree(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.executor().allow_parking();
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/host-main"),
+            json!({
+                "host_only.rs": "const HOST_MARKER: &str = \"needle_in_host_only\";\n",
+                "shared.rs": "const SHARED: &str = \"needle_shared\";\n",
+            }),
+        )
+        .await;
+        fs.insert_tree(
+            path!("/task-worktree"),
+            json!({
+                "task_only.rs": "const TASK_MARKER: &str = \"needle_in_task_only\";\n",
+                "shared.rs": "const SHARED: &str = \"needle_shared_modified_in_task\";\n",
+            }),
+        )
+        .await;
+
+        let project = Project::test(fs.clone(), [path!("/host-main").as_ref()], cx).await;
+        let (task_worktree, _) = project
+            .update(cx, |p, cx| {
+                p.find_or_create_worktree(path!("/task-worktree"), false, cx)
+            })
+            .await
+            .unwrap();
+        let _ = task_worktree
+            .read_with(cx, |w, _| w.as_local().unwrap().scan_complete())
+            .await;
+
+        let task_worktree_path = PathBuf::from(path!("/task-worktree"));
+        let (event_stream, _) =
+            ToolCallEventStream::test_with_task_worktree(task_worktree_path.clone());
+
+        // 1. Isolated thread finds a file changed only in task worktree
+        let input = GrepToolInput {
+            regex: "needle_in_task_only".to_string(),
+            include_pattern: None,
+            offset: 0,
+            case_sensitive: false,
+            max_ancestor_lines: default_max_ancestor_lines(),
+            context_lines: default_context_lines(),
+        };
+        let result = run_grep_tool_with_stream(input, project.clone(), event_stream, cx).await;
+        assert!(
+            result.contains("task_only.rs"),
+            "Isolated thread should find file changed only in task worktree, got: {result}"
+        );
+
+        // 2. Isolated thread returns NO results from host main checkout
+        let (event_stream, _) =
+            ToolCallEventStream::test_with_task_worktree(task_worktree_path.clone());
+        let input = GrepToolInput {
+            regex: "needle_in_host_only".to_string(),
+            include_pattern: None,
+            offset: 0,
+            case_sensitive: false,
+            max_ancestor_lines: default_max_ancestor_lines(),
+            context_lines: default_context_lines(),
+        };
+        let result = run_grep_tool_with_stream(input, project.clone(), event_stream, cx).await;
+        assert_eq!(
+            result, "No matches found",
+            "Isolated thread should NOT return results from host main checkout"
+        );
+
+        // Also check modified file: isolated thread only sees the task worktree version
+        let (event_stream, _) =
+            ToolCallEventStream::test_with_task_worktree(task_worktree_path.clone());
+        let input = GrepToolInput {
+            regex: "needle_shared".to_string(),
+            include_pattern: None,
+            offset: 0,
+            case_sensitive: false,
+            max_ancestor_lines: default_max_ancestor_lines(),
+            context_lines: default_context_lines(),
+        };
+        let result = run_grep_tool_with_stream(input, project.clone(), event_stream, cx).await;
+        assert!(
+            result.contains("needle_shared_modified_in_task"),
+            "Isolated thread should see task version of modified file, got: {result}"
+        );
+        assert!(
+            !result.contains("const SHARED: &str = \"needle_shared\";"),
+            "Isolated thread should not leak host version of shared file"
+        );
+
+        // 3. Non-isolated thread behaves as today (finds host main, ignores invisible task worktree)
+        let (non_isolated_stream, _) = ToolCallEventStream::test();
+        let input = GrepToolInput {
+            regex: "needle_in_host_only".to_string(),
+            include_pattern: None,
+            offset: 0,
+            case_sensitive: false,
+            max_ancestor_lines: default_max_ancestor_lines(),
+            context_lines: default_context_lines(),
+        };
+        let result =
+            run_grep_tool_with_stream(input, project.clone(), non_isolated_stream, cx).await;
+        assert!(
+            result.contains("host_only.rs"),
+            "Non-isolated thread should find host files as today, got: {result}"
+        );
+
+        let (non_isolated_stream, _) = ToolCallEventStream::test();
+        let input = GrepToolInput {
+            regex: "needle_in_task_only".to_string(),
+            include_pattern: None,
+            offset: 0,
+            case_sensitive: false,
+            max_ancestor_lines: default_max_ancestor_lines(),
+            context_lines: default_context_lines(),
+        };
+        let result =
+            run_grep_tool_with_stream(input, project.clone(), non_isolated_stream, cx).await;
+        assert_eq!(
+            result, "No matches found",
+            "Non-isolated thread should not search invisible worktree"
+        );
+
+        // 4. Missing/removed worktree handled with clear error
+        let (missing_worktree_stream, _) =
+            ToolCallEventStream::test_with_task_worktree(PathBuf::from(path!("/nonexistent-worktree")));
+        let input = GrepToolInput {
+            regex: "needle".to_string(),
+            include_pattern: None,
+            offset: 0,
+            case_sensitive: false,
+            max_ancestor_lines: default_max_ancestor_lines(),
+            context_lines: default_context_lines(),
+        };
+        let err = run_grep_tool_fallible(input, project.clone(), missing_worktree_stream, cx)
+            .await
+            .expect_err("Missing worktree must return error");
+        assert!(
+            err.contains("task worktree not found"),
+            "Error should clearly indicate task worktree was not found, got: {err}"
+        );
+
+        // Also test removed worktree
+        let task_worktree_id = task_worktree.read_with(cx, |w, _| w.id());
+        project.update(cx, |p, cx| p.remove_worktree(task_worktree_id, cx));
+        let (removed_worktree_stream, _) =
+            ToolCallEventStream::test_with_task_worktree(task_worktree_path);
+        let input = GrepToolInput {
+            regex: "needle".to_string(),
+            include_pattern: None,
+            offset: 0,
+            case_sensitive: false,
+            max_ancestor_lines: default_max_ancestor_lines(),
+            context_lines: default_context_lines(),
+        };
+        let err = run_grep_tool_fallible(input, project.clone(), removed_worktree_stream, cx)
+            .await
+            .expect_err("Removed worktree must return error");
+        assert!(
+            err.contains("task worktree not found"),
+            "Error should clearly indicate removed task worktree was not found, got: {err}"
+        );
+    }
+
 }
