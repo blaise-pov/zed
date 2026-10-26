@@ -146,9 +146,15 @@ impl AgentTool for GrepTool {
 
             let (results, scoped_worktree_id) = cx.update(|cx| {
                 let scoped_worktree_id = if let Some(task_worktree) = event_stream.task_worktree(cx) {
-                    let (worktree, _) = project
+                    let worktree = project
                         .read(cx)
-                        .find_worktree(&task_worktree, cx)
+                        .worktrees(cx)
+                        .find(|w| {
+                            let abs = w.read(cx).abs_path();
+                            abs.as_ref() == task_worktree.as_path()
+                                || util::paths::normalize_lexically(abs.as_ref()).ok().as_deref()
+                                    == util::paths::normalize_lexically(&task_worktree).ok().as_deref()
+                        })
                         .ok_or_else(|| {
                             format!("task worktree not found: {}", task_worktree.display())
                         })?;
@@ -1758,4 +1764,74 @@ mod tests {
         );
     }
 
+
+    #[gpui::test]
+    async fn test_grep_tool_isolated_nested_task_worktree(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.executor().allow_parking();
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/host-main"),
+            json!({
+                "host_file.rs": "const HOST_SECRET: &str = \"host_secret_marker\";\n",
+            }),
+        )
+        .await;
+        let nested_task_path = path!("/host-main/.worktrees/task-1");
+        fs.insert_tree(
+            nested_task_path,
+            json!({
+                "task_file.rs": "const TASK_SECRET: &str = \"task_marker\";\n",
+            }),
+        )
+        .await;
+
+        let project = Project::test(fs.clone(), [path!("/host-main").as_ref()], cx).await;
+        let task_worktree = project
+            .update(cx, |p, cx| {
+                p.create_worktree(nested_task_path, false, cx)
+            })
+            .await
+            .unwrap();
+        let _ = task_worktree
+            .read_with(cx, |w, _| w.as_local().unwrap().scan_complete())
+            .await;
+
+        let task_worktree_path = PathBuf::from(nested_task_path);
+        let (event_stream, _) =
+            ToolCallEventStream::test_with_task_worktree(task_worktree_path.clone());
+
+        // 1. Isolated thread finds task marker in nested task worktree
+        let input = GrepToolInput {
+            regex: "task_marker".to_string(),
+            include_pattern: None,
+            offset: 0,
+            case_sensitive: false,
+            max_ancestor_lines: default_max_ancestor_lines(),
+            context_lines: default_context_lines(),
+        };
+        let result = run_grep_tool_with_stream(input, project.clone(), event_stream, cx).await;
+        assert!(
+            result.contains("task_file.rs"),
+            "Isolated thread should find file in nested task worktree, got: {result}"
+        );
+
+        // 2. Isolated thread in nested task worktree must NOT leak host results
+        let (event_stream, _) =
+            ToolCallEventStream::test_with_task_worktree(task_worktree_path.clone());
+        let input = GrepToolInput {
+            regex: "host_secret_marker".to_string(),
+            include_pattern: None,
+            offset: 0,
+            case_sensitive: false,
+            max_ancestor_lines: default_max_ancestor_lines(),
+            context_lines: default_context_lines(),
+        };
+        let result = run_grep_tool_with_stream(input, project.clone(), event_stream, cx).await;
+        assert_eq!(
+            result, "No matches found",
+            "Isolated thread in nested task worktree must NOT return results from host checkout, got: {result}"
+        );
+    }
 }
