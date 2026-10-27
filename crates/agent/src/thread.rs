@@ -4316,29 +4316,49 @@ impl Thread {
         let timer = cx.background_executor().timer(retry.duration);
         event_stream.send_retry(retry);
         let _ = retry_now_rx.borrow();
-        futures::select! {
-            _ = timer.fuse() => {}
-            _ = cancellation_rx.changed().fuse() => {
+
+        let cancellation = async {
+            loop {
                 if *cancellation_rx.borrow() {
-                    let thread_id = this.read_with(cx, |this, _| this.id.clone()).ok();
-                    if let Some(thread_id) = thread_id {
-                        log::info!(
-                            "[cancel-audit] thread={} source=cancellation_rx_retry_delay attempt={}",
-                            thread_id,
-                            attempt
-                        );
+                    return;
+                }
+                if cancellation_rx.changed().await.is_err() {
+                    if *cancellation_rx.borrow() {
+                        return;
                     }
-                    log::debug!("Turn cancelled during retry delay, exiting");
-                    return Ok(ControlFlow::Break(()));
+                    std::future::pending::<()>().await;
                 }
             }
-            res = retry_now_rx.changed().fuse() => {
-                if res.is_ok() {
-                    return Ok(ControlFlow::Continue(()));
+        };
+
+        let retry_now = async {
+            if retry_now_rx.changed().await.is_ok() {
+                ()
+            } else {
+                std::future::pending::<()>().await;
+            }
+        };
+
+        futures::select_biased! {
+            _ = cancellation.fuse() => {
+                let thread_id = this.read_with(cx, |this, _| this.id.clone()).ok();
+                if let Some(thread_id) = thread_id {
+                    log::info!(
+                        "[cancel-audit] thread={} source=cancellation_rx_retry_delay attempt={}",
+                        thread_id,
+                        attempt
+                    );
                 }
+                log::debug!("Turn cancelled during retry delay, exiting");
+                Ok(ControlFlow::Break(()))
+            }
+            _ = retry_now.fuse() => {
+                Ok(ControlFlow::Continue(()))
+            }
+            _ = timer.fuse() => {
+                Ok(ControlFlow::Continue(()))
             }
         }
-        Ok(ControlFlow::Continue(()))
     }
 
     async fn perform_compaction_if_needed(
