@@ -1,12 +1,14 @@
+use crate::tools::tool_permissions::{
+    ResolvedProjectPath, canonicalize_worktree_roots, is_inside_task_worktree, resolve_tool_path,
+};
 use crate::{AgentTool, ToolCallEventStream, ToolInput};
 use agent_client_protocol::schema::v1 as acp;
 use futures::{Future, FutureExt as _};
 use gpui::{App, AsyncApp, Entity, Task};
 use language::{DiagnosticSeverity, OffsetRangeExt};
-use project::Project;
+use project::{Project, ProjectPath};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use std::path::Path;
 use std::{fmt::Write, sync::Arc};
 use ui::SharedString;
 use util::markdown::MarkdownInlineCode;
@@ -91,18 +93,15 @@ fn freshness_message(refreshed: bool) -> &'static str {
 /// read cached diagnostics), or `Err` if cancelled by the user.
 async fn pull_diagnostics(
     project: &Entity<Project>,
-    path: Option<&Path>,
+    project_path: Option<ProjectPath>,
     event_stream: &ToolCallEventStream,
     cx: &mut AsyncApp,
 ) -> Result<bool, String> {
-    match path {
-        Some(path) => {
+    match project_path {
+        Some(project_path) => {
             let open_buffer_task = project.update(cx, |project, cx| {
-                let Some(project_path) = project.find_project_path(path, cx) else {
-                    return Err(format!("Could not find path {} in project", path.display()));
-                };
-                Ok(project.open_buffer(project_path, cx))
-            })?;
+                project.open_buffer(project_path, cx)
+            });
 
             let buffer = with_cancellation(open_buffer_task, event_stream)
                 .await?
@@ -166,19 +165,37 @@ impl AgentTool for DiagnosticsTool {
         let project = self.project.clone();
         cx.spawn(async move |cx| {
             let input = input.recv().await.map_err(|e| e.to_string())?;
+            let task_worktree = cx.update(|cx| event_stream.task_worktree(cx));
 
             match input.path {
                 Some(ref path) if !path.is_empty() => {
+                    let fs = project.read_with(cx, |project, _cx| project.fs().clone());
+                    let canonical_roots = canonicalize_worktree_roots(&project, &fs, cx).await;
+                    let project_path = project
+                        .read_with(cx, |project, cx| {
+                            let resolved = resolve_tool_path(
+                                project,
+                                task_worktree.as_deref(),
+                                path,
+                                &canonical_roots,
+                                cx,
+                            )?;
+                            Ok(match resolved {
+                                ResolvedProjectPath::Safe(p) => p,
+                                ResolvedProjectPath::SymlinkEscape {
+                                    project_path, ..
+                                } => project_path,
+                            })
+                        })
+                        .map_err(|e: anyhow::Error| e.to_string())?;
+
                     let refreshed =
-                        pull_diagnostics(&project, Some(Path::new(path)), &event_stream, cx)
+                        pull_diagnostics(&project, Some(project_path.clone()), &event_stream, cx)
                             .await?;
 
                     let open_buffer_task = project.update(cx, |project, cx| {
-                        let Some(project_path) = project.find_project_path(path, cx) else {
-                            return Err(format!("Could not find path {path} in project"));
-                        };
-                        Ok(project.open_buffer(project_path, cx))
-                    })?;
+                        project.open_buffer(project_path, cx)
+                    });
 
                     let buffer = with_cancellation(open_buffer_task, &event_stream)
                         .await?
@@ -230,6 +247,15 @@ impl AgentTool for DiagnosticsTool {
                                     continue;
                                 };
 
+                                if let Some(ref task_worktree) = task_worktree {
+                                    if !is_inside_task_worktree(
+                                        worktree.read(cx).abs_path().as_ref(),
+                                        task_worktree,
+                                    ) {
+                                        continue;
+                                    }
+                                }
+
                                 has_diagnostics = true;
                                 output.push_str(&format!(
                                     "{}: {} error(s), {} warning(s)\n",
@@ -254,5 +280,273 @@ impl AgentTool for DiagnosticsTool {
                 }
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::{AppContext as _, TestAppContext};
+    use project::{FakeFs, Project};
+    use serde_json::json;
+    use settings::SettingsStore;
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+    use util::{path, rel_path::rel_path};
+
+    fn init_test(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = SettingsStore::test(cx);
+            cx.set_global(settings_store);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_diagnostics_isolated_task_worktree(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let host_root = path!("/root");
+        let task_worktree_path = path!("/worktrees/agent-task-1");
+
+        fs.insert_tree(
+            host_root,
+            json!({
+                "host_file.rs": "fn host() {}",
+                "shared.rs": "fn shared() {}"
+            }),
+        )
+        .await;
+
+        fs.insert_tree(
+            task_worktree_path,
+            json!({
+                "task_file.rs": "fn task() {}",
+                "shared.rs": "fn shared() {}"
+            }),
+        )
+        .await;
+
+        let project = Project::test(fs.clone(), [host_root.as_ref()], cx).await;
+        let (tree, _) = project
+            .update(cx, |project, cx| {
+                project.find_or_create_worktree(Path::new(task_worktree_path), false, cx)
+            })
+        .await
+        .unwrap();
+        tree.read_with(cx, |tree, _| tree.as_local().unwrap().scan_complete())
+        .await;
+        cx.run_until_parked();
+
+        let tool = Arc::new(DiagnosticsTool::new(project.clone()));
+
+        let thread = cx.update(|cx| {
+            let project_context = cx.new(|_cx| crate::ProjectContext::default());
+            let context_server_store = project.read(cx).context_server_store();
+            let context_server_registry =
+                cx.new(|cx| crate::tools::ContextServerRegistry::new(context_server_store, cx));
+            cx.new(|cx| {
+                let mut t = crate::Thread::new(
+                    project.clone(),
+                    project_context,
+                    context_server_registry,
+                    crate::Templates::new(),
+                    None,
+                    cx,
+                );
+                t.set_task_worktree(Some(PathBuf::from(task_worktree_path)));
+                t
+            })
+        });
+
+        let (isolated_stream, _) = ToolCallEventStream::test_with_thread(&thread);
+        let (non_isolated_stream, _) = ToolCallEventStream::test();
+
+        let server_id = lsp::LanguageServerId(0);
+
+        // Populate diagnostics in host shared.rs
+        let host_buffer = project
+            .update(cx, |project, cx| {
+                let project_path = project
+                    .find_project_path(Path::new(host_root).join("shared.rs"), cx)
+                    .unwrap();
+                project.open_buffer(project_path, cx)
+            })
+        .await
+        .unwrap();
+        host_buffer.update(cx, |buffer, cx| {
+            buffer.update_diagnostics(
+                server_id,
+                language::DiagnosticSet::from_sorted_entries(
+                    vec![language::DiagnosticEntry::new(
+                        language::Anchor::min_max_range_for_buffer(buffer.remote_id()),
+                        language::Diagnostic {
+                            severity: DiagnosticSeverity::ERROR,
+                            message: "host shared error".to_string().into(), is_primary: true,
+                            ..Default::default()
+                        },
+                    )],
+                    &buffer.snapshot(),
+                ),
+                cx,
+            );
+        });
+
+        // Populate diagnostics in task worktree shared.rs
+        let task_buffer = project
+            .update(cx, |project, cx| {
+                project.open_buffer(
+                    project::ProjectPath {
+                        worktree_id: tree.read(cx).id(),
+                        path: rel_path("shared.rs").into(),
+                    },
+                    cx,
+                )
+            })
+        .await
+        .unwrap();
+        task_buffer.update(cx, |buffer, cx| {
+            buffer.update_diagnostics(
+                server_id,
+                language::DiagnosticSet::from_sorted_entries(
+                    vec![language::DiagnosticEntry::new(
+                        language::Anchor::min_max_range_for_buffer(buffer.remote_id()),
+                        language::Diagnostic {
+                            severity: DiagnosticSeverity::ERROR,
+                            message: "task worktree shared error".to_string().into(), is_primary: true,
+                            ..Default::default()
+                        },
+                    )],
+                    &buffer.snapshot(),
+                ),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        // 1. Relative path in isolated thread reads task worktree diagnostics, never host main
+        let result = cx
+            .update(|cx| {
+                let input = DiagnosticsToolInput {
+                    path: Some("shared.rs".to_string()),
+                };
+                tool.clone().run(ToolInput::resolved(input), isolated_stream.clone(), cx)
+            })
+        .await
+        .unwrap();
+        assert!(
+            result.contains("task worktree shared error"),
+            "expected task worktree diagnostic, got: {result}"
+        );
+        assert!(
+            !result.contains("host shared error"),
+            "must never read host main diagnostic: {result}"
+        );
+
+        // 2. Relative path prefixed with worktree name also reads task worktree diagnostics
+        let result = cx
+            .update(|cx| {
+                let input = DiagnosticsToolInput {
+                    path: Some("agent-task-1/shared.rs".to_string()),
+                };
+                tool.clone().run(ToolInput::resolved(input), isolated_stream.clone(), cx)
+            })
+        .await
+        .unwrap();
+        assert!(
+            result.contains("task worktree shared error"),
+            "expected task worktree diagnostic for prefixed path, got: {result}"
+        );
+
+        // 3. Absolute host-worktree path is denied in isolated thread with clear message
+        let host_file_abs = format!("{}/host_file.rs", host_root);
+        let result = cx
+            .update(|cx| {
+                let input = DiagnosticsToolInput {
+                    path: Some(host_file_abs.clone()),
+                };
+                tool.clone().run(ToolInput::resolved(input), isolated_stream.clone(), cx)
+            })
+        .await;
+        assert!(
+            result.is_err(),
+            "host-worktree path should be denied in isolated thread"
+        );
+        let err_text = result.unwrap_err();
+        assert!(
+            err_text.contains("is outside the isolated task worktree"),
+            "error message must name the allowed root: {err_text}"
+        );
+
+        // 4. In non-isolated thread, absolute host path still works
+        let result = cx
+            .update(|cx| {
+                let input = DiagnosticsToolInput {
+                    path: Some(host_file_abs.clone()),
+                };
+                tool.clone().run(ToolInput::resolved(input), non_isolated_stream.clone(), cx)
+            })
+        .await
+        .unwrap();
+        assert!(
+            result.contains("File doesn't have errors or warnings!"),
+            "expected non-isolated thread to succeed on host path: {result}"
+        );
+
+        // 5. Whole-project filter (is_inside_task_worktree):
+        // Publish diagnostic summaries via LSP store for host_file.rs
+        let lsp_store = project.read_with(cx, |project, _| project.lsp_store());
+        lsp_store.update(cx, |lsp_store, cx| {
+            lsp_store
+                .update_diagnostics(
+                    server_id,
+                    lsp::PublishDiagnosticsParams {
+                        uri: lsp::Uri::from_file_path(path!("/root/host_file.rs")).unwrap(),
+                        version: None,
+                        diagnostics: vec![lsp::Diagnostic {
+                            range: lsp::Range::new(lsp::Position::new(0, 0), lsp::Position::new(0, 5)),
+                            severity: Some(lsp::DiagnosticSeverity::ERROR),
+                            message: lsp::DiagnosticMessage::from("host error message"),
+                            ..Default::default()
+                        }],
+                    },
+                    None,
+                    language::DiagnosticSourceKind::Pushed,
+                    &[],
+                    cx,
+                )
+            .unwrap();
+        });
+        cx.run_until_parked();
+
+        // In a non-isolated thread, host diagnostics are visible in whole-project summary
+        let non_isolated_summary = cx
+            .update(|cx| {
+                let input = DiagnosticsToolInput { path: None };
+                tool.clone().run(ToolInput::resolved(input), non_isolated_stream, cx)
+            })
+        .await
+        .unwrap();
+        assert!(
+            non_isolated_summary.contains("host_file.rs: 1 error(s), 0 warning(s)"),
+            "non-isolated thread should see host diagnostics: {non_isolated_summary}"
+        );
+
+        // In an isolated thread, host diagnostics are filtered out via is_inside_task_worktree
+        let isolated_summary = cx
+            .update(|cx| {
+                let input = DiagnosticsToolInput { path: None };
+                tool.clone().run(ToolInput::resolved(input), isolated_stream, cx)
+            })
+        .await
+        .unwrap();
+        assert!(
+            !isolated_summary.contains("host_file.rs"),
+            "isolated thread must NOT see host diagnostics: {isolated_summary}"
+        );
+        assert!(
+            isolated_summary.contains("No errors or warnings found in the project."),
+            "isolated thread should report no errors when host diagnostics are confined: {isolated_summary}"
+        );
     }
 }

@@ -143,7 +143,7 @@ async fn read_global_skill_file(
 
 use super::tool_permissions::{
     ResolvedProjectPath, authorize_symlink_access, canonicalize_worktree_roots,
-    resolve_global_skill_path, resolve_project_path,
+    resolve_global_skill_path, resolve_tool_path,
 };
 use crate::{AgentTool, ToolCallEventStream, ToolInput, outline};
 
@@ -276,11 +276,12 @@ impl AgentTool for ReadFileTool {
             }
 
             let canonical_roots = canonicalize_worktree_roots(&project, &fs, cx).await;
+            let task_worktree = cx.update(|cx| event_stream.task_worktree(cx));
 
             let (project_path, symlink_canonical_target) =
                 project.read_with(cx, |project, cx| {
                     let resolved =
-                        resolve_project_path(project, &input.path, &canonical_roots, cx)?;
+                        resolve_tool_path(project, task_worktree.as_deref(), &input.path, &canonical_roots, cx)?;
                     anyhow::Ok(match resolved {
                         ResolvedProjectPath::Safe(path) => (path, None),
                         ResolvedProjectPath::SymlinkEscape {
@@ -2041,5 +2042,149 @@ mod test {
             result.is_err(),
             "path outside skills dir should be rejected"
         );
+    }
+
+    #[gpui::test]
+    async fn test_read_file_isolated_task_worktree(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let host_root = path!("/root");
+        let task_worktree_path = path!("/worktrees/agent-task-1");
+
+        fs.insert_tree(
+            host_root,
+            json!({
+                "file.txt": "host content"
+            }),
+        )
+        .await;
+
+        fs.insert_tree(
+            task_worktree_path,
+            json!({
+                "file.txt": "worktree content"
+            }),
+        )
+        .await;
+
+        let project = Project::test(fs.clone(), [host_root.as_ref()], cx).await;
+        let (tree, _) = project
+            .update(cx, |project, cx| {
+                project.find_or_create_worktree(Path::new(task_worktree_path), false, cx)
+            })
+            .await
+            .unwrap();
+        tree.read_with(cx, |tree, _| tree.as_local().unwrap().scan_complete())
+            .await;
+        cx.run_until_parked();
+
+        let action_log = cx.new(|_| ActionLog::new(project.clone()));
+        let tool = Arc::new(ReadFileTool::new(project.clone(), action_log, true));
+
+        let thread = cx.update(|cx| {
+            let project_context = cx.new(|_cx| crate::ProjectContext::default());
+            let context_server_store = project.read(cx).context_server_store();
+            let context_server_registry =
+                cx.new(|cx| crate::tools::ContextServerRegistry::new(context_server_store, cx));
+            cx.new(|cx| {
+                let mut t = crate::Thread::new(
+                    project.clone(),
+                    project_context,
+                    context_server_registry,
+                    crate::Templates::new(),
+                    None,
+                    cx,
+                );
+                t.set_task_worktree(Some(PathBuf::from(task_worktree_path)));
+                t
+            })
+        });
+
+        let (event_stream, _) = ToolCallEventStream::test_with_thread(&thread);
+
+        // 1. Relative path in isolated thread reads task worktree content, never host main
+        let result = cx
+            .update(|cx| {
+                let input = ReadFileToolInput {
+                    path: "file.txt".to_string(),
+                    start_line: None,
+                    end_line: None,
+                };
+                tool.clone().run(ToolInput::resolved(input), event_stream.clone(), cx)
+            })
+            .await
+            .unwrap();
+        let content_str = match result {
+            LanguageModelToolResultContent::Text(text) => text,
+            _ => panic!("expected text output"),
+        };
+        assert!(
+            content_str.contains("worktree content"),
+            "expected worktree content, got: {content_str}"
+        );
+        assert!(
+            !content_str.contains("host content"),
+            "must never read host main content"
+        );
+
+        // 2. Relative path prefixed with worktree name also reads task worktree content
+        let result = cx
+            .update(|cx| {
+                let input = ReadFileToolInput {
+                    path: "agent-task-1/file.txt".to_string(),
+                    start_line: None,
+                    end_line: None,
+                };
+                tool.clone().run(ToolInput::resolved(input), event_stream.clone(), cx)
+            })
+            .await
+            .unwrap();
+        let content_str = match result {
+            LanguageModelToolResultContent::Text(text) => text,
+            _ => panic!("expected text output"),
+        };
+        assert!(content_str.contains("worktree content"));
+
+        // 3. Absolute host-worktree path is denied in isolated thread with clear message
+        let host_file_abs = format!("{}/file.txt", host_root);
+        let result = cx
+            .update(|cx| {
+                let input = ReadFileToolInput {
+                    path: host_file_abs.clone(),
+                    start_line: None,
+                    end_line: None,
+                };
+                tool.clone().run(ToolInput::resolved(input), event_stream, cx)
+            })
+            .await;
+        assert!(
+            result.is_err(),
+            "host-worktree path should be denied in isolated thread"
+        );
+        let err_text = error_text(result.unwrap_err());
+        assert!(
+            err_text.contains("is outside the isolated task worktree"),
+            "error message must name the allowed root: {err_text}"
+        );
+
+        // 4. In non-isolated thread, absolute host path still works
+        let (non_isolated_stream, _) = ToolCallEventStream::test();
+        let result = cx
+            .update(|cx| {
+                let input = ReadFileToolInput {
+                    path: host_file_abs,
+                    start_line: None,
+                    end_line: None,
+                };
+                tool.clone().run(ToolInput::resolved(input), non_isolated_stream, cx)
+            })
+            .await
+            .unwrap();
+        let content_str = match result {
+            LanguageModelToolResultContent::Text(text) => text,
+            _ => panic!("expected text output"),
+        };
+        assert!(content_str.contains("host content"));
     }
 }

@@ -4873,6 +4873,41 @@ impl Project {
         self.search_impl(query, cx).results(cx)
     }
 
+    fn search_in_worktree_impl(
+        &mut self,
+        query: SearchQuery,
+        worktree_id: WorktreeId,
+        cx: &mut Context<Self>,
+    ) -> SearchResultsHandle {
+        let searcher = match self.worktree_for_id(worktree_id, cx) {
+            Some(worktree) => project_search::Search::local_for_worktree(
+                self.fs.clone(),
+                self.buffer_store.clone(),
+                self.worktree_store.clone(),
+                worktree,
+                project_search::Search::MAX_SEARCH_RESULT_FILES + 1,
+            ),
+            None => project_search::Search::local_with_worktrees(
+                self.fs.clone(),
+                self.buffer_store.clone(),
+                self.worktree_store.clone(),
+                Vec::new(),
+                project_search::Search::MAX_SEARCH_RESULT_FILES + 1,
+                cx,
+            ),
+        };
+        searcher.into_handle(query, cx)
+    }
+
+    pub fn search_in_worktree(
+        &mut self,
+        query: SearchQuery,
+        worktree_id: WorktreeId,
+        cx: &mut Context<Self>,
+    ) -> SearchResults<SearchResult> {
+        self.search_in_worktree_impl(query, worktree_id, cx).results(cx)
+    }
+
     pub fn request_lsp<R: LspCommand>(
         &mut self,
         buffer_handle: Entity<Buffer>,
