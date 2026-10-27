@@ -234,6 +234,10 @@ pub trait AgentConnection {
         None
     }
 
+    fn retry_waiting(&self, _session_id: &acp_v1::SessionId, _cx: &mut App) -> bool {
+        false
+    }
+
     fn cancel(&self, session_id: &acp_v1::SessionId, cx: &mut App);
 
     /// Request-scoped elicitations are connection-level because they can arrive before a session

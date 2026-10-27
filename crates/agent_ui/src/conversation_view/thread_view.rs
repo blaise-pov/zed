@@ -3574,8 +3574,25 @@ impl ThreadView {
                 .icon(IconName::Warning)
                 .severity(Severity::Warning)
                 .title(state.last_error.clone())
-                .description(retry_message),
+                .description(retry_message)
+                .actions_slot(
+                    div()
+                        .debug_selector(|| "retry-now".into())
+                        .child(
+                            Button::new("retry-now", "Retry Now")
+                                .label_size(LabelSize::Small)
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.retry_waiting(cx);
+                                })),
+                        ),
+                ),
         )
+    }
+
+    pub fn retry_waiting(&mut self, cx: &mut Context<Self>) {
+        self.thread_retry_status.take();
+        self.thread.update(cx, |thread, cx| thread.retry_waiting(cx));
+        cx.notify();
     }
 
     fn activity_bar_bg(&self, cx: &Context<Self>) -> Hsla {

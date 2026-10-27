@@ -6462,6 +6462,10 @@ impl AcpThread {
         })
     }
 
+    pub fn retry_waiting(&mut self, cx: &mut Context<Self>) -> bool {
+        self.connection.retry_waiting(self.session_id(), cx)
+    }
+
     pub fn cancel(&mut self, cx: &mut Context<Self>) -> Task<()> {
         self.cancel_inner(RequestPermissionOutcome::Cancelled, cx)
     }

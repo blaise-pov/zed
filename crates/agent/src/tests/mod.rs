@@ -6498,6 +6498,77 @@ async fn test_send_retry_on_error(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+async fn test_retry_waiting(cx: &mut TestAppContext) {
+    let ThreadTest {
+        model,
+        thread,
+        fake,
+        ..
+    } = setup(cx, TestModel::Fake).await;
+
+    let retried = thread.read_with(cx, |thread, _cx| thread.retry_waiting());
+    assert!(!retried);
+
+    let mut events = thread
+        .update(cx, |thread, cx| {
+            thread.send(ClientUserMessageId::new(), ["Hello!"], cx)
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    assert_eq!(fake.pending_completions_for(&model).len(), 1);
+
+    fake.send_last_text(&model, "Hey,");
+    fake.send_last_error(
+        &model,
+        LanguageModelCompletionError::from_http_status(
+            LanguageModelProviderName::new("Anthropic"),
+            http_client::StatusCode::SERVICE_UNAVAILABLE,
+            "Anthropic's API servers are overloaded right now".to_string(),
+            Some(Duration::from_secs(60)),
+        ),
+    );
+    fake.end_last(&model);
+    cx.run_until_parked();
+
+    assert_eq!(fake.pending_completions_for(&model).len(), 0);
+
+    let retried = thread.read_with(cx, |thread, _cx| thread.retry_waiting());
+    assert!(retried);
+
+    cx.run_until_parked();
+    assert_eq!(
+        fake.pending_completions_for(&model).len(),
+        1,
+        "completion should resume immediately without advancing executor clock"
+    );
+
+    fake.send_last_text(&model, "there!");
+    fake.end_last(&model);
+    cx.run_until_parked();
+
+    let mut retry_events = Vec::new();
+    while let Some(Ok(event)) = events.next().await {
+        match event {
+            ThreadEvent::Retry(retry_status) => {
+                retry_events.push(retry_status);
+            }
+            ThreadEvent::Stop(..) => break,
+            _ => {}
+        }
+    }
+
+    assert_eq!(retry_events.len(), 1);
+    assert!(matches!(
+        retry_events[0],
+        acp_thread::RetryStatus { attempt: 1, .. }
+    ));
+
+    let retried = thread.read_with(cx, |thread, _cx| thread.retry_waiting());
+    assert!(!retried);
+}
+
+#[gpui::test]
 async fn test_send_retry_finishes_tool_calls_on_error(cx: &mut TestAppContext) {
     let ThreadTest {
         model,

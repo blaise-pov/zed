@@ -17784,4 +17784,175 @@ pub(crate) mod tests {
             self
         }
     }
+
+    #[derive(Clone)]
+    struct RetryTrackingConnection {
+        retry_waiting_called: Arc<Mutex<bool>>,
+    }
+
+    impl RetryTrackingConnection {
+        fn new(retry_waiting_called: Arc<Mutex<bool>>) -> Self {
+            Self {
+                retry_waiting_called,
+            }
+        }
+    }
+
+    impl AgentConnection for RetryTrackingConnection {
+        fn agent_id(&self) -> AgentId {
+            AgentId::new("retry-tracking")
+        }
+
+        fn telemetry_id(&self) -> SharedString {
+            "retry-tracking".into()
+        }
+
+        fn new_session(
+            self: Rc<Self>,
+            project: Entity<Project>,
+            work_dirs: PathList,
+            cx: &mut gpui::App,
+        ) -> Task<gpui::Result<Entity<AcpThread>>> {
+            let action_log = cx.new(|_| ActionLog::new(project.clone()));
+            let thread = cx.new(|cx| {
+                AcpThread::new(
+                    None,
+                    Some("RetryTrackingConnection".into()),
+                    Some(work_dirs),
+                    self,
+                    project,
+                    action_log,
+                    acp_v1::SessionId::new("retry-tracking-session"),
+                    watch::Receiver::constant(
+                        acp_v2::PromptCapabilities::new()
+                            .image(acp_v2::PromptImageCapabilities::new())
+                            .audio(acp_v2::PromptAudioCapabilities::new())
+                            .embedded_context(acp_v2::PromptEmbeddedContextCapabilities::new()),
+                    ),
+                    cx,
+                )
+            });
+            Task::ready(Ok(thread))
+        }
+
+        fn retry_waiting(&self, _session_id: &acp_v1::SessionId, _cx: &mut App) -> bool {
+            *self.retry_waiting_called.lock() = true;
+            true
+        }
+
+        fn auth_methods(&self) -> &[acp_v2::AuthMethod] {
+            &[]
+        }
+
+        fn authenticate(
+            &self,
+            _method_id: acp_v2::AuthMethodId,
+            _cx: &mut App,
+        ) -> Task<gpui::Result<()>> {
+            Task::ready(Ok(()))
+        }
+
+        fn prompt(
+            &self,
+            _params: acp_v2::PromptRequest,
+            _cx: &mut App,
+        ) -> Task<gpui::Result<acp_v1::PromptResponse>> {
+            Task::ready(Ok(acp_v1::PromptResponse::new(acp_v1::StopReason::EndTurn)))
+        }
+
+        fn cancel(&self, _session_id: &acp_v1::SessionId, _cx: &mut App) {}
+
+        fn into_any(self: Rc<Self>) -> Rc<dyn Any> {
+            self
+        }
+    }
+
+    #[gpui::test]
+    async fn test_thread_retry_status_callout_retry_now(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let retry_waiting_called = Arc::new(Mutex::new(false));
+        let connection = RetryTrackingConnection::new(retry_waiting_called.clone());
+
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection), cx).await;
+        add_to_workspace(conversation_view.clone(), cx);
+        let thread_view = active_thread(&conversation_view, cx);
+
+        thread_view.update(cx, |view, cx| {
+            let callout = view.render_thread_retry_status_callout(cx);
+            assert!(callout.is_none());
+        });
+
+        thread_view.update(cx, |view, cx| {
+            view.thread_retry_status = Some(RetryStatus {
+                attempt: 1,
+                max_attempts: 3,
+                duration: std::time::Duration::from_secs(10),
+                started_at: std::time::Instant::now(),
+                last_error: "Rate limited".into(),
+                meta: Default::default(),
+            });
+            cx.notify();
+        });
+
+        cx.run_until_parked();
+        let retry_button = cx
+            .debug_bounds("retry-now")
+            .expect("retry-now button should be rendered in retry status callout");
+
+        cx.simulate_click(retry_button.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+
+        assert!(
+            *retry_waiting_called.lock(),
+            "retry_waiting should call through to the thread connection"
+        );
+
+        thread_view.update(cx, |view, cx| {
+            assert!(
+                view.thread_retry_status.is_none(),
+                "retry_waiting should have cleared thread_retry_status"
+            );
+            assert!(
+                view.render_thread_retry_status_callout(cx).is_none(),
+                "callout should be dismissed after retry_now click"
+            );
+        });
+
+        assert!(
+            cx.debug_bounds("retry-now").is_none(),
+            "retry-now button should no longer exist after click"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_thread_view_retry_waiting_clears_status_and_calls_thread(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let retry_waiting_called = Arc::new(Mutex::new(false));
+        let connection = RetryTrackingConnection::new(retry_waiting_called.clone());
+
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection), cx).await;
+        let thread_view = active_thread(&conversation_view, cx);
+
+        thread_view.update(cx, |view, _| {
+            view.thread_retry_status = Some(RetryStatus {
+                attempt: 1,
+                max_attempts: 3,
+                duration: std::time::Duration::from_secs(10),
+                started_at: std::time::Instant::now(),
+                last_error: "Overloaded".into(),
+                meta: Default::default(),
+            });
+        });
+
+        thread_view.update(cx, |view, cx| {
+            view.retry_waiting(cx);
+            assert!(view.thread_retry_status.is_none());
+        });
+
+        assert!(*retry_waiting_called.lock());
+    }
 }
