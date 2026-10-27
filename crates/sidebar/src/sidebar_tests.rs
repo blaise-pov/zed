@@ -499,6 +499,7 @@ fn save_thread_metadata(
             remote_connection,
             agent_label: None,
             model: None,
+            diff_stats: None,
         };
         ThreadMetadataStore::global(cx).update(cx, |store, cx| store.save(metadata, cx));
     });
@@ -537,6 +538,7 @@ fn save_thread_metadata_with_main_paths(
         remote_connection: None,
         agent_label: None,
         model: None,
+        diff_stats: None,
     };
     cx.update(|cx| {
         ThreadMetadataStore::global(cx).update(cx, |store, cx| store.save(metadata, cx));
@@ -566,6 +568,7 @@ fn save_draft_metadata_with_main_paths(
         remote_connection: None,
         agent_label: None,
         model: None,
+        diff_stats: None,
     };
     cx.update(|cx| {
         ThreadMetadataStore::global(cx).update(cx, |store, cx| store.save(metadata, cx));
@@ -1504,6 +1507,7 @@ async fn test_neighboring_activatable_entry_stays_within_project(cx: &mut TestAp
                 remote_connection: None,
                 agent_label: None,
                 model: None,
+                diff_stats: None,
             },
             icon: IconName::ZedAgent,
             icon_from_external_svg: None,
@@ -1600,6 +1604,7 @@ async fn test_visible_entries_as_strings(cx: &mut TestAppContext) {
                     remote_connection: None,
                     agent_label: None,
                     model: None,
+                    diff_stats: None,
                 },
                 icon: IconName::ZedAgent,
                 icon_from_external_svg: None,
@@ -1631,6 +1636,7 @@ async fn test_visible_entries_as_strings(cx: &mut TestAppContext) {
                     remote_connection: None,
                     agent_label: None,
                     model: None,
+                    diff_stats: None,
                 },
                 icon: IconName::ZedAgent,
                 icon_from_external_svg: None,
@@ -1662,6 +1668,7 @@ async fn test_visible_entries_as_strings(cx: &mut TestAppContext) {
                     remote_connection: None,
                     agent_label: None,
                     model: None,
+                    diff_stats: None,
                 },
                 icon: IconName::ZedAgent,
                 icon_from_external_svg: None,
@@ -1694,6 +1701,7 @@ async fn test_visible_entries_as_strings(cx: &mut TestAppContext) {
                     remote_connection: None,
                     agent_label: None,
                     model: None,
+                    diff_stats: None,
                 },
                 icon: IconName::ZedAgent,
                 icon_from_external_svg: None,
@@ -1726,6 +1734,7 @@ async fn test_visible_entries_as_strings(cx: &mut TestAppContext) {
                     remote_connection: None,
                     agent_label: None,
                     model: None,
+                    diff_stats: None,
                 },
                 icon: IconName::ZedAgent,
                 icon_from_external_svg: None,
@@ -8280,6 +8289,7 @@ async fn test_sidebar_keeps_multi_root_thread_with_stale_main_paths(cx: &mut Tes
                     remote_connection: None,
                     agent_label: None,
                     model: None,
+                    diff_stats: None,
                 },
                 cx,
             )
@@ -8365,6 +8375,7 @@ async fn test_activate_archived_thread_with_saved_paths_activates_matching_works
                 remote_connection: None,
                 agent_label: None,
                 model: None,
+                diff_stats: None,
             },
             window,
             cx,
@@ -8437,6 +8448,7 @@ async fn test_activate_archived_thread_cwd_fallback_with_matching_workspace(
                 remote_connection: None,
                 agent_label: None,
                 model: None,
+                diff_stats: None,
             },
             window,
             cx,
@@ -8505,6 +8517,7 @@ async fn test_activate_archived_thread_no_paths_no_cwd_uses_active_workspace(
                 remote_connection: None,
                 agent_label: None,
                 model: None,
+                diff_stats: None,
             },
             window,
             cx,
@@ -8565,6 +8578,7 @@ async fn test_activate_archived_thread_saved_paths_opens_new_workspace(cx: &mut 
                 remote_connection: None,
                 agent_label: None,
                 model: None,
+                diff_stats: None,
             },
             window,
             cx,
@@ -8626,6 +8640,7 @@ async fn test_activate_archived_thread_reuses_workspace_in_another_window(cx: &m
                 remote_connection: None,
                 agent_label: None,
                 model: None,
+                diff_stats: None,
             },
             window,
             cx,
@@ -8707,6 +8722,7 @@ async fn test_activate_archived_thread_reuses_workspace_in_another_window_with_t
         remote_connection: None,
         agent_label: None,
         model: None,
+        diff_stats: None,
     };
     seed_thread_metadata(metadata.clone(), cx_a);
 
@@ -8792,6 +8808,7 @@ async fn test_activate_archived_thread_prefers_current_window_for_matching_paths
         remote_connection: None,
         agent_label: None,
         model: None,
+        diff_stats: None,
     };
     seed_thread_metadata(metadata.clone(), cx_a);
 
@@ -9124,6 +9141,7 @@ async fn test_archive_last_worktree_thread_removes_workspace(cx: &mut TestAppCon
             remote_connection: Some(remote_host),
             agent_label: None,
             model: None,
+            diff_stats: None,
         };
         ThreadMetadataStore::global(cx).update(cx, |store, cx| store.save(metadata, cx));
     });
@@ -9780,6 +9798,7 @@ async fn test_archive_last_worktree_thread_not_blocked_by_remote_thread_at_same_
             remote_connection: Some(remote_host),
             agent_label: None,
             model: None,
+            diff_stats: None,
         };
         ThreadMetadataStore::global(cx).update(cx, |store, cx| {
             store.save(metadata, cx);
@@ -10595,6 +10614,7 @@ async fn test_unarchive_first_thread_in_group_does_not_create_spurious_draft(
                     remote_connection: None,
                     agent_label: None,
                     model: None,
+                    diff_stats: None,
                 },
                 cx,
             )
@@ -10691,6 +10711,7 @@ async fn test_unarchive_into_new_workspace_does_not_create_duplicate_real_thread
                     remote_connection: None,
                     agent_label: None,
                     model: None,
+                    diff_stats: None,
                 },
                 cx,
             )
@@ -10922,6 +10943,7 @@ async fn test_unarchive_into_inactive_existing_workspace_does_not_leave_active_d
                     remote_connection: None,
                     agent_label: None,
                     model: None,
+                    diff_stats: None,
                 },
                 cx,
             )
@@ -11777,6 +11799,7 @@ async fn test_unarchive_linked_worktree_thread_into_project_group_shows_only_res
                     remote_connection: None,
                     agent_label: None,
                     model: None,
+                    diff_stats: None,
                 },
                 cx,
             )
@@ -12328,6 +12351,7 @@ async fn test_legacy_thread_with_canonical_path_opens_main_repo_workspace(cx: &m
             remote_connection: None,
             agent_label: None,
             model: None,
+            diff_stats: None,
         };
         ThreadMetadataStore::global(cx).update(cx, |store, cx| store.save(metadata, cx));
     });
@@ -13318,6 +13342,7 @@ mod property_test {
             remote_connection: None,
             agent_label: None,
             model: None,
+            diff_stats: None,
         };
         cx.update(|_, cx| {
             ThreadMetadataStore::global(cx).update(cx, |store, cx| store.save(metadata, cx))
@@ -13393,6 +13418,7 @@ mod property_test {
                         remote_connection: project.read(cx).remote_connection_options(cx),
                         agent_label: None,
                         model: None,
+                        diff_stats: None,
                     });
                     cx.update(|_, cx| {
                         ThreadMetadataStore::global(cx)
@@ -14263,6 +14289,7 @@ async fn test_remote_project_integration_does_not_briefly_render_as_separate_pro
             remote_connection,
             agent_label: None,
             model: None,
+            diff_stats: None,
         };
         ThreadMetadataStore::global(cx).update(cx, |store, cx| store.save(metadata, cx));
     });
@@ -15230,6 +15257,7 @@ async fn test_remote_archive_thread_with_active_connection(
             remote_connection,
             agent_label: None,
             model: None,
+            diff_stats: None,
         };
         ThreadMetadataStore::global(cx).update(cx, |store, cx| store.save(metadata, cx));
     });
@@ -15373,6 +15401,7 @@ async fn test_remote_linked_worktree_workspace_to_remove_uses_remote_connection(
             remote_connection: Some(remote_connection.clone()),
             agent_label: None,
             model: None,
+            diff_stats: None,
         };
         ThreadMetadataStore::global(cx).update(cx, |store, cx| store.save(metadata, cx));
     });
