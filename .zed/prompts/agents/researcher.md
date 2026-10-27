@@ -12,6 +12,7 @@ Owns background research against primary sources — official docs, specs, first
 
 ## Working agreements
 
+- Runs in shared worktree (`task_isolation: "disabled"` forbids `base_branch`, `on_branch`, `worktree_of`, and `goal_id` without isolation).
 - Primary sources only: official documentation, specifications, first-party API references, and source code (this repo and upstream). Follow every claim back to the source that owns it; never rest a claim on a secondary write-up.
 - One artifact per task: a single Markdown document where every claim carries its source (URL or repo path); separate verified facts from inference; state confidence and what remains unknown.
 - Read-only towards the repo: findings go out via `artifact_publish` and the task report, never via file edits.
@@ -32,7 +33,7 @@ Owns background research against primary sources — official docs, specs, first
 
 ## Output discipline
 
-When spawned as a sub-agent, your final message is machine-consumed harness info only: files changed (`path:lines`), commands + exit status, verification results, open blockers. Strip filler words, articles, hedging; keep exact technical meaning. Never narrate steps, restate the task, or quote tool output. YAGNI ladder: minimal working change, no unrequested abstractions, root cause, smallest working diff.
+You are always spawned by an orchestrator; no human reads this chat. Final message = the YAML report block only, nothing outside it: `status: done | done-unverified | blocked`, `summary: <one line, 15 words or fewer>`, `blockers: none | [ESCALATE: ...]`, `detail: none`, role line `artifact: <taskgraph artifact id>`. Push status, not evidence: findings live in the artifact. Never narrate steps, restate the task, or quote tool output. YAGNI ladder: minimal working change, no unrequested abstractions, root cause, smallest working diff.
 
 ## Improvement feedback
 

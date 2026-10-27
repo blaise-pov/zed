@@ -694,10 +694,12 @@ mod tests {
         AgentSettings {
             enabled: true,
             button: true,
+            task_button: true,
             dock: DockPosition::Right,
             task_dock: DockPosition::Left,
             task_graph_server_id: DEFAULT_TASK_GRAPH_SERVER_ID.to_string(),
             flexible: true,
+            task_flexible: false,
             default_width: px(300.),
             default_height: px(600.),
             max_content_width: Some(px(850.)),
@@ -709,6 +711,7 @@ mod tests {
             commit_message_include_project_rules: true,
             commit_message_instructions: None,
             thread_title_template: None,
+            task_contract_template: None,
             system_prompt_template: None,
             thread_summary_model: None,
             compaction_model: None,
@@ -747,7 +750,28 @@ mod tests {
             },
             thinking_display: Default::default(),
             task_worktree_limit: agent_settings::DEFAULT_TASK_WORKTREE_LIMIT,
+            spawn_step_timeout_seconds: Default::default(),
+            send_watchdog_seconds: std::time::Duration::from_secs(
+                agent_settings::DEFAULT_SEND_WATCHDOG_SECONDS,
+            ),
+            turn_watchdog_seconds: std::time::Duration::from_secs(
+                agent_settings::DEFAULT_TURN_WATCHDOG_SECONDS,
+            ),
             task_worktree_language_servers: agent_settings::DEFAULT_TASK_WORKTREE_LANGUAGE_SERVERS,
+            fetch_max_bytes: agent_settings::DEFAULT_FETCH_MAX_BYTES,
+            task_lifecycle_mode: agent_settings::DEFAULT_TASK_LIFECYCLE_MODE,
+            commit_on_session_end: agent_settings::DEFAULT_COMMIT_ON_SESSION_END,
+            cleanup: agent_settings::DEFAULT_CLEANUP,
+            register_metadata: agent_settings::DEFAULT_REGISTER_METADATA,
+            publish_ref_artifact: agent_settings::DEFAULT_PUBLISH_REF_ARTIFACT,
+            delete_goal_branches_on_graduation:
+                agent_settings::DEFAULT_DELETE_GOAL_BRANCHES_ON_GRADUATION,
+            delete_task_branches_on_graduation:
+                agent_settings::DEFAULT_DELETE_TASK_BRANCHES_ON_GRADUATION,
+            goal_graduation_base_branch: None,
+            task_worktree_retention_timeout_seconds: std::time::Duration::from_secs(
+                agent_settings::DEFAULT_TASK_WORKTREE_RETENTION_TIMEOUT_SECONDS,
+            ),
         }
     }
 

@@ -1,50 +1,26 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result};
+use fs::Fs;
 use futures::StreamExt;
+use git::repository::GitRepository;
 use gpui::{App, Context, Entity, Task};
 use parking_lot::Mutex;
 use project::Project;
 use project::git_store::worktrees_directory_for_repo;
 use serde::{Deserialize, Serialize};
+use util::ResultExt as _;
 
 use crate::agent_task::{AgentGoalSummary, AgentTaskId, AgentTaskSummary};
 use crate::task_worktree::{system_git_binary, task_worktree_context, task_worktree_path};
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DiffShortStat {
-    pub files: u32,
-    pub added: u32,
-    pub removed: u32,
-}
-
-impl DiffShortStat {
-    pub fn from_numstat(output: &str) -> Self {
-        let diff_stat = git::status::parse_numstat(output);
-        let files = u32::try_from(diff_stat.entries.len()).unwrap_or(u32::MAX);
-        let mut added = 0u32;
-        let mut removed = 0u32;
-        for (_, stat) in diff_stat.entries.iter() {
-            added = added.saturating_add(stat.added);
-            removed = removed.saturating_add(stat.deleted);
-        }
-        Self {
-            files,
-            added,
-            removed,
-        }
-    }
-}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GoalGitState {
     pub branch: String,
     pub branch_exists: bool,
     pub tip_sha: Option<String>,
-    pub diff: Option<DiffShortStat>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -53,7 +29,8 @@ pub struct TaskGitState {
     pub exists_on_disk: bool,
     pub branch: Option<String>,
     pub branch_exists: bool,
-    pub diff: Option<DiffShortStat>,
+    #[serde(default)]
+    pub retention_reason: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -69,136 +46,74 @@ pub struct TaskGitSnapshot {
     pub orphan_worktrees: Vec<OrphanWorktree>,
 }
 
-pub type DiffCache = Arc<Mutex<HashMap<(String, String), DiffShortStat>>>;
-
-#[allow(dead_code)]
-pub const SPEC_DIFF_CACHE_TTL: Duration = Duration::from_secs(30);
-
-#[allow(dead_code)]
-static TIMED_DIFF_CACHE: std::sync::OnceLock<
-    Mutex<HashMap<(PathBuf, String), (Instant, Option<DiffShortStat>)>>,
-> = std::sync::OnceLock::new();
-
-#[allow(dead_code)]
-fn timed_diff_cache() -> &'static Mutex<HashMap<(PathBuf, String), (Instant, Option<DiffShortStat>)>>
-{
-    TIMED_DIFF_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct RepoCacheKey {
+    pub dot_git: PathBuf,
+    pub fs_ptr: usize,
 }
 
-#[allow(dead_code)]
-fn get_timed_cached_diff(working_dir: &Path, diff_spec: &str) -> Option<Option<DiffShortStat>> {
-    let key = (working_dir.to_path_buf(), diff_spec.to_string());
-    let cache = timed_diff_cache().lock();
-    if let Some((timestamp, stat)) = cache.get(&key) {
-        if timestamp.elapsed() < SPEC_DIFF_CACHE_TTL {
-            return Some(*stat);
+impl RepoCacheKey {
+    pub fn new(dot_git: &Path, file_system: &Arc<dyn Fs>) -> Self {
+        Self {
+            dot_git: dot_git.to_path_buf(),
+            fs_ptr: Arc::as_ptr(file_system) as *const () as usize,
         }
     }
-    None
 }
 
-#[allow(dead_code)]
-fn set_timed_cached_diff(working_dir: &Path, diff_spec: &str, stat: Option<DiffShortStat>) {
-    let key = (working_dir.to_path_buf(), diff_spec.to_string());
-    timed_diff_cache()
-        .lock()
-        .insert(key, (Instant::now(), stat));
-}
+#[cfg(any(test, feature = "test-support"))]
+struct TestThreadLocal<T: 'static>(fn() -> &'static T);
 
-#[allow(dead_code)]
-static GLOBAL_DIFF_CACHE: std::sync::OnceLock<Mutex<HashMap<(String, String), DiffShortStat>>> =
-    std::sync::OnceLock::new();
+#[cfg(any(test, feature = "test-support"))]
+impl<T: 'static> std::ops::Deref for TestThreadLocal<T> {
+    type Target = T;
 
-#[allow(dead_code)]
-fn global_diff_cache() -> &'static Mutex<HashMap<(String, String), DiffShortStat>> {
-    GLOBAL_DIFF_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-#[allow(dead_code)]
-fn get_cached_diff(
-    cache: Option<&DiffCache>,
-    base_sha: &str,
-    head_sha: &str,
-) -> Option<DiffShortStat> {
-    let key = (base_sha.to_string(), head_sha.to_string());
-    if let Some(cache) = cache {
-        cache.lock().get(&key).copied()
-    } else {
-        global_diff_cache().lock().get(&key).copied()
+    fn deref(&self) -> &Self::Target {
+        (self.0)()
     }
 }
 
-#[allow(dead_code)]
-fn set_cached_diff(
-    cache: Option<&DiffCache>,
-    base_sha: String,
-    head_sha: String,
-    stat: DiffShortStat,
-) {
-    let key = (base_sha, head_sha);
-    if let Some(cache) = cache {
-        cache.lock().insert(key, stat);
-    } else {
-        global_diff_cache().lock().insert(key, stat);
-    }
-}
-
-#[allow(dead_code)]
-async fn compute_short_stat_for_diff(
-    working_dir: &Path,
-    diff_spec: &str,
-    base_sha: Option<&str>,
-    head_sha: Option<&str>,
-    cache: Option<&DiffCache>,
-) -> Option<DiffShortStat> {
-    if let (Some(base), Some(head)) = (base_sha, head_sha) {
-        if let Some(cached) = get_cached_diff(cache, base, head) {
-            return Some(cached);
-        }
-    } else if let Some(cached) = get_timed_cached_diff(working_dir, diff_spec) {
-        return cached;
-    }
-
-    if !working_dir.is_dir() {
-        return None;
-    }
-
-    let git_binary = system_git_binary()?;
-    let mut command = util::command::new_command(git_binary);
-    command.args(["diff", "--numstat", "--no-renames", diff_spec]);
-    command.current_dir(working_dir);
-
-    let stat = match command.output().await {
-        Ok(output) if output.status.success() => {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let stat = DiffShortStat::from_numstat(&stdout);
-            if let (Some(base), Some(head)) = (base_sha, head_sha) {
-                set_cached_diff(cache, base.to_string(), head.to_string(), stat);
+#[cfg(any(test, feature = "test-support"))]
+macro_rules! repo_cache_static {
+    ($name:ident: $ty:ty = $init:expr) => {
+        static $name: TestThreadLocal<$ty> = TestThreadLocal(|| {
+            thread_local! {
+                static INSTANCE: &'static $ty = Box::leak(Box::new($init));
             }
-            Some(stat)
-        }
-        Ok(output) => {
-            log::warn!(
-                "git diff {diff_spec} failed in {}: {}",
-                working_dir.display(),
-                String::from_utf8_lossy(&output.stderr)
-            );
-            None
-        }
-        Err(error) => {
-            log::warn!(
-                "failed to execute git diff {diff_spec} in {}: {error}",
-                working_dir.display()
-            );
-            None
-        }
+            INSTANCE.with(|instance| *instance)
+        });
     };
+}
 
-    if base_sha.is_none() || head_sha.is_none() {
-        set_timed_cached_diff(working_dir, diff_spec, stat);
-    }
+#[cfg(not(any(test, feature = "test-support")))]
+macro_rules! repo_cache_static {
+    ($name:ident: $ty:ty = $init:expr) => {
+        static $name: std::sync::LazyLock<$ty> = std::sync::LazyLock::new(|| $init);
+    };
+}
 
-    stat
+repo_cache_static!(
+    REPO_CACHE: Mutex<HashMap<RepoCacheKey, Arc<dyn GitRepository>>> =
+        Mutex::new(HashMap::default())
+);
+
+repo_cache_static!(
+    PROJECT_REPO_KEYS: Mutex<HashMap<gpui::EntityId, RepoCacheKey>> =
+        Mutex::new(HashMap::default())
+);
+
+pub fn get_cached_repo(key: &RepoCacheKey) -> Option<Arc<dyn GitRepository>> {
+    REPO_CACHE.lock().get(key).cloned()
+}
+
+pub fn set_cached_repo(key: RepoCacheKey, repository: Arc<dyn GitRepository>) {
+    REPO_CACHE.lock().insert(key, repository);
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub fn clear_repo_cache() {
+    REPO_CACHE.lock().clear();
+    PROJECT_REPO_KEYS.lock().clear();
 }
 
 pub fn snapshot(
@@ -207,14 +122,13 @@ pub fn snapshot(
     goals: &[AgentGoalSummary],
     cx: &mut App,
 ) -> Task<Result<TaskGitSnapshot>> {
-    snapshot_with_cache(project, tasks, goals, None, cx)
+    snapshot_with_cache(project, tasks, goals, cx)
 }
 
 pub fn snapshot_with_cache(
     project: &Entity<Project>,
     tasks: &[AgentTaskSummary],
     goals: &[AgentGoalSummary],
-    _diff_cache: Option<DiffCache>,
     cx: &mut App,
 ) -> Task<Result<TaskGitSnapshot>> {
     let tasks = tasks.to_vec();
@@ -230,10 +144,27 @@ pub fn snapshot_with_cache(
             })?;
 
         let dot_git = anchor_path.join(".git");
-        let git_binary = system_git_binary();
-        let git_repo = file_system
-            .open_repo(&dot_git, git_binary.as_deref())
-            .with_context(|| format!("opening repo at {}", dot_git.display()))?;
+        let cache_key = RepoCacheKey::new(&dot_git, &file_system);
+
+        let previous_key = PROJECT_REPO_KEYS
+            .lock()
+            .insert(project.entity_id(), cache_key.clone());
+        if let Some(previous_key) = previous_key {
+            if previous_key != cache_key {
+                REPO_CACHE.lock().remove(&previous_key);
+            }
+        }
+
+        let git_repo = if let Some(cached_repository) = get_cached_repo(&cache_key) {
+            cached_repository
+        } else {
+            let git_binary = system_git_binary();
+            let repository = file_system
+                .open_repo(&dot_git, git_binary.as_deref())
+                .with_context(|| format!("opening repo at {}", dot_git.display()))?;
+            set_cached_repo(cache_key, repository.clone());
+            repository
+        };
 
         let branches_scan = git_repo.branches().await?;
         let mut goals_map = HashMap::new();
@@ -249,9 +180,14 @@ pub fn snapshot_with_cache(
             let branch_name = branch_name.strip_prefix("origin/").unwrap_or(branch_name);
             if let Some(goal_id) = branch_name.strip_prefix("agent-goal/") {
                 let canonical_branch = format!("agent-goal/{goal_id}");
-                let tip_sha = branch
-                    .most_recent_commit
-                    .map(|commit| commit.sha.to_string());
+                let tip_sha = if let Some(commit) = &branch.most_recent_commit {
+                    Some(commit.sha.to_string())
+                } else {
+                    crate::task_worktree::resolve_ref_to_sha(&git_repo, &canonical_branch)
+                        .await
+                        .log_err()
+                        .flatten()
+                };
                 let entry = existing_goal_branches.entry(goal_id.to_string());
                 match entry {
                     std::collections::hash_map::Entry::Vacant(vacant) => {
@@ -265,9 +201,14 @@ pub fn snapshot_with_cache(
                 }
             } else if let Some(task_id) = branch_name.strip_prefix("agent-task/") {
                 let canonical_branch = format!("agent-task/{task_id}");
-                let tip_sha = branch
-                    .most_recent_commit
-                    .map(|commit| commit.sha.to_string());
+                let tip_sha = if let Some(commit) = &branch.most_recent_commit {
+                    Some(commit.sha.to_string())
+                } else {
+                    crate::task_worktree::resolve_ref_to_sha(&git_repo, &canonical_branch)
+                        .await
+                        .log_err()
+                        .flatten()
+                };
                 let entry = existing_task_branches.entry(task_id.to_string());
                 match entry {
                     std::collections::hash_map::Entry::Vacant(vacant) => {
@@ -291,7 +232,6 @@ pub fn snapshot_with_cache(
                         branch,
                         branch_exists: true,
                         tip_sha: tip_sha.clone(),
-                        diff: None,
                     },
                 );
             } else {
@@ -301,7 +241,6 @@ pub fn snapshot_with_cache(
                         branch,
                         branch_exists: false,
                         tip_sha: None,
-                        diff: None,
                     },
                 );
             }
@@ -312,7 +251,6 @@ pub fn snapshot_with_cache(
                 branch: branch_name,
                 branch_exists: true,
                 tip_sha,
-                diff: None,
             });
         }
 
@@ -364,6 +302,8 @@ pub fn snapshot_with_cache(
                 (None, false)
             };
 
+            let retention_reason = crate::task_worktree::task_worktree_retention_reason(&task.id);
+
             tasks_map.insert(
                 task.id.clone(),
                 TaskGitState {
@@ -371,7 +311,7 @@ pub fn snapshot_with_cache(
                     exists_on_disk,
                     branch,
                     branch_exists,
-                    diff: None,
+                    retention_reason,
                 },
             );
         }
@@ -390,7 +330,6 @@ pub struct TaskWorktreeStatus {
     is_loading: bool,
     last_error: Option<String>,
     current_epoch: u64,
-    diff_cache: DiffCache,
     last_tasks: Option<Vec<AgentTaskSummary>>,
     last_goals: Option<Vec<AgentGoalSummary>>,
 }
@@ -403,14 +342,17 @@ impl TaskWorktreeStatus {
             is_loading: false,
             last_error: None,
             current_epoch: 0,
-            diff_cache: Arc::new(Mutex::new(HashMap::new())),
             last_tasks: None,
             last_goals: None,
         }
     }
 
-    pub fn diff_cache(&self) -> &DiffCache {
-        &self.diff_cache
+    pub fn retention_reason(&self, task_id: &AgentTaskId) -> Option<String> {
+        self.snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.tasks.get(task_id))
+            .and_then(|state| state.retention_reason.clone())
+            .or_else(|| crate::task_worktree::task_worktree_retention_reason(task_id))
     }
 
     pub fn snapshot(&self) -> Option<&TaskGitSnapshot> {
@@ -423,6 +365,14 @@ impl TaskWorktreeStatus {
 
     pub fn last_error(&self) -> Option<&str> {
         self.last_error.as_deref()
+    }
+
+    pub fn cached_repo(&self, cx: &App) -> Option<Arc<dyn GitRepository>> {
+        let (_repository, anchor_path, _path_style, _worktree_setting, file_system) =
+            task_worktree_context(self.project.read(cx), cx).log_err()?;
+        let dot_git = anchor_path.join(".git");
+        let cache_key = RepoCacheKey::new(&dot_git, &file_system);
+        get_cached_repo(&cache_key)
     }
 
     pub fn refresh_if_needed(
@@ -466,16 +416,6 @@ impl TaskWorktreeStatus {
         goals: Vec<AgentGoalSummary>,
         cx: &mut Context<Self>,
     ) -> Task<Result<TaskGitSnapshot>> {
-        if self.snapshot.is_some()
-            && self.last_error.is_none()
-            && self.last_tasks.as_ref() == Some(&tasks)
-            && self.last_goals.as_ref() == Some(&goals)
-        {
-            if let Some(snapshot) = self.snapshot.clone() {
-                return Task::ready(Ok(snapshot));
-            }
-        }
-
         self.current_epoch = self.current_epoch.wrapping_add(1);
         let request_epoch = self.current_epoch;
         self.is_loading = true;
@@ -483,13 +423,7 @@ impl TaskWorktreeStatus {
 
         let tasks_clone = tasks.clone();
         let goals_clone = goals.clone();
-        let snapshot_task = snapshot_with_cache(
-            &self.project,
-            &tasks,
-            &goals,
-            Some(self.diff_cache.clone()),
-            cx,
-        );
+        let snapshot_task = snapshot_with_cache(&self.project, &tasks, &goals, cx);
         cx.spawn(async move |this, cx| {
             let result = snapshot_task.await;
             this.update(cx, |status, cx| {
@@ -540,6 +474,8 @@ mod tests {
     use crate::agent_task::{AgentGoalStatus, AgentTaskStatus};
 
     fn init_test(cx: &mut TestAppContext) {
+        crate::task_worktree::reset_registry_for_tests();
+        clear_repo_cache();
         cx.update(|cx| {
             let settings_store = SettingsStore::test(cx);
             cx.set_global(settings_store);
@@ -606,6 +542,8 @@ mod tests {
                 created_at: None,
                 assigned_profile: None,
                 model: None,
+                session_id: None,
+                metrics: None,
             },
             AgentTaskSummary {
                 id: AgentTaskId::from("TASK-2"),
@@ -619,6 +557,8 @@ mod tests {
                 created_at: None,
                 assigned_profile: None,
                 model: None,
+                session_id: None,
+                metrics: None,
             },
         ];
 
@@ -631,6 +571,8 @@ mod tests {
                 tasks_total: 2,
                 tasks_done: 0,
                 created_at: None,
+                metrics: None,
+                session_id: None,
             },
             AgentGoalSummary {
                 goal_id: "GOAL-2".to_string(),
@@ -640,6 +582,8 @@ mod tests {
                 tasks_total: 1,
                 tasks_done: 0,
                 created_at: None,
+                metrics: None,
+                session_id: None,
             },
         ];
 
@@ -653,14 +597,12 @@ mod tests {
         assert_eq!(goal_1_state.branch, "agent-goal/GOAL-1");
         assert!(goal_1_state.branch_exists);
         assert_eq!(goal_1_state.tip_sha.as_deref(), Some("goal-1-sha-200"));
-        assert_eq!(goal_1_state.diff, None);
 
         // GOAL-2 branch does not exist
         let goal_2_state = snapshot.goals.get("GOAL-2").unwrap();
         assert_eq!(goal_2_state.branch, "agent-goal/GOAL-2");
         assert!(!goal_2_state.branch_exists);
         assert_eq!(goal_2_state.tip_sha, None);
-        assert_eq!(goal_2_state.diff, None);
 
         // TASK-1 exists on disk
         let task_1_state = snapshot.tasks.get(&AgentTaskId::from("TASK-1")).unwrap();
@@ -673,7 +615,6 @@ mod tests {
         );
         assert_eq!(task_1_state.branch, None);
         assert!(!task_1_state.branch_exists);
-        assert_eq!(task_1_state.diff, None);
 
         // TASK-2 does not exist on disk
         let task_2_state = snapshot.tasks.get(&AgentTaskId::from("TASK-2")).unwrap();
@@ -686,7 +627,6 @@ mod tests {
         );
         assert_eq!(task_2_state.branch, None);
         assert!(!task_2_state.branch_exists);
-        assert_eq!(task_2_state.diff, None);
 
         // TASK-ORPHAN is in orphan_worktrees
         assert_eq!(snapshot.orphan_worktrees.len(), 1);
@@ -871,6 +811,8 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
+            session_id: None,
+            metrics: None,
         }];
 
         let goals = vec![AgentGoalSummary {
@@ -881,6 +823,8 @@ mod tests {
             tasks_total: 1,
             tasks_done: 0,
             created_at: None,
+            metrics: None,
+            session_id: None,
         }];
 
         let snapshot = cx
@@ -891,90 +835,6 @@ mod tests {
         let task_1_state = snapshot.tasks.get(&AgentTaskId::from("TASK-1")).unwrap();
         assert_eq!(task_1_state.branch, Some("agent-task/TASK-1".to_string()));
         assert!(task_1_state.branch_exists);
-        assert_eq!(task_1_state.diff, None);
-    }
-
-    #[test]
-    fn test_diff_short_stat_from_numstat() {
-        let sample = "10\t5\tcrates/agent/src/lib.rs\n\
-                      3\t0\tREADME.md\n\
-                      -\t-\tassets/image.png\n\
-                      0\t12\tsrc/old.rs\n";
-        let stat = DiffShortStat::from_numstat(sample);
-        assert_eq!(stat.files, 3);
-        assert_eq!(stat.added, 13);
-        assert_eq!(stat.removed, 17);
-
-        // Empty output
-        let empty_stat = DiffShortStat::from_numstat("");
-        assert_eq!(empty_stat.files, 0);
-        assert_eq!(empty_stat.added, 0);
-        assert_eq!(empty_stat.removed, 0);
-
-        // Binary files only
-        let binary_stat = DiffShortStat::from_numstat("-\t-\tfoo.png\n-\t-\tbar.jpg\n");
-        assert_eq!(binary_stat.files, 0);
-        assert_eq!(binary_stat.added, 0);
-        assert_eq!(binary_stat.removed, 0);
-    }
-
-    #[test]
-    fn test_diff_cache_lookup_and_insert() {
-        let cache = Arc::new(Mutex::new(HashMap::new()));
-        let base = "sha-base-1";
-        let head = "sha-head-1";
-
-        assert_eq!(get_cached_diff(Some(&cache), base, head), None);
-
-        let stat = DiffShortStat {
-            files: 2,
-            added: 15,
-            removed: 4,
-        };
-        set_cached_diff(Some(&cache), base.to_string(), head.to_string(), stat);
-
-        assert_eq!(get_cached_diff(Some(&cache), base, head), Some(stat));
-    }
-
-    #[gpui::test]
-    async fn test_compute_diff_short_stat_cached() {
-        let cache = Arc::new(Mutex::new(HashMap::new()));
-        let base_sha = "base123";
-        let head_sha = "head456";
-        let expected = DiffShortStat {
-            files: 5,
-            added: 100,
-            removed: 20,
-        };
-        set_cached_diff(
-            Some(&cache),
-            base_sha.to_string(),
-            head_sha.to_string(),
-            expected,
-        );
-
-        let non_existent_dir = std::path::Path::new("/does/not/exist");
-        let result = compute_short_stat_for_diff(
-            non_existent_dir,
-            "base...head",
-            Some(base_sha),
-            Some(head_sha),
-            Some(&cache),
-        )
-        .await;
-
-        assert_eq!(result, Some(expected));
-
-        // When not cached and dir does not exist, returns None
-        let uncached = compute_short_stat_for_diff(
-            non_existent_dir,
-            "base...head",
-            Some("other_base"),
-            Some("other_head"),
-            Some(&cache),
-        )
-        .await;
-        assert_eq!(uncached, None);
     }
 
     #[test]
@@ -1035,6 +895,8 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
+            session_id: None,
+            metrics: None,
         }];
 
         let snap1 = status_entity
@@ -1044,14 +906,120 @@ mod tests {
         let notifies_after_first = notify_count.load(std::sync::atomic::Ordering::SeqCst);
         assert!(notifies_after_first > 0);
 
+        // refresh_if_needed reuses cached snapshot and does not notify
         let snap2 = status_entity
-            .update(cx, |s, cx| s.refresh(tasks.clone(), vec![], cx))
+            .update(cx, |s, cx| s.refresh_if_needed(tasks.clone(), vec![], cx))
             .await
             .unwrap();
         assert_eq!(snap1, snap2);
         assert_eq!(
             notify_count.load(std::sync::atomic::Ordering::SeqCst),
             notifies_after_first
+        );
+
+        // refresh unconditionally re-evaluates snapshot and notifies
+        let snap3 = status_entity
+            .update(cx, |s, cx| s.refresh(tasks.clone(), vec![], cx))
+            .await
+            .unwrap();
+        assert_eq!(snap1, snap3);
+        assert!(notify_count.load(std::sync::atomic::Ordering::SeqCst) > notifies_after_first);
+    }
+
+    #[gpui::test]
+    async fn test_task_worktree_status_refresh_reevaluates_snapshot_on_disk_changes(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/root"),
+            json!({
+                ".git": {
+                    "HEAD": "ref: refs/heads/main\n"
+                }
+            }),
+        )
+        .await;
+
+        let dot_git = std::path::Path::new(path!("/root/.git"));
+        fs.with_git_state(dot_git, true, |state| {
+            state.branches.insert("main".into());
+            state
+                .refs
+                .insert("refs/heads/main".into(), "main-sha-100".into());
+            state.refs.insert("HEAD".into(), "main-sha-100".into());
+        })
+        .unwrap();
+
+        let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
+        let status_entity =
+            cx.update(|cx| cx.new(|cx| TaskWorktreeStatus::new(project.clone(), cx)));
+
+        let tasks = vec![AgentTaskSummary {
+            id: AgentTaskId::from("TASK-1"),
+            parent_id: None,
+            goal_id: None,
+            title: "Task 1".to_string(),
+            status: AgentTaskStatus::Running,
+            attempt: 1,
+            assignee: None,
+            write_scopes: vec![],
+            created_at: None,
+            assigned_profile: None,
+            model: None,
+            session_id: None,
+            metrics: None,
+        }];
+
+        // Initial snapshot: worktree does not exist on disk
+        let snap1 = status_entity
+            .update(cx, |s, cx| s.refresh(tasks.clone(), vec![], cx))
+            .await
+            .unwrap();
+        assert!(
+            !snap1
+                .tasks
+                .get(&AgentTaskId::from("TASK-1"))
+                .unwrap()
+                .exists_on_disk
+        );
+
+        // Now create worktree on disk
+        fs.insert_tree(
+            path!("/worktrees/root"),
+            json!({
+                "agent-task-TASK-1": {
+                    "file.rs": "fn main() {}"
+                }
+            }),
+        )
+        .await;
+
+        // refresh_if_needed retains the cached snapshot
+        let snap_cached = status_entity
+            .update(cx, |s, cx| s.refresh_if_needed(tasks.clone(), vec![], cx))
+            .await
+            .unwrap();
+        assert!(
+            !snap_cached
+                .tasks
+                .get(&AgentTaskId::from("TASK-1"))
+                .unwrap()
+                .exists_on_disk
+        );
+
+        // refresh re-queries filesystem and git despite tasks and goals being unchanged
+        let snap_refreshed = status_entity
+            .update(cx, |s, cx| s.refresh(tasks.clone(), vec![], cx))
+            .await
+            .unwrap();
+        assert!(
+            snap_refreshed
+                .tasks
+                .get(&AgentTaskId::from("TASK-1"))
+                .unwrap()
+                .exists_on_disk
         );
     }
 
@@ -1095,6 +1063,8 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
+            session_id: None,
+            metrics: None,
         }];
         let goals = vec![AgentGoalSummary {
             goal_id: "GOAL-1".to_string(),
@@ -1104,6 +1074,8 @@ mod tests {
             tasks_total: 1,
             tasks_done: 0,
             created_at: None,
+            metrics: None,
+            session_id: None,
         }];
 
         let snap1 = status_entity
@@ -1141,6 +1113,8 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
+            session_id: None,
+            metrics: None,
         });
 
         let snap3 = status_entity
@@ -1153,20 +1127,213 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_compute_diff_short_stat_timed_cache_when_sha_missing() {
-        let test_dir = std::path::Path::new("/test/timed_cache_dir");
-        let diff_spec = "main...feature";
-        let expected = DiffShortStat {
-            files: 3,
-            added: 12,
-            removed: 5,
-        };
+    async fn test_snapshot_reuses_cached_git_repository_handle(cx: &mut TestAppContext) {
+        init_test(cx);
 
-        set_timed_cached_diff(test_dir, diff_spec, Some(expected));
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/root_cache_reuse"),
+            json!({
+                ".git": {
+                    "HEAD": "ref: refs/heads/main\n"
+                }
+            }),
+        )
+        .await;
 
-        let result =
-            compute_short_stat_for_diff(test_dir, diff_spec, None, Some("head_sha"), None).await;
+        let dot_git = std::path::Path::new(path!("/root_cache_reuse/.git"));
+        fs.with_git_state(dot_git, true, |state| {
+            state.branches.insert("main".into());
+            state
+                .refs
+                .insert("refs/heads/main".into(), "main-sha-100".into());
+            state.refs.insert("HEAD".into(), "main-sha-100".into());
+        })
+        .unwrap();
 
-        assert_eq!(result, Some(expected));
+        let project = Project::test(fs.clone(), [path!("/root_cache_reuse").as_ref()], cx).await;
+        let file_system: Arc<dyn Fs> = fs.clone();
+        let cache_key = RepoCacheKey::new(dot_git, &file_system);
+
+        assert!(get_cached_repo(&cache_key).is_none());
+
+        let snapshot_1 = cx
+            .update(|cx| snapshot(&project, &[], &[], cx))
+            .await
+            .unwrap();
+
+        let first_repo = get_cached_repo(&cache_key)
+            .expect("repository handle should be cached after first snapshot");
+
+        let snapshot_2 = cx
+            .update(|cx| snapshot(&project, &[], &[], cx))
+            .await
+            .unwrap();
+
+        let second_repo = get_cached_repo(&cache_key)
+            .expect("repository handle should be cached after second snapshot");
+
+        assert_eq!(snapshot_1, snapshot_2);
+        assert!(
+            Arc::ptr_eq(&first_repo, &second_repo),
+            "snapshot must reuse the cached repository handle across calls"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_snapshot_invalidates_cached_repository_when_dot_git_changes(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/root_invalidation_1"),
+            json!({
+                ".git": {
+                    "HEAD": "ref: refs/heads/main\n"
+                }
+            }),
+        )
+        .await;
+
+        let dot_git_1 = std::path::Path::new(path!("/root_invalidation_1/.git"));
+        fs.with_git_state(dot_git_1, true, |state| {
+            state.branches.insert("main".into());
+            state
+                .refs
+                .insert("refs/heads/main".into(), "main-sha-100".into());
+            state.refs.insert("HEAD".into(), "main-sha-100".into());
+        })
+        .unwrap();
+
+        fs.insert_tree(
+            path!("/root_invalidation_2"),
+            json!({
+                ".git": {
+                    "HEAD": "ref: refs/heads/main\n"
+                }
+            }),
+        )
+        .await;
+
+        let dot_git_2 = std::path::Path::new(path!("/root_invalidation_2/.git"));
+        fs.with_git_state(dot_git_2, true, |state| {
+            state.branches.insert("main".into());
+            state
+                .refs
+                .insert("refs/heads/main".into(), "main-sha-200".into());
+            state.refs.insert("HEAD".into(), "main-sha-200".into());
+        })
+        .unwrap();
+
+        let project = Project::test(
+            fs.clone(),
+            [
+                path!("/root_invalidation_1").as_ref(),
+                path!("/root_invalidation_2").as_ref(),
+            ],
+            cx,
+        )
+        .await;
+        let file_system: Arc<dyn Fs> = fs.clone();
+        let key_1 = RepoCacheKey::new(dot_git_1, &file_system);
+        let key_2 = RepoCacheKey::new(dot_git_2, &file_system);
+
+        cx.update(|cx| snapshot(&project, &[], &[], cx))
+            .await
+            .unwrap();
+
+        assert!(get_cached_repo(&key_1).is_some());
+        assert!(get_cached_repo(&key_2).is_none());
+
+        let worktree_1 = project.read_with(cx, |project, cx| {
+            project.visible_worktrees(cx).next().unwrap()
+        });
+        let worktree_1_id = worktree_1.read_with(cx, |worktree, _| worktree.id());
+
+        project.update(cx, |project, cx| {
+            project.remove_worktree(worktree_1_id, cx);
+        });
+
+        cx.update(|cx| snapshot(&project, &[], &[], cx))
+            .await
+            .unwrap();
+
+        assert!(
+            get_cached_repo(&key_1).is_none(),
+            "previous repository handle must be invalidated when dot_git changes"
+        );
+        assert!(
+            get_cached_repo(&key_2).is_some(),
+            "new repository handle must be cached under new dot_git key"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_task_worktree_status_surfaces_retention_reason(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/root"),
+            json!({
+                ".git": {
+                    "HEAD": "ref: refs/heads/main\n"
+                }
+            }),
+        )
+        .await;
+
+        let dot_git = std::path::Path::new(path!("/root/.git"));
+        fs.with_git_state(dot_git, true, |state| {
+            state
+                .refs
+                .insert("refs/heads/main".into(), "main-sha-status".into());
+            state.refs.insert("HEAD".into(), "main-sha-status".into());
+            state.branches.insert("main".into());
+        })
+        .unwrap();
+
+        let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
+        let host_id = AgentTaskId::from("TASK-STATUS-RET");
+
+        crate::task_worktree::register_worktree_holder(&host_id, "session-viewer-1");
+
+        let tasks = vec![AgentTaskSummary {
+            id: host_id.clone(),
+            parent_id: None,
+            goal_id: None,
+            title: "Status Task".to_string(),
+            status: AgentTaskStatus::Running,
+            attempt: 1,
+            assignee: None,
+            write_scopes: vec![],
+            created_at: None,
+            assigned_profile: None,
+            model: None,
+            session_id: None,
+            metrics: None,
+        }];
+
+        let snapshot = cx
+            .update(|cx| snapshot(&project, &tasks, &[], cx))
+            .await
+            .unwrap();
+
+        let task_state = snapshot.tasks.get(&host_id).unwrap();
+        assert_eq!(
+            task_state.retention_reason,
+            Some("holder:session-viewer-1".to_string())
+        );
+
+        let status_entity =
+            cx.update(|cx| cx.new(|cx| TaskWorktreeStatus::new(project.clone(), cx)));
+        let refresh_task = status_entity.update(cx, |s, cx| s.refresh(tasks, vec![], cx));
+        refresh_task.await.unwrap();
+
+        assert_eq!(
+            status_entity.read_with(cx, |s, _| s.retention_reason(&host_id)),
+            Some("holder:session-viewer-1".to_string())
+        );
     }
 }

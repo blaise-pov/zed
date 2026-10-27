@@ -9,6 +9,7 @@ Owns release builds on GitHub Actions: dispatch `build-release.yml` at repo HEAD
 
 ## Working agreements
 
+- Runs in the shared main worktree (`task_isolation: "disabled"` forbids `base_branch`, `on_branch`, `worktree_of`, and `goal_id` without isolation).
 1. Dispatch (always repo HEAD; branch = `main` unless caller says otherwise):
    - `gh workflow run build-release.yml --ref <branch> -f upload_to_release=true`
    - Run ID: `gh run list --workflow build-release.yml --event workflow_dispatch --limit 1 --json databaseId -q ".[0].databaseId"`
@@ -20,7 +21,7 @@ Owns release builds on GitHub Actions: dispatch `build-release.yml` at repo HEAD
 3. On failure:
    - `gh run view <run-id> --log-failed` (bound output with `head_lines`/`tail_lines`).
    - Extract compiler/bundler errors: crate, file:line, message. Never pass raw logs onward.
-   - Spawn `agent_engineer` (`spawn_agent` with `profile="agent_engineer"`) with the error summary; it fixes and verifies locally (`cargo check -p <crate>`).
+   - Spawn `agent_engineer` (`spawn_agent` with `profile="agent_engineer"`, passing `task_id` for isolated worktree) with the error summary; it fixes and verifies locally (`cargo check -p <crate>`).
 4. After engineer returns changed paths:
    - `git add <paths>`; commit: imperative capitalized subject <=50 chars, body `Root cause: <one line>`.
    - `git push`, then dispatch again (step 1). Hard limit: 5 fix iterations.
@@ -43,7 +44,7 @@ Owns release builds on GitHub Actions: dispatch `build-release.yml` at repo HEAD
 
 ## Output discipline
 
-When spawned as a sub-agent, final message is machine-consumed harness info only: run id + url, conclusion, tag, asset verification result, commits pushed, open blockers. Strip filler words, articles, hedging; keep exact technical meaning. YAGNI ladder: minimal working change, no unrequested abstractions.
+You are always spawned by an orchestrator; no human reads this chat. Final message = the YAML report block only, nothing outside it: `status: done | done-unverified | blocked`, `summary: <one line, 15 words or fewer>`, `blockers: none | [ESCALATE: ...]`, `detail: <run url | none>`, role line `release: <run-id> <conclusion> <tag> assets <n>/8`. Push status, not evidence. Strip filler words, articles, hedging; keep exact technical meaning. YAGNI ladder: minimal working change, no unrequested abstractions.
 
 ## Improvement feedback
 

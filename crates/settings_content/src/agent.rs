@@ -96,6 +96,30 @@ pub enum ThinkingBlockDisplay {
     AlwaysCollapsed,
 }
 
+/// The lifecycle management mode for agent tasks.
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    JsonSchema,
+    MergeFrom,
+    strum::VariantArray,
+    strum::VariantNames,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum TaskLifecycleMode {
+    /// Automatic lifecycle actions performed by the agent runtime.
+    #[default]
+    Runtime,
+    /// The runtime performs no automatic task lifecycle actions; the agent manages its own lifecycle.
+    Agent,
+}
+
 /// Threshold at which agent auto-compaction runs. See
 /// [`AutoCompactSettingsContent::threshold`] for the accepted formats.
 ///
@@ -308,6 +332,28 @@ impl crate::merge_from::MergeFrom for TerminalWatchdogSettingsContent {
     }
 }
 
+/// Timeouts in seconds for spawn sub-steps.
+#[with_fallible_options]
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom, Debug, Default)]
+pub struct SpawnStepTimeoutSettingsContent {
+    /// Timeout in seconds for task graph operations during spawn.
+    ///
+    /// Default: 120
+    pub task_graph: Option<u64>,
+    /// Timeout in seconds for commit operations during spawn.
+    ///
+    /// Default: 300
+    pub commit: Option<u64>,
+    /// Timeout in seconds for cleanup operations during spawn.
+    ///
+    /// Default: 60
+    pub cleanup: Option<u64>,
+    /// Timeout in seconds for diff operations during spawn.
+    ///
+    /// Default: 30
+    pub diff: Option<u64>,
+}
+
 #[with_fallible_options]
 #[derive(Clone, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom, Debug, Default)]
 pub struct AgentSettingsContent {
@@ -319,6 +365,10 @@ pub struct AgentSettingsContent {
     ///
     /// Default: true
     pub button: Option<bool>,
+    /// Whether to show the agent task panel button in the status bar.
+    ///
+    /// Default: true
+    pub task_button: Option<bool>,
     /// Where to dock the agent panel.
     ///
     /// Default: left (Agentic layout), right (Classic layout)
@@ -340,6 +390,11 @@ pub struct AgentSettingsContent {
     ///
     /// Default: true
     pub flexible: Option<bool>,
+    /// Whether the agent task panel should use flexible (proportional) sizing when docked to the
+    /// left or right.
+    ///
+    /// Default: false
+    pub task_flexible: Option<bool>,
     /// The deprecated version of `threads_sidebar.position`.
     ///
     /// Don't use this field.
@@ -410,6 +465,8 @@ pub struct AgentSettingsContent {
     /// When specified and successfully read, completely replaces the default
     /// title generation prompt.
     pub thread_title_template: Option<String>,
+    /// Path to a custom Handlebars template file for the task contract injected into subagents.
+    pub task_contract_template: Option<String>,
     /// Path to a custom base Handlebars/Markdown template file for the agent system prompt.
     pub system_prompt_template: Option<String>,
     /// Model to use for generating thread summaries. Defaults to default_model when not specified.
@@ -538,10 +595,59 @@ pub struct AgentSettingsContent {
     ///
     /// Default: 3
     pub task_worktree_limit: Option<usize>,
+    /// Timeouts in seconds for spawn sub-steps (task_graph, commit, cleanup, diff).
+    pub spawn_step_timeout_seconds: Option<SpawnStepTimeoutSettingsContent>,
+    /// Timeout in seconds for sending messages to a sub-agent before watchdog kills the turn.
+    ///
+    /// Default: 30
+    pub send_watchdog_seconds: Option<u64>,
+    /// Timeout in seconds for a turn before watchdog kills the turn.
+    ///
+    /// Default: 120
+    pub turn_watchdog_seconds: Option<u64>,
     /// Whether language servers should be started for task worktrees by default.
     ///
     /// Default: true
     pub task_worktree_language_servers: Option<bool>,
+    /// Maximum bytes returned by the fetch tool before output is truncated.
+    ///
+    /// Default: 102400 (100 KB)
+    pub fetch_max_bytes: Option<usize>,
+    /// The task lifecycle management mode.
+    ///
+    /// Values: "runtime", "agent".
+    /// When set to "agent", the runtime performs no automatic task lifecycle actions.
+    ///
+    /// Default: "runtime"
+    pub task_lifecycle_mode: Option<TaskLifecycleMode>,
+    /// Whether to automatically commit task worktrees at session end.
+    ///
+    /// Default: true
+    pub commit_on_session_end: Option<bool>,
+    /// Whether to automatically clean up and evict task worktrees.
+    ///
+    /// Default: true
+    pub cleanup: Option<bool>,
+    /// Whether to automatically register task metadata in the task graph server.
+    ///
+    /// Default: true
+    pub register_metadata: Option<bool>,
+    /// Whether to publish task ref artifacts to the task graph server upon merge.
+    ///
+    /// Default: true
+    pub publish_ref_artifact: Option<bool>,
+    /// Whether to delete the goal branch when cleaning up a graduated goal.
+    ///
+    /// Default: true
+    pub delete_goal_branches_on_graduation: Option<bool>,
+    /// Whether to delete task branches when cleaning up a graduated goal.
+    ///
+    /// Default: true
+    pub delete_task_branches_on_graduation: Option<bool>,
+    /// Base branch to target when preparing goal graduation.
+    ///
+    /// Default: null
+    pub goal_graduation_base_branch: Option<String>,
 }
 
 impl AgentSettingsContent {
@@ -579,6 +685,10 @@ impl AgentSettingsContent {
 
     pub fn set_flexible_size(&mut self, flexible: bool) {
         self.flexible = Some(flexible);
+    }
+
+    pub fn set_task_flexible_size(&mut self, flexible: bool) {
+        self.task_flexible = Some(flexible);
     }
 
     pub fn set_model(&mut self, language_model: LanguageModelSelection) {
@@ -1876,6 +1986,99 @@ mod tests {
         let mut base2 = configured.clone();
         base2.merge_from(&absent);
         assert_eq!(base2, configured);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_spawn_step_timeout_content_deserialization_and_merge() -> anyhow::Result<()> {
+        use crate::merge_from::MergeFrom as _;
+
+        // Absent fields deserialize to None
+        let absent: SpawnStepTimeoutSettingsContent = serde_json::from_str("{}")?;
+        assert_eq!(absent.task_graph, None);
+        assert_eq!(absent.commit, None);
+        assert_eq!(absent.cleanup, None);
+        assert_eq!(absent.diff, None);
+
+        // Explicit values deserialize properly
+        let configured: SpawnStepTimeoutSettingsContent = serde_json::from_str(
+            r#"{
+                "task_graph": 120,
+                "commit": 300,
+                "cleanup": 60,
+                "diff": 30
+            }"#,
+        )?;
+        assert_eq!(configured.task_graph, Some(120));
+        assert_eq!(configured.commit, Some(300));
+        assert_eq!(configured.cleanup, Some(60));
+        assert_eq!(configured.diff, Some(30));
+
+        // MergeFrom: partial update overrides existing value
+        let partial: SpawnStepTimeoutSettingsContent = serde_json::from_str(
+            r#"{
+                "task_graph": 200,
+                "diff": 45
+            }"#,
+        )?;
+        let mut base = configured;
+        base.merge_from(&partial);
+        assert_eq!(base.task_graph, Some(200));
+        assert_eq!(base.commit, Some(300));
+        assert_eq!(base.cleanup, Some(60));
+        assert_eq!(base.diff, Some(45));
+
+        // MergeFrom: absent fields do not override existing values
+        let mut base2 = configured;
+        base2.merge_from(&absent);
+        assert_eq!(base2, configured);
+
+        // AgentSettingsContent deserializes new timeout fields
+        let agent_content: AgentSettingsContent = serde_json::from_str(
+            r#"{
+                "spawn_step_timeout_seconds": {
+                    "task_graph": 100,
+                    "commit": 250
+                },
+                "send_watchdog_seconds": 45,
+                "turn_watchdog_seconds": 180
+            }"#,
+        )?;
+        assert_eq!(
+            agent_content.spawn_step_timeout_seconds,
+            Some(SpawnStepTimeoutSettingsContent {
+                task_graph: Some(100),
+                commit: Some(250),
+                cleanup: None,
+                diff: None,
+            })
+        );
+        assert_eq!(agent_content.send_watchdog_seconds, Some(45));
+        assert_eq!(agent_content.turn_watchdog_seconds, Some(180));
+
+        // AgentSettingsContent MergeFrom
+        let mut base_agent: AgentSettingsContent = agent_content;
+        let overlay_agent: AgentSettingsContent = serde_json::from_str(
+            r#"{
+                "spawn_step_timeout_seconds": {
+                    "diff": 15
+                },
+                "turn_watchdog_seconds": 240
+            }"#,
+        )?;
+        base_agent.merge_from(&overlay_agent);
+        assert_eq!(
+            base_agent.spawn_step_timeout_seconds,
+            Some(SpawnStepTimeoutSettingsContent {
+                task_graph: Some(100),
+                commit: Some(250),
+                cleanup: None,
+                diff: Some(15),
+            })
+        );
+        assert_eq!(base_agent.send_watchdog_seconds, Some(45));
+        assert_eq!(base_agent.turn_watchdog_seconds, Some(240));
 
         Ok(())
     }

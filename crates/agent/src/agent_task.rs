@@ -270,6 +270,35 @@ where
     deserializer.deserialize_any(CreatedAtVisitor)
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentDiffShortstat {
+    pub files_changed: u64,
+    pub insertions: u64,
+    pub deletions: u64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct AgentTaskMetrics {
+    #[serde(default)]
+    pub duration_ms: Option<u64>,
+    #[serde(default)]
+    pub input_tokens: Option<u64>,
+    #[serde(default)]
+    pub output_tokens: Option<u64>,
+    #[serde(default)]
+    pub cache_read_tokens: Option<u64>,
+    #[serde(default)]
+    pub cache_creation_tokens: Option<u64>,
+    #[serde(default)]
+    pub total_tokens: Option<u64>,
+    #[serde(default)]
+    pub cost_usd: Option<f64>,
+    #[serde(default, alias = "turns")]
+    pub turns_count: Option<u32>,
+    #[serde(default)]
+    pub diff: Option<AgentDiffShortstat>,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AgentTaskSummary {
     pub id: AgentTaskId,
@@ -287,6 +316,30 @@ pub struct AgentTaskSummary {
     pub assigned_profile: Option<SharedString>,
     #[serde(default)]
     pub model: Option<SharedString>,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub metrics: Option<AgentTaskMetrics>,
+}
+
+impl Default for AgentTaskSummary {
+    fn default() -> Self {
+        Self {
+            id: AgentTaskId::from(""),
+            parent_id: None,
+            goal_id: None,
+            title: String::new(),
+            status: AgentTaskStatus::Ready,
+            attempt: 0,
+            assignee: None,
+            write_scopes: Vec::new(),
+            created_at: None,
+            assigned_profile: None,
+            model: None,
+            session_id: None,
+            metrics: None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -299,110 +352,40 @@ pub struct AgentGoalSummary {
     pub tasks_done: u64,
     #[serde(default, deserialize_with = "deserialize_created_at")]
     pub created_at: Option<u64>,
+    #[serde(default)]
+    pub metrics: Option<AgentTaskMetrics>,
+    #[serde(default)]
+    pub session_id: Option<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub enum AgentItemKind {
-    Goal,
-    Task,
-    Other(SharedString),
-}
-
-impl AgentItemKind {
-    pub fn as_str(&self) -> &str {
-        match self {
-            Self::Goal => "goal",
-            Self::Task => "task",
-            Self::Other(custom) => custom.as_ref(),
+impl Default for AgentGoalSummary {
+    fn default() -> Self {
+        Self {
+            goal_id: String::new(),
+            title: String::new(),
+            status: AgentGoalStatus::Running,
+            priority: 0,
+            tasks_total: 0,
+            tasks_done: 0,
+            created_at: None,
+            metrics: None,
+            session_id: None,
         }
     }
 }
 
-impl Serialize for AgentItemKind {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        serializer.serialize_str(self.as_str())
-    }
-}
-
-impl<'de> Deserialize<'de> for AgentItemKind {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let s = String::deserialize(deserializer)?;
-        Ok(match s.to_ascii_lowercase().as_str() {
-            "goal" => Self::Goal,
-            "task" => Self::Task,
-            _ => Self::Other(SharedString::from(s)),
-        })
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-pub struct AgentGoalProgress {
-    pub done: u64,
-    pub total: u64,
-}
-
-impl<'de> Deserialize<'de> for AgentGoalProgress {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let value = serde_json::Value::deserialize(deserializer)?;
-        let done = value
-            .get("done")
-            .or_else(|| value.get("tasks_done"))
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0);
-        let total = value
-            .get("total")
-            .or_else(|| value.get("tasks_total"))
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0);
-        Ok(Self { done, total })
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct AgentUnifiedItem {
-    pub kind: AgentItemKind,
-    pub id: String,
-    #[serde(default)]
-    pub title: String,
-    #[serde(default)]
-    pub status: String,
-    #[serde(default)]
-    pub priority: i64,
-    #[serde(default, deserialize_with = "deserialize_created_at")]
-    pub created_at: Option<u64>,
-    #[serde(default)]
-    pub failure_reason: Option<String>,
-    #[serde(default)]
-    pub progress: Option<AgentGoalProgress>,
-    #[serde(default)]
-    pub assignee: Option<SharedString>,
-    #[serde(default)]
-    pub assigned_profile: Option<SharedString>,
-    #[serde(default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AgentTurnRecord {
+    pub duration_ms: u64,
+    pub tokens: Option<language_model::TokenUsage>,
     pub model: Option<SharedString>,
-    #[serde(default)]
-    pub parent_id: Option<String>,
-    #[serde(default)]
-    pub goal_id: Option<String>,
-}
-
-impl AgentUnifiedItem {
-    pub fn task_status(&self) -> AgentTaskStatus {
-        AgentTaskStatus::from_str(&self.status)
-    }
-
-    pub fn goal_status(&self) -> AgentGoalStatus {
-        AgentGoalStatus::from_str(&self.status)
-    }
+    pub session_id: Option<SharedString>,
+    pub error: Option<SharedString>,
+    pub branch: Option<SharedString>,
+    pub commit_sha: Option<SharedString>,
+    pub output_summary: Option<SharedString>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diff: Option<AgentDiffShortstat>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
@@ -490,10 +473,15 @@ pub trait AgentTaskProvider: 'static + Send + Sync {
     fn server_id(&self) -> ContextServerId;
     fn fetch_graph(&self, cx: &mut App) -> Task<Result<AgentTaskGraph>>;
     fn get_task(&self, id: &AgentTaskId, cx: &mut App) -> Task<Result<AgentTaskDetail>>;
-    fn ensure_task(&self, id: &AgentTaskId, title: &str, cx: &mut App) -> Task<Result<()>> {
-        let _ = id;
-        let _ = title;
-        let _ = cx;
+    fn update_task_metadata(
+        &self,
+        id: &AgentTaskId,
+        model: Option<&str>,
+        assignee: Option<&str>,
+        session_id: Option<&str>,
+        cx: &mut App,
+    ) -> Task<Result<()>> {
+        let _ = (id, model, assignee, session_id, cx);
         Task::ready(Ok(()))
     }
     fn complete_task(&self, id: &AgentTaskId, cx: &mut App) -> Task<Result<()>>;
@@ -501,16 +489,39 @@ pub trait AgentTaskProvider: 'static + Send + Sync {
     fn archive_task(&self, id: &AgentTaskId, cx: &mut App) -> Task<Result<()>>;
     fn unarchive_task(&self, id: &AgentTaskId, cx: &mut App) -> Task<Result<()>>;
     fn delete_task(&self, id: &AgentTaskId, cx: &mut App) -> Task<Result<()>>;
-    fn list_events(&self, limit: u32, cx: &mut App) -> Task<Result<Vec<AgentTaskEvent>>>;
     fn list_artifacts(
         &self,
         task_id: &AgentTaskId,
         cx: &mut App,
     ) -> Task<Result<Vec<AgentTaskArtifact>>>;
     fn get_artifact(&self, artifact_id: &str, cx: &mut App) -> Task<Result<AgentTaskArtifact>>;
-    fn fetch_items(&self, cx: &mut App) -> Task<Result<Vec<AgentUnifiedItem>>> {
-        let _ = cx;
-        Task::ready(Err(anyhow::anyhow!("item_list not supported")))
+    fn record_turn(
+        &self,
+        task_id: &AgentTaskId,
+        record: AgentTurnRecord,
+        cx: &mut App,
+    ) -> Task<Result<u32>> {
+        let _ = (task_id, record, cx);
+        Task::ready(Ok(0))
+    }
+    fn publish_artifact(
+        &self,
+        task_id: &AgentTaskId,
+        kind: &str,
+        content: &str,
+        summary: Option<&str>,
+        cx: &mut App,
+    ) -> Task<Result<String>> {
+        let _ = (task_id, kind, content, summary, cx);
+        Task::ready(Ok(String::new()))
+    }
+    fn update_task_title(&self, id: &AgentTaskId, title: &str, cx: &mut App) -> Task<Result<()>> {
+        let _ = (id, title, cx);
+        Task::ready(Err(anyhow::anyhow!("update_task_title not supported")))
+    }
+    fn update_goal_title(&self, goal_id: &str, title: &str, cx: &mut App) -> Task<Result<()>> {
+        let _ = (goal_id, title, cx);
+        Task::ready(Err(anyhow::anyhow!("update_goal_title not supported")))
     }
     fn set_task_status(
         &self,
@@ -650,165 +661,17 @@ mod tests {
     }
 
     #[test]
-    fn test_unified_item_tolerant_parsing() {
-        let json_data = json!({
-            "kind": "task",
-            "id": "TASK-1",
-            "title": "A task item",
-            "status": "cancelled",
-            "priority": 10,
-            "created_at": 1710000000000u64,
-            "failure_reason": "something went wrong",
-            "progress": {
-                "done": 1,
-                "total": 2
-            },
-            "assigned_profile": "coder",
-            "model": "gpt-4",
-            "parent_id": "TASK-0",
-            "goal_id": "GOAL-1"
-        });
-
-        let item: AgentUnifiedItem = serde_json::from_value(json_data).unwrap();
-        assert_eq!(item.kind, AgentItemKind::Task);
-        assert_eq!(item.id, "TASK-1");
-        assert_eq!(item.title, "A task item");
-        assert_eq!(item.status, "cancelled");
-        assert_eq!(item.task_status(), AgentTaskStatus::Cancelled);
-        assert_eq!(item.priority, 10);
-        assert_eq!(item.created_at, Some(1710000000000));
-        assert_eq!(
-            item.failure_reason,
-            Some("something went wrong".to_string())
-        );
-        assert_eq!(item.progress, Some(AgentGoalProgress { done: 1, total: 2 }));
-        assert_eq!(item.assignee, None);
-        assert_eq!(item.assigned_profile, Some(SharedString::from("coder")));
-        assert_eq!(item.model, Some(SharedString::from("gpt-4")));
-        assert_eq!(item.parent_id, Some("TASK-0".to_string()));
-        assert_eq!(item.goal_id, Some("GOAL-1".to_string()));
-
-        // RFC3339 string created_at and tasks_done/tasks_total progress shape
-        let json_rfc3339 = json!({
-            "kind": "goal",
-            "id": "GOAL-2",
-            "title": "A goal item",
-            "status": "active",
-            "created_at": "2024-03-09T12:00:00Z",
-            "progress": {
-                "tasks_done": 3,
-                "tasks_total": 5
-            },
-            "extra_field_should_be_ignored": true
-        });
-
-        let item2: AgentUnifiedItem = serde_json::from_value(json_rfc3339).unwrap();
-        assert_eq!(item2.kind, AgentItemKind::Goal);
-        assert_eq!(item2.id, "GOAL-2");
-        assert_eq!(item2.goal_status(), AgentGoalStatus::Running);
-        assert_eq!(item2.priority, 0); // default
-        assert!(item2.created_at.is_some());
-        assert_eq!(
-            item2.progress,
-            Some(AgentGoalProgress { done: 3, total: 5 })
-        );
-        assert_eq!(item2.failure_reason, None);
-        assert_eq!(item2.assignee, None);
-        assert_eq!(item2.assigned_profile, None);
-        assert_eq!(item2.model, None);
-
-        // Minimal item with null/absent fields
-        let json_minimal = json!({
-            "kind": "other_kind",
-            "id": "ITEM-3",
-            "created_at": null,
-            "progress": null
-        });
-
-        let item3: AgentUnifiedItem = serde_json::from_value(json_minimal).unwrap();
-        assert_eq!(
-            item3.kind,
-            AgentItemKind::Other(SharedString::from("other_kind"))
-        );
-        assert_eq!(item3.id, "ITEM-3");
-        assert_eq!(item3.title, "");
-        assert_eq!(item3.created_at, None);
-        assert_eq!(item3.progress, None);
-    }
-
-    #[test]
-    fn test_parse_real_item_list_payload() {
-        let sample = r#"{
-  "items": [
-    {
-      "id": "TASK-2", "kind": "task", "project_id": "my-project", "parent_id": "TASK-1", "goal_id": "GOAL-1",
-      "title": "Реализация репозитория БД", "description": "Создать схемы и миграции", "type": "feature",
-      "status": "running", "priority": 2, "assignee": "repository", "model": "claude-3-7-sonnet",
-      "created_at": "2026-10-07T12:05:00Z", "updated_at": "2026-10-07T12:06:00Z", "metadata": {}
-    },
-    {
-      "id": "TASK-1", "kind": "task", "project_id": "my-project", "goal_id": "GOAL-1",
-      "title": "Архитектура бекенда", "description": "Спроектировать сервис", "type": "architecture",
-      "status": "ready", "priority": 1, "assignee": "backend", "model": "gemini-2.5-pro",
-      "created_at": "2026-10-07T12:00:00Z", "updated_at": "2026-10-07T12:00:00Z", "metadata": {}
-    },
-    {
-      "id": "GOAL-1", "kind": "goal", "project_id": "my-project", "title": "Релиз модуля оплаты",
-      "description": "Запуск платежного шлюза", "status": "running", "priority": 1,
-      "progress": { "tasks_total": 2, "tasks_done": 0 },
-      "created_at": "2026-10-07T11:50:00Z", "updated_at": "2026-10-07T11:50:00Z", "metadata": {}
-    }
-  ]
-}"#;
-
-        #[derive(Deserialize)]
-        struct ItemListResponse {
-            items: Vec<AgentUnifiedItem>,
-        }
-
-        let parsed: ItemListResponse =
-            serde_json::from_str(sample).expect("failed to parse real item_list payload");
-        assert_eq!(parsed.items.len(), 3);
-
-        let task2 = &parsed.items[0];
-        assert_eq!(task2.id, "TASK-2");
-        assert_eq!(task2.kind, AgentItemKind::Task);
-        assert_eq!(task2.parent_id.as_deref(), Some("TASK-1"));
-        assert_eq!(task2.goal_id.as_deref(), Some("GOAL-1"));
-        assert_eq!(task2.assignee, Some(SharedString::from("repository")));
-        assert_eq!(task2.model, Some(SharedString::from("claude-3-7-sonnet")));
-        assert_eq!(task2.created_at, Some(1791374700000));
-
-        let task1 = &parsed.items[1];
-        assert_eq!(task1.id, "TASK-1");
-        assert_eq!(task1.kind, AgentItemKind::Task);
-        assert_eq!(task1.goal_id.as_deref(), Some("GOAL-1"));
-        assert_eq!(task1.assignee, Some(SharedString::from("backend")));
-        assert_eq!(task1.model, Some(SharedString::from("gemini-2.5-pro")));
-        assert_eq!(task1.created_at, Some(1791374400000));
-
-        let goal1 = &parsed.items[2];
-        assert_eq!(goal1.id, "GOAL-1");
-        assert_eq!(goal1.kind, AgentItemKind::Goal);
-        assert_eq!(goal1.title, "Релиз модуля оплаты");
-        let progress = goal1.progress.as_ref().expect("missing goal progress");
-        assert_eq!(progress.total, 2);
-        assert_eq!(progress.done, 0);
-        assert_eq!(goal1.created_at, Some(1791373800000));
-    }
-
-    #[test]
     fn test_created_at_rfc3339_with_offset() {
         let json_with_offset = r#"{
             "id": "TASK-OFFSET",
-            "kind": "task",
             "title": "Offset Task",
             "status": "ready",
-            "priority": 1,
+            "attempt": 1,
+            "write_scopes": [],
             "created_at": "2026-10-07T15:05:00+03:00"
         }"#;
 
-        let item: AgentUnifiedItem = serde_json::from_str(json_with_offset)
+        let item: AgentTaskSummary = serde_json::from_str(json_with_offset)
             .expect("failed to parse item with +03:00 offset");
         assert_eq!(item.created_at, Some(1791374700000));
     }
@@ -954,6 +817,8 @@ mod tests {
                 tasks_total: 2,
                 tasks_done: 1,
                 created_at: None,
+                metrics: None,
+                session_id: None,
             }
         );
 
@@ -961,5 +826,124 @@ mod tests {
         let serialized = serde_json::to_string(&graph_new).unwrap();
         let deserialized: AgentTaskGraph = serde_json::from_str(&serialized).unwrap();
         assert_eq!(deserialized, graph_new);
+    }
+
+    #[test]
+    fn test_task_metrics_deserialization() {
+        let json_data = json!({
+            "duration_ms": 12500,
+            "input_tokens": 1500,
+            "output_tokens": 250,
+            "cache_read_tokens": 300,
+            "cache_creation_tokens": 50,
+            "total_tokens": 2100,
+            "cost_usd": 0.015,
+            "turns_count": 3
+        });
+        let metrics: AgentTaskMetrics = serde_json::from_value(json_data).unwrap();
+        assert_eq!(metrics.duration_ms, Some(12500));
+        assert_eq!(metrics.input_tokens, Some(1500));
+        assert_eq!(metrics.output_tokens, Some(250));
+        assert_eq!(metrics.cache_read_tokens, Some(300));
+        assert_eq!(metrics.cache_creation_tokens, Some(50));
+        assert_eq!(metrics.total_tokens, Some(2100));
+        assert_eq!(metrics.cost_usd, Some(0.015));
+        assert_eq!(metrics.turns_count, Some(3));
+
+        // Alias "turns" -> turns_count
+        let json_alias = json!({
+            "turns": 5
+        });
+        let metrics_alias: AgentTaskMetrics = serde_json::from_value(json_alias).unwrap();
+        assert_eq!(metrics_alias.turns_count, Some(5));
+
+        // Task summary with metrics
+        let task_json = json!({
+            "id": "TASK-METRICS",
+            "title": "Task with metrics",
+            "status": "completed",
+            "attempt": 1,
+            "write_scopes": [],
+            "metrics": {
+                "duration_ms": 5000,
+                "input_tokens": 100,
+                "output_tokens": 20
+            }
+        });
+        let task: AgentTaskSummary = serde_json::from_value(task_json).unwrap();
+        assert!(task.metrics.is_some());
+        let m = task.metrics.unwrap();
+        assert_eq!(m.duration_ms, Some(5000));
+        assert_eq!(m.input_tokens, Some(100));
+        assert_eq!(m.output_tokens, Some(20));
+    }
+
+    #[gpui::test]
+    async fn test_default_agent_task_provider_update_title_unsupported(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        struct DefaultProvider;
+        impl AgentTaskProvider for DefaultProvider {
+            fn server_id(&self) -> ContextServerId {
+                ContextServerId("dummy".into())
+            }
+            fn fetch_graph(&self, _cx: &mut App) -> Task<Result<AgentTaskGraph>> {
+                Task::ready(Err(anyhow::anyhow!("not implemented")))
+            }
+            fn get_task(&self, _id: &AgentTaskId, _cx: &mut App) -> Task<Result<AgentTaskDetail>> {
+                Task::ready(Err(anyhow::anyhow!("not implemented")))
+            }
+            fn complete_task(&self, _id: &AgentTaskId, _cx: &mut App) -> Task<Result<()>> {
+                Task::ready(Err(anyhow::anyhow!("not implemented")))
+            }
+            fn fail_task(
+                &self,
+                _id: &AgentTaskId,
+                _reason: &str,
+                _cx: &mut App,
+            ) -> Task<Result<()>> {
+                Task::ready(Err(anyhow::anyhow!("not implemented")))
+            }
+            fn archive_task(&self, _id: &AgentTaskId, _cx: &mut App) -> Task<Result<()>> {
+                Task::ready(Err(anyhow::anyhow!("not implemented")))
+            }
+            fn unarchive_task(&self, _id: &AgentTaskId, _cx: &mut App) -> Task<Result<()>> {
+                Task::ready(Err(anyhow::anyhow!("not implemented")))
+            }
+            fn delete_task(&self, _id: &AgentTaskId, _cx: &mut App) -> Task<Result<()>> {
+                Task::ready(Err(anyhow::anyhow!("not implemented")))
+            }
+            fn list_artifacts(
+                &self,
+                _task_id: &AgentTaskId,
+                _cx: &mut App,
+            ) -> Task<Result<Vec<AgentTaskArtifact>>> {
+                Task::ready(Err(anyhow::anyhow!("not implemented")))
+            }
+            fn get_artifact(
+                &self,
+                _artifact_id: &str,
+                _cx: &mut App,
+            ) -> Task<Result<AgentTaskArtifact>> {
+                Task::ready(Err(anyhow::anyhow!("not implemented")))
+            }
+        }
+
+        let provider = DefaultProvider;
+        let task_res = cx
+            .update(|cx| provider.update_task_title(&AgentTaskId::from("TASK-1"), "New Title", cx))
+            .await;
+        assert_eq!(
+            task_res.unwrap_err().to_string(),
+            "update_task_title not supported"
+        );
+
+        let goal_res = cx
+            .update(|cx| provider.update_goal_title("GOAL-1", "New Title", cx))
+            .await;
+        assert_eq!(
+            goal_res.unwrap_err().to_string(),
+            "update_goal_title not supported"
+        );
     }
 }

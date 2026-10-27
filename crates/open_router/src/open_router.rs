@@ -741,14 +741,20 @@ impl From<ApiError> for language_model_core::LanguageModelCompletionError {
         let status = error
             .status
             .and_then(|status| http_client::StatusCode::from_u16(status).ok());
-        let category = http_client::StatusCode::from_u16(error.code)
-            .ok()
-            .map(|status| ProviderErrorCategory::from_http_status(status, &error.message))
-            .filter(|category| *category != ProviderErrorCategory::Other)
-            .or_else(|| {
-                status.map(|status| ProviderErrorCategory::from_http_status(status, &error.message))
-            })
-            .unwrap_or(ProviderErrorCategory::Other);
+        let category = if error.code == 502 || status == Some(http_client::StatusCode::BAD_GATEWAY) {
+            ProviderErrorCategory::InternalServer
+        } else {
+            http_client::StatusCode::from_u16(error.code)
+                .ok()
+                .map(|status| ProviderErrorCategory::from_http_status(status, &error.message))
+                .filter(|category| *category != ProviderErrorCategory::Other)
+                .or_else(|| {
+                    status.map(|status| {
+                        ProviderErrorCategory::from_http_status(status, &error.message)
+                    })
+                })
+                .unwrap_or(ProviderErrorCategory::Other)
+        };
         Self::from_provider_response(
             provider,
             status,

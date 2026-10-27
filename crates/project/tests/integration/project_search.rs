@@ -2,7 +2,10 @@ use std::{path::Path, sync::Arc};
 
 use crate::init_test;
 use fs::FakeFs;
-use project::{Project, ProjectEntryId, project_search::PathInclusionMatcher, search::SearchQuery};
+use project::{
+    Project, ProjectEntryId, project_search::PathInclusionMatcher,
+    search::{SearchQuery, SearchResult},
+};
 use serde_json::json;
 use settings::Settings;
 use util::{
@@ -111,4 +114,88 @@ async fn test_path_inclusion_matcher(cx: &mut gpui::TestAppContext) {
         &worktree_snapshot,
         &worktree_settings
     ));
+}
+
+#[gpui::test]
+async fn test_search_in_worktree(cx: &mut gpui::TestAppContext) {
+    init_test(cx);
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(
+        path!("/visible-worktree"),
+        json!({
+            "one.rs": "const TARGET: &str = \"target_visible\";",
+        }),
+    )
+    .await;
+    fs.insert_tree(
+        path!("/invisible-worktree"),
+        json!({
+            "two.rs": "const TARGET: &str = \"target_invisible\";",
+        }),
+    )
+    .await;
+
+    let project = Project::test(fs.clone(), [path!("/visible-worktree").as_ref()], cx).await;
+    let (invisible_worktree, _) = project
+        .update(cx, |p, cx| p.find_or_create_worktree(path!("/invisible-worktree"), false, cx))
+        .await
+        .unwrap();
+    let invisible_id = invisible_worktree.read_with(cx, |w, _| w.id());
+    let _ = invisible_worktree
+        .read_with(cx, |w, _| w.as_local().unwrap().scan_complete())
+        .await;
+
+    let visible_worktree = project.read_with(cx, |p, cx| p.visible_worktrees(cx).next().unwrap());
+    let visible_id = visible_worktree.read_with(cx, |w, _| w.id());
+
+    // 1. Regular project.search() only finds visible worktree
+    let query = SearchQuery::text(
+        "TARGET",
+        false,
+        true,
+        false,
+        Default::default(),
+        Default::default(),
+        false,
+        None,
+    )
+    .unwrap();
+    let rx = project.update(cx, |p, cx| p.search(query.clone(), cx));
+    let mut results = Vec::new();
+    while let Ok(res) = rx.rx.recv().await {
+        if let SearchResult::Buffer { buffer, .. } = res {
+            results.push(buffer.read_with(cx, |b, cx| {
+                b.file().unwrap().full_path(cx).to_string_lossy().to_string()
+            }));
+        }
+    }
+    assert_eq!(results.len(), 1);
+    assert!(results[0].contains("one.rs"));
+
+    // 2. search_in_worktree() for invisible worktree returns only invisible worktree
+    let rx = project.update(cx, |p, cx| p.search_in_worktree(query.clone(), invisible_id, cx));
+    let mut results = Vec::new();
+    while let Ok(res) = rx.rx.recv().await {
+        if let SearchResult::Buffer { buffer, .. } = res {
+            results.push(buffer.read_with(cx, |b, cx| {
+                b.file().unwrap().full_path(cx).to_string_lossy().to_string()
+            }));
+        }
+    }
+    assert_eq!(results.len(), 1);
+    assert!(results[0].contains("two.rs"));
+
+    // 3. search_in_worktree() for visible worktree returns only visible worktree
+    let rx = project.update(cx, |p, cx| p.search_in_worktree(query.clone(), visible_id, cx));
+    let mut results = Vec::new();
+    while let Ok(res) = rx.rx.recv().await {
+        if let SearchResult::Buffer { buffer, .. } = res {
+            results.push(buffer.read_with(cx, |b, cx| {
+                b.file().unwrap().full_path(cx).to_string_lossy().to_string()
+            }));
+        }
+    }
+    assert_eq!(results.len(), 1);
+    assert!(results[0].contains("one.rs"));
 }

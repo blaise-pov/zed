@@ -710,15 +710,10 @@ impl EditSession {
                     .and_then(|t| t.read(cx).task_worktree().map(std::path::Path::to_path_buf))
             });
             if let Some(ref task_worktree) = task_worktree {
-                if path.is_relative() {
-                    let worktree_name = task_worktree
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or("");
-                    if !path.starts_with(worktree_name) {
-                        path = task_worktree.join(&path);
-                    }
-                }
+                path = crate::tools::tool_permissions::rebase_task_worktree_path(
+                    task_worktree,
+                    &path,
+                );
             }
 
             let project_path = cx.update(|cx| resolve_path(mode, &path, &context.project, cx))?;

@@ -1238,7 +1238,7 @@ impl RealGitRepository {
             .clone()
             .or(bundled_git_binary_path)
             .context("no git binary available")?;
-        log::info!(
+        log::debug!(
             "opening git repository at {dotgit_path:?} using git binary {any_git_binary_path:?}"
         );
         let dotgit_parent = dotgit_path.parent().context(".git has no parent")?;
@@ -7251,4 +7251,3 @@ mod tests {
         }
     }
 }
-

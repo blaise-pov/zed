@@ -1,6 +1,9 @@
 use agent_client_protocol::schema::v1 as acp;
-use agent_settings::AgentProfileSettings;
+use agent_settings::{AgentPermissionMode, AgentProfileSettings};
 use anyhow::Result;
+use brush_parser::ast;
+use brush_parser::word::WordPiece;
+use brush_parser::{Parser, ParserOptions, SourceInfo};
 use collections::{HashMap, HashSet};
 use futures::FutureExt as _;
 use gpui::{App, AsyncApp, Entity, SharedString, Task};
@@ -9,6 +12,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use settings::Settings;
 use std::{
+    io::BufReader,
     path::{Path, PathBuf},
     rc::Rc,
     sync::Arc,
@@ -23,6 +27,9 @@ use crate::sandboxing::{
     sandboxing_enabled_for_project,
 };
 use crate::tools::terminal_watchdog;
+use crate::tools::tool_permissions::{
+    canonicalize_worktree_roots, expand_home_prefix, is_dot_path, is_path_in_profile_write_scope,
+};
 use crate::{AgentTool, ThreadEnvironment, ToolCallEventStream, ToolInput};
 
 const COMMAND_OUTPUT_LIMIT: u64 = 16 * 1024;
@@ -880,6 +887,1065 @@ async fn wrap_terminal_command(
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MutationTarget {
+    pub raw_path: String,
+    pub effective_path: PathBuf,
+}
+
+impl MutationTarget {
+    pub fn new(raw_path: impl Into<String>, current_cd: &Path) -> Self {
+        let raw_path = raw_path.into();
+        let path = Path::new(&raw_path);
+        let effective_path = if path.is_absolute() {
+            path.to_path_buf()
+        } else if current_cd.as_os_str().is_empty() || current_cd == Path::new(".") {
+            path.to_path_buf()
+        } else {
+            current_cd.join(path)
+        };
+        Self {
+            raw_path,
+            effective_path,
+        }
+    }
+
+    pub fn is_dot_path(&self) -> bool {
+        is_dot_path(Path::new(&self.raw_path)) || is_dot_path(&self.effective_path)
+    }
+
+    pub fn display_path(&self) -> String {
+        if is_dot_path(Path::new(&self.raw_path)) {
+            self.raw_path.clone()
+        } else {
+            self.effective_path.to_string_lossy().replace('\\', "/")
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TerminalDotPathValidation {
+    Allowed,
+    Denied { path: String },
+    NeedsPrompt { path: String },
+}
+
+pub fn is_terminal_target_in_write_scope(
+    target: &MutationTarget,
+    working_dir: Option<&Path>,
+    project: &Entity<Project>,
+    canonical_worktree_roots: &[PathBuf],
+    profile: Option<&AgentProfileSettings>,
+    cx: &App,
+) -> bool {
+    let raw_path = Path::new(&target.raw_path);
+    let effective_path = &target.effective_path;
+    let resolved_working_path = working_dir.map(|w| w.join(&target.raw_path));
+
+    let paths_to_check: Vec<&Path> = [
+        Some(raw_path),
+        Some(effective_path.as_path()),
+        resolved_working_path.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+
+    let tool_names = [TerminalTool::NAME, "edit_file", "write_file"];
+
+    for tool_name in tool_names {
+        for path in &paths_to_check {
+            if is_path_in_profile_write_scope(
+                tool_name,
+                path,
+                project,
+                canonical_worktree_roots,
+                profile,
+                cx,
+            ) {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+pub fn validate_terminal_dot_paths(
+    command: &str,
+    cd: &str,
+    working_dir: Option<&Path>,
+    project: &Entity<Project>,
+    canonical_worktree_roots: &[PathBuf],
+    profile: Option<&AgentProfileSettings>,
+    cx: &App,
+) -> TerminalDotPathValidation {
+    let mode = profile
+        .as_ref()
+        .map_or(AgentPermissionMode::Interactive, |p| {
+            p.effective_permission_mode()
+        });
+
+    if mode == AgentPermissionMode::Unrestricted {
+        return TerminalDotPathValidation::Allowed;
+    }
+
+    let targets = extract_terminal_mutation_targets(command, cd);
+    for target in targets {
+        if !target.is_dot_path() {
+            continue;
+        }
+
+        let in_scope = is_terminal_target_in_write_scope(
+            &target,
+            working_dir,
+            project,
+            canonical_worktree_roots,
+            profile,
+            cx,
+        );
+
+        if !in_scope {
+            let display_path = target.display_path();
+            return match mode {
+                AgentPermissionMode::Autonomous => TerminalDotPathValidation::Denied {
+                    path: display_path,
+                },
+                _ => TerminalDotPathValidation::NeedsPrompt {
+                    path: display_path,
+                },
+            };
+        }
+    }
+
+    TerminalDotPathValidation::Allowed
+}
+
+pub fn extract_terminal_mutation_targets(command: &str, base_cd: &str) -> Vec<MutationTarget> {
+    let reader = BufReader::new(command.as_bytes());
+    let options = ParserOptions::default();
+    let source_info = SourceInfo::default();
+    let mut parser = Parser::new(reader, &options, &source_info);
+
+    let mut current_cd = if base_cd.is_empty() || base_cd == "." {
+        PathBuf::new()
+    } else {
+        PathBuf::from(base_cd)
+    };
+
+    match parser.parse_program() {
+        Ok(program) => {
+            let mut targets = Vec::new();
+            extract_targets_from_program(&program, &mut current_cd, &mut targets);
+            targets
+        }
+        Err(_) => extract_targets_fallback(command, &current_cd),
+    }
+}
+
+fn extract_targets_from_program(
+    program: &ast::Program,
+    current_cd: &mut PathBuf,
+    targets: &mut Vec<MutationTarget>,
+) {
+    for compound_list in &program.complete_commands {
+        extract_targets_from_compound_list(compound_list, current_cd, targets);
+    }
+}
+
+fn extract_targets_from_compound_list(
+    compound_list: &ast::CompoundList,
+    current_cd: &mut PathBuf,
+    targets: &mut Vec<MutationTarget>,
+) {
+    for item in &compound_list.0 {
+        extract_targets_from_and_or_list(&item.0, current_cd, targets);
+    }
+}
+
+fn extract_targets_from_and_or_list(
+    and_or_list: &ast::AndOrList,
+    current_cd: &mut PathBuf,
+    targets: &mut Vec<MutationTarget>,
+) {
+    extract_targets_from_pipeline(&and_or_list.first, current_cd, targets);
+    for and_or in &and_or_list.additional {
+        match and_or {
+            ast::AndOr::And(pipeline) | ast::AndOr::Or(pipeline) => {
+                extract_targets_from_pipeline(pipeline, current_cd, targets);
+            }
+        }
+    }
+}
+
+fn extract_targets_from_pipeline(
+    pipeline: &ast::Pipeline,
+    current_cd: &mut PathBuf,
+    targets: &mut Vec<MutationTarget>,
+) {
+    if pipeline.seq.len() > 1 {
+        for cmd in &pipeline.seq {
+            let mut sub_cd = current_cd.clone();
+            extract_targets_from_command(cmd, &mut sub_cd, targets);
+        }
+    } else {
+        for cmd in &pipeline.seq {
+            extract_targets_from_command(cmd, current_cd, targets);
+        }
+    }
+}
+
+fn extract_targets_from_command(
+    command: &ast::Command,
+    current_cd: &mut PathBuf,
+    targets: &mut Vec<MutationTarget>,
+) {
+    match command {
+        ast::Command::Simple(simple) => {
+            extract_targets_from_simple_command(simple, current_cd, targets);
+        }
+        ast::Command::Compound(compound, redirect_list) => {
+            extract_targets_from_compound_command(compound, current_cd, targets);
+            if let Some(redirect_list) = redirect_list {
+                for redirect in &redirect_list.0 {
+                    extract_targets_from_io_redirect(redirect, current_cd, targets);
+                }
+            }
+        }
+        ast::Command::Function(func) => {
+            extract_targets_from_compound_command(&func.body.0, current_cd, targets);
+            if let Some(redirect_list) = &func.body.1 {
+                for redirect in &redirect_list.0 {
+                    extract_targets_from_io_redirect(redirect, current_cd, targets);
+                }
+            }
+        }
+        ast::Command::ExtendedTest(_) => {}
+    }
+}
+
+fn extract_targets_from_compound_command(
+    compound: &ast::CompoundCommand,
+    current_cd: &mut PathBuf,
+    targets: &mut Vec<MutationTarget>,
+) {
+    match compound {
+        ast::CompoundCommand::BraceGroup(brace_group) => {
+            extract_targets_from_compound_list(&brace_group.list, current_cd, targets);
+        }
+        ast::CompoundCommand::Subshell(subshell) => {
+            let mut sub_cd = current_cd.clone();
+            extract_targets_from_compound_list(&subshell.list, &mut sub_cd, targets);
+        }
+        ast::CompoundCommand::ForClause(for_clause) => {
+            extract_targets_from_compound_list(&for_clause.body.list, current_cd, targets);
+        }
+        ast::CompoundCommand::WhileClause(while_clause)
+        | ast::CompoundCommand::UntilClause(while_clause) => {
+            extract_targets_from_compound_list(&while_clause.0, current_cd, targets);
+            extract_targets_from_compound_list(&while_clause.1.list, current_cd, targets);
+        }
+        ast::CompoundCommand::IfClause(if_clause) => {
+            extract_targets_from_compound_list(&if_clause.condition, current_cd, targets);
+            extract_targets_from_compound_list(&if_clause.then, current_cd, targets);
+            if let Some(elses) = &if_clause.elses {
+                for else_item in elses {
+                    if let Some(condition) = &else_item.condition {
+                        extract_targets_from_compound_list(condition, current_cd, targets);
+                    }
+                    extract_targets_from_compound_list(&else_item.body, current_cd, targets);
+                }
+            }
+        }
+        ast::CompoundCommand::CaseClause(case_clause) => {
+            for item in &case_clause.cases {
+                if let Some(cmd) = &item.cmd {
+                    extract_targets_from_compound_list(cmd, current_cd, targets);
+                }
+            }
+        }
+        ast::CompoundCommand::Arithmetic(_) => {}
+        ast::CompoundCommand::ArithmeticForClause(arith) => {
+            extract_targets_from_compound_list(&arith.body.list, current_cd, targets);
+        }
+    }
+}
+
+fn extract_targets_from_io_redirect(
+    redirect: &ast::IoRedirect,
+    current_cd: &Path,
+    targets: &mut Vec<MutationTarget>,
+) {
+    match redirect {
+        ast::IoRedirect::File(_fd, kind, target) => match kind {
+            ast::IoFileRedirectKind::Write
+            | ast::IoFileRedirectKind::Append
+            | ast::IoFileRedirectKind::Clobber
+            | ast::IoFileRedirectKind::ReadAndWrite => {
+                if let ast::IoFileRedirectTarget::Filename(word) = target {
+                    let s = word_to_string(word);
+                    if !is_known_safe_redirect_target(&s) {
+                        targets.push(MutationTarget::new(s, current_cd));
+                    }
+                }
+            }
+            _ => {}
+        },
+        ast::IoRedirect::OutputAndError(word, _) => {
+            let s = word_to_string(word);
+            if !is_known_safe_redirect_target(&s) {
+                targets.push(MutationTarget::new(s, current_cd));
+            }
+        }
+        _ => {}
+    }
+}
+
+fn extract_targets_from_simple_command(
+    simple: &ast::SimpleCommand,
+    current_cd: &mut PathBuf,
+    targets: &mut Vec<MutationTarget>,
+) {
+    if let Some(prefix) = &simple.prefix {
+        for item in &prefix.0 {
+            if let ast::CommandPrefixOrSuffixItem::IoRedirect(redirect) = item {
+                extract_targets_from_io_redirect(redirect, current_cd, targets);
+            }
+        }
+    }
+
+    if let Some(suffix) = &simple.suffix {
+        for item in &suffix.0 {
+            if let ast::CommandPrefixOrSuffixItem::IoRedirect(redirect) = item {
+                extract_targets_from_io_redirect(redirect, current_cd, targets);
+            }
+        }
+    }
+
+    let mut words = Vec::new();
+    if let Some(word) = &simple.word_or_name {
+        words.push(word_to_string(word));
+    }
+
+    if let Some(suffix) = &simple.suffix {
+        for item in &suffix.0 {
+            if let ast::CommandPrefixOrSuffixItem::Word(word) = item {
+                words.push(word_to_string(word));
+            }
+        }
+    }
+
+    if words.is_empty() {
+        return;
+    }
+
+    let start_idx = 0;
+    let raw_cmd = &words[start_idx];
+    let exec_name = Path::new(raw_cmd)
+        .file_name()
+        .and_then(|f| f.to_str())
+        .unwrap_or(raw_cmd);
+
+    let (effective_exec, cmd_args) = if (exec_name == "sudo" || exec_name == "env") && words.len() > 1 {
+        let mut next_cmd_idx = None;
+        for (i, word) in words.iter().enumerate().skip(1) {
+            if !word.starts_with('-') && !word.contains('=') {
+                next_cmd_idx = Some(i);
+                break;
+            }
+        }
+        if let Some(idx) = next_cmd_idx {
+            let raw = &words[idx];
+            let name = Path::new(raw)
+                .file_name()
+                .and_then(|f| f.to_str())
+                .unwrap_or(raw);
+            (name, &words[idx + 1..])
+        } else {
+            (exec_name, &words[1..])
+        }
+    } else {
+        (exec_name, &words[1..])
+    };
+
+    match effective_exec {
+        "cd" => {
+            update_current_cd(cmd_args, current_cd);
+        }
+        "tee" => {
+            extract_tee_targets(cmd_args, current_cd, targets);
+        }
+        "rm" => {
+            extract_rm_targets(cmd_args, current_cd, targets);
+        }
+        "mv" => {
+            extract_mv_targets(cmd_args, current_cd, targets);
+        }
+        "cp" => {
+            extract_cp_targets(cmd_args, current_cd, targets);
+        }
+        "touch" => {
+            extract_touch_targets(cmd_args, current_cd, targets);
+        }
+        "truncate" => {
+            extract_truncate_targets(cmd_args, current_cd, targets);
+        }
+        "mkdir" => {
+            extract_mkdir_targets(cmd_args, current_cd, targets);
+        }
+        "sed" => {
+            extract_sed_targets(cmd_args, current_cd, targets);
+        }
+        "git" => {
+            extract_git_targets(cmd_args, current_cd, targets);
+        }
+        _ => {}
+    }
+}
+
+fn update_current_cd(args: &[String], current_cd: &mut PathBuf) {
+    let mut dir_arg = None;
+    for arg in args {
+        if arg == "--" {
+            continue;
+        }
+        if !arg.starts_with('-') {
+            dir_arg = Some(arg.as_str());
+            break;
+        }
+    }
+
+    let Some(dir) = dir_arg else {
+        return;
+    };
+
+    if dir == "~" || dir.starts_with("~/") {
+        if let Some(expanded) = expand_home_prefix(Path::new(dir)) {
+            *current_cd = expanded;
+            return;
+        }
+    }
+
+    let path = Path::new(dir);
+    if path.is_absolute() {
+        *current_cd = path.to_path_buf();
+    } else {
+        if dir == "." {
+            return;
+        }
+        if dir == ".." {
+            if let Some(parent) = current_cd.parent() {
+                if !parent.as_os_str().is_empty() {
+                    *current_cd = parent.to_path_buf();
+                    return;
+                }
+            }
+        }
+        if current_cd.as_os_str().is_empty() || *current_cd == Path::new(".") {
+            *current_cd = path.to_path_buf();
+        } else {
+            *current_cd = current_cd.join(path);
+        }
+    }
+
+    if let Ok(normalized) = util::paths::normalize_lexically(current_cd) {
+        *current_cd = normalized;
+    }
+}
+
+fn extract_tee_targets(args: &[String], current_cd: &Path, targets: &mut Vec<MutationTarget>) {
+    let mut after_dash_dash = false;
+    let mut skip_next = false;
+    for arg in args {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        if after_dash_dash {
+            targets.push(MutationTarget::new(arg, current_cd));
+            continue;
+        }
+        if arg == "--" {
+            after_dash_dash = true;
+            continue;
+        }
+        if arg.starts_with('-') {
+            if arg == "--output-error" {
+                skip_next = true;
+            }
+            continue;
+        }
+        targets.push(MutationTarget::new(arg, current_cd));
+    }
+}
+
+fn extract_rm_targets(args: &[String], current_cd: &Path, targets: &mut Vec<MutationTarget>) {
+    let mut after_dash_dash = false;
+    for arg in args {
+        if after_dash_dash {
+            targets.push(MutationTarget::new(arg, current_cd));
+            continue;
+        }
+        if arg == "--" {
+            after_dash_dash = true;
+            continue;
+        }
+        if arg.starts_with('-') {
+            continue;
+        }
+        targets.push(MutationTarget::new(arg, current_cd));
+    }
+}
+
+fn extract_mv_targets(args: &[String], current_cd: &Path, targets: &mut Vec<MutationTarget>) {
+    let mut i = 0;
+    let mut after_dash_dash = false;
+    while i < args.len() {
+        let arg = &args[i];
+        if after_dash_dash {
+            targets.push(MutationTarget::new(arg, current_cd));
+            i += 1;
+            continue;
+        }
+        if arg == "--" {
+            after_dash_dash = true;
+            i += 1;
+            continue;
+        }
+        if arg == "-t" {
+            if i + 1 < args.len() {
+                targets.push(MutationTarget::new(&args[i + 1], current_cd));
+                i += 2;
+                continue;
+            }
+        } else if let Some(target_dir) = arg.strip_prefix("--target-directory=") {
+            targets.push(MutationTarget::new(target_dir, current_cd));
+            i += 1;
+            continue;
+        } else if arg.starts_with("-t") && arg.len() > 2 {
+            targets.push(MutationTarget::new(&arg[2..], current_cd));
+            i += 1;
+            continue;
+        } else if arg == "-S" {
+            i += 2;
+            continue;
+        } else if arg.starts_with('-') {
+            i += 1;
+            continue;
+        } else {
+            targets.push(MutationTarget::new(arg, current_cd));
+            i += 1;
+        }
+    }
+}
+
+fn extract_cp_targets(args: &[String], current_cd: &Path, targets: &mut Vec<MutationTarget>) {
+    let mut i = 0;
+    let mut after_dash_dash = false;
+    let mut target_dir_specified = false;
+    let mut non_flag_operands = Vec::new();
+
+    while i < args.len() {
+        let arg = &args[i];
+        if after_dash_dash {
+            non_flag_operands.push(arg);
+            i += 1;
+            continue;
+        }
+        if arg == "--" {
+            after_dash_dash = true;
+            i += 1;
+            continue;
+        }
+        if arg == "-t" {
+            if i + 1 < args.len() {
+                targets.push(MutationTarget::new(&args[i + 1], current_cd));
+                target_dir_specified = true;
+                i += 2;
+                continue;
+            }
+        } else if let Some(target_dir) = arg.strip_prefix("--target-directory=") {
+            targets.push(MutationTarget::new(target_dir, current_cd));
+            target_dir_specified = true;
+            i += 1;
+            continue;
+        } else if arg.starts_with("-t") && arg.len() > 2 {
+            targets.push(MutationTarget::new(&arg[2..], current_cd));
+            target_dir_specified = true;
+            i += 1;
+            continue;
+        } else if arg == "-S" {
+            i += 2;
+            continue;
+        } else if arg.starts_with('-') {
+            i += 1;
+            continue;
+        } else {
+            non_flag_operands.push(arg);
+            i += 1;
+        }
+    }
+
+    if !target_dir_specified {
+        if let Some(dest) = non_flag_operands.last() {
+            targets.push(MutationTarget::new(*dest, current_cd));
+        }
+    }
+}
+
+fn extract_touch_targets(args: &[String], current_cd: &Path, targets: &mut Vec<MutationTarget>) {
+    let mut i = 0;
+    let mut after_dash_dash = false;
+    while i < args.len() {
+        let arg = &args[i];
+        if after_dash_dash {
+            targets.push(MutationTarget::new(arg, current_cd));
+            i += 1;
+            continue;
+        }
+        if arg == "--" {
+            after_dash_dash = true;
+            i += 1;
+            continue;
+        }
+        if arg == "-d" || arg == "-t" || arg == "-r" {
+            i += 2;
+            continue;
+        }
+        if arg.starts_with("--date=") || arg.starts_with("--reference=") {
+            i += 1;
+            continue;
+        }
+        if arg.starts_with('-') {
+            i += 1;
+            continue;
+        }
+        targets.push(MutationTarget::new(arg, current_cd));
+        i += 1;
+    }
+}
+
+fn extract_truncate_targets(args: &[String], current_cd: &Path, targets: &mut Vec<MutationTarget>) {
+    let mut i = 0;
+    let mut after_dash_dash = false;
+    while i < args.len() {
+        let arg = &args[i];
+        if after_dash_dash {
+            targets.push(MutationTarget::new(arg, current_cd));
+            i += 1;
+            continue;
+        }
+        if arg == "--" {
+            after_dash_dash = true;
+            i += 1;
+            continue;
+        }
+        if arg == "-s" || arg == "-r" {
+            i += 2;
+            continue;
+        }
+        if arg.starts_with("--size=") || arg.starts_with("--reference=") {
+            i += 1;
+            continue;
+        }
+        if arg.starts_with('-') {
+            i += 1;
+            continue;
+        }
+        targets.push(MutationTarget::new(arg, current_cd));
+        i += 1;
+    }
+}
+
+fn extract_mkdir_targets(args: &[String], current_cd: &Path, targets: &mut Vec<MutationTarget>) {
+    let mut i = 0;
+    let mut after_dash_dash = false;
+    while i < args.len() {
+        let arg = &args[i];
+        if after_dash_dash {
+            targets.push(MutationTarget::new(arg, current_cd));
+            i += 1;
+            continue;
+        }
+        if arg == "--" {
+            after_dash_dash = true;
+            i += 1;
+            continue;
+        }
+        if arg == "-m" {
+            i += 2;
+            continue;
+        }
+        if arg.starts_with("--mode=") {
+            i += 1;
+            continue;
+        }
+        if arg.starts_with('-') {
+            i += 1;
+            continue;
+        }
+        targets.push(MutationTarget::new(arg, current_cd));
+        i += 1;
+    }
+}
+
+fn extract_sed_targets(args: &[String], current_cd: &Path, targets: &mut Vec<MutationTarget>) {
+    let has_in_place = args.iter().any(|arg| {
+        arg == "-i"
+            || (arg.starts_with("-i") && arg.len() > 2)
+            || arg == "--in-place"
+            || arg.starts_with("--in-place=")
+    });
+
+    if !has_in_place {
+        return;
+    }
+
+    let mut i = 0;
+    let mut has_e_or_f = false;
+    let mut non_flag_operands = Vec::new();
+    let mut after_dash_dash = false;
+
+    while i < args.len() {
+        let arg = &args[i];
+        if after_dash_dash {
+            non_flag_operands.push(arg.as_str());
+            i += 1;
+            continue;
+        }
+        if arg == "--" {
+            after_dash_dash = true;
+            i += 1;
+            continue;
+        }
+        if arg == "-e" || arg == "-f" {
+            has_e_or_f = true;
+            i += 2;
+            continue;
+        }
+        if arg.starts_with("--expression=") || arg.starts_with("--file=") {
+            has_e_or_f = true;
+            i += 1;
+            continue;
+        }
+        if arg == "-i" {
+            if i + 1 < args.len() && (args[i + 1].is_empty() || args[i + 1].starts_with('.')) {
+                i += 2;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+        if arg.starts_with("-i") || arg.starts_with("--in-place") {
+            i += 1;
+            continue;
+        }
+        if arg.starts_with('-') {
+            i += 1;
+            continue;
+        }
+        non_flag_operands.push(arg.as_str());
+        i += 1;
+    }
+
+    let file_operands = if has_e_or_f {
+        &non_flag_operands[..]
+    } else if non_flag_operands.len() > 1 {
+        &non_flag_operands[1..]
+    } else {
+        &[]
+    };
+
+    for file in file_operands {
+        targets.push(MutationTarget::new(*file, current_cd));
+    }
+}
+
+fn extract_git_targets(args: &[String], current_cd: &Path, targets: &mut Vec<MutationTarget>) {
+    let mut git_cd = current_cd.to_path_buf();
+    let mut i = 0;
+
+    while i < args.len() {
+        let arg = &args[i];
+        if arg == "-C" {
+            if i + 1 < args.len() {
+                let dir = &args[i + 1];
+                let path = Path::new(dir);
+                if path.is_absolute() {
+                    git_cd = path.to_path_buf();
+                } else if git_cd.as_os_str().is_empty() || git_cd == Path::new(".") {
+                    git_cd = path.to_path_buf();
+                } else {
+                    git_cd = git_cd.join(path);
+                }
+                i += 2;
+                continue;
+            }
+        } else if let Some(dir) = arg.strip_prefix("-C") {
+            let path = Path::new(dir);
+            if path.is_absolute() {
+                git_cd = path.to_path_buf();
+            } else if git_cd.as_os_str().is_empty() || git_cd == Path::new(".") {
+                git_cd = path.to_path_buf();
+            } else {
+                git_cd = git_cd.join(path);
+            }
+            i += 1;
+            continue;
+        } else if arg == "-c" {
+            i += 2;
+            continue;
+        } else if arg.starts_with("--git-dir=") || arg.starts_with("--work-tree=") {
+            i += 1;
+            continue;
+        } else if arg == "--git-dir" || arg == "--work-tree" {
+            i += 2;
+            continue;
+        } else if arg.starts_with('-') {
+            i += 1;
+            continue;
+        } else {
+            break;
+        }
+    }
+
+    if i >= args.len() {
+        return;
+    }
+
+    let subcommand = &args[i];
+    let sub_args = &args[i + 1..];
+
+    match subcommand.as_str() {
+        "add" | "rm" => {
+            let mut after_dash_dash = false;
+            for arg in sub_args {
+                if after_dash_dash {
+                    targets.push(MutationTarget::new(arg, &git_cd));
+                    continue;
+                }
+                if arg == "--" {
+                    after_dash_dash = true;
+                    continue;
+                }
+                if arg.starts_with('-') {
+                    continue;
+                }
+                targets.push(MutationTarget::new(arg, &git_cd));
+            }
+        }
+        "restore" => {
+            let mut after_dash_dash = false;
+            let mut skip_next = false;
+            for arg in sub_args {
+                if skip_next {
+                    skip_next = false;
+                    continue;
+                }
+                if after_dash_dash {
+                    targets.push(MutationTarget::new(arg, &git_cd));
+                    continue;
+                }
+                if arg == "--" {
+                    after_dash_dash = true;
+                    continue;
+                }
+                if arg == "-s" || arg == "--source" {
+                    skip_next = true;
+                    continue;
+                }
+                if arg.starts_with("--source=") {
+                    continue;
+                }
+                if arg.starts_with('-') {
+                    continue;
+                }
+                targets.push(MutationTarget::new(arg, &git_cd));
+            }
+        }
+        "checkout" => {
+            let mut after_dash_dash = false;
+            let has_dash_dash = sub_args.iter().any(|a| a == "--");
+            if has_dash_dash {
+                for arg in sub_args {
+                    if after_dash_dash {
+                        targets.push(MutationTarget::new(arg, &git_cd));
+                        continue;
+                    }
+                    if arg == "--" {
+                        after_dash_dash = true;
+                    }
+                }
+            } else {
+                let mut is_branch_switch = false;
+                for arg in sub_args {
+                    if arg == "-b" || arg == "-B" {
+                        is_branch_switch = true;
+                        break;
+                    }
+                }
+                if !is_branch_switch {
+                    for arg in sub_args {
+                        if !arg.starts_with('-') {
+                            let target = MutationTarget::new(arg, &git_cd);
+                            if target.is_dot_path() {
+                                targets.push(target);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn extract_targets_fallback(command: &str, current_cd: &Path) -> Vec<MutationTarget> {
+    let mut targets = Vec::new();
+    let mut effective_cd = current_cd.to_path_buf();
+
+    if let Ok(re_cd) = regex::Regex::new(r#"\bcd\s+([^\s;&|]+)"#) {
+        if let Some(captures) = re_cd.captures(command) {
+            if let Some(dir) = captures.get(1) {
+                let dir_str = dir.as_str().trim_matches('\'').trim_matches('"');
+                update_current_cd(&[dir_str.to_string()], &mut effective_cd);
+            }
+        }
+    }
+
+    if let Ok(re_redir) = regex::Regex::new(r#"(?:>|>>|>\||&>|&>>)\s*([^\s;&|<>]+)"#) {
+        for captures in re_redir.captures_iter(command) {
+            if let Some(target) = captures.get(1) {
+                let target_str = target.as_str().trim_matches('\'').trim_matches('"');
+                if !is_known_safe_redirect_target(target_str) {
+                    targets.push(MutationTarget::new(target_str, &effective_cd));
+                }
+            }
+        }
+    }
+
+    if let Ok(re_cmd) = regex::Regex::new(r#"\b(rm|mv|cp|touch|truncate|mkdir|tee)\s+([^;&|]+)"#) {
+        for captures in re_cmd.captures_iter(command) {
+            if let (Some(cmd), Some(args)) = (captures.get(1), captures.get(2)) {
+                let tokens: Vec<String> = args
+                    .as_str()
+                    .split_whitespace()
+                    .map(|s| s.trim_matches('\'').trim_matches('"').to_string())
+                    .collect();
+                match cmd.as_str() {
+                    "rm" => extract_rm_targets(&tokens, &effective_cd, &mut targets),
+                    "mv" => extract_mv_targets(&tokens, &effective_cd, &mut targets),
+                    "cp" => extract_cp_targets(&tokens, &effective_cd, &mut targets),
+                    "touch" => extract_touch_targets(&tokens, &effective_cd, &mut targets),
+                    "truncate" => extract_truncate_targets(&tokens, &effective_cd, &mut targets),
+                    "mkdir" => extract_mkdir_targets(&tokens, &effective_cd, &mut targets),
+                    "tee" => extract_tee_targets(&tokens, &effective_cd, &mut targets),
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    if let Ok(re_sed) = regex::Regex::new(r#"\bsed\s+-[^;&|]*i[^;&|]*\s+([^;&|]+)"#) {
+        for captures in re_sed.captures_iter(command) {
+            if let Some(args) = captures.get(1) {
+                let mut tokens = vec!["-i".to_string()];
+                tokens.extend(
+                    args.as_str()
+                        .split_whitespace()
+                        .map(|s| s.trim_matches('\'').trim_matches('"').to_string()),
+                );
+                extract_sed_targets(&tokens, &effective_cd, &mut targets);
+            }
+        }
+    }
+
+    if let Ok(re_git) = regex::Regex::new(r#"\bgit\s+(.+)"#) {
+        for captures in re_git.captures_iter(command) {
+            if let Some(args) = captures.get(1) {
+                let tokens: Vec<String> = args
+                    .as_str()
+                    .split_whitespace()
+                    .map(|s| s.trim_matches('\'').trim_matches('"').to_string())
+                    .collect();
+                extract_git_targets(&tokens, &effective_cd, &mut targets);
+            }
+        }
+    }
+
+    targets
+}
+
+fn normalize_word(word: &ast::Word) -> Option<String> {
+    let options = ParserOptions::default();
+    let pieces = brush_parser::word::parse(&word.value, &options).ok()?;
+    let mut result = String::new();
+    for piece_with_source in &pieces {
+        normalize_word_piece_into(
+            &piece_with_source.piece,
+            &word.value,
+            piece_with_source.start_index,
+            piece_with_source.end_index,
+            &mut result,
+        )?;
+    }
+    Some(result)
+}
+
+fn normalize_word_piece_into(
+    piece: &WordPiece,
+    raw_value: &str,
+    start_index: usize,
+    end_index: usize,
+    result: &mut String,
+) -> Option<()> {
+    match piece {
+        WordPiece::Text(text) => result.push_str(text),
+        WordPiece::SingleQuotedText(text) => result.push_str(text),
+        WordPiece::AnsiCQuotedText(text) => result.push_str(text),
+        WordPiece::EscapeSequence(text) => {
+            result.push_str(text.strip_prefix('\\').unwrap_or(text));
+        }
+        WordPiece::DoubleQuotedSequence(pieces)
+        | WordPiece::GettextDoubleQuotedSequence(pieces) => {
+            for inner in pieces {
+                normalize_word_piece_into(
+                    &inner.piece,
+                    raw_value,
+                    inner.start_index,
+                    inner.end_index,
+                    result,
+                )?;
+            }
+        }
+        WordPiece::TildePrefix(prefix) => {
+            result.push('~');
+            result.push_str(prefix);
+        }
+        WordPiece::ParameterExpansion(_)
+        | WordPiece::CommandSubstitution(_)
+        | WordPiece::BackquotedCommandSubstitution(_)
+        | WordPiece::ArithmeticExpression(_) => {
+            let source = raw_value.get(start_index..end_index)?;
+            result.push_str(source);
+        }
+    }
+    Some(())
+}
+
+fn word_to_string(word: &ast::Word) -> String {
+    normalize_word(word).unwrap_or_else(|| {
+        word.value
+            .trim_matches('\'')
+            .trim_matches('"')
+            .to_string()
+    })
+}
+
+fn is_known_safe_redirect_target(normalized_target: &str) -> bool {
+    normalized_target == "/dev/null" || normalized_target.eq_ignore_ascii_case("nul")
+}
+
 async fn run_terminal_tool(
     project: Entity<Project>,
     environment: Rc<dyn ThreadEnvironment>,
@@ -897,15 +1963,42 @@ async fn run_terminal_tool(
     let selection = input.selection;
     let sandbox_input = input.sandbox.clone().unwrap_or_default();
 
+    let fs = cx.update(|cx| project.read(cx).fs().clone());
+    let canonical_roots = canonicalize_worktree_roots(&project, &fs, cx).await;
+
     let (working_dir, authorize, sandboxing, is_local_project, wsl_zed_release) =
         cx.update(|cx| {
             let task_worktree = event_stream.task_worktree(cx);
             let working_dir = working_dir(&input.cd, &project, task_worktree.as_deref(), cx)
                 .map_err(|err| err.to_string())?;
+
+            let profile = event_stream.profile_settings(cx);
             let context =
                 crate::ToolPermissionContext::new(TerminalTool::NAME, vec![input.command.clone()]);
-            let authorize =
-                event_stream.authorize(SharedString::new(input.command.clone()), context, cx);
+
+            let authorize = match validate_terminal_dot_paths(
+                &input.command,
+                &input.cd,
+                working_dir.as_deref(),
+                &project,
+                &canonical_roots,
+                profile.as_ref(),
+                cx,
+            ) {
+                TerminalDotPathValidation::Denied { path } => {
+                    return Err(format!(
+                        "PolicyDenied: Terminal command mutates/stages hidden path '{path}' without explicit write_scope"
+                    ));
+                }
+                TerminalDotPathValidation::NeedsPrompt { .. } => {
+                    let title = format!("{} (hidden / configuration file)", input.command);
+                    event_stream.authorize_always_prompt(title, context, cx)
+                }
+                TerminalDotPathValidation::Allowed => {
+                    event_stream.authorize(SharedString::new(input.command.clone()), context, cx)
+                }
+            };
+
             let sandboxing =
                 input.sandbox.is_some() && sandboxing_enabled_for_project(project.read(cx), cx);
             let is_local_project = project.read(cx).is_local();
@@ -1340,7 +2433,8 @@ async fn run_terminal_tool(
             .clone();
         let profile = event_stream.profile_settings(cx);
         let effective = effective_terminal_wrapper(global_wrapper.as_deref(), profile.as_ref());
-        let root = project_root_path(project.read(cx), cx);
+        let task_worktree = event_stream.task_worktree(cx);
+        let root = task_worktree.or_else(|| project_root_path(project.read(cx), cx));
         (effective, root)
     });
 
@@ -2001,36 +3095,42 @@ fn working_dir(
     task_worktree: Option<&Path>,
     cx: &mut App,
 ) -> Result<Option<PathBuf>> {
-    if let Some(task_worktree) = task_worktree {
-        if cd == "." || cd.is_empty() {
-            return Ok(Some(task_worktree.to_path_buf()));
-        }
-        let cd_path = Path::new(cd);
-        let resolved = if cd_path.is_absolute() {
-            cd_path.to_path_buf()
-        } else {
-            let worktree_name = task_worktree
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("");
-            if let Ok(rel) = cd_path.strip_prefix(worktree_name) {
-                task_worktree.join(rel)
-            } else {
-                task_worktree.join(cd_path)
-            }
-        };
-        let normalized = util::paths::normalize_lexically(&resolved)?;
-        let normalized_task_worktree = util::paths::normalize_lexically(task_worktree)?;
-        if !normalized.starts_with(&normalized_task_worktree) {
-            anyhow::bail!(
-                "`cd` directory {cd:?} is outside the isolated task worktree {}.",
-                task_worktree.display()
-            );
-        }
-        return Ok(Some(normalized));
-    }
-
     let project = project.read(cx);
+    let path_style = project.path_style(cx);
+    let worktree_roots = project
+        .worktrees(cx)
+        .filter_map(|worktree| {
+            let worktree = worktree.read(cx);
+            // Skip single-file worktrees: a file can't be a working directory.
+            let root_dir = worktree.root_dir()?;
+            Some((worktree.root_name_str(), root_dir.to_path_buf()))
+        })
+        .collect::<Vec<_>>();
+
+    if let Some(task_worktree) = task_worktree {
+        let anchor_path = crate::task_worktree::task_worktree_anchor_path(task_worktree);
+        let matching_roots: Vec<(&str, PathBuf)> = if let Some(anchor) = anchor_path.as_deref() {
+            let matched = worktree_roots
+                .iter()
+                .filter(|(_, abs_path)| {
+                    abs_path == anchor
+                        || util::paths::normalize_lexically(abs_path).ok()
+                            == util::paths::normalize_lexically(anchor).ok()
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            if matched.is_empty() {
+                worktree_roots
+            } else {
+                matched
+            }
+        } else {
+            worktree_roots
+        };
+
+        return resolve_cd_in_task_worktree(cd, path_style, task_worktree, &matching_roots)
+            .map(Some);
+    }
 
     if cd == "." || cd.is_empty() {
         let mut worktrees = project.worktrees(cx);
@@ -2046,23 +3146,105 @@ fn working_dir(
             None => Ok(None),
         }
     } else {
-        let path_style = project.path_style(cx);
-        let worktree_roots = project
-            .worktrees(cx)
-            .filter_map(|worktree| {
-                let worktree = worktree.read(cx);
-                // Skip single-file worktrees: a file can't be a working directory.
-                let root_dir = worktree.root_dir()?;
-                Some((worktree.root_name_str(), root_dir.to_path_buf()))
-            })
-            .collect::<Vec<_>>();
-
         if let Some(dir) = resolve_cd_in_worktrees(cd, path_style, &worktree_roots) {
             return Ok(Some(dir));
         }
 
         anyhow::bail!("`cd` directory {cd:?} was not in any root directory in the project.");
     }
+}
+
+fn resolve_cd_in_task_worktree(
+    cd: &str,
+    path_style: util::paths::PathStyle,
+    task_worktree: &Path,
+    worktree_roots: &[(&str, PathBuf)],
+) -> Result<PathBuf> {
+    let normalized_task_worktree = util::paths::normalize_lexically(task_worktree)?;
+
+    if cd == "." || cd.is_empty() {
+        return Ok(normalized_task_worktree);
+    }
+
+    let cd_norm = path_style.normalize(cd);
+    if cd_norm.is_empty() || cd_norm == "." {
+        return Ok(normalized_task_worktree);
+    }
+
+    let cd_path = Path::new(&cd_norm);
+    let is_absolute = path_style.is_absolute(&cd_norm);
+
+    let task_worktree_subpath = if is_absolute {
+        task_worktree
+            .to_str()
+            .and_then(|str_path| {
+                let prefix = path_style.normalize(str_path);
+                let subpath = path_style.strip_prefix(cd_path, Path::new(&prefix))?;
+                Some(subpath.display(path_style).to_string())
+            })
+            .or_else(|| {
+                normalized_task_worktree.to_str().and_then(|str_path| {
+                    let prefix = path_style.normalize(str_path);
+                    let subpath = path_style.strip_prefix(cd_path, Path::new(&prefix))?;
+                    Some(subpath.display(path_style).to_string())
+                })
+            })
+    } else {
+        task_worktree
+            .file_name()
+            .and_then(|name| name.to_str())
+            .filter(|name| !name.is_empty())
+            .and_then(|name| {
+                let subpath = path_style.strip_prefix(cd_path, Path::new(name))?;
+                Some(subpath.display(path_style).to_string())
+            })
+    };
+
+    let project_worktree_subpath = worktree_roots.iter().find_map(|(root_name, abs_path)| {
+        if is_absolute {
+            abs_path
+                .to_str()
+                .and_then(|str_path| {
+                    let prefix = path_style.normalize(str_path);
+                    let subpath = path_style.strip_prefix(cd_path, Path::new(&prefix))?;
+                    Some(subpath.display(path_style).to_string())
+                })
+                .or_else(|| {
+                    let normalized = util::paths::normalize_lexically(abs_path).ok()?;
+                    let prefix = path_style.normalize(normalized.to_str()?);
+                    let subpath = path_style.strip_prefix(cd_path, Path::new(&prefix))?;
+                    Some(subpath.display(path_style).to_string())
+                })
+        } else {
+            let subpath = path_style.strip_prefix(cd_path, Path::new(root_name))?;
+            Some(subpath.display(path_style).to_string())
+        }
+    });
+
+    let resolved = if let Some(subpath) = task_worktree_subpath.or(project_worktree_subpath) {
+        if subpath.is_empty() {
+            task_worktree.to_path_buf()
+        } else {
+            task_worktree.join(&subpath)
+        }
+    } else if !is_absolute {
+        task_worktree.join(cd_path)
+    } else {
+        cd_path.to_path_buf()
+    };
+
+    let normalized = util::paths::normalize_lexically(&resolved)
+        .ok()
+        .filter(|normalized| normalized.starts_with(&normalized_task_worktree));
+
+    let Some(normalized) = normalized else {
+        anyhow::bail!(
+            "`cd` directory {cd:?} is outside the isolated task worktree {}.",
+            task_worktree.display()
+        );
+    };
+
+    Ok(normalized)
 }
 
 /// Resolves a `cd` argument to an absolute worktree directory. `cd` may be a
@@ -2108,6 +3290,612 @@ fn resolve_cd_in_worktrees(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_tool_permissions_extract_mutation_targets_redirects() {
+        let targets = extract_terminal_mutation_targets("echo secret > .env", ".");
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].raw_path, ".env");
+        assert!(targets[0].is_dot_path());
+
+        let targets = extract_terminal_mutation_targets("echo secret >> .env.local", ".");
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].raw_path, ".env.local");
+        assert!(targets[0].is_dot_path());
+
+        let targets = extract_terminal_mutation_targets("echo secret >| .env.override", ".");
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].raw_path, ".env.override");
+        assert!(targets[0].is_dot_path());
+
+        let targets = extract_terminal_mutation_targets("cmd > /dev/null 2> /dev/null", ".");
+        assert!(targets.is_empty(), "/dev/null redirect should not be extracted as mutation target");
+    }
+
+    #[test]
+    fn test_tool_permissions_extract_mutation_targets_tee() {
+        let targets = extract_terminal_mutation_targets("echo foo | tee .env", ".");
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].raw_path, ".env");
+        assert!(targets[0].is_dot_path());
+
+        let targets = extract_terminal_mutation_targets("echo foo | tee -a .env", ".");
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].raw_path, ".env");
+        assert!(targets[0].is_dot_path());
+    }
+
+    #[test]
+    fn test_tool_permissions_extract_mutation_targets_file_mutating_commands() {
+        // rm
+        let targets = extract_terminal_mutation_targets("rm -rf .git", ".");
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].raw_path, ".git");
+        assert!(targets[0].is_dot_path());
+
+        let targets = extract_terminal_mutation_targets("rm -- .env", ".");
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].raw_path, ".env");
+        assert!(targets[0].is_dot_path());
+
+        // mv
+        let targets = extract_terminal_mutation_targets("mv src.txt .dest.txt", ".");
+        assert_eq!(targets.len(), 2);
+        assert!(targets.iter().any(|t| t.raw_path == ".dest.txt" && t.is_dot_path()));
+
+        let targets = extract_terminal_mutation_targets("mv -t .backup file.txt", ".");
+        assert!(targets.iter().any(|t| t.raw_path == ".backup" && t.is_dot_path()));
+
+        // cp (destination only)
+        let targets = extract_terminal_mutation_targets("cp src.txt .dest.txt", ".");
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].raw_path, ".dest.txt");
+        assert!(targets[0].is_dot_path());
+
+        let targets = extract_terminal_mutation_targets("cp -t .backup file.txt", ".");
+        assert!(targets.iter().any(|t| t.raw_path == ".backup" && t.is_dot_path()));
+
+        // touch
+        let targets = extract_terminal_mutation_targets("touch .env", ".");
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].raw_path, ".env");
+        assert!(targets[0].is_dot_path());
+
+        let targets = extract_terminal_mutation_targets("touch -a .env", ".");
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].raw_path, ".env");
+
+        let targets = extract_terminal_mutation_targets("touch -r ref.txt .env", ".");
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].raw_path, ".env");
+
+        // sed -i
+        let targets = extract_terminal_mutation_targets("sed -i 's/foo/bar/' .env", ".");
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].raw_path, ".env");
+        assert!(targets[0].is_dot_path());
+
+        let targets = extract_terminal_mutation_targets("sed -i.bak 's/foo/bar/' .env", ".");
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].raw_path, ".env");
+        assert!(targets[0].is_dot_path());
+
+        // sed without -i should NOT extract targets
+        let targets = extract_terminal_mutation_targets("sed 's/foo/bar/' .env", ".");
+        assert!(targets.is_empty(), "sed without -i is read-only");
+
+        let targets = extract_terminal_mutation_targets("sed -e 's/foo/bar/' .env", ".");
+        assert!(targets.is_empty(), "sed -e without -i is read-only");
+
+        // truncate
+        let targets = extract_terminal_mutation_targets("truncate -s 0 .env", ".");
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].raw_path, ".env");
+        assert!(targets[0].is_dot_path());
+
+        // mkdir
+        let targets = extract_terminal_mutation_targets("mkdir -p .github/workflows", ".");
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].raw_path, ".github/workflows");
+        assert!(targets[0].is_dot_path());
+    }
+
+    #[test]
+    fn test_tool_permissions_extract_mutation_targets_git_commands() {
+        // git add
+        let targets = extract_terminal_mutation_targets("git add .env", ".");
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].raw_path, ".env");
+        assert!(targets[0].is_dot_path());
+
+        let targets = extract_terminal_mutation_targets("git add -A .github/workflows/ci.yml", ".");
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].raw_path, ".github/workflows/ci.yml");
+        assert!(targets[0].is_dot_path());
+
+        // git rm
+        let targets = extract_terminal_mutation_targets("git rm -rf .git", ".");
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].raw_path, ".git");
+        assert!(targets[0].is_dot_path());
+
+        // git restore
+        let targets = extract_terminal_mutation_targets("git restore .env", ".");
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].raw_path, ".env");
+        assert!(targets[0].is_dot_path());
+
+        let targets = extract_terminal_mutation_targets("git restore --staged .env", ".");
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].raw_path, ".env");
+        assert!(targets[0].is_dot_path());
+
+        // git checkout
+        let targets = extract_terminal_mutation_targets("git checkout -- .env", ".");
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].raw_path, ".env");
+        assert!(targets[0].is_dot_path());
+
+        let targets = extract_terminal_mutation_targets("git checkout .env", ".");
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].raw_path, ".env");
+        assert!(targets[0].is_dot_path());
+
+        let targets = extract_terminal_mutation_targets("git checkout main", ".");
+        assert!(targets.is_empty(), "branch checkout is not a dot-path mutation target");
+
+        // git -C
+        let targets = extract_terminal_mutation_targets("git -C .github add ci.yml", ".");
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].raw_path, "ci.yml");
+        assert!(targets[0].is_dot_path(), "git -C .github should make target a dot-path");
+    }
+
+    #[test]
+    fn test_tool_permissions_extract_mutation_targets_read_only_commands() {
+        assert!(extract_terminal_mutation_targets("cat .env", ".").is_empty());
+        assert!(extract_terminal_mutation_targets("git status", ".").is_empty());
+        assert!(extract_terminal_mutation_targets("git diff", ".").is_empty());
+        assert!(extract_terminal_mutation_targets("git diff .env", ".").is_empty());
+        assert!(extract_terminal_mutation_targets("git log -n 5", ".").is_empty());
+        assert!(extract_terminal_mutation_targets("grep foo .env", ".").is_empty());
+        assert!(extract_terminal_mutation_targets("head -n 10 .env", ".").is_empty());
+    }
+
+    #[test]
+    fn test_tool_permissions_extract_mutation_targets_cd_tracking() {
+        // cd .hidden && touch file.txt
+        let targets = extract_terminal_mutation_targets("cd .hidden && touch file.txt", ".");
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].raw_path, "file.txt");
+        assert!(targets[0].is_dot_path());
+        assert_eq!(targets[0].display_path(), ".hidden/file.txt");
+
+        // normal cd should not make normal files dot-paths
+        let targets = extract_terminal_mutation_targets("cd normal && touch file.txt", ".");
+        assert_eq!(targets.len(), 1);
+        assert!(!targets[0].is_dot_path());
+
+        // base_cd is dot-path
+        let targets = extract_terminal_mutation_targets("touch file.txt", ".github");
+        assert_eq!(targets.len(), 1);
+        assert!(targets[0].is_dot_path());
+        assert_eq!(targets[0].display_path(), ".github/file.txt");
+    }
+
+    #[gpui::test]
+    async fn test_tool_permissions_terminal_dot_path_autonomous_blocked_with_policy_denied(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        crate::tests::init_test(cx);
+
+        let fs = fs::FakeFs::new(cx.executor());
+        fs.insert_tree(
+            "/root",
+            serde_json::json!({
+                ".env": "SECRET=123\n"
+            }),
+        )
+        .await;
+
+        let project = project::Project::test(fs, ["/root".as_ref()], cx).await;
+        let fs_arc = project.read_with(cx, |p, _cx| p.fs().clone());
+        let roots = canonicalize_worktree_roots(&project, &fs_arc, cx).await;
+
+        let profile = AgentProfileSettings {
+            name: "autonomous_profile".into(),
+            origin: Default::default(),
+            tools: collections::IndexMap::default(),
+            enable_all_context_servers: false,
+            context_servers: collections::IndexMap::default(),
+            default_model: None,
+            custom_prompt_path: None,
+            system_prompt_template: None,
+            description: None,
+            skills: None,
+            delegation: None,
+            tool_permissions: None,
+            permission_mode: Some(AgentPermissionMode::Autonomous),
+            terminal_wrapper_command: None,
+            task_isolation: agent_settings::TaskIsolation::default(),
+            task_worktree_language_servers: None,
+        };
+
+        cx.read(|cx| {
+            let res = validate_terminal_dot_paths(
+                "rm .env",
+                "root",
+                None,
+                &project,
+                &roots,
+                Some(&profile),
+                cx,
+            );
+            assert_eq!(
+                res,
+                TerminalDotPathValidation::Denied {
+                    path: ".env".to_string()
+                }
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_tool_permissions_terminal_dot_path_autonomous_allowed_with_explicit_write_scope(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        crate::tests::init_test(cx);
+
+        let fs = fs::FakeFs::new(cx.executor());
+        fs.insert_tree(
+            "/root",
+            serde_json::json!({
+                ".env": "SECRET=123\n"
+            }),
+        )
+        .await;
+
+        let project = project::Project::test(fs, ["/root".as_ref()], cx).await;
+        let fs_arc = project.read_with(cx, |p, _cx| p.fs().clone());
+        let roots = canonicalize_worktree_roots(&project, &fs_arc, cx).await;
+
+        let mut tools = collections::HashMap::default();
+        tools.insert(
+            Arc::from("terminal"),
+            agent_settings::ToolRules {
+                default: Some(settings::ToolPermissionMode::Allow),
+                always_allow: vec![],
+                always_deny: vec![],
+                always_confirm: vec![],
+                write_scopes: Some(
+                    agent_settings::WriteScopes::new(vec![Arc::from(".env*")]).unwrap(),
+                ),
+                invalid_patterns: vec![],
+            },
+        );
+        let profile = AgentProfileSettings {
+            name: "autonomous_scoped".into(),
+            origin: Default::default(),
+            tools: collections::IndexMap::default(),
+            enable_all_context_servers: false,
+            context_servers: collections::IndexMap::default(),
+            default_model: None,
+            custom_prompt_path: None,
+            system_prompt_template: None,
+            description: None,
+            skills: None,
+            delegation: None,
+            tool_permissions: Some(agent_settings::ToolPermissions {
+                default: settings::ToolPermissionMode::Allow,
+                tools,
+            }),
+            permission_mode: Some(AgentPermissionMode::Autonomous),
+            terminal_wrapper_command: None,
+            task_isolation: agent_settings::TaskIsolation::default(),
+            task_worktree_language_servers: None,
+        };
+
+        cx.read(|cx| {
+            let res = validate_terminal_dot_paths(
+                "rm .env",
+                "root",
+                None,
+                &project,
+                &roots,
+                Some(&profile),
+                cx,
+            );
+            assert_eq!(res, TerminalDotPathValidation::Allowed);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_tool_permissions_terminal_dot_path_interactive_triggers_prompt(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        crate::tests::init_test(cx);
+
+        let fs = fs::FakeFs::new(cx.executor());
+        fs.insert_tree(
+            "/root",
+            serde_json::json!({
+                ".env": "SECRET=123\n"
+            }),
+        )
+        .await;
+
+        let project = project::Project::test(fs, ["/root".as_ref()], cx).await;
+        let fs_arc = project.read_with(cx, |p, _cx| p.fs().clone());
+        let roots = canonicalize_worktree_roots(&project, &fs_arc, cx).await;
+
+        let profile = AgentProfileSettings {
+            name: "interactive_profile".into(),
+            origin: Default::default(),
+            tools: collections::IndexMap::default(),
+            enable_all_context_servers: false,
+            context_servers: collections::IndexMap::default(),
+            default_model: None,
+            custom_prompt_path: None,
+            system_prompt_template: None,
+            description: None,
+            skills: None,
+            delegation: None,
+            tool_permissions: None,
+            permission_mode: Some(AgentPermissionMode::Interactive),
+            terminal_wrapper_command: None,
+            task_isolation: agent_settings::TaskIsolation::default(),
+            task_worktree_language_servers: None,
+        };
+
+        cx.read(|cx| {
+            let res = validate_terminal_dot_paths(
+                "rm .env",
+                "root",
+                None,
+                &project,
+                &roots,
+                Some(&profile),
+                cx,
+            );
+            assert_eq!(
+                res,
+                TerminalDotPathValidation::NeedsPrompt {
+                    path: ".env".to_string()
+                }
+            );
+
+            // Read-only command is allowed without prompt
+            let res_cat = validate_terminal_dot_paths(
+                "cat .env",
+                "root",
+                None,
+                &project,
+                &roots,
+                Some(&profile),
+                cx,
+            );
+            assert_eq!(res_cat, TerminalDotPathValidation::Allowed);
+
+            let res_git_status = validate_terminal_dot_paths(
+                "git status",
+                "root",
+                None,
+                &project,
+                &roots,
+                Some(&profile),
+                cx,
+            );
+            assert_eq!(res_git_status, TerminalDotPathValidation::Allowed);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_tool_permissions_terminal_dot_path_cd_hidden_autonomous_blocked(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        crate::tests::init_test(cx);
+
+        let fs = fs::FakeFs::new(cx.executor());
+        fs.insert_tree(
+            "/root",
+            serde_json::json!({
+                ".github": {
+                    "ci.yml": "name: CI\n"
+                }
+            }),
+        )
+        .await;
+
+        let project = project::Project::test(fs, ["/root".as_ref()], cx).await;
+        let fs_arc = project.read_with(cx, |p, _cx| p.fs().clone());
+        let roots = canonicalize_worktree_roots(&project, &fs_arc, cx).await;
+
+        let profile = AgentProfileSettings {
+            name: "autonomous_profile".into(),
+            origin: Default::default(),
+            tools: collections::IndexMap::default(),
+            enable_all_context_servers: false,
+            context_servers: collections::IndexMap::default(),
+            default_model: None,
+            custom_prompt_path: None,
+            system_prompt_template: None,
+            description: None,
+            skills: None,
+            delegation: None,
+            tool_permissions: None,
+            permission_mode: Some(AgentPermissionMode::Autonomous),
+            terminal_wrapper_command: None,
+            task_isolation: agent_settings::TaskIsolation::default(),
+            task_worktree_language_servers: None,
+        };
+
+        cx.read(|cx| {
+            let res = validate_terminal_dot_paths(
+                "cd .github && touch ci.yml",
+                "root",
+                None,
+                &project,
+                &roots,
+                Some(&profile),
+                cx,
+            );
+            assert!(matches!(res, TerminalDotPathValidation::Denied { .. }));
+        });
+    }
+
+    #[gpui::test]
+    async fn test_tool_permissions_terminal_tool_end_to_end_autonomous_denial(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        crate::tests::init_test(cx);
+
+        let fs = fs::FakeFs::new(cx.executor());
+        fs.insert_tree(
+            "/root",
+            serde_json::json!({
+                ".env": "SECRET=123\n"
+            }),
+        )
+        .await;
+
+        let project = project::Project::test(fs, ["/root".as_ref()], cx).await;
+        let environment = std::rc::Rc::new(cx.update(|cx| {
+            crate::tests::FakeThreadEnvironment::default()
+                .with_terminal(crate::tests::FakeTerminalHandle::new_never_exits(cx))
+        }));
+
+        let profile_id = agent_settings::AgentProfileId("autonomous_denial".into());
+        let profile = AgentProfileSettings {
+            name: "autonomous_denial".into(),
+            origin: Default::default(),
+            tools: collections::IndexMap::default(),
+            enable_all_context_servers: false,
+            context_servers: collections::IndexMap::default(),
+            default_model: None,
+            custom_prompt_path: None,
+            system_prompt_template: None,
+            description: None,
+            skills: None,
+            delegation: None,
+            tool_permissions: None,
+            permission_mode: Some(AgentPermissionMode::Autonomous),
+            terminal_wrapper_command: None,
+            task_isolation: agent_settings::TaskIsolation::default(),
+            task_worktree_language_servers: None,
+        };
+
+        cx.update(|cx| {
+            let mut settings = agent_settings::AgentSettings::get_global(cx).clone();
+            settings.profiles.insert(profile_id.clone(), profile);
+            agent_settings::AgentSettings::override_global(settings, cx);
+        });
+
+        #[allow(clippy::arc_with_non_send_sync)]
+        let tool = std::sync::Arc::new(TerminalTool::new(project, environment));
+        let (event_stream, _rx) = ToolCallEventStream::test_with_profile(profile_id);
+
+        let task = cx.update(|cx| {
+            tool.run(
+                crate::ToolInput::resolved(TerminalToolInput {
+                    command: "echo test > .env".to_string(),
+                    cd: "root".to_string(),
+                    timeout_ms: None,
+                    ..Default::default()
+                }),
+                event_stream,
+                cx,
+            )
+        });
+
+        let result = task.await;
+        assert!(result.is_err(), "expected PolicyDenied error, got: {:?}", result);
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("PolicyDenied: Terminal command mutates/stages hidden path '.env' without explicit write_scope"),
+            "expected exact error message, got: {err}"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_tool_permissions_terminal_tool_end_to_end_interactive_prompt(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        crate::tests::init_test(cx);
+
+        let fs = fs::FakeFs::new(cx.executor());
+        fs.insert_tree(
+            "/root",
+            serde_json::json!({
+                ".env": "SECRET=123\n"
+            }),
+        )
+        .await;
+
+        let project = project::Project::test(fs, ["/root".as_ref()], cx).await;
+        let environment = std::rc::Rc::new(cx.update(|cx| {
+            crate::tests::FakeThreadEnvironment::default()
+                .with_terminal(crate::tests::FakeTerminalHandle::new_never_exits(cx))
+        }));
+
+        let profile_id = agent_settings::AgentProfileId("interactive_test".into());
+        let profile = AgentProfileSettings {
+            name: "interactive_test".into(),
+            origin: Default::default(),
+            tools: collections::IndexMap::default(),
+            enable_all_context_servers: false,
+            context_servers: collections::IndexMap::default(),
+            default_model: None,
+            custom_prompt_path: None,
+            system_prompt_template: None,
+            description: None,
+            skills: None,
+            delegation: None,
+            tool_permissions: None,
+            permission_mode: Some(AgentPermissionMode::Interactive),
+            terminal_wrapper_command: None,
+            task_isolation: agent_settings::TaskIsolation::default(),
+            task_worktree_language_servers: None,
+        };
+
+        cx.update(|cx| {
+            let mut settings = agent_settings::AgentSettings::get_global(cx).clone();
+            settings.profiles.insert(profile_id.clone(), profile);
+            agent_settings::AgentSettings::override_global(settings, cx);
+        });
+
+        #[allow(clippy::arc_with_non_send_sync)]
+        let tool = std::sync::Arc::new(TerminalTool::new(project, environment));
+        let (event_stream, mut rx) = ToolCallEventStream::test_with_profile(profile_id);
+
+        let task = cx.update(|cx| {
+            tool.run(
+                crate::ToolInput::resolved(TerminalToolInput {
+                    command: "rm .env".to_string(),
+                    cd: "root".to_string(),
+                    timeout_ms: None,
+                    ..Default::default()
+                }),
+                event_stream,
+                cx,
+            )
+        });
+
+        let auth = rx.expect_authorization().await;
+        let title = auth.tool_call.fields.title.unwrap_or_default();
+        assert!(
+            title.contains("(hidden / configuration file)"),
+            "expected prompt title to contain '(hidden / configuration file)', got: {title}"
+        );
+        assert!(auth
+            .response
+            .send(acp_thread::SelectedPermissionOutcome::new(
+                acp::PermissionOptionId::new("allow"),
+                acp::PermissionOptionKind::AllowOnce,
+            ))
+            .is_ok());
+
+        task.await.unwrap();
+    }
 
     #[test]
     fn test_resolve_cd_uses_project_path_style() {
@@ -2227,6 +4015,224 @@ mod tests {
             None,
             "a Windows-absolute path that escapes its worktree via `..` is rejected"
         );
+    }
+
+    #[test]
+    fn test_resolve_cd_in_task_worktree() {
+        #[cfg(not(target_os = "windows"))]
+        {
+            use util::paths::PathStyle::Unix;
+            let unix_roots: Vec<(&str, PathBuf)> = vec![
+                ("zed", PathBuf::from("/projects/zed")),
+                ("other", PathBuf::from("/projects/other")),
+            ];
+            let task_worktree = PathBuf::from("/worktrees/zed/agent-task-1");
+
+            assert_eq!(
+                resolve_cd_in_task_worktree(".", Unix, &task_worktree, &unix_roots).unwrap(),
+                PathBuf::from("/worktrees/zed/agent-task-1")
+            );
+            assert_eq!(
+                resolve_cd_in_task_worktree("", Unix, &task_worktree, &unix_roots).unwrap(),
+                PathBuf::from("/worktrees/zed/agent-task-1")
+            );
+            assert_eq!(
+                resolve_cd_in_task_worktree("./", Unix, &task_worktree, &unix_roots).unwrap(),
+                PathBuf::from("/worktrees/zed/agent-task-1")
+            );
+            assert_eq!(
+                resolve_cd_in_task_worktree("zed", Unix, &task_worktree, &unix_roots).unwrap(),
+                PathBuf::from("/worktrees/zed/agent-task-1")
+            );
+            assert_eq!(
+                resolve_cd_in_task_worktree("zed/crates/agent", Unix, &task_worktree, &unix_roots).unwrap(),
+                PathBuf::from("/worktrees/zed/agent-task-1/crates/agent")
+            );
+            assert_eq!(
+                resolve_cd_in_task_worktree("crates/agent", Unix, &task_worktree, &unix_roots).unwrap(),
+                PathBuf::from("/worktrees/zed/agent-task-1/crates/agent")
+            );
+            assert_eq!(
+                resolve_cd_in_task_worktree("./crates/agent", Unix, &task_worktree, &unix_roots).unwrap(),
+                PathBuf::from("/worktrees/zed/agent-task-1/crates/agent")
+            );
+            assert_eq!(
+                resolve_cd_in_task_worktree("/projects/zed", Unix, &task_worktree, &unix_roots).unwrap(),
+                PathBuf::from("/worktrees/zed/agent-task-1")
+            );
+            assert_eq!(
+                resolve_cd_in_task_worktree("/projects/zed/crates/agent", Unix, &task_worktree, &unix_roots).unwrap(),
+                PathBuf::from("/worktrees/zed/agent-task-1/crates/agent")
+            );
+            assert_eq!(
+                resolve_cd_in_task_worktree("agent-task-1", Unix, &task_worktree, &unix_roots).unwrap(),
+                PathBuf::from("/worktrees/zed/agent-task-1")
+            );
+            assert_eq!(
+                resolve_cd_in_task_worktree("agent-task-1/crates/agent", Unix, &task_worktree, &unix_roots).unwrap(),
+                PathBuf::from("/worktrees/zed/agent-task-1/crates/agent")
+            );
+            assert_eq!(
+                resolve_cd_in_task_worktree("/worktrees/zed/agent-task-1", Unix, &task_worktree, &unix_roots).unwrap(),
+                PathBuf::from("/worktrees/zed/agent-task-1")
+            );
+            assert_eq!(
+                resolve_cd_in_task_worktree("/worktrees/zed/agent-task-1/crates/agent", Unix, &task_worktree, &unix_roots).unwrap(),
+                PathBuf::from("/worktrees/zed/agent-task-1/crates/agent")
+            );
+            assert_eq!(
+                resolve_cd_in_task_worktree("zedextra", Unix, &task_worktree, &unix_roots).unwrap(),
+                PathBuf::from("/worktrees/zed/agent-task-1/zedextra")
+            );
+            assert!(resolve_cd_in_task_worktree("../escape", Unix, &task_worktree, &unix_roots).is_err());
+            assert!(resolve_cd_in_task_worktree("zed/../../escape", Unix, &task_worktree, &unix_roots).is_err());
+            assert!(resolve_cd_in_task_worktree("/other/dir", Unix, &task_worktree, &unix_roots).is_err());
+        }
+
+        #[cfg(target_os = "windows")]
+        {
+            use util::paths::PathStyle::Windows;
+
+            let windows_roots: Vec<(&str, PathBuf)> = vec![
+                ("zed", PathBuf::from("C:\\projects\\zed")),
+                ("other", PathBuf::from("C:\\projects\\other")),
+            ];
+            let task_worktree = PathBuf::from("C:\\worktrees\\zed\\agent-task-1");
+
+            assert_eq!(
+                resolve_cd_in_task_worktree(".", Windows, &task_worktree, &windows_roots).unwrap(),
+                PathBuf::from("C:\\worktrees\\zed\\agent-task-1")
+            );
+            assert_eq!(
+                resolve_cd_in_task_worktree("", Windows, &task_worktree, &windows_roots).unwrap(),
+                PathBuf::from("C:\\worktrees\\zed\\agent-task-1")
+            );
+            assert_eq!(
+                resolve_cd_in_task_worktree("./", Windows, &task_worktree, &windows_roots).unwrap(),
+                PathBuf::from("C:\\worktrees\\zed\\agent-task-1")
+            );
+            assert_eq!(
+                resolve_cd_in_task_worktree("zed", Windows, &task_worktree, &windows_roots).unwrap(),
+                PathBuf::from("C:\\worktrees\\zed\\agent-task-1")
+            );
+            assert_eq!(
+                resolve_cd_in_task_worktree("zed/crates/agent", Windows, &task_worktree, &windows_roots).unwrap(),
+                PathBuf::from("C:\\worktrees\\zed\\agent-task-1\\crates\\agent")
+            );
+            assert_eq!(
+                resolve_cd_in_task_worktree("zed\\crates\\agent", Windows, &task_worktree, &windows_roots).unwrap(),
+                PathBuf::from("C:\\worktrees\\zed\\agent-task-1\\crates\\agent")
+            );
+            assert_eq!(
+                resolve_cd_in_task_worktree("crates/agent", Windows, &task_worktree, &windows_roots).unwrap(),
+                PathBuf::from("C:\\worktrees\\zed\\agent-task-1\\crates\\agent")
+            );
+            assert_eq!(
+                resolve_cd_in_task_worktree("crates\\agent", Windows, &task_worktree, &windows_roots).unwrap(),
+                PathBuf::from("C:\\worktrees\\zed\\agent-task-1\\crates\\agent")
+            );
+            assert_eq!(
+                resolve_cd_in_task_worktree("./crates/agent", Windows, &task_worktree, &windows_roots).unwrap(),
+                PathBuf::from("C:\\worktrees\\zed\\agent-task-1\\crates\\agent")
+            );
+            assert_eq!(
+                resolve_cd_in_task_worktree(".\\crates\\agent", Windows, &task_worktree, &windows_roots).unwrap(),
+                PathBuf::from("C:\\worktrees\\zed\\agent-task-1\\crates\\agent")
+            );
+            assert_eq!(
+                resolve_cd_in_task_worktree("C:/projects/zed", Windows, &task_worktree, &windows_roots).unwrap(),
+                PathBuf::from("C:\\worktrees\\zed\\agent-task-1")
+            );
+            assert_eq!(
+                resolve_cd_in_task_worktree("C:\\projects\\zed", Windows, &task_worktree, &windows_roots).unwrap(),
+                PathBuf::from("C:\\worktrees\\zed\\agent-task-1")
+            );
+            assert_eq!(
+                resolve_cd_in_task_worktree("C:/projects/zed/crates/agent", Windows, &task_worktree, &windows_roots).unwrap(),
+                PathBuf::from("C:\\worktrees\\zed\\agent-task-1\\crates\\agent")
+            );
+            assert_eq!(
+                resolve_cd_in_task_worktree("c:\\projects\\zed\\crates\\agent", Windows, &task_worktree, &windows_roots).unwrap(),
+                PathBuf::from("C:\\worktrees\\zed\\agent-task-1\\crates\\agent")
+            );
+            assert_eq!(
+                resolve_cd_in_task_worktree("agent-task-1", Windows, &task_worktree, &windows_roots).unwrap(),
+                PathBuf::from("C:\\worktrees\\zed\\agent-task-1")
+            );
+            assert_eq!(
+                resolve_cd_in_task_worktree("agent-task-1\\crates\\agent", Windows, &task_worktree, &windows_roots).unwrap(),
+                PathBuf::from("C:\\worktrees\\zed\\agent-task-1\\crates\\agent")
+            );
+            assert_eq!(
+                resolve_cd_in_task_worktree("agent-task-1/crates/agent", Windows, &task_worktree, &windows_roots).unwrap(),
+                PathBuf::from("C:\\worktrees\\zed\\agent-task-1\\crates\\agent")
+            );
+            assert_eq!(
+                resolve_cd_in_task_worktree("C:\\worktrees\\zed\\agent-task-1", Windows, &task_worktree, &windows_roots).unwrap(),
+                PathBuf::from("C:\\worktrees\\zed\\agent-task-1")
+            );
+            assert_eq!(
+                resolve_cd_in_task_worktree("C:\\worktrees\\zed\\agent-task-1\\crates\\agent", Windows, &task_worktree, &windows_roots).unwrap(),
+                PathBuf::from("C:\\worktrees\\zed\\agent-task-1\\crates\\agent")
+            );
+            assert_eq!(
+                resolve_cd_in_task_worktree("zedextra", Windows, &task_worktree, &windows_roots).unwrap(),
+                PathBuf::from("C:\\worktrees\\zed\\agent-task-1\\zedextra")
+            );
+            assert!(resolve_cd_in_task_worktree("..\\escape", Windows, &task_worktree, &windows_roots).is_err());
+            assert!(resolve_cd_in_task_worktree("../escape", Windows, &task_worktree, &windows_roots).is_err());
+            assert!(resolve_cd_in_task_worktree("zed/../../escape", Windows, &task_worktree, &windows_roots).is_err());
+            assert!(resolve_cd_in_task_worktree("D:\\other", Windows, &task_worktree, &windows_roots).is_err());
+        }
+    }
+
+    #[gpui::test]
+    async fn test_working_dir_in_task_worktree(cx: &mut gpui::TestAppContext) {
+        crate::tests::init_test(cx);
+
+        let fs = fs::FakeFs::new(cx.executor());
+        let root_path = if cfg!(target_os = "windows") {
+            "C:\\projects\\zed"
+        } else {
+            "/projects/zed"
+        };
+        let task_worktree_path = if cfg!(target_os = "windows") {
+            PathBuf::from("C:\\worktrees\\zed\\agent-task-182")
+        } else {
+            PathBuf::from("/worktrees/zed/agent-task-182")
+        };
+
+        fs.insert_tree(root_path, serde_json::json!({})).await;
+        let project = project::Project::test(fs, [root_path.as_ref()], cx).await;
+
+        cx.update(|cx| {
+            let res_dot = working_dir(".", &project, Some(&task_worktree_path), cx)
+                .expect("cd . should succeed")
+                .expect("should return a path");
+            assert_eq!(res_dot, task_worktree_path);
+
+            let res_root = working_dir("zed", &project, Some(&task_worktree_path), cx)
+                .expect("cd zed should succeed")
+                .expect("should return a path");
+            assert_eq!(res_root, task_worktree_path);
+
+            let res_sub = working_dir("zed/crates/agent", &project, Some(&task_worktree_path), cx)
+                .expect("cd zed/crates/agent should succeed")
+                .expect("should return a path");
+            assert_eq!(res_sub, task_worktree_path.join("crates").join("agent"));
+
+            let res_rel = working_dir("crates/agent", &project, Some(&task_worktree_path), cx)
+                .expect("cd crates/agent should succeed")
+                .expect("should return a path");
+            assert_eq!(res_rel, task_worktree_path.join("crates").join("agent"));
+
+            let res_abs = working_dir(root_path, &project, Some(&task_worktree_path), cx)
+                .expect("cd <root_path> should succeed")
+                .expect("should return a path");
+            assert_eq!(res_abs, task_worktree_path);
+
+            assert!(working_dir("../escape", &project, Some(&task_worktree_path), cx).is_err());
+        });
     }
 
     #[test]

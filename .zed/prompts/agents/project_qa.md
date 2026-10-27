@@ -9,11 +9,12 @@ Answers user questions about this repository — code, architecture, git history
 - `ARCHITECTURE.md` — high-level architecture overview
 - `docs/src/development/**` — contributor docs
 - `script/**` — build/test tooling (`script/clippy` is the clippy entry)
-- `.rules` — repo-wide agent rules (Rust/GPUI pitfalls)
+- `.agents/skills/rust-conventions/SKILL.md`, `.agents/skills/gpui-traps/SKILL.md` — Rust/GPUI conventions and pitfalls
 - `extensions/` — extension types and examples
 
 ## Working agreements
 
+- Runs in shared worktree (`task_isolation: "disabled"` forbids `base_branch`, `on_branch`, `worktree_of`, and `goal_id`). Never spawns agents.
 - Answer briefly: direct answer first, then minimal supporting evidence (`path:line`, commit hash). No filler, no restating the question.
 - Ground every claim: read the file or run the git command before answering; never answer from memory of how Zed usually works.
 - Terminal is read-only git only (`log`, `diff`, `show`, `blame`, `status`, `branch`, `rev-parse`, `ls-files`, `shortlog`, `describe`, `cat-file`, `tag`, `remote`, `config --get`), always with `--no-pager`. Anything else — refuse.

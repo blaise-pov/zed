@@ -1,106 +1,79 @@
-use std::collections::VecDeque;
+use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+#[cfg(not(any(test, feature = "test-support")))]
+use std::sync::LazyLock;
 
 use anyhow::Result;
-use gpui::{App, Context, Task};
+use gpui::{App, Context, Entity, Task, TaskExt, WeakEntity};
+use project::Project;
 use util::ResultExt;
 
 use crate::agent_task::{
-    AgentGoalStatus, AgentGoalSummary, AgentItemKind, AgentTaskArtifact, AgentTaskDetail,
-    AgentTaskEvent, AgentTaskEventKind, AgentTaskGraph, AgentTaskId, AgentTaskProvider,
-    AgentTaskStatus, AgentTaskSummary, AgentUnifiedItem,
+    AgentGoalStatus, AgentTaskArtifact, AgentTaskDetail, AgentTaskGraph, AgentTaskId,
+    AgentTaskProvider, AgentTaskStatus,
 };
 
-fn merge_items_into_graph(graph: &mut AgentTaskGraph, items: &[AgentUnifiedItem]) {
-    let items_by_id: std::collections::HashMap<&str, &AgentUnifiedItem> =
-        items.iter().map(|item| (item.id.as_str(), item)).collect();
+#[cfg(any(test, feature = "test-support"))]
+struct TestThreadLocal<T: 'static>(fn() -> &'static T);
 
-    for task in &mut graph.tasks {
-        if let Some(item) = items_by_id.get(task.id.as_str()) {
-            if task.created_at.is_none() {
-                task.created_at = item.created_at;
-            }
-            if task.parent_id.is_none() {
-                task.parent_id = item.parent_id.as_deref().map(AgentTaskId::from);
-            }
-            if task.goal_id.is_none() {
-                task.goal_id = item.goal_id.clone();
-            }
-            if task.title.is_empty() {
-                task.title = item.title.clone();
-            }
-            let item_profile = item
-                .assigned_profile
-                .clone()
-                .or_else(|| item.assignee.clone());
-            if (task.assigned_profile.is_none()
-                || task.assigned_profile.as_ref().is_some_and(|p| p.is_empty()))
-                && item_profile.is_some()
-            {
-                task.assigned_profile = item_profile;
-            }
-            if task.model.is_none() {
-                task.model = item.model.clone();
-            }
-        }
+#[cfg(any(test, feature = "test-support"))]
+impl<T: 'static> std::ops::Deref for TestThreadLocal<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        (self.0)()
     }
+}
 
-    let mut existing_task_ids: std::collections::HashSet<AgentTaskId> =
-        graph.tasks.iter().map(|t| t.id.clone()).collect();
-
-    for item in items.iter().filter(|item| item.kind == AgentItemKind::Task) {
-        let task_id = AgentTaskId::from(item.id.as_str());
-        if !existing_task_ids.contains(&task_id) {
-            existing_task_ids.insert(task_id.clone());
-            let item_profile = item
-                .assigned_profile
-                .clone()
-                .or_else(|| item.assignee.clone());
-            graph.tasks.push(AgentTaskSummary {
-                id: task_id,
-                parent_id: item.parent_id.as_deref().map(AgentTaskId::from),
-                goal_id: item.goal_id.clone(),
-                title: item.title.clone(),
-                status: item.task_status(),
-                attempt: 1,
-                assignee: item.assignee.clone(),
-                write_scopes: Vec::new(),
-                created_at: item.created_at,
-                assigned_profile: item_profile,
-                model: item.model.clone(),
-            });
-        }
-    }
-
-    for goal in &mut graph.goals {
-        if let Some(item) = items_by_id.get(goal.goal_id.as_str()) {
-            if goal.created_at.is_none() {
-                goal.created_at = item.created_at;
+#[cfg(any(test, feature = "test-support"))]
+macro_rules! task_store_static {
+    ($name:ident: $ty:ty = $init:expr) => {
+        static $name: TestThreadLocal<$ty> = TestThreadLocal(|| {
+            thread_local! {
+                static INSTANCE: &'static $ty = Box::leak(Box::new($init));
             }
-            if goal.tasks_total == 0 {
-                if let Some(progress) = &item.progress {
-                    goal.tasks_total = progress.total;
-                    goal.tasks_done = progress.done;
-                }
-            }
-        }
-    }
+            INSTANCE.with(|instance| *instance)
+        });
+    };
+}
 
-    if graph.goals.is_empty() {
-        for item in items.iter().filter(|item| item.kind == AgentItemKind::Goal) {
-            let (tasks_done, tasks_total) = match &item.progress {
-                Some(progress) => (progress.done, progress.total),
-                None => (0, 0),
-            };
-            graph.goals.push(AgentGoalSummary {
-                goal_id: item.id.clone(),
-                title: item.title.clone(),
-                status: item.goal_status(),
-                priority: item.priority,
-                tasks_total,
-                tasks_done,
-                created_at: item.created_at,
+#[cfg(not(any(test, feature = "test-support")))]
+macro_rules! task_store_static {
+    ($name:ident: $ty:ty = $init:expr) => {
+        static $name: LazyLock<$ty> = LazyLock::new(|| $init);
+    };
+}
+
+task_store_static!(
+    PROJECT_TASK_STORES: parking_lot::RwLock<HashMap<gpui::EntityId, WeakEntity<AgentTaskStore>>> =
+        parking_lot::RwLock::new(HashMap::default())
+);
+
+pub fn register_task_store_for_project(
+    project_id: gpui::EntityId,
+    store: WeakEntity<AgentTaskStore>,
+) {
+    let mut reg = PROJECT_TASK_STORES.write();
+    reg.retain(|_, weak| weak.upgrade().is_some());
+    reg.insert(project_id, store);
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub fn reset_registry_for_tests() {
+    let mut reg = PROJECT_TASK_STORES.write();
+    reg.clear();
+}
+
+pub fn refresh_task_store_for_project(project: &Entity<Project>, cx: &mut App) {
+    let store = {
+        let mut reg = PROJECT_TASK_STORES.write();
+        reg.retain(|_, weak| weak.upgrade().is_some());
+        reg.get(&project.entity_id()).cloned()
+    };
+    if let Some(store) = store {
+        if let Some(store) = store.upgrade() {
+            store.update(cx, |store, cx| {
+                store.refresh(cx).detach_and_log_err(cx);
             });
         }
     }
@@ -108,24 +81,36 @@ fn merge_items_into_graph(graph: &mut AgentTaskGraph, items: &[AgentUnifiedItem]
 
 pub struct AgentTaskStore {
     provider: Arc<dyn AgentTaskProvider>,
+    project: Option<Entity<Project>>,
     graph: AgentTaskGraph,
-    events: VecDeque<AgentTaskEvent>,
+    has_initial_refresh: bool,
     is_offline: bool,
     last_error: Option<String>,
-    _poll_task: Option<Task<()>>,
 }
 
 impl AgentTaskStore {
     pub fn new(provider: Arc<dyn AgentTaskProvider>, cx: &mut Context<Self>) -> Self {
+        Self::new_with_project(provider, None, cx)
+    }
+
+    pub fn new_with_project(
+        provider: Arc<dyn AgentTaskProvider>,
+        project: Option<Entity<Project>>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        if let Some(project) = &project {
+            register_task_store_for_project(project.entity_id(), cx.weak_entity());
+        }
+
         let mut store = Self {
             provider,
+            project,
             graph: AgentTaskGraph::default(),
-            events: VecDeque::new(),
+            has_initial_refresh: false,
             is_offline: false,
             last_error: None,
-            _poll_task: None,
         };
-        store.start_polling(cx);
+        store.refresh(cx).detach_and_log_err(cx);
         store
     }
 
@@ -133,24 +118,28 @@ impl AgentTaskStore {
         &self.provider
     }
 
+    pub fn project(&self) -> Option<&Entity<Project>> {
+        self.project.as_ref()
+    }
+
+    pub fn set_project(&mut self, project: Option<Entity<Project>>) {
+        self.project = project;
+    }
+
     /// Swap the backing provider (e.g. when the configured task server id
     /// changes) and refresh from the new server.
     pub fn set_provider(&mut self, provider: Arc<dyn AgentTaskProvider>, cx: &mut Context<Self>) {
         self.provider = provider;
         self.graph = AgentTaskGraph::default();
-        self.events.clear();
+        self.has_initial_refresh = false;
         self.is_offline = false;
         self.last_error = None;
-        self.refresh(cx).detach();
+        self.refresh(cx).detach_and_log_err(cx);
         cx.notify();
     }
 
     pub fn graph(&self) -> &AgentTaskGraph {
         &self.graph
-    }
-
-    pub fn events(&self) -> &VecDeque<AgentTaskEvent> {
-        &self.events
     }
 
     pub fn is_offline(&self) -> bool {
@@ -161,53 +150,56 @@ impl AgentTaskStore {
         self.last_error.as_deref()
     }
 
-    pub fn start_polling(&mut self, cx: &mut Context<Self>) {
-        let poll_task = cx.spawn(async move |this, cx| {
-            loop {
-                let refresh_task = this.update(cx, |store, cx| store.refresh(cx));
-                if let Ok(task) = refresh_task {
-                    task.await.log_err();
-                }
-                cx.background_executor().timer(Duration::from_secs(5)).await;
-            }
-        });
-        self._poll_task = Some(poll_task);
-    }
-
     pub fn refresh(&mut self, cx: &mut Context<Self>) -> Task<Result<()>> {
         let provider = self.provider.clone();
         let graph_task = provider.fetch_graph(cx);
-        let items_task = provider.fetch_items(cx);
-        let events_task = provider.list_events(200, cx);
 
         cx.spawn(async move |this, cx| {
-            let (graph_result, items_result, events_result) =
-                futures::join!(graph_task, items_task, events_task);
+            let graph_result = graph_task.await;
 
             this.update(cx, |store, cx| {
                 let mut changed = false;
 
                 match graph_result {
-                    Ok(mut graph) => {
-                        match items_result {
-                            Ok(items) => {
-                                merge_items_into_graph(&mut graph, &items);
-                            }
-                            Err(err) => {
-                                log::warn!("failed to fetch unified items: {err:?}");
+                    Ok(graph) => {
+                        for task in &graph.tasks {
+                            if let Some(session_id) = &task.session_id {
+                                crate::task_worktree::register_task_session(
+                                    &task.id,
+                                    session_id.clone(),
+                                );
                             }
                         }
 
-                        match events_result {
-                            Ok(events) => {
-                                if store.events.make_contiguous() != events.as_slice() {
-                                    store.events = events.into();
-                                    changed = true;
+                        if store.has_initial_refresh {
+                            if let Some(project) = store.project.clone() {
+                                for new_task in &graph.tasks {
+                                    let old_task =
+                                        store.graph.tasks.iter().find(|t| t.id == new_task.id);
+                                    let transitioned_to_terminal = old_task
+                                        .map_or(false, |old| !old.status.is_terminal())
+                                        && new_task.status.is_terminal();
+
+                                    if transitioned_to_terminal
+                                        && crate::task_worktree::task_worktree_path_for_id(
+                                            &new_task.id,
+                                        )
+                                        .is_some()
+                                        && !crate::task_worktree::has_active_subagent_session(
+                                            &new_task.id,
+                                        )
+                                    {
+                                        let project = project.clone();
+                                        let task_id = new_task.id.clone();
+                                        crate::task_worktree::auto_cleanup_task_worktree(
+                                            project, &task_id, cx,
+                                        )
+                                        .detach_and_log_err(cx);
+                                    }
                                 }
                             }
-                            Err(err) => {
-                                log::error!("failed to fetch events: {err:?}");
-                            }
+                        } else {
+                            store.has_initial_refresh = true;
                         }
 
                         if store.graph != graph {
@@ -248,31 +240,9 @@ impl AgentTaskStore {
         })
     }
 
-    pub fn policy_denied_event_for_task(&self, task_id: &AgentTaskId) -> Option<&AgentTaskEvent> {
-        self.events.iter().find(|e| {
-            e.kind == AgentTaskEventKind::PolicyDenied && e.task_id.as_ref() == Some(task_id)
-        })
-    }
-
     pub fn complete_task(&mut self, id: &AgentTaskId, cx: &mut Context<Self>) -> Task<Result<()>> {
         let provider = self.provider.clone();
         let task = provider.complete_task(id, cx);
-        cx.spawn(async move |this, cx| {
-            task.await?;
-            let refresh_task = this.update(cx, |store, cx| store.refresh(cx))?;
-            refresh_task.await?;
-            Ok(())
-        })
-    }
-
-    pub fn ensure_task(
-        &mut self,
-        id: &AgentTaskId,
-        title: &str,
-        cx: &mut Context<Self>,
-    ) -> Task<Result<()>> {
-        let provider = self.provider.clone();
-        let task = provider.ensure_task(id, title, cx);
         cx.spawn(async move |this, cx| {
             task.await?;
             let refresh_task = this.update(cx, |store, cx| store.refresh(cx))?;
@@ -395,6 +365,38 @@ impl AgentTaskStore {
         })
     }
 
+    pub fn update_task_title(
+        &mut self,
+        id: &AgentTaskId,
+        title: &str,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
+        let provider = self.provider.clone();
+        let task = provider.update_task_title(id, title, cx);
+        cx.spawn(async move |this, cx| {
+            task.await?;
+            let refresh_task = this.update(cx, |store, cx| store.refresh(cx))?;
+            refresh_task.await?;
+            Ok(())
+        })
+    }
+
+    pub fn update_goal_title(
+        &mut self,
+        goal_id: &str,
+        title: &str,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
+        let provider = self.provider.clone();
+        let task = provider.update_goal_title(goal_id, title, cx);
+        cx.spawn(async move |this, cx| {
+            task.await?;
+            let refresh_task = this.update(cx, |store, cx| store.refresh(cx))?;
+            refresh_task.await?;
+            Ok(())
+        })
+    }
+
     pub fn get_task_detail(&self, id: &AgentTaskId, cx: &mut App) -> Task<Result<AgentTaskDetail>> {
         self.provider.get_task(id, cx)
     }
@@ -414,34 +416,91 @@ impl AgentTaskStore {
 
 #[cfg(test)]
 mod tests {
+    use crate::agent_task::AgentTaskEvent;
+    use fs::Fs;
+    use settings::Settings;
     use std::sync::Mutex;
 
     use super::*;
-    use crate::agent_task::AgentTaskStatus;
-    use crate::agent_task::AgentTaskSummary;
+    use crate::agent_task::{AgentGoalSummary, AgentTaskStatus, AgentTaskSummary};
     use context_server::ContextServerId;
-    use gpui::{App, AppContext, SharedString, TestAppContext};
+    use gpui::{App, AppContext, TestAppContext};
 
     #[derive(Default)]
     struct CallCounts {
         archive_calls: Vec<AgentTaskId>,
         unarchive_calls: Vec<AgentTaskId>,
         delete_calls: Vec<AgentTaskId>,
-        ensure_task_calls: Vec<(AgentTaskId, String)>,
         set_task_status_calls: Vec<(AgentTaskId, AgentTaskStatus)>,
         set_goal_status_calls: Vec<(String, AgentGoalStatus)>,
         archive_goal_calls: Vec<String>,
         unarchive_goal_calls: Vec<String>,
         delete_goal_calls: Vec<String>,
+        update_task_title_calls: Vec<(AgentTaskId, String)>,
+        update_goal_title_calls: Vec<(String, String)>,
         fetch_graph_count: usize,
-        fetch_items_count: usize,
+    }
+
+    #[derive(Default)]
+    struct DynamicProvider {
+        graph: parking_lot::Mutex<AgentTaskGraph>,
+        #[allow(dead_code)]
+        events: parking_lot::Mutex<Vec<AgentTaskEvent>>,
+    }
+
+    impl AgentTaskProvider for DynamicProvider {
+        fn server_id(&self) -> ContextServerId {
+            ContextServerId("dynamic_test".into())
+        }
+
+        fn fetch_graph(&self, _cx: &mut App) -> Task<Result<AgentTaskGraph>> {
+            Task::ready(Ok(self.graph.lock().clone()))
+        }
+
+        fn get_task(&self, _id: &AgentTaskId, _cx: &mut App) -> Task<Result<AgentTaskDetail>> {
+            Task::ready(Err(anyhow::anyhow!("not implemented")))
+        }
+
+        fn complete_task(&self, _id: &AgentTaskId, _cx: &mut App) -> Task<Result<()>> {
+            Task::ready(Ok(()))
+        }
+
+        fn fail_task(&self, _id: &AgentTaskId, _reason: &str, _cx: &mut App) -> Task<Result<()>> {
+            Task::ready(Ok(()))
+        }
+
+        fn archive_task(&self, _id: &AgentTaskId, _cx: &mut App) -> Task<Result<()>> {
+            Task::ready(Ok(()))
+        }
+
+        fn unarchive_task(&self, _id: &AgentTaskId, _cx: &mut App) -> Task<Result<()>> {
+            Task::ready(Ok(()))
+        }
+
+        fn delete_task(&self, _id: &AgentTaskId, _cx: &mut App) -> Task<Result<()>> {
+            Task::ready(Ok(()))
+        }
+
+        fn list_artifacts(
+            &self,
+            _task_id: &AgentTaskId,
+            _cx: &mut App,
+        ) -> Task<Result<Vec<AgentTaskArtifact>>> {
+            Task::ready(Ok(vec![]))
+        }
+
+        fn get_artifact(
+            &self,
+            _artifact_id: &str,
+            _cx: &mut App,
+        ) -> Task<Result<AgentTaskArtifact>> {
+            Task::ready(Err(anyhow::anyhow!("not implemented")))
+        }
     }
 
     #[derive(Default)]
     struct TestProvider {
         should_fail: bool,
-        items_fail: bool,
-        items: Vec<AgentUnifiedItem>,
         tasks: Vec<AgentTaskSummary>,
         goals: Vec<AgentGoalSummary>,
         calls: Arc<Mutex<CallCounts>>,
@@ -470,6 +529,8 @@ mod tests {
                         created_at: None,
                         assigned_profile: None,
                         model: None,
+                        session_id: None,
+                        metrics: None,
                     }]
                 } else {
                     self.tasks.clone()
@@ -478,15 +539,6 @@ mod tests {
                     tasks,
                     goals: self.goals.clone(),
                 }))
-            }
-        }
-
-        fn fetch_items(&self, _cx: &mut App) -> Task<Result<Vec<AgentUnifiedItem>>> {
-            self.calls.lock().unwrap().fetch_items_count += 1;
-            if self.items_fail {
-                Task::ready(Err(anyhow::anyhow!("items failed")))
-            } else {
-                Task::ready(Ok(self.items.clone()))
             }
         }
 
@@ -545,25 +597,35 @@ mod tests {
             Task::ready(Ok(()))
         }
 
+        fn update_task_title(
+            &self,
+            id: &AgentTaskId,
+            title: &str,
+            _cx: &mut App,
+        ) -> Task<Result<()>> {
+            self.calls
+                .lock()
+                .unwrap()
+                .update_task_title_calls
+                .push((id.clone(), title.to_string()));
+            Task::ready(Ok(()))
+        }
+
+        fn update_goal_title(&self, goal_id: &str, title: &str, _cx: &mut App) -> Task<Result<()>> {
+            self.calls
+                .lock()
+                .unwrap()
+                .update_goal_title_calls
+                .push((goal_id.to_string(), title.to_string()));
+            Task::ready(Ok(()))
+        }
+
         fn get_task(&self, _id: &AgentTaskId, _cx: &mut App) -> Task<Result<AgentTaskDetail>> {
             Task::ready(Err(anyhow::anyhow!("not implemented")))
         }
 
         fn complete_task(&self, _id: &AgentTaskId, _cx: &mut App) -> Task<Result<()>> {
             Task::ready(Ok(()))
-        }
-
-        fn ensure_task(&self, id: &AgentTaskId, title: &str, _cx: &mut App) -> Task<Result<()>> {
-            self.calls
-                .lock()
-                .unwrap()
-                .ensure_task_calls
-                .push((id.clone(), title.to_string()));
-            if self.should_fail {
-                Task::ready(Err(anyhow::anyhow!("offline")))
-            } else {
-                Task::ready(Ok(()))
-            }
         }
 
         fn fail_task(&self, _id: &AgentTaskId, _reason: &str, _cx: &mut App) -> Task<Result<()>> {
@@ -583,10 +645,6 @@ mod tests {
         fn delete_task(&self, id: &AgentTaskId, _cx: &mut App) -> Task<Result<()>> {
             self.calls.lock().unwrap().delete_calls.push(id.clone());
             Task::ready(Ok(()))
-        }
-
-        fn list_events(&self, _limit: u32, _cx: &mut App) -> Task<Result<Vec<AgentTaskEvent>>> {
-            Task::ready(Ok(vec![]))
         }
 
         fn list_artifacts(
@@ -709,34 +767,6 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_agent_task_store_ensure_task(cx: &mut TestAppContext) {
-        let calls = Arc::new(Mutex::new(CallCounts::default()));
-        let provider = Arc::new(TestProvider {
-            should_fail: false,
-            calls: calls.clone(),
-            ..Default::default()
-        });
-        let store = cx.update(|cx| cx.new(|cx| AgentTaskStore::new(provider, cx)));
-        cx.run_until_parked();
-
-        let initial_refreshes = calls.lock().unwrap().fetch_graph_count;
-        let task_id = AgentTaskId::from("TASK-1");
-        let result = store
-            .update(cx, |store, cx| {
-                store.ensure_task(&task_id, "Test Title", cx)
-            })
-            .await;
-        assert!(result.is_ok());
-
-        let counts = calls.lock().unwrap();
-        assert_eq!(
-            counts.ensure_task_calls,
-            vec![(task_id, "Test Title".to_string())]
-        );
-        assert_eq!(counts.fetch_graph_count, initial_refreshes + 1);
-    }
-
-    #[gpui::test]
     async fn test_agent_task_store_set_task_status(cx: &mut TestAppContext) {
         let calls = Arc::new(Mutex::new(CallCounts::default()));
         let provider = Arc::new(TestProvider {
@@ -809,161 +839,56 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_agent_task_store_merge_items(cx: &mut TestAppContext) {
-        use crate::agent_task::AgentGoalProgress;
-        use gpui::SharedString;
-
-        let initial_task = AgentTaskSummary {
-            id: AgentTaskId::from("TASK-1"),
-            parent_id: None,
-            goal_id: Some("GOAL-1".to_string()),
-            title: "Task Title From Graph".to_string(),
-            status: AgentTaskStatus::Running,
-            attempt: 1,
-            assignee: None,
-            write_scopes: vec![],
-            created_at: None,
-            assigned_profile: None,
-            model: None,
-        };
-
-        let initial_goal = AgentGoalSummary {
-            goal_id: "GOAL-1".to_string(),
-            title: "Goal Title From Graph".to_string(),
-            status: AgentGoalStatus::Running,
-            priority: 2,
-            tasks_total: 0,
-            tasks_done: 0,
-            created_at: None,
-        };
-
-        let items = vec![
-            AgentUnifiedItem {
-                kind: AgentItemKind::Task,
-                id: "TASK-1".to_string(),
-                title: "Task Title From Item".to_string(),
-                status: "completed".to_string(), // graph status should win
-                priority: 5,
-                created_at: Some(1710000000000),
-                failure_reason: None,
-                progress: None,
-                assignee: None,
-                assigned_profile: Some(SharedString::from("code_mechanic")),
-                model: Some(SharedString::from("gpt-4o")),
-                parent_id: None,
-                goal_id: None,
-            },
-            AgentUnifiedItem {
-                kind: AgentItemKind::Goal,
-                id: "GOAL-1".to_string(),
-                title: "Goal Title From Item".to_string(),
-                status: "blocked".to_string(),
-                priority: 1,
-                created_at: Some(1709999999000),
-                failure_reason: None,
-                progress: Some(AgentGoalProgress { done: 3, total: 5 }),
-                assignee: None,
-                assigned_profile: None,
-                model: None,
-                parent_id: None,
-                goal_id: None,
-            },
-        ];
-
+    async fn test_agent_task_store_update_task_title(cx: &mut TestAppContext) {
+        let calls = Arc::new(Mutex::new(CallCounts::default()));
         let provider = Arc::new(TestProvider {
-            tasks: vec![initial_task],
-            goals: vec![initial_goal],
-            items,
+            calls: calls.clone(),
             ..Default::default()
         });
-
         let store = cx.update(|cx| cx.new(|cx| AgentTaskStore::new(provider, cx)));
         cx.run_until_parked();
 
-        store.update(cx, |store, _cx| {
-            let task = &store.graph().tasks[0];
-            // item fields filled
-            assert_eq!(task.created_at, Some(1710000000000));
-            assert_eq!(
-                task.assigned_profile,
-                Some(SharedString::from("code_mechanic"))
-            );
-            assert_eq!(task.model, Some(SharedString::from("gpt-4o")));
-            // graph source of truth preserved
-            assert_eq!(task.status, AgentTaskStatus::Running);
-            assert_eq!(task.title, "Task Title From Graph");
+        let initial_refreshes = calls.lock().unwrap().fetch_graph_count;
+        let task_id = AgentTaskId::from("TASK-1");
+        let result = store
+            .update(cx, |store, cx| {
+                store.update_task_title(&task_id, "New Task Title", cx)
+            })
+            .await;
+        assert!(result.is_ok());
 
-            let goal = &store.graph().goals[0];
-            assert_eq!(goal.created_at, Some(1709999999000));
-            assert_eq!(goal.tasks_done, 3);
-            assert_eq!(goal.tasks_total, 5);
-            assert_eq!(goal.status, AgentGoalStatus::Running);
-            assert_eq!(goal.title, "Goal Title From Graph");
-        });
+        let counts = calls.lock().unwrap();
+        assert_eq!(
+            counts.update_task_title_calls,
+            vec![(task_id, "New Task Title".to_string())]
+        );
+        assert_eq!(counts.fetch_graph_count, initial_refreshes + 1);
     }
 
     #[gpui::test]
-    async fn test_agent_task_store_synthesize_goals_when_graph_goals_empty(
-        cx: &mut TestAppContext,
-    ) {
-        use crate::agent_task::AgentGoalProgress;
-
-        let items = vec![AgentUnifiedItem {
-            kind: AgentItemKind::Goal,
-            id: "GOAL-SYNTH".to_string(),
-            title: "Synthesized Goal".to_string(),
-            status: "running".to_string(),
-            priority: 3,
-            created_at: Some(1710000050000),
-            failure_reason: None,
-            progress: Some(AgentGoalProgress { done: 1, total: 2 }),
-            assignee: None,
-            assigned_profile: None,
-            model: None,
-            parent_id: None,
-            goal_id: None,
-        }];
-
+    async fn test_agent_task_store_update_goal_title(cx: &mut TestAppContext) {
+        let calls = Arc::new(Mutex::new(CallCounts::default()));
         let provider = Arc::new(TestProvider {
-            tasks: vec![],
-            goals: vec![], // empty goals in graph
-            items,
+            calls: calls.clone(),
             ..Default::default()
         });
-
         let store = cx.update(|cx| cx.new(|cx| AgentTaskStore::new(provider, cx)));
         cx.run_until_parked();
 
-        store.update(cx, |store, _cx| {
-            assert_eq!(store.graph().goals.len(), 1);
-            let goal = &store.graph().goals[0];
-            assert_eq!(goal.goal_id, "GOAL-SYNTH");
-            assert_eq!(goal.title, "Synthesized Goal");
-            assert_eq!(goal.status, AgentGoalStatus::Running);
-            assert_eq!(goal.priority, 3);
-            assert_eq!(goal.tasks_done, 1);
-            assert_eq!(goal.tasks_total, 2);
-            assert_eq!(goal.created_at, Some(1710000050000));
-        });
-    }
+        let initial_refreshes = calls.lock().unwrap().fetch_graph_count;
+        let result = store
+            .update(cx, |store, cx| {
+                store.update_goal_title("GOAL-1", "New Goal Title", cx)
+            })
+            .await;
+        assert!(result.is_ok());
 
-    #[gpui::test]
-    async fn test_agent_task_store_items_failure_non_fatal(cx: &mut TestAppContext) {
-        let provider = Arc::new(TestProvider {
-            should_fail: false,
-            items_fail: true,
-            ..Default::default()
-        });
-
-        let store = cx.update(|cx| cx.new(|cx| AgentTaskStore::new(provider, cx)));
-        cx.run_until_parked();
-
-        store.update(cx, |store, _cx| {
-            assert!(!store.is_offline());
-            assert_eq!(store.last_error(), None);
-            assert_eq!(store.graph().tasks.len(), 1);
-            assert_eq!(store.graph().tasks[0].id.as_str(), "TASK-1");
-        });
+        let counts = calls.lock().unwrap();
+        assert_eq!(
+            counts.update_goal_title_calls,
+            vec![("GOAL-1".to_string(), "New Goal Title".to_string())]
+        );
+        assert_eq!(counts.fetch_graph_count, initial_refreshes + 1);
     }
 
     #[test]
@@ -981,321 +906,9 @@ mod tests {
         assert_eq!(deserialized, AgentTaskStatus::Archived);
     }
 
-    #[test]
-    fn test_merge_items_assigned_profile_priority() {
-        let mut graph = AgentTaskGraph {
-            tasks: vec![
-                AgentTaskSummary {
-                    id: AgentTaskId::from("TASK-WITHOUT-PROFILE"),
-                    parent_id: None,
-                    goal_id: None,
-                    title: "No Profile Task".to_string(),
-                    status: AgentTaskStatus::Ready,
-                    attempt: 0,
-                    assignee: None,
-                    write_scopes: vec![],
-                    created_at: None,
-                    assigned_profile: None,
-                    model: None,
-                },
-                AgentTaskSummary {
-                    id: AgentTaskId::from("TASK-WITH-EXISTING-PROFILE"),
-                    parent_id: None,
-                    goal_id: None,
-                    title: "Existing Profile Task".to_string(),
-                    status: AgentTaskStatus::Running,
-                    attempt: 1,
-                    assignee: None,
-                    write_scopes: vec![],
-                    created_at: None,
-                    assigned_profile: Some(SharedString::from("senior_engineer")),
-                    model: None,
-                },
-            ],
-            goals: vec![],
-        };
-
-        let items = vec![
-            AgentUnifiedItem {
-                kind: AgentItemKind::Task,
-                id: "TASK-WITHOUT-PROFILE".to_string(),
-                title: "No Profile Task".to_string(),
-                status: "ready".to_string(),
-                priority: 1,
-                created_at: Some(1791374700000),
-                failure_reason: None,
-                progress: None,
-                assignee: Some(SharedString::from("repository")),
-                assigned_profile: None,
-                model: Some(SharedString::from("claude-3-7-sonnet")),
-                parent_id: None,
-                goal_id: None,
-            },
-            AgentUnifiedItem {
-                kind: AgentItemKind::Task,
-                id: "TASK-WITH-EXISTING-PROFILE".to_string(),
-                title: "Existing Profile Task".to_string(),
-                status: "running".to_string(),
-                priority: 2,
-                created_at: Some(1791374400000),
-                failure_reason: None,
-                progress: None,
-                assignee: None,
-                assigned_profile: None,
-                model: None,
-                parent_id: None,
-                goal_id: None,
-            },
-        ];
-
-        merge_items_into_graph(&mut graph, &items);
-
-        let task_without_profile = &graph.tasks[0];
-        assert_eq!(
-            task_without_profile.assigned_profile,
-            Some(SharedString::from("repository"))
-        );
-        assert_eq!(task_without_profile.created_at, Some(1791374700000));
-        assert_eq!(
-            task_without_profile.model,
-            Some(SharedString::from("claude-3-7-sonnet"))
-        );
-
-        let task_with_profile = &graph.tasks[1];
-        assert_eq!(
-            task_with_profile.assigned_profile,
-            Some(SharedString::from("senior_engineer"))
-        );
-    }
-
-    #[test]
-    fn test_merge_items_synthesizes_missing_tasks_and_syncs_parent_and_goal_id() {
-        let mut graph = AgentTaskGraph {
-            tasks: vec![AgentTaskSummary {
-                id: AgentTaskId::from("TASK-EXISTING"),
-                parent_id: None,
-                goal_id: None,
-                title: "Existing Task".to_string(),
-                status: AgentTaskStatus::Running,
-                attempt: 1,
-                assignee: None,
-                write_scopes: vec![],
-                created_at: None,
-                assigned_profile: None,
-                model: None,
-            }],
-            goals: vec![],
-        };
-
-        let items = vec![
-            AgentUnifiedItem {
-                kind: AgentItemKind::Task,
-                id: "TASK-EXISTING".to_string(),
-                title: "Existing Task Title".to_string(),
-                status: "running".to_string(),
-                priority: 1,
-                created_at: Some(100),
-                failure_reason: None,
-                progress: None,
-                assignee: None,
-                assigned_profile: None,
-                model: None,
-                parent_id: Some("TASK-PARENT".to_string()),
-                goal_id: Some("GOAL-42".to_string()),
-            },
-            AgentUnifiedItem {
-                kind: AgentItemKind::Task,
-                id: "TASK-SYNTHESIZED".to_string(),
-                title: "Synthesized Task".to_string(),
-                status: "ready".to_string(),
-                priority: 2,
-                created_at: Some(200),
-                failure_reason: None,
-                progress: None,
-                assignee: Some(SharedString::from("coder")),
-                assigned_profile: Some(SharedString::from("code_mechanic")),
-                model: Some(SharedString::from("claude-3-7-sonnet")),
-                parent_id: Some("TASK-EXISTING".to_string()),
-                goal_id: Some("GOAL-42".to_string()),
-            },
-        ];
-
-        merge_items_into_graph(&mut graph, &items);
-
-        let existing = &graph.tasks[0];
-        assert_eq!(existing.parent_id, Some(AgentTaskId::from("TASK-PARENT")));
-        assert_eq!(existing.goal_id, Some("GOAL-42".to_string()));
-
-        assert_eq!(graph.tasks.len(), 2);
-        let synthesized = &graph.tasks[1];
-        assert_eq!(synthesized.id, AgentTaskId::from("TASK-SYNTHESIZED"));
-        assert_eq!(synthesized.title, "Synthesized Task");
-        assert_eq!(synthesized.status, AgentTaskStatus::Ready);
-        assert_eq!(
-            synthesized.parent_id,
-            Some(AgentTaskId::from("TASK-EXISTING"))
-        );
-        assert_eq!(synthesized.goal_id, Some("GOAL-42".to_string()));
-        assert_eq!(synthesized.created_at, Some(200));
-        assert_eq!(
-            synthesized.assigned_profile,
-            Some(SharedString::from("code_mechanic"))
-        );
-        assert_eq!(
-            synthesized.model,
-            Some(SharedString::from("claude-3-7-sonnet"))
-        );
-    }
-
-    #[test]
-    fn test_merge_items_parent_id_goal_id_and_synthesize_tasks() {
-        let mut graph = AgentTaskGraph {
-            tasks: vec![AgentTaskSummary {
-                id: AgentTaskId::from("TASK-EXISTING"),
-                parent_id: None,
-                goal_id: None,
-                title: "".to_string(),
-                status: AgentTaskStatus::Ready,
-                attempt: 1,
-                assignee: None,
-                write_scopes: vec![],
-                created_at: None,
-                assigned_profile: None,
-                model: None,
-            }],
-            goals: vec![],
-        };
-
-        let items = vec![
-            AgentUnifiedItem {
-                kind: AgentItemKind::Task,
-                id: "TASK-EXISTING".to_string(),
-                title: "Existing Task Title".to_string(),
-                status: "running".to_string(), // graph status Ready should win
-                priority: 2,
-                created_at: Some(1791500000000),
-                failure_reason: None,
-                progress: None,
-                assignee: Some(SharedString::from("assignee_fallback")),
-                assigned_profile: None,
-                model: Some(SharedString::from("gpt-4o")),
-                parent_id: Some("TASK-PARENT-1".to_string()),
-                goal_id: Some("GOAL-10".to_string()),
-            },
-            AgentUnifiedItem {
-                kind: AgentItemKind::Task,
-                id: "TASK-SYNTHESIZED".to_string(),
-                title: "Synthesized Task".to_string(),
-                status: "running".to_string(),
-                priority: 1,
-                created_at: Some(1791500001000),
-                failure_reason: None,
-                progress: None,
-                assignee: None,
-                assigned_profile: Some(SharedString::from("agent_engineer")),
-                model: Some(SharedString::from("claude-3-7-sonnet")),
-                parent_id: Some("TASK-EXISTING".to_string()),
-                goal_id: Some("GOAL-10".to_string()),
-            },
-        ];
-
-        merge_items_into_graph(&mut graph, &items);
-
-        assert_eq!(graph.tasks.len(), 2);
-        let existing = &graph.tasks[0];
-        assert_eq!(existing.parent_id, Some(AgentTaskId::from("TASK-PARENT-1")));
-        assert_eq!(existing.goal_id, Some("GOAL-10".to_string()));
-        assert_eq!(existing.title, "Existing Task Title");
-        assert_eq!(existing.status, AgentTaskStatus::Ready);
-        assert_eq!(existing.created_at, Some(1791500000000));
-        assert_eq!(
-            existing.assigned_profile,
-            Some(SharedString::from("assignee_fallback"))
-        );
-        assert_eq!(existing.model, Some(SharedString::from("gpt-4o")));
-
-        let synth = &graph.tasks[1];
-        assert_eq!(synth.id, AgentTaskId::from("TASK-SYNTHESIZED"));
-        assert_eq!(synth.parent_id, Some(AgentTaskId::from("TASK-EXISTING")));
-        assert_eq!(synth.goal_id, Some("GOAL-10".to_string()));
-        assert_eq!(synth.title, "Synthesized Task");
-        assert_eq!(synth.status, AgentTaskStatus::Running);
-        assert_eq!(synth.attempt, 1);
-        assert_eq!(synth.created_at, Some(1791500001000));
-        assert_eq!(
-            synth.assigned_profile,
-            Some(SharedString::from("agent_engineer"))
-        );
-        assert_eq!(synth.model, Some(SharedString::from("claude-3-7-sonnet")));
-    }
-
     #[gpui::test]
     async fn test_agent_task_store_refresh_dirty_checking(cx: &mut TestAppContext) {
         use std::sync::atomic::{AtomicUsize, Ordering};
-
-        struct DynamicProvider {
-            graph: parking_lot::Mutex<AgentTaskGraph>,
-            events: parking_lot::Mutex<Vec<AgentTaskEvent>>,
-        }
-
-        impl AgentTaskProvider for DynamicProvider {
-            fn server_id(&self) -> ContextServerId {
-                ContextServerId("dynamic_test".into())
-            }
-
-            fn fetch_graph(&self, _cx: &mut App) -> Task<Result<AgentTaskGraph>> {
-                Task::ready(Ok(self.graph.lock().clone()))
-            }
-
-            fn get_task(&self, _id: &AgentTaskId, _cx: &mut App) -> Task<Result<AgentTaskDetail>> {
-                Task::ready(Err(anyhow::anyhow!("not implemented")))
-            }
-
-            fn complete_task(&self, _id: &AgentTaskId, _cx: &mut App) -> Task<Result<()>> {
-                Task::ready(Ok(()))
-            }
-
-            fn fail_task(
-                &self,
-                _id: &AgentTaskId,
-                _reason: &str,
-                _cx: &mut App,
-            ) -> Task<Result<()>> {
-                Task::ready(Ok(()))
-            }
-
-            fn archive_task(&self, _id: &AgentTaskId, _cx: &mut App) -> Task<Result<()>> {
-                Task::ready(Ok(()))
-            }
-
-            fn unarchive_task(&self, _id: &AgentTaskId, _cx: &mut App) -> Task<Result<()>> {
-                Task::ready(Ok(()))
-            }
-
-            fn delete_task(&self, _id: &AgentTaskId, _cx: &mut App) -> Task<Result<()>> {
-                Task::ready(Ok(()))
-            }
-
-            fn list_events(&self, _limit: u32, _cx: &mut App) -> Task<Result<Vec<AgentTaskEvent>>> {
-                Task::ready(Ok(self.events.lock().clone()))
-            }
-
-            fn list_artifacts(
-                &self,
-                _task_id: &AgentTaskId,
-                _cx: &mut App,
-            ) -> Task<Result<Vec<AgentTaskArtifact>>> {
-                Task::ready(Ok(vec![]))
-            }
-
-            fn get_artifact(
-                &self,
-                _artifact_id: &str,
-                _cx: &mut App,
-            ) -> Task<Result<AgentTaskArtifact>> {
-                Task::ready(Err(anyhow::anyhow!("not implemented")))
-            }
-        }
 
         let initial_graph = AgentTaskGraph {
             tasks: vec![AgentTaskSummary {
@@ -1310,6 +923,8 @@ mod tests {
                 created_at: None,
                 assigned_profile: None,
                 model: None,
+                session_id: None,
+                metrics: None,
             }],
             goals: vec![],
         };
@@ -1345,5 +960,356 @@ mod tests {
         let refresh_task = store.update(cx, |s, cx| s.refresh(cx));
         refresh_task.await.ok();
         assert_eq!(notify_count.load(Ordering::SeqCst), initial_notifies + 1);
+    }
+
+    #[gpui::test]
+    async fn test_agent_task_store_refresh_rehydrates_session_id(cx: &mut TestAppContext) {
+        crate::task_worktree::reset_registry_for_tests();
+
+        let initial_graph = AgentTaskGraph {
+            tasks: vec![AgentTaskSummary {
+                id: AgentTaskId::from("TASK-REHYDRATE-1"),
+                parent_id: None,
+                goal_id: None,
+                title: "Task with session".to_string(),
+                status: AgentTaskStatus::Running,
+                attempt: 1,
+                assignee: None,
+                write_scopes: vec![],
+                created_at: None,
+                assigned_profile: None,
+                model: None,
+                session_id: Some("session-rehydrated-42".to_string()),
+                metrics: None,
+            }],
+            goals: vec![],
+        };
+
+        let provider = Arc::new(TestProvider {
+            tasks: initial_graph.tasks,
+            ..Default::default()
+        });
+
+        assert_eq!(
+            crate::task_worktree::task_session_id_for_id(&AgentTaskId::from("TASK-REHYDRATE-1")),
+            None
+        );
+
+        let _store = cx.update(|cx| cx.new(|cx| AgentTaskStore::new(provider.clone(), cx)));
+        cx.run_until_parked();
+
+        assert_eq!(
+            crate::task_worktree::task_session_id_for_id(&AgentTaskId::from("TASK-REHYDRATE-1")),
+            Some("session-rehydrated-42".to_string())
+        );
+    }
+
+    #[gpui::test]
+    async fn test_terminal_reaction_flips_to_completed_cleans_worktree(cx: &mut TestAppContext) {
+        crate::task_worktree::reset_registry_for_tests();
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            project::project_settings::ProjectSettings::register(cx);
+            agent_settings::AgentSettings::register(cx);
+        });
+
+        let fs = fs::FakeFs::new(cx.executor());
+        fs.insert_tree(
+            "/root",
+            serde_json::json!({
+                ".git": {}
+            }),
+        )
+        .await;
+
+        let project = Project::test(fs.clone(), ["/root".as_ref()], cx).await;
+        let task_id = AgentTaskId::from("TASK-TERM-1");
+        let task = AgentTaskSummary {
+            id: task_id.clone(),
+            title: "Terminal task".to_string(),
+            status: AgentTaskStatus::Ready,
+            ..Default::default()
+        };
+
+        let path = cx
+            .update(|cx| crate::task_worktree::ensure_task_worktree(project.clone(), &task, cx))
+            .await
+            .expect("worktree creation should succeed");
+        assert!(crate::task_worktree::task_worktree_path_for_id(&task_id).is_some());
+
+        let initial_graph = AgentTaskGraph {
+            tasks: vec![task.clone()],
+            goals: vec![],
+        };
+        let provider = Arc::new(DynamicProvider {
+            graph: parking_lot::Mutex::new(initial_graph),
+            events: parking_lot::Mutex::new(Vec::new()),
+        });
+
+        let store = cx.update(|cx| {
+            cx.new(|cx| AgentTaskStore::new_with_project(provider.clone(), Some(project), cx))
+        });
+        cx.run_until_parked();
+
+        assert!(crate::task_worktree::task_worktree_path_for_id(&task_id).is_some());
+
+        let mut completed_task = task.clone();
+        completed_task.status = AgentTaskStatus::Completed;
+        *provider.graph.lock() = AgentTaskGraph {
+            tasks: vec![completed_task],
+            goals: vec![],
+        };
+
+        let refresh_task = store.update(cx, |s, cx| s.refresh(cx));
+        refresh_task.await.ok();
+        cx.run_until_parked();
+
+        assert!(
+            crate::task_worktree::task_worktree_path_for_id(&task_id).is_none(),
+            "worktree should be unregistered after auto cleanup"
+        );
+        assert!(
+            !fs.is_dir(&path).await,
+            "worktree directory should be removed"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_terminal_reaction_active_subagent_session_retains_worktree(
+        cx: &mut TestAppContext,
+    ) {
+        crate::task_worktree::reset_registry_for_tests();
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            project::project_settings::ProjectSettings::register(cx);
+            agent_settings::AgentSettings::register(cx);
+        });
+
+        let fs = fs::FakeFs::new(cx.executor());
+        fs.insert_tree(
+            "/root",
+            serde_json::json!({
+                ".git": {}
+            }),
+        )
+        .await;
+
+        let project = Project::test(fs.clone(), ["/root".as_ref()], cx).await;
+        let task_id = AgentTaskId::from("TASK-TERM-2");
+        let task = AgentTaskSummary {
+            id: task_id.clone(),
+            title: "Terminal task with active session".to_string(),
+            status: AgentTaskStatus::Ready,
+            ..Default::default()
+        };
+
+        let path = cx
+            .update(|cx| crate::task_worktree::ensure_task_worktree(project.clone(), &task, cx))
+            .await
+            .expect("worktree creation should succeed");
+        assert!(crate::task_worktree::task_worktree_path_for_id(&task_id).is_some());
+
+        let initial_graph = AgentTaskGraph {
+            tasks: vec![task.clone()],
+            goals: vec![],
+        };
+        let provider = Arc::new(DynamicProvider {
+            graph: parking_lot::Mutex::new(initial_graph),
+            events: parking_lot::Mutex::new(Vec::new()),
+        });
+
+        let store = cx.update(|cx| {
+            cx.new(|cx| AgentTaskStore::new_with_project(provider.clone(), Some(project), cx))
+        });
+        cx.run_until_parked();
+
+        let guard = crate::task_worktree::SubagentSessionGuard::test_new(task_id.clone());
+
+        let mut completed_task = task.clone();
+        completed_task.status = AgentTaskStatus::Completed;
+        *provider.graph.lock() = AgentTaskGraph {
+            tasks: vec![completed_task],
+            goals: vec![],
+        };
+
+        let refresh_task = store.update(cx, |s, cx| s.refresh(cx));
+        refresh_task.await.ok();
+        cx.run_until_parked();
+
+        assert!(
+            crate::task_worktree::task_worktree_path_for_id(&task_id).is_some(),
+            "worktree should be retained when active session is present"
+        );
+        assert!(
+            fs.is_dir(&path).await,
+            "worktree directory should still exist"
+        );
+
+        drop(guard);
+    }
+
+    #[gpui::test]
+    async fn test_terminal_reaction_terminal_status_unchanged_no_cleanup(cx: &mut TestAppContext) {
+        crate::task_worktree::reset_registry_for_tests();
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            project::project_settings::ProjectSettings::register(cx);
+            agent_settings::AgentSettings::register(cx);
+        });
+
+        let fs = fs::FakeFs::new(cx.executor());
+        fs.insert_tree(
+            "/root",
+            serde_json::json!({
+                ".git": {}
+            }),
+        )
+        .await;
+
+        let project = Project::test(fs.clone(), ["/root".as_ref()], cx).await;
+        let task_id = AgentTaskId::from("TASK-TERM-3");
+        let task = AgentTaskSummary {
+            id: task_id.clone(),
+            title: "Already completed task".to_string(),
+            status: AgentTaskStatus::Completed,
+            ..Default::default()
+        };
+
+        let path = cx
+            .update(|cx| crate::task_worktree::ensure_task_worktree(project.clone(), &task, cx))
+            .await
+            .expect("worktree creation should succeed");
+
+        let initial_graph = AgentTaskGraph {
+            tasks: vec![task.clone()],
+            goals: vec![],
+        };
+        let provider = Arc::new(DynamicProvider {
+            graph: parking_lot::Mutex::new(initial_graph.clone()),
+            events: parking_lot::Mutex::new(Vec::new()),
+        });
+
+        let store = cx.update(|cx| {
+            cx.new(|cx| AgentTaskStore::new_with_project(provider.clone(), Some(project), cx))
+        });
+        cx.run_until_parked();
+
+        let refresh_task = store.update(cx, |s, cx| s.refresh(cx));
+        refresh_task.await.ok();
+        cx.run_until_parked();
+
+        assert!(
+            crate::task_worktree::task_worktree_path_for_id(&task_id).is_some(),
+            "worktree should not be cleaned when terminal status did not change"
+        );
+        assert!(fs.is_dir(&path).await);
+    }
+
+    #[gpui::test]
+    async fn test_terminal_reaction_first_refresh_already_terminal_no_cleanup(
+        cx: &mut TestAppContext,
+    ) {
+        crate::task_worktree::reset_registry_for_tests();
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            project::project_settings::ProjectSettings::register(cx);
+            agent_settings::AgentSettings::register(cx);
+        });
+
+        let fs = fs::FakeFs::new(cx.executor());
+        fs.insert_tree(
+            "/root",
+            serde_json::json!({
+                ".git": {}
+            }),
+        )
+        .await;
+
+        let project = Project::test(fs.clone(), ["/root".as_ref()], cx).await;
+        let task_id = AgentTaskId::from("TASK-TERM-4");
+        let task = AgentTaskSummary {
+            id: task_id.clone(),
+            title: "Startup completed task".to_string(),
+            status: AgentTaskStatus::Completed,
+            ..Default::default()
+        };
+
+        let path = cx
+            .update(|cx| crate::task_worktree::ensure_task_worktree(project.clone(), &task, cx))
+            .await
+            .expect("worktree creation should succeed");
+
+        let initial_graph = AgentTaskGraph {
+            tasks: vec![task.clone()],
+            goals: vec![],
+        };
+        let provider = Arc::new(DynamicProvider {
+            graph: parking_lot::Mutex::new(initial_graph),
+            events: parking_lot::Mutex::new(Vec::new()),
+        });
+
+        let _store = cx.update(|cx| {
+            cx.new(|cx| AgentTaskStore::new_with_project(provider.clone(), Some(project), cx))
+        });
+        cx.run_until_parked();
+
+        assert!(
+            crate::task_worktree::task_worktree_path_for_id(&task_id).is_some(),
+            "worktree should not be cleaned on initial refresh bootstrap"
+        );
+        assert!(fs.is_dir(&path).await);
+    }
+
+    #[gpui::test]
+    async fn test_refresh_task_store_for_project(cx: &mut TestAppContext) {
+        reset_registry_for_tests();
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            project::project_settings::ProjectSettings::register(cx);
+            agent_settings::AgentSettings::register(cx);
+        });
+
+        let fs = fs::FakeFs::new(cx.executor());
+        let project = Project::test(fs.clone(), [], cx).await;
+
+        let calls = Arc::new(Mutex::new(CallCounts::default()));
+        let provider = Arc::new(TestProvider {
+            calls: calls.clone(),
+            ..Default::default()
+        });
+
+        let store = cx.update(|cx| {
+            cx.new(|cx| AgentTaskStore::new_with_project(provider, Some(project.clone()), cx))
+        });
+        cx.run_until_parked();
+
+        let initial_refreshes = calls.lock().unwrap().fetch_graph_count;
+        assert_eq!(initial_refreshes, 1);
+
+        cx.update(|cx| {
+            refresh_task_store_for_project(&project, cx);
+        });
+        cx.run_until_parked();
+
+        assert_eq!(calls.lock().unwrap().fetch_graph_count, 2);
+
+        drop(store);
+        cx.update(|cx| {
+            refresh_task_store_for_project(&project, cx);
+        });
+        cx.run_until_parked();
+
+        assert_eq!(calls.lock().unwrap().fetch_graph_count, 2);
+
+        let reg = PROJECT_TASK_STORES.read();
+        assert!(
+            !reg.contains_key(&project.entity_id()),
+            "dead weak store handle should be pruned on refresh"
+        );
     }
 }

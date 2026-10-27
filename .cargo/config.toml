@@ -1,6 +1,16 @@
 [build]
 # Limit jobs to 4 to prevent LLVM OOM during release builds on machines with <= 16GB RAM
 jobs = 4
+rustc-wrapper = "sccache"
+incremental = false
+
+# Убирает тяжелые PDB у всех внешних библиотек в debug-сборке
+[profile.dev.package."*"]
+debug = false
+
+# Если отладчик в Zed вам не нужен вообще, можно отключить debug-инфо целиком:
+[profile.dev]
+debug = 1
 
 [target.'cfg(all())']
 # v0 mangling scheme provides more detailed backtraces around closures

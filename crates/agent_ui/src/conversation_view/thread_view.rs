@@ -2231,94 +2231,105 @@ impl ThreadView {
         cx.notify();
     }
 
+    pub(crate) fn thread_error_details(
+        &self,
+        error: &ThreadError,
+        cx: &App,
+    ) -> (&'static str, Option<SharedString>, SharedString) {
+        match error {
+            ThreadError::ZedPaymentRequired => (
+                "payment_required",
+                None,
+                "You reached your free usage limit. Upgrade to Zed Pro for more prompts."
+                    .into(),
+            ),
+            ThreadError::Refusal => {
+                let model_or_agent_name = self.current_model_name(cx);
+                let message = format!(
+                    "{} refused to respond to this prompt. This can happen when a model believes the prompt violates its content policy or safety guidelines, so rephrasing it can sometimes address the issue.",
+                    model_or_agent_name
+                );
+                ("refusal", None, message.into())
+            }
+            ThreadError::DataRetentionConsentRequired => {
+                let message = format!(
+                    "{} is not available with Zero Data Retention.",
+                    self.current_model_name(cx)
+                );
+                ("data_retention_consent_required", None, message.into())
+            }
+            ThreadError::AuthenticationRequired(message) => {
+                ("authentication_required", None, message.clone())
+            }
+            ThreadError::RateLimitExceeded { provider } => (
+                "rate_limit_exceeded",
+                None,
+                format!("{provider}'s rate limit was reached.").into(),
+            ),
+            ThreadError::ServerOverloaded { provider } => (
+                "server_overloaded",
+                None,
+                format!("{provider}'s servers are temporarily unavailable.").into(),
+            ),
+            ThreadError::PromptTooLarge => (
+                "prompt_too_large",
+                None,
+                "Context too large for the model's context window.".into(),
+            ),
+            ThreadError::NoCredentials { provider } => (
+                "no_api_key",
+                None,
+                format!("No credentials configured for {provider}.").into(),
+            ),
+            ThreadError::StreamError { provider } => (
+                "stream_error",
+                None,
+                format!("Connection to {provider}'s API was interrupted.").into(),
+            ),
+            ThreadError::AuthenticationFailed { provider } => (
+                "invalid_api_key",
+                None,
+                format!("Authentication with {provider} failed.").into(),
+            ),
+            ThreadError::PermissionDenied { provider, message } => (
+                "permission_denied",
+                None,
+                message.clone().unwrap_or_else(|| {
+                    format!(
+                        "{provider}'s API rejected the request due to insufficient permissions."
+                    )
+                    .into()
+                }),
+            ),
+            ThreadError::ProviderRejection { message } => {
+                ("provider_rejection", None, message.clone())
+            }
+            ThreadError::MaxOutputTokens => (
+                "max_output_tokens",
+                None,
+                "Model reached its maximum output length.".into(),
+            ),
+            ThreadError::NoModelSelected => {
+                ("no_model_selected", None, "No model selected.".into())
+            }
+            ThreadError::ApiError { provider } => (
+                "api_error",
+                None,
+                format!("{provider}'s API returned an unexpected error.").into(),
+            ),
+            ThreadError::Other {
+                acp_error_code,
+                message,
+            } => ("other", acp_error_code.clone(), message.clone()),
+        }
+    }
+
+    pub(crate) fn thread_error_message(&self, error: &ThreadError, cx: &App) -> SharedString {
+        self.thread_error_details(error, cx).2
+    }
+
     fn emit_thread_error_telemetry(&self, error: &ThreadError, cx: &mut Context<Self>) {
-        let (error_kind, acp_error_code, message): (&str, Option<SharedString>, SharedString) =
-            match error {
-                ThreadError::ZedPaymentRequired => (
-                    "payment_required",
-                    None,
-                    "You reached your free usage limit. Upgrade to Zed Pro for more prompts."
-                        .into(),
-                ),
-                ThreadError::Refusal => {
-                    let model_or_agent_name = self.current_model_name(cx);
-                    let message = format!(
-                        "{} refused to respond to this prompt. This can happen when a model believes the prompt violates its content policy or safety guidelines, so rephrasing it can sometimes address the issue.",
-                        model_or_agent_name
-                    );
-                    ("refusal", None, message.into())
-                }
-                ThreadError::DataRetentionConsentRequired => {
-                    let message = format!(
-                        "{} is not available with Zero Data Retention.",
-                        self.current_model_name(cx)
-                    );
-                    ("data_retention_consent_required", None, message.into())
-                }
-                ThreadError::AuthenticationRequired(message) => {
-                    ("authentication_required", None, message.clone())
-                }
-                ThreadError::RateLimitExceeded { provider } => (
-                    "rate_limit_exceeded",
-                    None,
-                    format!("{provider}'s rate limit was reached.").into(),
-                ),
-                ThreadError::ServerOverloaded { provider } => (
-                    "server_overloaded",
-                    None,
-                    format!("{provider}'s servers are temporarily unavailable.").into(),
-                ),
-                ThreadError::PromptTooLarge => (
-                    "prompt_too_large",
-                    None,
-                    "Context too large for the model's context window.".into(),
-                ),
-                ThreadError::NoCredentials { provider } => (
-                    "no_api_key",
-                    None,
-                    format!("No credentials configured for {provider}.").into(),
-                ),
-                ThreadError::StreamError { provider } => (
-                    "stream_error",
-                    None,
-                    format!("Connection to {provider}'s API was interrupted.").into(),
-                ),
-                ThreadError::AuthenticationFailed { provider } => (
-                    "invalid_api_key",
-                    None,
-                    format!("Authentication with {provider} failed.").into(),
-                ),
-                ThreadError::PermissionDenied { provider, message } => (
-                    "permission_denied",
-                    None,
-                    message.clone().unwrap_or_else(|| {
-                        format!(
-                            "{provider}'s API rejected the request due to insufficient permissions."
-                        )
-                        .into()
-                    }),
-                ),
-                ThreadError::ProviderRejection { message } => {
-                    ("provider_rejection", None, message.clone())
-                }
-                ThreadError::MaxOutputTokens => (
-                    "max_output_tokens",
-                    None,
-                    "Model reached its maximum output length.".into(),
-                ),
-                ThreadError::NoModelSelected => {
-                    ("no_model_selected", None, "No model selected.".into())
-                }
-                ThreadError::ApiError { provider } => (
-                    "api_error",
-                    None,
-                    format!("{provider}'s API returned an unexpected error.").into(),
-                ),
-                ThreadError::Other {
-                    acp_error_code,
-                    message,
-                } => ("other", acp_error_code.clone(), message.clone()),
-            };
+        let (error_kind, acp_error_code, message) = self.thread_error_details(error, cx);
 
         let agent_telemetry_id = self.thread.read(cx).connection().telemetry_id();
         let session_id = self.thread.read(cx).session_id().clone();
@@ -11419,13 +11430,12 @@ impl ThreadView {
                 _ => false,
             });
 
-        let model_name = thread_view
-            .and_then(|view| view.read(cx).as_native_thread(cx))
-            .and_then(|thread| {
-                let thread = thread.read(cx);
-                let model = thread.model()?;
-                Some(model.name().0)
-            });
+        let native_thread = thread_view.and_then(|view| view.read(cx).as_native_thread(cx));
+        let model_name = native_thread.as_ref().and_then(|thread| {
+            let thread = thread.read(cx);
+            let model = thread.model()?;
+            Some(model.name().0)
+        });
         let thread_title = thread
             .as_ref()
             .and_then(|t| t.read(cx).title())
@@ -11544,7 +11554,8 @@ impl ThreadView {
             "Click to Preview"
         };
 
-        let error_message = self.subagent_error_message(&tool_call.status(), tool_call, cx);
+        let error_message =
+            self.subagent_error_message(&tool_call.status(), tool_call, thread_view, cx);
 
         let title_line = h_flex()
             .min_w_0()
@@ -11558,25 +11569,49 @@ impl ThreadView {
                     .truncate(),
             );
 
+        let worktree_name = native_thread
+            .as_ref()
+            .and_then(|nt| nt.read(cx).worktree_root_path(cx))
+            .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+            .or_else(|| {
+                task_id.as_ref().and_then(|id| {
+                    agent::task_worktree::task_worktree_path_for_id(&agent::AgentTaskId::from(
+                        id.as_str(),
+                    ))
+                    .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+                })
+            })
+            .or_else(|| {
+                tool_call
+                    .raw_output
+                    .as_ref()
+                    .and_then(|output| output.get("isolation"))
+                    .and_then(|v| v.as_str())
+                    .and_then(|iso| {
+                        iso.strip_prefix("worktree:")
+                            .or_else(|| iso.strip_prefix("checkout:"))
+                            .map(|remainder| remainder.to_string())
+                    })
+                    .filter(|s| !s.is_empty())
+            });
+
+        let formatted_duration = thread
+            .as_ref()
+            .and_then(|thread| thread.read(cx).activity_duration())
+            .map(|duration| {
+                let secs = duration.as_secs();
+                if secs < 60 {
+                    format!("{secs}s")
+                } else {
+                    format!("{}m {}s", secs / 60, secs % 60)
+                }
+            });
+
+        let token_usage = native_thread
+            .as_ref()
+            .map(|thread| thread.read(cx).cumulative_token_usage());
+
         let mut metadata_segments: Vec<AnyElement> = Vec::new();
-
-        metadata_segments.push(
-            Label::new(profile_label.clone())
-                .size(LabelSize::Custom(self.tool_name_font_size()))
-                .color(Color::Muted)
-                .flex_none()
-                .into_any_element(),
-        );
-
-        if let Some(model_name) = model_name {
-            metadata_segments.push(
-                Label::new(model_name)
-                    .size(LabelSize::Custom(self.tool_name_font_size()))
-                    .color(Color::Muted)
-                    .flex_none()
-                    .into_any_element(),
-            );
-        }
 
         if let Some(goal_id) = goal_id {
             metadata_segments.push(
@@ -11596,6 +11631,67 @@ impl ThreadView {
                     .flex_none()
                     .into_any_element(),
             );
+        }
+
+        metadata_segments.push(
+            Label::new(profile_label.clone())
+                .size(LabelSize::Custom(self.tool_name_font_size()))
+                .color(Color::Muted)
+                .flex_none()
+                .into_any_element(),
+        );
+
+        if let Some(model_name) = model_name {
+            metadata_segments.push(
+                Label::new(model_name)
+                    .size(LabelSize::Custom(self.tool_name_font_size()))
+                    .color(Color::Muted)
+                    .flex_none()
+                    .into_any_element(),
+            );
+        }
+
+        if let Some(worktree_name) = worktree_name {
+            metadata_segments.push(
+                h_flex()
+                    .flex_none()
+                    .gap_0p5()
+                    .items_center()
+                    .max_w_32()
+                    .overflow_hidden()
+                    .child(
+                        Icon::new(IconName::GitWorktree)
+                            .size(IconSize::Custom(self.tool_name_font_size()))
+                            .color(Color::Muted),
+                    )
+                    .child(
+                        Label::new(worktree_name)
+                            .size(LabelSize::Custom(self.tool_name_font_size()))
+                            .color(Color::Muted)
+                            .truncate(),
+                    )
+                    .into_any_element(),
+            );
+        }
+
+        if let Some(usage) = token_usage {
+            let out = usage.output_tokens;
+            let in_tokens = usage.input_tokens;
+            let cached = usage.cache_read_input_tokens + usage.cache_creation_input_tokens;
+            if out > 0 || in_tokens > 0 || cached > 0 {
+                metadata_segments.push(
+                    Label::new(format!(
+                        "{}/{}/{}",
+                        crate::humanize_token_count(out),
+                        crate::humanize_token_count(in_tokens),
+                        crate::humanize_token_count(cached),
+                    ))
+                    .size(LabelSize::Custom(self.tool_name_font_size()))
+                    .color(Color::Muted)
+                    .flex_none()
+                    .into_any_element(),
+                );
+            }
         }
 
         if files_changed > 0 {
@@ -11650,6 +11746,7 @@ impl ThreadView {
                     .px_1()
                     .py_1()
                     .w_full()
+                    .gap_1p5()
                     .items_center()
                     .justify_between()
                     .when(!has_no_title_or_canceled, |this| {
@@ -11715,6 +11812,24 @@ impl ThreadView {
                                     }))
                             }),
                     )
+                    .when_some(formatted_duration, |this, duration_str| {
+                        this.child(
+                            h_flex()
+                                .flex_none()
+                                .gap_0p5()
+                                .items_center()
+                                .child(
+                                    Icon::new(IconName::Clock)
+                                        .size(IconSize::Custom(self.tool_name_font_size()))
+                                        .color(Color::Muted),
+                                )
+                                .child(
+                                    Label::new(duration_str)
+                                        .size(LabelSize::Custom(self.tool_name_font_size()))
+                                        .color(Color::Muted),
+                                ),
+                        )
+                    })
                     .when(is_running && subagent_session_id.is_some(), |buttons| {
                         buttons.child(
                             IconButton::new(format!("stop-subagent-{}", entry_ix), IconName::Stop)
@@ -11805,7 +11920,8 @@ impl ThreadView {
                                 Callout::new()
                                     .severity(Severity::Error)
                                     .icon(IconName::XCircle)
-                                    .title(message),
+                                    .title("Subagent Failed")
+                                    .description(message),
                             )
                         })
                         .child(fullscreen_toggle)
@@ -11912,25 +12028,51 @@ impl ThreadView {
         &self,
         status: &ToolCallStatus,
         tool_call: &ToolCall,
+        thread_view: Option<&Entity<ThreadView>>,
         cx: &App,
     ) -> Option<SharedString> {
-        if matches!(status, ToolCallStatus::Failed) {
-            tool_call.content().iter().find_map(|content| {
-                if let ToolCallContent::ContentBlock { block, .. } = content {
-                    if let Some(source) = block.text_content(cx).filter(|source| !source.is_empty())
-                    {
-                        if source == "User canceled" {
-                            return None;
-                        } else {
-                            return Some(SharedString::from(source));
-                        }
-                    }
-                }
-                None
-            })
-        } else {
-            None
+        if !matches!(status, ToolCallStatus::Failed | ToolCallStatus::Rejected) {
+            return None;
         }
+
+        let is_user_canceled = tool_call.content().iter().any(|content| match content {
+            ToolCallContent::ContentBlock { block, .. } => {
+                block.text_content(cx) == Some("User canceled")
+            }
+            ToolCallContent::Other { markdown, .. } => {
+                markdown.read(cx).source().as_ref() == "User canceled"
+            }
+            _ => false,
+        });
+        if is_user_canceled {
+            return None;
+        }
+
+        let content_message = tool_call.content().iter().find_map(|content| match content {
+            ToolCallContent::ContentBlock { block, .. } => {
+                let source = block.text_content(cx).filter(|source| !source.is_empty())?;
+                if source == "User canceled" {
+                    None
+                } else {
+                    Some(SharedString::from(source))
+                }
+            }
+            ToolCallContent::Other { markdown, .. } => {
+                let source = markdown.read(cx).source();
+                if source.is_empty() || source.as_ref() == "User canceled" {
+                    None
+                } else {
+                    Some(source.clone())
+                }
+            }
+            _ => None,
+        });
+
+        content_message.or_else(|| {
+            let subagent_view = thread_view?.read(cx);
+            let thread_error = subagent_view.thread_error.as_ref()?;
+            Some(subagent_view.thread_error_message(thread_error, cx))
+        })
     }
 
     fn tool_card_header_bg(&self, cx: &Context<Self>) -> Hsla {

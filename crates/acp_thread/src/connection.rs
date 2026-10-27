@@ -121,6 +121,18 @@ pub trait AgentConnection {
         Task::ready(Err(anyhow::Error::msg("Loading sessions is not supported")))
     }
 
+    /// Load an existing session by ID in standalone mode (promoted, detached from parent).
+    fn load_session_standalone(
+        self: Rc<Self>,
+        session_id: acp_v1::SessionId,
+        project: Entity<Project>,
+        work_dirs: PathList,
+        title: Option<SharedString>,
+        cx: &mut App,
+    ) -> Task<Result<Entity<AcpThread>>> {
+        self.load_session(session_id, project, work_dirs, title, cx)
+    }
+
     /// Whether this agent supports closing existing sessions.
     fn supports_close_session(&self) -> bool {
         false

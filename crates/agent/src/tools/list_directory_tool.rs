@@ -1,6 +1,6 @@
 use super::tool_permissions::{
     ResolvedProjectPath, authorize_symlink_access, canonicalize_worktree_roots,
-    resolve_global_skill_path, resolve_project_path,
+    is_inside_task_worktree, resolve_global_skill_path, resolve_tool_path,
 };
 use crate::{AgentTool, ToolCallEventStream, ToolInput};
 use agent_client_protocol::schema::v1 as acp;
@@ -214,17 +214,36 @@ impl AgentTool for ListDirectoryTool {
                 .await
                 .map_err(|e| e.to_string())?;
 
+            let task_worktree = cx.update(|cx| event_stream.task_worktree(cx));
+
             // Sometimes models will return these even though we tell it to give a path and not a glob.
             // When this happens, just list the root worktree directories.
             if matches!(input.path.as_str(), "." | "" | "./" | "*") {
                 let output = project.read_with(cx, |project, cx| {
                     project
                         .worktrees(cx)
+                        .filter(|worktree| {
+                            if let Some(task_worktree) = &task_worktree {
+                                is_inside_task_worktree(
+                                    worktree.read(cx).abs_path().as_ref(),
+                                    task_worktree,
+                                )
+                            } else {
+                                true
+                            }
+                        })
                         .filter_map(|worktree| {
                             let worktree = worktree.read(cx);
                             let root_entry = worktree.root_entry()?;
+                            let root_name = worktree.root_name().display(worktree.path_style());
+                            let path_str = root_entry.path.display(worktree.path_style());
                             if root_entry.is_dir() {
-                                Some(root_entry.path.display(worktree.path_style()))
+                                let display = if path_str.is_empty() {
+                                    root_name
+                                } else {
+                                    path_str
+                                };
+                                Some(display)
                             } else {
                                 None
                             }
@@ -255,7 +274,13 @@ impl AgentTool for ListDirectoryTool {
 
             let (project_path, symlink_canonical_target) =
                 project.read_with(cx, |project, cx| -> anyhow::Result<_> {
-                    let resolved = resolve_project_path(project, &input.path, &canonical_roots, cx)?;
+                    let resolved = resolve_tool_path(
+                        project,
+                        task_worktree.as_deref(),
+                        &input.path,
+                        &canonical_roots,
+                        cx,
+                    )?;
                     Ok(match resolved {
                         ResolvedProjectPath::Safe(path) => (path, None),
                         ResolvedProjectPath::SymlinkEscape {
@@ -338,7 +363,7 @@ impl AgentTool for ListDirectoryTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui::{TestAppContext, UpdateGlobal};
+    use gpui::{AppContext, TestAppContext, UpdateGlobal};
     use indoc::indoc;
     use project::{FakeFs, Project};
     use serde_json::json;
@@ -1250,6 +1275,125 @@ mod tests {
         assert!(
             result.is_err(),
             "path outside skills dir should be rejected"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_list_directory_isolated_task_worktree(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let host_root = path!("/host_project");
+        let task_worktree_path = path!("/worktrees/agent-task-2");
+
+        fs.insert_tree(
+            host_root,
+            serde_json::json!({
+                "host_file.rs": "fn host() {}",
+                "host_dir": {
+                    "sub.rs": ""
+                }
+            }),
+        )
+        .await;
+
+        fs.insert_tree(
+            task_worktree_path,
+            serde_json::json!({
+                "task_file.rs": "fn task() {}",
+                "task_dir": {
+                    "sub.rs": ""
+                }
+            }),
+        )
+        .await;
+
+        let project = Project::test(fs.clone(), [host_root.as_ref()], cx).await;
+        let (tree, _) = project
+            .update(cx, |project, cx| {
+                project.find_or_create_worktree(std::path::Path::new(task_worktree_path), false, cx)
+            })
+            .await
+            .unwrap();
+        tree.read_with(cx, |tree, _| tree.as_local().unwrap().scan_complete())
+            .await;
+        cx.run_until_parked();
+
+        let tool = Arc::new(ListDirectoryTool::new(project.clone()));
+
+        let thread = cx.update(|cx| {
+            let project_context = cx.new(|_cx| crate::ProjectContext::default());
+            let context_server_store = project.read(cx).context_server_store();
+            let context_server_registry =
+                cx.new(|cx| crate::tools::ContextServerRegistry::new(context_server_store, cx));
+            cx.new(|cx| {
+                let mut t = crate::Thread::new(
+                    project.clone(),
+                    project_context,
+                    context_server_registry,
+                    crate::Templates::new(),
+                    None,
+                    cx,
+                );
+                t.set_task_worktree(Some(std::path::PathBuf::from(task_worktree_path)));
+                t
+            })
+        });
+
+        let (event_stream, _) = ToolCallEventStream::test_with_thread(&thread);
+
+        // 1. Root listing in isolated thread lists ONLY the task worktree
+        let output = cx
+            .update(|cx| {
+                let input = ListDirectoryToolInput {
+                    path: ".".to_string(),
+                };
+                tool.clone().run(ToolInput::resolved(input), event_stream.clone(), cx)
+            })
+            .await
+            .unwrap();
+        assert!(
+            output.contains("agent-task-2"),
+            "should list task worktree root: {output}"
+        );
+        assert!(
+            !output.contains("host_project"),
+            "should NOT list host root: {output}"
+        );
+
+        // 2. Listing relative task worktree directory returns only task worktree entries
+        let output = cx
+            .update(|cx| {
+                let input = ListDirectoryToolInput {
+                    path: "task_dir".to_string(),
+                };
+                tool.clone().run(ToolInput::resolved(input), event_stream.clone(), cx)
+            })
+            .await
+            .unwrap();
+        assert!(
+            output.contains("task_dir/sub.rs") || output.contains("task_dir\\sub.rs"),
+            "expected task_dir/sub.rs, got: {output}"
+        );
+
+        // 3. Absolute host-worktree directory is denied in isolated thread
+        let host_dir_abs = format!("{}/host_dir", host_root);
+        let result = cx
+            .update(|cx| {
+                let input = ListDirectoryToolInput {
+                    path: host_dir_abs,
+                };
+                tool.clone().run(ToolInput::resolved(input), event_stream, cx)
+            })
+            .await;
+        assert!(
+            result.is_err(),
+            "host directory path should be denied in isolated thread"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("is outside the isolated task worktree"),
+            "error message should name allowed root: {err}"
         );
     }
 }

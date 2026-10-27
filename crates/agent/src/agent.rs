@@ -280,6 +280,7 @@ impl Session {
 
 struct PendingSession {
     task: Shared<Task<Result<Entity<AcpThread>, Arc<anyhow::Error>>>>,
+    promoted: bool,
 }
 
 pub struct LanguageModels {
@@ -834,20 +835,25 @@ impl NativeAgent {
             )
         });
 
-        self.register_session(thread, project_id, cx)
+        self.register_session(thread, project_id, false, cx)
     }
 
     fn register_session(
         &mut self,
         thread_handle: Entity<Thread>,
         project_id: EntityId,
+        promote: bool,
         cx: &mut Context<Self>,
     ) -> Entity<AcpThread> {
         let connection = Rc::new(NativeAgentConnection(cx.entity()));
 
         let thread = thread_handle.read(cx);
         let session_id = thread.id().clone();
-        let parent_session_id = thread.parent_thread_id();
+        let parent_session_id = if promote {
+            None
+        } else {
+            thread.parent_thread_id()
+        };
         let title = thread.title();
         let draft_prompt = thread.draft_prompt().map(Vec::from);
         let scroll_position = thread.ui_scroll_position();
@@ -1329,7 +1335,7 @@ impl NativeAgent {
         })
     }
 
-    fn load_worktree_info_for_system_prompt(
+    pub(crate) fn load_worktree_info_for_system_prompt(
         worktree: Entity<Worktree>,
         project: Entity<Project>,
         cx: &mut App,
@@ -1746,9 +1752,31 @@ impl NativeAgent {
         project: Entity<Project>,
         cx: &mut Context<Self>,
     ) -> Task<Result<Entity<AcpThread>>> {
+        self.open_thread_internal(id, project, false, cx)
+    }
+
+    pub fn open_thread_standalone(
+        &mut self,
+        id: acp_v1::SessionId,
+        project: Entity<Project>,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<Entity<AcpThread>>> {
+        self.open_thread_internal(id, project, true, cx)
+    }
+
+    fn open_thread_internal(
+        &mut self,
+        id: acp_v1::SessionId,
+        project: Entity<Project>,
+        promote: bool,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<Entity<AcpThread>>> {
         if let Some(session) = self.sessions.get(&id) {
             if let Some(acp_thread) = session.acp_thread.upgrade() {
-                return Task::ready(Ok(acp_thread));
+                let is_already_standalone = acp_thread.read(cx).parent_session_id().is_none();
+                if !promote || is_already_standalone {
+                    return Task::ready(Ok(acp_thread));
+                }
             }
             let acp_thread_id = session.acp_thread.entity_id();
             let draft_prompt = session.draft_prompt(cx);
@@ -1756,8 +1784,10 @@ impl NativeAgent {
         }
 
         if let Some(pending) = self.pending_sessions.get(&id) {
-            let task = pending.task.clone();
-            return cx.background_spawn(async move { task.await.map_err(|err| anyhow!(err)) });
+            if pending.promoted == promote {
+                let task = pending.task.clone();
+                return cx.background_spawn(async move { task.await.map_err(|err| anyhow!(err)) });
+            }
         }
 
         let task = self.load_thread(id.clone(), project.clone(), cx);
@@ -1779,7 +1809,7 @@ impl NativeAgent {
                         .update(cx, |this, cx| {
                             let project_id = this.get_or_create_project_state(&project, cx);
                             this.pending_sessions.remove(&id);
-                            this.register_session(thread.clone(), project_id, cx)
+                            this.register_session(thread.clone(), project_id, promote, cx)
                         })
                         .map_err(Arc::new)?;
                     let events = thread.update(cx, |thread, cx| thread.replay(cx));
@@ -1801,6 +1831,7 @@ impl NativeAgent {
             id,
             PendingSession {
                 task: shared_task.clone(),
+                promoted: promote,
             },
         );
 
@@ -2883,6 +2914,19 @@ impl acp_thread::AgentConnection for NativeAgentConnection {
             .update(cx, |agent, cx| agent.open_thread(session_id, project, cx))
     }
 
+    fn load_session_standalone(
+        self: Rc<Self>,
+        session_id: acp_v1::SessionId,
+        project: Entity<Project>,
+        _work_dirs: PathList,
+        _title: Option<SharedString>,
+        cx: &mut App,
+    ) -> Task<Result<Entity<acp_thread::AcpThread>>> {
+        self.0.update(cx, |agent, cx| {
+            agent.open_thread_standalone(session_id, project, cx)
+        })
+    }
+
     fn auth_methods(&self) -> &[acp_v2::AuthMethod] {
         &[] // No auth for in-process
     }
@@ -3403,7 +3447,7 @@ impl NativeThreadEnvironment {
                 &parent_thread_entity,
                 profile,
                 model.as_ref(),
-                task_worktree,
+                task_worktree.clone(),
                 cx,
             );
             let title = if depth > 1 {
@@ -3415,6 +3459,15 @@ impl NativeThreadEnvironment {
             thread
         });
 
+        if let Some(ref task_worktree) = task_worktree {
+            self.setup_isolated_project_context(
+                &subagent_thread,
+                task_worktree,
+                &parent_thread_entity,
+                cx,
+            );
+        }
+
         let session_id = subagent_thread.read(cx).id().clone();
 
         let acp_thread = self
@@ -3425,7 +3478,8 @@ impl NativeThreadEnvironment {
                     .get(&parent_session_id)
                     .map(|s| s.project_id)
                     .context("parent session not found")?;
-                let acp_thread = agent.register_session(subagent_thread.clone(), project_id, cx);
+                let acp_thread =
+                    agent.register_session(subagent_thread.clone(), project_id, false, cx);
                 let parent_session = agent
                     .sessions
                     .get_mut(&parent_session_id)
@@ -3484,16 +3538,69 @@ impl NativeThreadEnvironment {
         task_worktree: Option<PathBuf>,
         cx: &mut App,
     ) -> Result<Rc<dyn SubagentHandle>> {
-        let (subagent_thread, acp_thread) = self.agent.update(cx, |agent, _cx| {
-            let session = agent
-                .sessions
-                .get(&session_id)
-                .ok_or_else(|| anyhow!("No subagent session found with id {session_id}"))?;
-            let acp_thread = session
-                .acp_thread
+        let (subagent_thread, acp_thread) = self.agent.update(cx, |agent, cx| {
+            if let Some(session) = agent.sessions.get(&session_id) {
+                if let Some(acp_thread) = session.acp_thread.upgrade() {
+                    return anyhow::Ok((session.thread.clone(), acp_thread));
+                }
+            }
+
+            let parent_thread_entity = self
+                .thread
                 .upgrade()
-                .ok_or_else(|| anyhow!("Subagent session {session_id} was released"))?;
-            anyhow::Ok((session.thread.clone(), acp_thread))
+                .ok_or_else(|| anyhow!("Parent thread no longer exists"))?;
+            let (project, parent_session_id) = {
+                let parent_thread = parent_thread_entity.read(cx);
+                (parent_thread.project().clone(), parent_thread.id().clone())
+            };
+            let database = ThreadsDatabase::from_cx(cx)
+                .ok_or_else(|| anyhow!("No subagent session found with id {session_id}"))?;
+            let db_thread = database
+                .load_thread_sync(&session_id)?
+                .ok_or_else(|| anyhow!("No subagent session found with id {session_id}"))?;
+
+            let project_id = agent.get_or_create_project_state(&project, cx);
+            let project_state = agent
+                .projects
+                .get(&project_id)
+                .context("project state not found")?;
+            let summarization_model =
+                LanguageModelRegistry::read_global(cx).thread_summary_model(cx);
+            let templates = agent.templates.clone();
+
+            let subagent_thread = cx.new(|cx| {
+                let mut thread = Thread::from_db(
+                    session_id.clone(),
+                    db_thread,
+                    project_state.project.clone(),
+                    project_state.project_context.clone(),
+                    project_state.context_server_registry.clone(),
+                    templates,
+                    cx,
+                );
+                thread.set_summarization_model(summarization_model, cx);
+                thread
+            });
+
+            let acp_thread = agent.register_session(subagent_thread.clone(), project_id, false, cx);
+            let parent_session = agent
+                .sessions
+                .get_mut(&parent_session_id)
+                .context("parent session not found")?;
+            parent_session.subagents.push(acp_thread.clone());
+
+            let events = subagent_thread.update(cx, |thread, cx| thread.replay(cx));
+            let weak_acp = acp_thread.downgrade();
+            cx.spawn(async move |_this, cx| {
+                cx.update(|cx| {
+                    NativeAgentConnection::handle_thread_events(events, weak_acp, None, cx)
+                })
+                .await
+                .log_err();
+            })
+            .detach();
+
+            anyhow::Ok((subagent_thread, acp_thread))
         })??;
 
         // A follow-up keeps running the resumed agent, so it holds a
@@ -3549,10 +3656,33 @@ impl NativeThreadEnvironment {
             });
         }
 
-        if let Some(task_worktree) = task_worktree {
-            subagent_thread.update(cx, |thread, _cx| {
-                thread.set_task_worktree(Some(task_worktree));
+        let effective_task_worktree = task_worktree
+            .or_else(|| subagent_thread.read(cx).task_worktree().map(|p| p.to_path_buf()))
+            .or_else(|| {
+                let found_task_id = subagent_thread
+                    .read(cx)
+                    .task_id()
+                    .map(|tid| crate::AgentTaskId::from(tid.to_string()))
+                    .or_else(|| crate::task_worktree::task_id_for_session_id(&session_id.to_string()));
+                if let Some(ref tid) = found_task_id {
+                    if subagent_thread.read(cx).task_id().is_none() {
+                        subagent_thread.update(cx, |t, _| t.set_task_id(Some(tid.to_string())));
+                    }
+                }
+                found_task_id.and_then(|tid| crate::task_worktree::task_worktree_path_for_id(&tid))
             });
+        if let Some(task_worktree) = effective_task_worktree {
+            subagent_thread.update(cx, |thread, _cx| {
+                thread.set_task_worktree(Some(task_worktree.clone()));
+            });
+            if let Some(parent_thread_entity) = self.thread.upgrade() {
+                self.setup_isolated_project_context(
+                    &subagent_thread,
+                    &task_worktree,
+                    &parent_thread_entity,
+                    cx,
+                );
+            }
         }
 
         let depth = subagent_thread.read(cx).depth();
@@ -3568,6 +3698,58 @@ impl NativeThreadEnvironment {
         }
 
         self.prompt_subagent(session_id, subagent_thread, acp_thread, slot_guard)
+    }
+
+    fn setup_isolated_project_context(
+        &self,
+        subagent_thread: &Entity<Thread>,
+        task_worktree: &Path,
+        parent_thread: &Entity<Thread>,
+        cx: &mut App,
+    ) {
+        let project = parent_thread.read(cx).project().clone();
+        let skills = parent_thread
+            .read(cx)
+            .project_context()
+            .read(cx)
+            .skills()
+            .to_vec();
+
+        let task_id = subagent_thread
+            .read(cx)
+            .task_id()
+            .map(|tid| crate::AgentTaskId::from(tid.to_string()));
+
+        let (initial_worktree_context, worktree_entity) =
+            initial_task_worktree_context(&project, task_id.as_ref(), task_worktree, cx);
+
+        let project_context = cx.new(|_| {
+            ProjectContext::new(vec![initial_worktree_context]).with_skills(skills)
+        });
+        subagent_thread.update(cx, |thread, _cx| {
+            thread.set_project_context(project_context.clone());
+        });
+
+        if let Some(worktree_entity) = worktree_entity {
+            let info_task = NativeAgent::load_worktree_info_for_system_prompt(
+                worktree_entity,
+                project,
+                cx,
+            );
+            let subagent_project_context = project_context;
+            let worktree_path = task_worktree.to_path_buf();
+            cx.spawn(async move |cx| {
+                let (worktree_context, _) = info_task.await;
+                crate::task_worktree::cache_task_worktree_context(worktree_path, worktree_context.clone());
+                cx.update(|cx| {
+                    subagent_project_context.update(cx, |ctx, cx| {
+                        ctx.worktrees = vec![worktree_context];
+                        ctx.has_rules = ctx.worktrees.iter().any(|w| w.rules_file.is_some());
+                        cx.notify();
+                    });
+                });
+            }).detach();
+        }
     }
 
     fn prompt_subagent(
@@ -3589,6 +3771,56 @@ impl NativeThreadEnvironment {
         )) as _)
     }
 }
+
+pub(crate) fn find_task_worktree_entity(
+    project: &Entity<Project>,
+    task_id: Option<&crate::AgentTaskId>,
+    path: &Path,
+    cx: &App,
+) -> Option<Entity<Worktree>> {
+    task_id
+        .and_then(|tid| crate::task_worktree::task_worktree_entity_for_id(project.entity_id(), tid))
+        .or_else(|| {
+            crate::task_worktree::task_worktree_entity_for_path(project.entity_id(), path, cx)
+        })
+        .or_else(|| {
+            project.read(cx).worktrees(cx).find(|w| {
+                let abs = w.read(cx).abs_path();
+                abs.as_ref() == path
+                    || util::paths::normalize_lexically(abs.as_ref()).ok().as_deref()
+                        == util::paths::normalize_lexically(path).ok().as_deref()
+            })
+        })
+}
+
+pub(crate) fn initial_task_worktree_context(
+    project: &Entity<Project>,
+    task_id: Option<&crate::AgentTaskId>,
+    path: &Path,
+    cx: &App,
+) -> (WorktreeContext, Option<Entity<Worktree>>) {
+    let worktree_entity = find_task_worktree_entity(project, task_id, path, cx);
+    let cached = crate::task_worktree::cached_task_worktree_context(path);
+    let worktree_context = cached.unwrap_or_else(|| {
+        let (root_name, abs_path) = if let Some(ref worktree_entity) = worktree_entity {
+            let tree = worktree_entity.read(cx);
+            (tree.root_name_str().to_string(), tree.abs_path())
+        } else {
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| path.to_string_lossy().to_string());
+            (name, Arc::from(path))
+        };
+        WorktreeContext {
+            root_name,
+            abs_path,
+            rules_file: None,
+        }
+    });
+    (worktree_context, worktree_entity)
+}
+
 
 impl ThreadEnvironment for NativeThreadEnvironment {
     fn create_terminal(
@@ -3722,14 +3954,44 @@ impl ThreadEnvironment for NativeThreadEnvironment {
         goal_id: Option<String>,
         base_branch: Option<String>,
         on_branch: Option<String>,
+        worktree_of: Option<String>,
         cx: &mut AsyncApp,
     ) -> Task<Result<PathBuf>> {
         let Some(parent_thread_entity) = self.thread.upgrade() else {
             return Task::ready(Err(anyhow!("Parent thread no longer exists")));
         };
+        if let Some(ref host_id) = worktree_of {
+            let host_task_id = crate::AgentTaskId::from(host_id.clone());
+            if let Some(path) = crate::task_worktree::task_worktree_path_for_id(&host_task_id) {
+                let project = cx.update(|cx| parent_thread_entity.read(cx).project().clone());
+                let info_task = cx.update(|cx| {
+                    let worktree_entity = find_task_worktree_entity(
+                        &project,
+                        Some(&host_task_id),
+                        &path,
+                        cx,
+                    );
+                    worktree_entity.map(|we| {
+                        NativeAgent::load_worktree_info_for_system_prompt(we, project.clone(), cx)
+                    })
+                });
+                return cx.spawn(async move |_| {
+                    if let Some(info_task) = info_task {
+                        let (worktree_context, _) = info_task.await;
+                        crate::task_worktree::cache_task_worktree_context(path.clone(), worktree_context);
+                    }
+                    Ok(path)
+                });
+            } else {
+                return Task::ready(Err(anyhow!("host task '{host_id}' has no active worktree")));
+            }
+        }
         let project = cx.update(|cx| parent_thread_entity.read(cx).project().clone());
+        let task_id_typed = crate::AgentTaskId::from(task_id);
+        let on_branch = on_branch.or_else(|| crate::task_worktree::task_worktree_checkout_target(&task_id_typed));
+        let goal_id = goal_id.or_else(|| crate::task_worktree::task_worktree_goal_branch(&task_id_typed));
         let task_summary = crate::AgentTaskSummary {
-            id: crate::AgentTaskId::from(task_id),
+            id: task_id_typed.clone(),
             parent_id: None,
             goal_id: goal_id.clone(),
             title: format!("agent-task/{task_id}"),
@@ -3740,24 +4002,118 @@ impl ThreadEnvironment for NativeThreadEnvironment {
             created_at: None,
             assigned_profile: None,
             model: None,
+            session_id: None,
+            metrics: None,
         };
-        cx.update(|cx| {
-            crate::task_worktree::ensure_task_worktree_with_policy(
-                project,
-                &task_summary,
-                goal_id,
-                base_branch,
-                on_branch,
-                cx,
-            )
+        cx.spawn(async move |cx| {
+            let ensure_task = cx.update(|cx| {
+                crate::task_worktree::ensure_task_worktree_with_policy(
+                    project.clone(),
+                    &task_summary,
+                    goal_id,
+                    base_branch,
+                    on_branch,
+                    cx,
+                )
+            });
+            let worktree_path = ensure_task.await?;
+            let info_task = cx.update(|cx| {
+                let worktree_entity = find_task_worktree_entity(
+                    &project,
+                    Some(&task_id_typed),
+                    &worktree_path,
+                    cx,
+                );
+                worktree_entity.map(|we| {
+                    NativeAgent::load_worktree_info_for_system_prompt(we, project.clone(), cx)
+                })
+            });
+            if let Some(info_task) = info_task {
+                let (worktree_context, _) = info_task.await;
+                crate::task_worktree::cache_task_worktree_context(worktree_path.clone(), worktree_context);
+            }
+            Ok(worktree_path)
         })
     }
 
+    fn ensure_subagent_loaded(
+        &self,
+        session_id: &acp_v1::SessionId,
+        cx: &mut AsyncApp,
+    ) -> Task<Result<()>> {
+        let (agent, project, parent_session_id) = match cx.update(|cx| {
+            let agent = self.agent.upgrade().context("Agent no longer exists")?;
+            let parent_thread = self
+                .thread
+                .upgrade()
+                .context("Parent thread no longer exists")?;
+            if let Some(session) = agent.read(cx).sessions.get(session_id) {
+                if session.acp_thread.upgrade().is_some() {
+                    return Ok(None);
+                }
+            }
+            let project = parent_thread.read(cx).project().clone();
+            let parent_session_id = parent_thread.read(cx).id().clone();
+            anyhow::Ok(Some((agent, project, parent_session_id)))
+        }) {
+            Ok(Some(tuple)) => tuple,
+            Ok(None) => return Task::ready(Ok(())),
+            Err(err) => return Task::ready(Err(err)),
+        };
+
+        let session_id = session_id.clone();
+        cx.spawn(async move |cx| {
+            let open_task = cx.update(|cx| {
+                agent.update(cx, |agent, cx| {
+                    agent.open_thread(session_id.clone(), project, cx)
+                })
+            });
+            let acp_thread = open_task.await?;
+            cx.update(|cx| {
+                agent.update(cx, |agent, cx| {
+                    if let Some(parent_session) = agent.sessions.get_mut(&parent_session_id) {
+                        if !parent_session
+                            .subagents
+                            .iter()
+                            .any(|subagent| subagent.read(cx).session_id() == &session_id)
+                        {
+                            parent_session.subagents.push(acp_thread);
+                        }
+                    }
+                })
+            });
+            Ok(())
+        })
+    }
+
+    fn subagent_profile_id(
+        &self,
+        session_id: &acp_v1::SessionId,
+        cx: &App,
+    ) -> Option<agent_settings::AgentProfileId> {
+        if let Some(agent_entity) = self.agent.upgrade() {
+            let agent = agent_entity.read(cx);
+            if let Some(session) = agent.sessions.get(session_id) {
+                return Some(session.thread.read(cx).profile().clone());
+            }
+        }
+        ThreadsDatabase::from_cx(cx)
+            .and_then(|db| db.load_thread_sync(session_id).ok().flatten())
+            .and_then(|t| t.profile)
+    }
+
     fn subagent_task_id(&self, session_id: &acp_v1::SessionId, cx: &App) -> Option<String> {
-        let agent_entity = self.agent.upgrade()?;
-        let agent = agent_entity.read(cx);
-        let session = agent.sessions.get(session_id)?;
-        session.thread.read(cx).task_id().map(|id| id.to_string())
+        if let Some(agent_entity) = self.agent.upgrade() {
+            let agent = agent_entity.read(cx);
+            if let Some(session) = agent.sessions.get(session_id) {
+                if let Some(task_id) = session.thread.read(cx).task_id() {
+                    return Some(task_id.to_string());
+                }
+            }
+        }
+        ThreadsDatabase::from_cx(cx)
+            .and_then(|db| db.load_thread_sync(session_id).ok().flatten())
+            .and_then(|t| t.task_id)
     }
 
     fn commit_subagent_worktree(
@@ -3776,12 +4132,36 @@ impl ThreadEnvironment for NativeThreadEnvironment {
             (project, task_id)
         });
         cx.spawn(async move |cx| {
-            let task = cx.update(|cx| {
-                crate::task_worktree::commit_and_merge_task_worktree(
-                    project, &task_id, is_error, cx,
-                )
-            });
-            task.await
+            let executor = cx.background_executor().clone();
+            let result = crate::task_worktree::retry_on_git_lock_contention(&executor, || {
+                let task = cx.update(|cx| {
+                    crate::task_worktree::commit_and_merge_task_worktree(
+                        project.clone(),
+                        &task_id,
+                        is_error,
+                        cx,
+                    )
+                });
+                task
+            })
+            .await;
+            match result {
+                Ok(details) => Ok(details),
+                Err(err) => {
+                    let err_str = err.to_string();
+                    let commit_error = if crate::task_worktree::is_git_lock_contention(&err_str) {
+                        Some(format!("git lock contention: {err:#}"))
+                    } else {
+                        Some(format!("commit failed: {err_str}"))
+                    };
+                    Ok(crate::task_worktree::fallback_isolation_details(
+                        &task_id,
+                        "worktree",
+                        commit_error,
+                        None,
+                    ))
+                }
+            }
         })
     }
 
@@ -3801,42 +4181,6 @@ impl ThreadEnvironment for NativeThreadEnvironment {
         cx.spawn(async move |cx| {
             let task = cx.update(|cx| {
                 crate::task_worktree::auto_cleanup_task_worktree(project, &task_id, cx)
-            });
-            task.await
-        })
-    }
-
-    fn ensure_task_registered(
-        &self,
-        task_id: &str,
-        title: &str,
-        cx: &mut AsyncApp,
-    ) -> Task<Result<()>> {
-        let Some(parent_thread_entity) = self.thread.upgrade() else {
-            return Task::ready(Err(anyhow!("Parent thread no longer exists")));
-        };
-        let (project, task_id_typed, title_string) = cx.update(|cx| {
-            let project = parent_thread_entity.read(cx).project().clone();
-            (
-                project,
-                crate::AgentTaskId::from(task_id.to_string()),
-                title.to_string(),
-            )
-        });
-        cx.spawn(async move |cx| {
-            let task = cx.update(|cx| {
-                let context_server_store = project.read(cx).context_server_store();
-                let server_id = context_server::ContextServerId(
-                    agent_settings::AgentSettings::get_for_project(project.read(cx), cx)
-                        .task_graph_server_id
-                        .clone()
-                        .into(),
-                );
-                let provider = crate::mcp_agent_task_provider::McpAgentTaskProvider::new(
-                    context_server_store,
-                    server_id,
-                );
-                provider.ensure_task(&task_id_typed, &title_string, cx)
             });
             task.await
         })
@@ -3878,6 +4222,194 @@ impl ThreadEnvironment for NativeThreadEnvironment {
         })
     }
 
+    fn update_task_registered(
+        &self,
+        task_id: &str,
+        model: Option<&str>,
+        assignee: Option<&str>,
+        session_id: Option<&str>,
+        cx: &mut AsyncApp,
+    ) -> Task<Result<()>> {
+        let Some(parent_thread_entity) = self.thread.upgrade() else {
+            return Task::ready(Err(anyhow!("Parent thread no longer exists")));
+        };
+        let (project, task_id_typed, model_opt, assignee_opt, session_id_opt) = cx.update(|cx| {
+            let project = parent_thread_entity.read(cx).project().clone();
+            (
+                project,
+                crate::AgentTaskId::from(task_id.to_string()),
+                model.map(str::to_string),
+                assignee.map(str::to_string),
+                session_id.map(str::to_string),
+            )
+        });
+        cx.spawn(async move |cx| {
+            let task = cx.update(|cx| {
+                let context_server_store = project.read(cx).context_server_store();
+                let server_id = context_server::ContextServerId(
+                    agent_settings::AgentSettings::get_for_project(project.read(cx), cx)
+                        .task_graph_server_id
+                        .clone()
+                        .into(),
+                );
+                let provider = crate::mcp_agent_task_provider::McpAgentTaskProvider::new(
+                    context_server_store,
+                    server_id,
+                );
+                provider.update_task_metadata(
+                    &task_id_typed,
+                    model_opt.as_deref(),
+                    assignee_opt.as_deref(),
+                    session_id_opt.as_deref(),
+                    cx,
+                )
+            });
+            task.await
+        })
+    }
+
+    fn set_task_status_registered(
+        &self,
+        task_id: &str,
+        status: crate::AgentTaskStatus,
+        cx: &mut AsyncApp,
+    ) -> Task<Result<()>> {
+        let Some(parent_thread_entity) = self.thread.upgrade() else {
+            return Task::ready(Err(anyhow!("Parent thread no longer exists")));
+        };
+        let (project, task_id_typed) = cx.update(|cx| {
+            let project = parent_thread_entity.read(cx).project().clone();
+            (project, crate::AgentTaskId::from(task_id.to_string()))
+        });
+        cx.spawn(async move |cx| {
+            let task = cx.update(|cx| {
+                let context_server_store = project.read(cx).context_server_store();
+                let server_id = context_server::ContextServerId(
+                    agent_settings::AgentSettings::get_for_project(project.read(cx), cx)
+                        .task_graph_server_id
+                        .clone()
+                        .into(),
+                );
+                let provider = crate::mcp_agent_task_provider::McpAgentTaskProvider::new(
+                    context_server_store,
+                    server_id,
+                );
+                provider.set_task_status(&task_id_typed, &status, cx)
+            });
+            task.await
+        })
+    }
+
+    fn get_task_registered(
+        &self,
+        task_id: &str,
+        cx: &mut AsyncApp,
+    ) -> Task<Result<crate::AgentTaskDetail>> {
+        let Some(parent_thread_entity) = self.thread.upgrade() else {
+            return Task::ready(Err(anyhow!("Parent thread no longer exists")));
+        };
+        let (project, task_id_typed) = cx.update(|cx| {
+            let project = parent_thread_entity.read(cx).project().clone();
+            (project, crate::AgentTaskId::from(task_id.to_string()))
+        });
+        cx.spawn(async move |cx| {
+            let task = cx.update(|cx| {
+                let context_server_store = project.read(cx).context_server_store();
+                let server_id = context_server::ContextServerId(
+                    agent_settings::AgentSettings::get_for_project(project.read(cx), cx)
+                        .task_graph_server_id
+                        .clone()
+                        .into(),
+                );
+                let provider = crate::mcp_agent_task_provider::McpAgentTaskProvider::new(
+                    context_server_store,
+                    server_id,
+                );
+                provider.get_task(&task_id_typed, cx)
+            });
+            task.await
+        })
+    }
+
+    fn record_turn(
+        &self,
+        task_id: &str,
+        record: crate::AgentTurnRecord,
+        cx: &mut AsyncApp,
+    ) -> Task<Result<u32>> {
+        let Some(parent_thread_entity) = self.thread.upgrade() else {
+            return Task::ready(Err(anyhow!("Parent thread no longer exists")));
+        };
+        let (project, task_id_typed) = cx.update(|cx| {
+            let project = parent_thread_entity.read(cx).project().clone();
+            (project, crate::AgentTaskId::from(task_id.to_string()))
+        });
+        cx.spawn(async move |cx| {
+            let task = cx.update(|cx| {
+                let context_server_store = project.read(cx).context_server_store();
+                let server_id = context_server::ContextServerId(
+                    agent_settings::AgentSettings::get_for_project(project.read(cx), cx)
+                        .task_graph_server_id
+                        .clone()
+                        .into(),
+                );
+                let provider = crate::mcp_agent_task_provider::McpAgentTaskProvider::new(
+                    context_server_store,
+                    server_id,
+                );
+                provider.record_turn(&task_id_typed, record, cx)
+            });
+            task.await
+        })
+    }
+
+    fn publish_artifact(
+        &self,
+        task_id: &str,
+        kind: &str,
+        content: &str,
+        summary: Option<&str>,
+        cx: &mut AsyncApp,
+    ) -> Task<Result<String>> {
+        let Some(parent_thread_entity) = self.thread.upgrade() else {
+            return Task::ready(Err(anyhow!("Parent thread no longer exists")));
+        };
+        let (project, task_id_typed, kind_string, content_string, summary_string) =
+            cx.update(|cx| {
+                let project = parent_thread_entity.read(cx).project().clone();
+                (
+                    project,
+                    crate::AgentTaskId::from(task_id.to_string()),
+                    kind.to_string(),
+                    content.to_string(),
+                    summary.map(str::to_string),
+                )
+            });
+        cx.spawn(async move |cx| {
+            let task = cx.update(|cx| {
+                let context_server_store = project.read(cx).context_server_store();
+                let server_id = context_server::ContextServerId(
+                    agent_settings::AgentSettings::get_for_project(project.read(cx), cx)
+                        .task_graph_server_id
+                        .clone()
+                        .into(),
+                );
+                let provider = crate::mcp_agent_task_provider::McpAgentTaskProvider::new(
+                    context_server_store,
+                    server_id,
+                );
+                provider.publish_artifact(
+                    &task_id_typed,
+                    &kind_string,
+                    &content_string,
+                    summary_string.as_deref(),
+                    cx,
+                )
+            });
+            task.await
+        })
+    }
+
     fn create_sibling_thread(
         &self,
         request: SiblingThreadRequest,
@@ -3911,20 +4443,32 @@ impl ThreadEnvironment for NativeThreadEnvironment {
             })
         }
     }
+
+    fn worktree_root_path(&self, cx: &App) -> Option<Arc<Path>> {
+        self.thread
+            .upgrade()
+            .and_then(|thread| thread.read(cx).worktree_root_path(cx))
+    }
+
+    fn templates(&self, cx: &App) -> Option<Arc<Templates>> {
+        self.thread
+            .upgrade()
+            .map(|thread| thread.read(cx).templates.clone())
+    }
 }
 
 pub struct NativeSubagentHandle {
-    session_id: acp_v1::SessionId,
-    parent_thread: WeakEntity<Thread>,
-    subagent_thread: Entity<Thread>,
-    acp_thread: Entity<acp_thread::AcpThread>,
+    pub(crate) session_id: acp_v1::SessionId,
+    pub(crate) parent_thread: WeakEntity<Thread>,
+    pub(crate) subagent_thread: Entity<Thread>,
+    pub(crate) acp_thread: Entity<acp_thread::AcpThread>,
     /// Releases the sub-agent's concurrency slot when this handle is dropped,
     /// i.e. when the spawning tool call finishes or is cancelled.
-    _slot_guard: SubagentSlotGuard,
+    pub(crate) _slot_guard: SubagentSlotGuard,
 }
 
 impl NativeSubagentHandle {
-    fn new(
+    pub(crate) fn new(
         session_id: acp_v1::SessionId,
         subagent_thread: Entity<Thread>,
         acp_thread: Entity<acp_thread::AcpThread>,
@@ -3941,6 +4485,30 @@ impl NativeSubagentHandle {
     }
 }
 
+const WATCHDOG_POLL_INTERVAL: Duration = Duration::from_millis(250);
+
+fn extract_last_agent_message_content(thread: &Thread) -> Result<String> {
+    thread
+        .last_message()
+        .and_then(|message| {
+            let content = message
+                .as_agent_message()?
+                .content
+                .iter()
+                .filter_map(|content| match content {
+                    AgentMessageContent::Text(text) => Some(text.as_str()),
+                    _ => None,
+                })
+                .join("\n\n");
+            if content.is_empty() {
+                None
+            } else {
+                Some(content)
+            }
+        })
+        .context("No response from subagent")
+}
+
 impl SubagentHandle for NativeSubagentHandle {
     fn id(&self) -> acp_v1::SessionId {
         self.session_id.clone()
@@ -3948,6 +4516,17 @@ impl SubagentHandle for NativeSubagentHandle {
 
     fn num_entries(&self, cx: &App) -> usize {
         self.acp_thread.read(cx).entries().len()
+    }
+
+    fn model_id(&self, cx: &App) -> Option<String> {
+        self.subagent_thread
+            .read(cx)
+            .model()
+            .map(|model| model.id().0.to_string())
+    }
+
+    fn cumulative_token_usage(&self, cx: &App) -> Option<language_model::TokenUsage> {
+        Some(self.subagent_thread.read(cx).cumulative_token_usage())
     }
 
     fn send(&self, message: String, cx: &AsyncApp) -> Task<Result<String>> {
@@ -3958,12 +4537,15 @@ impl SubagentHandle for NativeSubagentHandle {
 
         cx.spawn(async move |cx| {
             let start_time = std::time::Instant::now();
-            let (task, token_limit_rx, _subscription) = cx.update(|cx| {
+            let (task, token_limit_rx, _subscription, send_watchdog_timeout) = cx.update(|cx| {
                 parent_thread
                     .update(cx, |parent_thread, _cx| {
                         parent_thread.register_running_subagent(thread.downgrade())
                     })
                     .ok();
+
+                let send_watchdog_timeout =
+                    thread.read(cx).agent_settings(cx).send_watchdog_seconds;
 
                 let ratio_before_prompt = thread
                     .read(cx)
@@ -3985,91 +4567,125 @@ impl SubagentHandle for NativeSubagentHandle {
                 let task = acp_thread.update(cx, |acp_thread, cx| {
                     acp_thread.send(vec![message.into()], cx)
                 });
-                (task, token_limit_rx, subscription)
+                (task, token_limit_rx, subscription, send_watchdog_timeout)
             });
 
             let mut task = task.fuse();
-            let response = futures::select_biased! {
-                response = task => response,
-                _ = token_limit_rx.fuse() => {
-                    if thread.read_with(cx, |thread, _| thread.is_turn_complete()) {
-                        task.await
-                    } else {
+            let mut token_limit_rx = token_limit_rx.fuse();
+            let mut turn_complete_timer =
+                futures::future::Either::Left(futures::future::pending::<()>()).fuse();
+            let mut turn_complete_timer_active = false;
+
+            enum SendOutcome {
+                Response(Result<Option<acp_thread::SubmissionResponse>>),
+                WatchdogResolved(Result<String>),
+            }
+
+            let send_outcome: SendOutcome = loop {
+                let mut watchdog_poll =
+                    cx.background_executor().timer(WATCHDOG_POLL_INTERVAL).fuse();
+                futures::select_biased! {
+                    response = task => {
+                        break SendOutcome::Response(response);
+                    }
+                    _ = token_limit_rx => {
+                        if thread.read_with(cx, |thread, _| thread.is_turn_complete()) {
+                            let response = task.await;
+                            break SendOutcome::Response(response);
+                        } else {
+                            log::info!(
+                                "[cancel-audit] session={} source=subagent_token_limit_cancel",
+                                subagent_session_id
+                            );
+                            thread.update(cx, |thread, cx| thread.cancel(cx)).await;
+                            break SendOutcome::Response(Err(anyhow!(
+                                "The agent is nearing the end of its context window and has been \
+                                 stopped. You can prompt the thread again to have the agent wrap up \
+                                 or hand off its work."
+                            )));
+                        }
+                    }
+                    _ = turn_complete_timer => {
                         log::info!(
-                            "[cancel-audit] session={} source=subagent_token_limit_cancel",
-                            subagent_session_id
+                            "[cancel-audit] session={} elapsed_ms={} source=send_watchdog_turn_complete",
+                            subagent_session_id,
+                            start_time.elapsed().as_millis()
                         );
-                        thread.update(cx, |thread, cx| thread.cancel(cx)).await;
-                        Err(anyhow!(
-                            "The agent is nearing the end of its context window and has been \
-                             stopped. You can prompt the thread again to have the agent wrap up \
-                             or hand off its work."
-                        ))
+                        let extracted = thread.read_with(cx, |thread, _cx| {
+                            extract_last_agent_message_content(thread)
+                        });
+                        break SendOutcome::WatchdogResolved(extracted);
+                    }
+                    _ = watchdog_poll => {
+                        let is_complete = thread.read_with(cx, |thread, _| thread.is_turn_complete());
+                        if is_complete {
+                            if !turn_complete_timer_active && !send_watchdog_timeout.is_zero() {
+                                turn_complete_timer = futures::future::Either::Right(
+                                    cx.background_executor().timer(send_watchdog_timeout),
+                                ).fuse();
+                                turn_complete_timer_active = true;
+                            }
+                        } else if turn_complete_timer_active {
+                            turn_complete_timer = futures::future::Either::Left(
+                                futures::future::pending::<()>(),
+                            ).fuse();
+                            turn_complete_timer_active = false;
+                        }
                     }
                 }
             };
-            let discard_partial_output = matches!(
-                &response,
-                Ok(Some(acp_thread::SubmissionResponse::LegacyCompleted(response))) if response.stop_reason == acp_v1::StopReason::Cancelled
-                    || response.stop_reason == acp_v1::StopReason::Refusal
-            );
-            let result = match response {
-                Ok(Some(acp_thread::SubmissionResponse::LegacyCompleted(response))) => match response.stop_reason {
-                    acp_v1::StopReason::Cancelled => {
-                        let (parent_id, parent_canceling, parent_was_canceled, parent_turn_complete) =
-                            parent_thread
-                                .read_with(cx, |parent, _| {
-                                    (
-                                        parent.id().clone(),
-                                        parent.is_canceling(),
-                                        parent.was_canceled(),
-                                        parent.is_turn_complete(),
-                                    )
-                                })
-                                .unwrap_or_else(|_| (acp_v1::SessionId::from("unknown"), false, false, false));
-                        let subagent_task_id = thread
-                            .read_with(cx, |t, _| t.task_id().unwrap_or("-").to_string());
-                        log::info!(
-                            "[cancel-audit] session={} task_id={} parent_id={} parent_canceling={} parent_was_canceled={} parent_turn_complete={} elapsed_ms={} source=subagent_stop_cancelled",
-                            subagent_session_id,
-                            subagent_task_id,
-                            parent_id,
-                            parent_canceling,
-                            parent_was_canceled,
-                            parent_turn_complete,
-                            start_time.elapsed().as_millis(),
-                        );
-                        Err(anyhow!("User canceled"))
-                    }
-                    acp_v1::StopReason::MaxTokens => Err(anyhow!("The agent reached the maximum number of tokens.")),
-                    acp_v1::StopReason::MaxTurnRequests => Err(anyhow!("The agent reached the maximum number of allowed requests between user turns. Try prompting again.")),
-                    acp_v1::StopReason::Refusal => Err(anyhow!("The agent refused to process that prompt. Try again.")),
-                    _ => thread.read_with(cx, |thread, _cx| {
-                        thread
-                            .last_message()
-                            .and_then(|message| {
-                                let content = message.as_agent_message()?
-                                    .content
-                                    .iter()
-                                    .filter_map(|content| match content {
-                                        AgentMessageContent::Text(text) => Some(text.as_str()),
-                                        _ => None,
-                                    })
-                                    .join("\n\n");
-                                if content.is_empty() {
-                                    None
-                                } else {
-                                    Some(content)
-                                }
-                            })
-                            .context("No response from subagent")
-                    }),
-                },
-                Ok(Some(acp_thread::SubmissionResponse::Accepted(_))) => {
-                    Err(anyhow!("Native subagent returned acceptance instead of turn completion"))
+
+            let (discard_partial_output, result) = match send_outcome {
+                SendOutcome::WatchdogResolved(resolved) => (false, resolved),
+                SendOutcome::Response(response) => {
+                    let discard_partial_output = matches!(
+                        &response,
+                        Ok(Some(acp_thread::SubmissionResponse::LegacyCompleted(response))) if response.stop_reason == acp_v1::StopReason::Cancelled
+                            || response.stop_reason == acp_v1::StopReason::Refusal
+                    );
+                    let result = match response {
+                        Ok(Some(acp_thread::SubmissionResponse::LegacyCompleted(response))) => match response.stop_reason {
+                            acp_v1::StopReason::Cancelled => {
+                                let (parent_id, parent_canceling, parent_was_canceled, parent_turn_complete) =
+                                    parent_thread
+                                        .read_with(cx, |parent, _| {
+                                            (
+                                                parent.id().clone(),
+                                                parent.is_canceling(),
+                                                parent.was_canceled(),
+                                                parent.is_turn_complete(),
+                                            )
+                                        })
+                                        .unwrap_or_else(|_| (acp_v1::SessionId::from("unknown"), false, false, false));
+                                let subagent_task_id = thread
+                                    .read_with(cx, |t, _| t.task_id().unwrap_or("-").to_string());
+                                log::info!(
+                                    "[cancel-audit] session={} task_id={} parent_id={} parent_canceling={} parent_was_canceled={} parent_turn_complete={} elapsed_ms={} source=subagent_stop_cancelled",
+                                    subagent_session_id,
+                                    subagent_task_id,
+                                    parent_id,
+                                    parent_canceling,
+                                    parent_was_canceled,
+                                    parent_turn_complete,
+                                    start_time.elapsed().as_millis(),
+                                );
+                                Err(anyhow!("User canceled"))
+                            }
+                            acp_v1::StopReason::MaxTokens => Err(anyhow!("The agent reached the maximum number of tokens.")),
+                            acp_v1::StopReason::MaxTurnRequests => Err(anyhow!("The agent reached the maximum number of allowed requests between user turns. Try prompting again.")),
+                            acp_v1::StopReason::Refusal => Err(anyhow!("The agent refused to process that prompt. Try again.")),
+                            _ => thread.read_with(cx, |thread, _cx| {
+                                extract_last_agent_message_content(thread)
+                            }),
+                        },
+                        Ok(Some(acp_thread::SubmissionResponse::Accepted(_))) => {
+                            Err(anyhow!("Native subagent returned acceptance instead of turn completion"))
+                        }
+                        Ok(None) => Err(anyhow!("No response from the agent. You can try messaging again.")),
+                        Err(error) => Err(error),
+                    };
+                    (discard_partial_output, result)
                 }
-                Ok(None) => Err(anyhow!("No response from the agent. You can try messaging again.")),
-                Err(error) => Err(error),
             };
 
             parent_thread
@@ -5020,7 +5636,10 @@ mod internal_tests {
                 threshold: agent_settings::AutoCompactThreshold::Percentage(0.5),
             };
             agent_settings::AgentSettings::override_global(settings, cx);
-            thread.update(cx, |thread, cx| thread.set_model(model.clone(), cx));
+            thread.update(cx, |thread, cx| {
+                thread.set_model(model.clone(), cx);
+                thread.set_summarization_model(None, cx);
+            });
         });
 
         let first_prompt = cx.update(|cx| {
@@ -5084,6 +5703,7 @@ mod internal_tests {
         );
         fake.end_stream(&model, &first_compaction_request);
         cx.run_until_parked();
+        cx.executor().advance_clock(Duration::from_secs(70));
 
         let second_compaction_request = fake
             .pending_completions()
@@ -6545,7 +7165,7 @@ mod internal_tests {
         // Run the subagent through the production registration path.
         // This is what installs the `SkillTool` on the thread.
         let _subagent_acp = agent.update(cx, |agent, cx| {
-            agent.register_session(subagent_thread.clone(), parent_project_id, cx)
+            agent.register_session(subagent_thread.clone(), parent_project_id, false, cx)
         });
 
         // Verify the subagent thread has the `SkillTool` installed —
@@ -8372,6 +8992,310 @@ mod internal_tests {
     }
 
     #[gpui::test]
+    async fn test_subagent_standalone_open_promotes_session(cx: &mut TestAppContext) {
+
+        let fake = init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            "/",
+            json!({
+                "a": {
+                    "file.txt": "hello"
+                }
+            }),
+        )
+        .await;
+        let project = Project::test(fs.clone(), [path!("/a").as_ref()], cx).await;
+        let thread_store = cx.new(|cx| ThreadStore::new(cx));
+        let agent = cx
+            .update(|cx| NativeAgent::new(thread_store.clone(), Templates::new(), fs.clone(), cx));
+        let connection = Rc::new(NativeAgentConnection(agent.clone()));
+
+        let acp_thread = cx
+            .update(|cx| {
+                connection
+                    .clone()
+                    .new_session(project.clone(), PathList::new(&[Path::new("")]), cx)
+            })
+            .await
+            .unwrap();
+        let parent_session_id = acp_thread.read_with(cx, |t, _| t.session_id().clone());
+        let parent_thread =
+            cx.update(|cx| native_thread_for_session(&agent, &parent_session_id, cx));
+        let environment = NativeThreadEnvironment {
+            agent: agent.downgrade(),
+            thread: parent_thread.downgrade(),
+            acp_thread: acp_thread.downgrade(),
+        };
+
+        cx.update(|cx| {
+            let mut settings = agent_settings::AgentSettings::get_global(cx).clone();
+            let default_profile_id = settings.default_profile.clone();
+            if let Some(profile) = settings.profiles.get_mut(&default_profile_id) {
+                profile.delegation = Some(agent_settings::Delegation {
+                    allowed: vec![default_profile_id.clone()],
+                    max_depth: 5,
+                });
+            }
+            agent_settings::AgentSettings::override_global(settings, cx);
+        });
+
+        let subagent_handle = cx
+            .update(|cx| {
+                environment.create_subagent_thread("worker".to_string(), None, None, None, cx)
+            })
+            .unwrap();
+        let subagent_session_id = subagent_handle.id();
+        let subagent_thread = agent.read_with(cx, |agent, _| {
+            agent
+                .sessions
+                .get(&subagent_session_id)
+                .unwrap()
+                .thread
+                .clone()
+        });
+
+        // Initially registered as a subagent
+        let initial_subagent_acp = agent.read_with(cx, |agent, _| {
+            agent.sessions.get(&subagent_session_id).unwrap().acp_thread.upgrade().unwrap()
+        });
+        assert!(initial_subagent_acp.read_with(cx, |t, _| t.parent_session_id().is_some()));
+        assert_eq!(
+            initial_subagent_acp.read_with(cx, |t, _| t.parent_session_id().cloned()),
+            Some(parent_session_id.clone())
+        );
+
+        let model = fake.model("fake");
+        subagent_thread.update(cx, |t, cx| {
+            t.set_model(model.clone(), cx);
+            t.send(ClientUserMessageId::new(), ["subagent task"], cx)
+                .unwrap();
+        });
+        cx.run_until_parked();
+
+        let completion = fake.pending_completions().pop().unwrap();
+        fake.send_text(&model, &completion, "completed work");
+        fake.end_stream(&model, &completion);
+        cx.run_until_parked();
+
+        agent.update(cx, |agent, cx| {
+            agent.save_thread(subagent_thread.clone(), cx);
+        });
+        cx.run_until_parked();
+
+        // 1. Open standalone while the subagent AcpThread is still alive in memory
+        let promoted_acp = cx
+            .update(|cx| {
+                use acp_thread::AgentConnection as _;
+                connection
+                    .clone()
+                    .load_session_standalone(
+                        subagent_session_id.clone(),
+                        project.clone(),
+                        PathList::new(&[Path::new("")]),
+                        None,
+                        cx,
+                    )
+            })
+            .await
+            .unwrap();
+
+        // The promoted AcpThread must have no parent session ID
+        assert_eq!(promoted_acp.read_with(cx, |t, _| t.parent_session_id().cloned()), None);
+
+        // Underlying Thread in database must preserve parent_thread_id
+        let db_future = cx.update(|cx| ThreadsDatabase::connect(cx));
+        let database = db_future.await.unwrap();
+        let loaded_from_db = database.load_thread(subagent_session_id.clone()).await.unwrap().unwrap();
+        assert_eq!(
+            loaded_from_db.subagent_context.as_ref().map(|c| c.parent_thread_id.0.as_ref()),
+            Some(parent_session_id.0.as_ref())
+        );
+
+        // 2. Re-opening standalone returns the already-promoted AcpThread
+        let reloaded_acp = cx
+            .update(|cx| {
+                use acp_thread::AgentConnection as _;
+                connection
+                    .clone()
+                    .load_session_standalone(
+                        subagent_session_id.clone(),
+                        project.clone(),
+                        PathList::new(&[Path::new("")]),
+                        None,
+                        cx,
+                    )
+            })
+            .await
+            .unwrap();
+        assert_eq!(promoted_acp.entity_id(), reloaded_acp.entity_id());
+        assert_eq!(reloaded_acp.read_with(cx, |t, _| t.parent_session_id().cloned()), None);
+    }
+
+    #[gpui::test]
+    async fn test_subagent_persists_task_id_and_resumes_across_restarts(cx: &mut TestAppContext) {
+        use crate::ThreadEnvironment;
+
+        let fake = init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            "/",
+            json!({
+                "a": {
+                    "file.txt": "hello"
+                }
+            }),
+        )
+        .await;
+        let project = Project::test(fs.clone(), [path!("/a").as_ref()], cx).await;
+        let thread_store = cx.new(|cx| ThreadStore::new(cx));
+        let agent = cx
+            .update(|cx| NativeAgent::new(thread_store.clone(), Templates::new(), fs.clone(), cx));
+        let connection = Rc::new(NativeAgentConnection(agent.clone()));
+
+        let acp_thread = cx
+            .update(|cx| {
+                connection
+                    .clone()
+                    .new_session(project.clone(), PathList::new(&[Path::new("")]), cx)
+            })
+            .await
+            .unwrap();
+        let parent_session_id = acp_thread.read_with(cx, |t, _| t.session_id().clone());
+        let parent_thread =
+            cx.update(|cx| native_thread_for_session(&agent, &parent_session_id, cx));
+        let environment = NativeThreadEnvironment {
+            agent: agent.downgrade(),
+            thread: parent_thread.downgrade(),
+            acp_thread: acp_thread.downgrade(),
+        };
+
+        cx.update(|cx| {
+            let mut settings = agent_settings::AgentSettings::get_global(cx).clone();
+            let default_profile_id = settings.default_profile.clone();
+            if let Some(profile) = settings.profiles.get_mut(&default_profile_id) {
+                profile.delegation = Some(agent_settings::Delegation {
+                    allowed: vec![default_profile_id.clone()],
+                    max_depth: 5,
+                });
+            }
+            agent_settings::AgentSettings::override_global(settings, cx);
+        });
+
+        let subagent_handle = cx
+            .update(|cx| {
+                environment.create_subagent_thread("worker".to_string(), None, None, None, cx)
+            })
+            .unwrap();
+        let subagent_session_id = subagent_handle.id();
+        let subagent_thread = agent.read_with(cx, |agent, _| {
+            agent
+                .sessions
+                .get(&subagent_session_id)
+                .unwrap()
+                .thread
+                .clone()
+        });
+
+        let model = fake.model("fake");
+        subagent_thread.update(cx, |t, cx| {
+            t.set_model(model.clone(), cx);
+            t.set_task_id(Some("TASK-42".to_string()));
+            t.send(ClientUserMessageId::new(), ["subagent task"], cx)
+                .unwrap();
+        });
+        cx.run_until_parked();
+
+        let completion = fake.pending_completions().pop().unwrap();
+        fake.send_text(&model, &completion, "completed work");
+        fake.end_stream(&model, &completion);
+        cx.run_until_parked();
+
+        agent.update(cx, |agent, cx| {
+            agent.save_thread(subagent_thread.clone(), cx);
+        });
+        cx.run_until_parked();
+
+        // 1. Verify subagent_task_id from memory
+        assert_eq!(
+            cx.update(|cx| environment.subagent_task_id(&subagent_session_id, cx)),
+            Some("TASK-42".to_string())
+        );
+
+        // 2. Simulate restart / thread release by evicting subagent session from memory
+        drop(subagent_handle);
+        cx.update(|cx| {
+            agent.update(cx, |agent, _cx| {
+                agent.sessions.remove(&subagent_session_id);
+                if let Some(parent_session) = agent.sessions.get_mut(&parent_session_id) {
+                    parent_session.subagents.clear();
+                }
+            });
+        });
+        assert!(!agent.read_with(cx, |agent, _| {
+            agent.sessions.contains_key(&subagent_session_id)
+        }));
+
+        // 3. Verify subagent_task_id falls back to SQLite
+        assert_eq!(
+            cx.update(|cx| environment.subagent_task_id(&subagent_session_id, cx)),
+            Some("TASK-42".to_string())
+        );
+
+        // 4. Test ensure_subagent_loaded restores session from SQLite
+        let mut async_cx = cx.to_async();
+        let load_task = environment.ensure_subagent_loaded(&subagent_session_id, &mut async_cx);
+        load_task.await.unwrap();
+        cx.run_until_parked();
+
+        agent.read_with(cx, |agent, cx| {
+            assert!(agent.sessions.contains_key(&subagent_session_id));
+            let session = &agent.sessions[&subagent_session_id];
+            assert!(session.acp_thread.upgrade().is_some());
+            assert_eq!(session.thread.read(cx).task_id(), Some("TASK-42"));
+        });
+
+        // 5. Test resume_subagent_thread with restored in-memory session
+        let resumed = cx
+            .update(|cx| {
+                environment.resume_subagent_thread(subagent_session_id.clone(), None, None, cx)
+            })
+            .unwrap();
+        assert_eq!(resumed.id(), subagent_session_id);
+
+        // 6. Test resume_subagent_thread fallback to SQLite when missing from memory
+        drop(resumed);
+        cx.update(|cx| {
+            agent.update(cx, |agent, _cx| {
+                agent.sessions.remove(&subagent_session_id);
+                if let Some(parent_session) = agent.sessions.get_mut(&parent_session_id) {
+                    parent_session.subagents.clear();
+                }
+            });
+        });
+        assert!(!agent.read_with(cx, |agent, _| {
+            agent.sessions.contains_key(&subagent_session_id)
+        }));
+
+        let direct_resumed = cx
+            .update(|cx| {
+                environment.resume_subagent_thread(subagent_session_id.clone(), None, None, cx)
+            })
+            .unwrap();
+        assert_eq!(direct_resumed.id(), subagent_session_id);
+        agent.read_with(cx, |agent, cx| {
+            assert!(agent.sessions.contains_key(&subagent_session_id));
+            assert_eq!(
+                agent.sessions[&subagent_session_id]
+                    .thread
+                    .read(cx)
+                    .task_id(),
+                Some("TASK-42")
+            );
+        });
+    }
+
+    #[gpui::test]
     async fn test_save_burst_preserves_in_flight_write(cx: &mut TestAppContext) {
         let fake = init_test(cx);
         let fs = FakeFs::new(cx.executor());
@@ -9092,6 +10016,757 @@ mod internal_tests {
             agent.save_thread(thread.clone(), cx);
         });
     }
+
+    struct TestSubagentHandle {
+        id: acp_v1::SessionId,
+    }
+
+    impl crate::SubagentHandle for TestSubagentHandle {
+        fn id(&self) -> acp_v1::SessionId {
+            self.id.clone()
+        }
+
+        fn num_entries(&self, _cx: &App) -> usize {
+            1
+        }
+
+        fn send(&self, _message: String, _cx: &gpui::AsyncApp) -> Task<anyhow::Result<String>> {
+            Task::ready(Ok("subagent response".to_string()))
+        }
+    }
+
+    struct LifecycleTrackingEnvironment {
+        session_id: acp_v1::SessionId,
+        metadata_calls:
+            std::cell::RefCell<Vec<(String, Option<String>, Option<String>, Option<String>)>>,
+        status_transitions: std::cell::RefCell<Vec<(String, crate::AgentTaskStatus)>>,
+        commit_calls: std::cell::RefCell<Vec<String>>,
+        cleanup_calls: std::cell::RefCell<Vec<String>>,
+        failed_tasks: std::cell::RefCell<Vec<(String, String)>>,
+    }
+
+    impl LifecycleTrackingEnvironment {
+        fn new(session_id: &str) -> Self {
+            Self {
+                session_id: acp_v1::SessionId::new(session_id),
+                metadata_calls: std::cell::RefCell::new(Vec::new()),
+                status_transitions: std::cell::RefCell::new(Vec::new()),
+                commit_calls: std::cell::RefCell::new(Vec::new()),
+                cleanup_calls: std::cell::RefCell::new(Vec::new()),
+                failed_tasks: std::cell::RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    impl ThreadEnvironment for LifecycleTrackingEnvironment {
+        fn create_terminal(
+            &self,
+            _command: String,
+            _extra_env: Vec<acp_v1::EnvVariable>,
+            _cd: Option<std::path::PathBuf>,
+            _output_byte_limit: Option<u64>,
+            _sandbox_wrap: Option<acp_thread::SandboxWrap>,
+            _cx: &mut gpui::AsyncApp,
+        ) -> Task<anyhow::Result<Rc<dyn crate::TerminalHandle>>> {
+            Task::ready(Err(anyhow::anyhow!("not supported")))
+        }
+
+        fn create_subagent(
+            &self,
+            _label: String,
+            _profile: Option<agent_settings::AgentProfileId>,
+            _model: Option<acp_thread::AgentModelId>,
+            _task_worktree: Option<std::path::PathBuf>,
+            _cx: &mut App,
+        ) -> anyhow::Result<Rc<dyn crate::SubagentHandle>> {
+            Ok(Rc::new(TestSubagentHandle {
+                id: self.session_id.clone(),
+            }))
+        }
+
+        fn resume_subagent(
+            &self,
+            _session_id: acp_v1::SessionId,
+            _profile: Option<agent_settings::AgentProfileId>,
+            _task_worktree: Option<std::path::PathBuf>,
+            _cx: &mut App,
+        ) -> anyhow::Result<Rc<dyn crate::SubagentHandle>> {
+            Ok(Rc::new(TestSubagentHandle {
+                id: self.session_id.clone(),
+            }))
+        }
+
+        fn ensure_subagent_worktree(
+            &self,
+            task_id: &str,
+            _goal_id: Option<String>,
+            _base_branch: Option<String>,
+            _on_branch: Option<String>,
+            _worktree_of: Option<String>,
+            _cx: &mut gpui::AsyncApp,
+        ) -> Task<anyhow::Result<std::path::PathBuf>> {
+            Task::ready(Ok(std::path::PathBuf::from(format!("/worktree/{}", task_id))))
+        }
+
+        fn commit_subagent_worktree(
+            &self,
+            task_id: &str,
+            _task_worktree: &std::path::Path,
+            _is_error: bool,
+            _cx: &mut gpui::AsyncApp,
+        ) -> Task<anyhow::Result<crate::task_worktree::SubagentIsolationDetails>> {
+            self.commit_calls.borrow_mut().push(task_id.to_string());
+            Task::ready(Ok(crate::task_worktree::SubagentIsolationDetails {
+                mode: "worktree".to_string(),
+                branch: format!("agent-task/{task_id}"),
+                base_branch: None,
+                head_sha: Some("commit-sha".to_string()),
+                changed_files: 1,
+                commit_error: None,
+                merged_into: None,
+                merge_conflict: None,
+            }))
+        }
+
+        fn auto_cleanup_subagent_worktree(
+            &self,
+            task_id: &str,
+            _cx: &mut gpui::AsyncApp,
+        ) -> Task<anyhow::Result<bool>> {
+            self.cleanup_calls.borrow_mut().push(task_id.to_string());
+            Task::ready(Ok(true))
+        }
+
+        fn fail_task_registered(
+            &self,
+            task_id: &str,
+            reason: &str,
+            _cx: &mut gpui::AsyncApp,
+        ) -> Task<anyhow::Result<()>> {
+            self.failed_tasks
+                .borrow_mut()
+                .push((task_id.to_string(), reason.to_string()));
+            Task::ready(Ok(()))
+        }
+
+        fn update_task_registered(
+            &self,
+            task_id: &str,
+            model: Option<&str>,
+            assignee: Option<&str>,
+            session_id: Option<&str>,
+            _cx: &mut gpui::AsyncApp,
+        ) -> Task<anyhow::Result<()>> {
+            self.metadata_calls.borrow_mut().push((
+                task_id.to_string(),
+                model.map(str::to_string),
+                assignee.map(str::to_string),
+                session_id.map(str::to_string),
+            ));
+            Task::ready(Ok(()))
+        }
+
+        fn set_task_status_registered(
+            &self,
+            task_id: &str,
+            status: crate::AgentTaskStatus,
+            _cx: &mut gpui::AsyncApp,
+        ) -> Task<anyhow::Result<()>> {
+            self.status_transitions
+                .borrow_mut()
+                .push((task_id.to_string(), status));
+            Task::ready(Ok(()))
+        }
+
+        fn get_task_registered(
+            &self,
+            task_id: &str,
+            _cx: &mut gpui::AsyncApp,
+        ) -> Task<anyhow::Result<crate::AgentTaskDetail>> {
+            Task::ready(Ok(crate::AgentTaskDetail {
+                summary: crate::AgentTaskSummary {
+                    id: crate::AgentTaskId::from(task_id),
+                    title: task_id.to_string(),
+                    status: crate::AgentTaskStatus::Ready,
+                    attempt: 1,
+                    ..Default::default()
+                },
+                description: String::new(),
+                acceptance_criteria: Vec::new(),
+                events_tail: Vec::new(),
+            }))
+        }
+
+        fn record_turn(
+            &self,
+            _task_id: &str,
+            _record: crate::AgentTurnRecord,
+            _cx: &mut gpui::AsyncApp,
+        ) -> Task<anyhow::Result<u32>> {
+            Task::ready(Ok(1))
+        }
+    }
+
+    #[gpui::test]
+    async fn test_spawn_agent_task_lifecycle_mode_agent_skips_all_automations(
+        cx: &mut TestAppContext,
+    ) {
+        crate::tests::init_test(cx);
+        cx.update(|cx| {
+            cx.update_global::<SettingsStore, _>(|store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings.agent.get_or_insert_default().task_lifecycle_mode =
+                        Some(agent_settings::TaskLifecycleMode::Agent);
+                });
+            });
+        });
+
+        let task_id = "TASK-LIFECYCLE-AGENT";
+        let env = Rc::new(LifecycleTrackingEnvironment::new("subagent-agent-mode"));
+        #[allow(clippy::arc_with_non_send_sync)]
+        let tool = Arc::new(crate::tools::SpawnAgentTool::new(env.clone()));
+        let (event_stream, _rx) = crate::ToolCallEventStream::test();
+
+        let result = cx
+            .update(|cx| {
+                tool.run(
+                    crate::ToolInput::resolved(crate::tools::SpawnAgentToolInput {
+                        label: "agent mode test".to_string(),
+                        message: "do nothing automatically".to_string(),
+                        task_id: Some(task_id.to_string()),
+                        ..Default::default()
+                    }),
+                    event_stream,
+                    cx,
+                )
+            })
+            .await;
+
+        assert!(matches!(
+            result,
+            Ok(crate::tools::SpawnAgentToolOutput::Success { .. })
+        ));
+        assert_eq!(env.status_transitions.borrow().clone(), vec![]);
+        assert_eq!(env.metadata_calls.borrow().clone(), vec![]);
+        assert_eq!(env.commit_calls.borrow().clone(), Vec::<String>::new());
+        assert_eq!(env.cleanup_calls.borrow().clone(), Vec::<String>::new());
+        assert_eq!(env.failed_tasks.borrow().clone(), vec![]);
+    }
+
+    #[gpui::test]
+    async fn test_spawn_agent_task_lifecycle_runtime_mode_and_toggles(cx: &mut TestAppContext) {
+        crate::tests::init_test(cx);
+
+        // 1. Default runtime mode: all automations run
+        {
+            let task_id = "TASK-RUNTIME-DEFAULT";
+            let env = Rc::new(LifecycleTrackingEnvironment::new("subagent-runtime-1"));
+            #[allow(clippy::arc_with_non_send_sync)]
+            let tool = Arc::new(crate::tools::SpawnAgentTool::new(env.clone()));
+            let (event_stream, _rx) = crate::ToolCallEventStream::test();
+
+            let result = cx
+                .update(|cx| {
+                    tool.run(
+                        crate::ToolInput::resolved(crate::tools::SpawnAgentToolInput {
+                            label: "runtime default".to_string(),
+                            message: "run all automations".to_string(),
+                            task_id: Some(task_id.to_string()),
+                            base_branch: Some("main".to_string()),
+                            ..Default::default()
+                        }),
+                        event_stream,
+                        cx,
+                    )
+                })
+                .await;
+
+            assert!(matches!(
+                result,
+                Ok(crate::tools::SpawnAgentToolOutput::Success { .. })
+            ));
+            assert_eq!(
+                env.status_transitions.borrow().clone(),
+                vec![
+                    (task_id.to_string(), crate::AgentTaskStatus::Running),
+                    (task_id.to_string(), crate::AgentTaskStatus::Completed),
+                ]
+            );
+            assert_eq!(env.metadata_calls.borrow().len(), 1);
+            assert_eq!(env.commit_calls.borrow().clone(), vec![task_id.to_string()]);
+            assert_eq!(
+                env.cleanup_calls.borrow().clone(),
+                vec![task_id.to_string()]
+            );
+        }
+
+        // 2. Runtime mode with register_metadata = false
+        {
+            cx.update(|cx| {
+                cx.update_global::<SettingsStore, _>(|store, cx| {
+                    store.update_user_settings(cx, |settings| {
+                        settings.agent.get_or_insert_default().register_metadata = Some(false);
+                    });
+                });
+            });
+
+            let task_id = "TASK-NO-METADATA";
+            let env = Rc::new(LifecycleTrackingEnvironment::new("subagent-runtime-2"));
+            #[allow(clippy::arc_with_non_send_sync)]
+            let tool = Arc::new(crate::tools::SpawnAgentTool::new(env.clone()));
+            let (event_stream, _rx) = crate::ToolCallEventStream::test();
+
+            let result = cx
+                .update(|cx| {
+                    tool.run(
+                        crate::ToolInput::resolved(crate::tools::SpawnAgentToolInput {
+                            label: "no metadata".to_string(),
+                            message: "skip metadata".to_string(),
+                            task_id: Some(task_id.to_string()),
+                            base_branch: Some("main".to_string()),
+                            ..Default::default()
+                        }),
+                        event_stream,
+                        cx,
+                    )
+                })
+                .await;
+
+            assert!(matches!(
+                result,
+                Ok(crate::tools::SpawnAgentToolOutput::Success { .. })
+            ));
+            assert_eq!(env.metadata_calls.borrow().clone(), vec![]);
+            assert_eq!(
+                env.status_transitions.borrow().clone(),
+                vec![
+                    (task_id.to_string(), crate::AgentTaskStatus::Running),
+                    (task_id.to_string(), crate::AgentTaskStatus::Completed),
+                ]
+            );
+            assert_eq!(env.commit_calls.borrow().clone(), vec![task_id.to_string()]);
+            assert_eq!(
+                env.cleanup_calls.borrow().clone(),
+                vec![task_id.to_string()]
+            );
+        }
+
+        // 3. Runtime mode with commit_on_session_end = false
+        {
+            cx.update(|cx| {
+                cx.update_global::<SettingsStore, _>(|store, cx| {
+                    store.update_user_settings(cx, |settings| {
+                        let agent = settings.agent.get_or_insert_default();
+                        agent.register_metadata = Some(true);
+                        agent.commit_on_session_end = Some(false);
+                    });
+                });
+            });
+
+            let task_id = "TASK-NO-COMMIT";
+            let env = Rc::new(LifecycleTrackingEnvironment::new("subagent-runtime-3"));
+            #[allow(clippy::arc_with_non_send_sync)]
+            let tool = Arc::new(crate::tools::SpawnAgentTool::new(env.clone()));
+            let (event_stream, _rx) = crate::ToolCallEventStream::test();
+
+            let result = cx
+                .update(|cx| {
+                    tool.run(
+                        crate::ToolInput::resolved(crate::tools::SpawnAgentToolInput {
+                            label: "no commit".to_string(),
+                            message: "skip commit".to_string(),
+                            task_id: Some(task_id.to_string()),
+                            base_branch: Some("main".to_string()),
+                            ..Default::default()
+                        }),
+                        event_stream,
+                        cx,
+                    )
+                })
+                .await;
+
+            assert!(matches!(
+                result,
+                Ok(crate::tools::SpawnAgentToolOutput::Success { .. })
+            ));
+            assert_eq!(env.commit_calls.borrow().clone(), Vec::<String>::new());
+            assert_eq!(env.metadata_calls.borrow().len(), 1);
+            assert_eq!(
+                env.status_transitions.borrow().clone(),
+                vec![
+                    (task_id.to_string(), crate::AgentTaskStatus::Running),
+                    (task_id.to_string(), crate::AgentTaskStatus::Completed),
+                ]
+            );
+            assert_eq!(
+                env.cleanup_calls.borrow().clone(),
+                vec![task_id.to_string()]
+            );
+        }
+
+        // 4. Runtime mode with cleanup = false
+        {
+            cx.update(|cx| {
+                cx.update_global::<SettingsStore, _>(|store, cx| {
+                    store.update_user_settings(cx, |settings| {
+                        let agent = settings.agent.get_or_insert_default();
+                        agent.commit_on_session_end = Some(true);
+                        agent.cleanup = Some(false);
+                    });
+                });
+            });
+
+            let task_id = "TASK-NO-CLEANUP";
+            let env = Rc::new(LifecycleTrackingEnvironment::new("subagent-runtime-4"));
+            #[allow(clippy::arc_with_non_send_sync)]
+            let tool = Arc::new(crate::tools::SpawnAgentTool::new(env.clone()));
+            let (event_stream, _rx) = crate::ToolCallEventStream::test();
+
+            let result = cx
+                .update(|cx| {
+                    tool.run(
+                        crate::ToolInput::resolved(crate::tools::SpawnAgentToolInput {
+                            label: "no cleanup".to_string(),
+                            message: "skip cleanup".to_string(),
+                            task_id: Some(task_id.to_string()),
+                            base_branch: Some("main".to_string()),
+                            ..Default::default()
+                        }),
+                        event_stream,
+                        cx,
+                    )
+                })
+                .await;
+
+            assert!(matches!(
+                result,
+                Ok(crate::tools::SpawnAgentToolOutput::Success { .. })
+            ));
+            assert_eq!(env.cleanup_calls.borrow().clone(), Vec::<String>::new());
+            assert_eq!(env.metadata_calls.borrow().len(), 1);
+            assert_eq!(env.commit_calls.borrow().clone(), vec![task_id.to_string()]);
+            assert_eq!(
+                env.status_transitions.borrow().clone(),
+                vec![
+                    (task_id.to_string(), crate::AgentTaskStatus::Running),
+                    (task_id.to_string(), crate::AgentTaskStatus::Completed),
+                ]
+            );
+        }
+    }
+
+        #[gpui::test]
+        async fn test_isolated_subagent_per_thread_project_context(cx: &mut TestAppContext) {
+            init_test(cx);
+            let fs = FakeFs::new(cx.executor());
+            fs.insert_tree(
+                path!("/host"),
+                json!({
+                    ".git": {},
+                    ".rules": "HOST RULES"
+                }),
+            )
+            .await;
+
+            let project = Project::test(fs.clone(), [path!("/host").as_ref()], cx).await;
+            let thread_store = cx.new(|cx| ThreadStore::new(cx));
+            let agent = cx.update(|cx| NativeAgent::new(thread_store, Templates::new(), fs.clone(), cx));
+            let connection = Rc::new(NativeAgentConnection(agent.clone()));
+            let provider = Arc::new(FakeLanguageModelProvider::new(
+                LanguageModelProviderId::from("fake-corp".to_string()),
+                LanguageModelProviderName::from("Fake Corp".to_string()),
+            ));
+            let model = provider.update_model("test-model", |model| {
+                model.name = LanguageModelName::from("Test Model".to_string());
+            });
+            cx.update(|cx| {
+                LanguageModelRegistry::global(cx).update(cx, |registry, cx| {
+                    registry.register_provider(provider, cx);
+                    registry.set_default_model(Some(model), cx);
+                });
+            });
+
+            cx.run_until_parked();
+
+            let acp_thread = cx
+                .update(|cx| connection.new_session(project.clone(), PathList::new(&[Path::new("")]), cx))
+                .await
+                .unwrap();
+            let parent_session_id = acp_thread.read_with(cx, |thread, _| thread.session_id().clone());
+            let parent_thread = cx.update(|cx| native_thread_for_session(&agent, &parent_session_id, cx));
+            let environment = NativeThreadEnvironment {
+                agent: agent.downgrade(),
+                thread: parent_thread.downgrade(),
+                acp_thread: acp_thread.downgrade(),
+            };
+
+            // 1. Ensure a task worktree for an isolated agent.
+            let worktree_path = environment
+                .ensure_subagent_worktree("TASK-101", None, None, None, None, &mut cx.to_async())
+                .await
+                .expect("ensuring task worktree should succeed");
+
+            // Write isolated branch rules into the task worktree
+            fs.insert_file(
+                worktree_path.join(".rules"),
+                "ISOLATED BRANCH RULES".as_bytes().to_vec(),
+            )
+            .await;
+            cx.run_until_parked();
+
+            // 2. Create the isolated subagent thread with task_worktree.
+            let subagent_handle = cx
+                .update(|cx| {
+                    environment.create_subagent_thread(
+                        "isolated-worker".to_string(),
+                        None,
+                        None,
+                        Some(worktree_path.clone()),
+                        cx,
+                    )
+                })
+                .expect("creating isolated subagent should succeed");
+            cx.run_until_parked();
+
+            let subagent_thread = agent.read_with(cx, |agent, _| {
+                agent.sessions.get(&subagent_handle.id()).unwrap().thread.clone()
+            });
+
+            // 3. Create an interactive (non-worktree) subagent thread.
+            let non_isolated_handle = cx
+                .update(|cx| {
+                    environment.create_subagent_thread(
+                        "interactive-worker".to_string(),
+                        None,
+                        None,
+                        None,
+                        cx,
+                    )
+                })
+                .expect("creating non-isolated subagent should succeed");
+            cx.run_until_parked();
+
+            let non_isolated_thread = agent.read_with(cx, |agent, _| {
+                agent.sessions.get(&non_isolated_handle.id()).unwrap().thread.clone()
+            });
+
+            // Verify: Isolated thread system prompt lists ONLY the task worktree root and its branch rules
+            let subagent_messages = subagent_thread.read_with(cx, |thread, cx| {
+                thread.build_request_messages(Vec::new(), cx)
+            });
+            let subagent_prompt = subagent_messages[0].string_contents();
+            let worktree_path_str = worktree_path.to_string_lossy();
+
+            assert!(
+                subagent_prompt.contains(&*worktree_path_str),
+                "isolated thread system prompt must list the task worktree path ({worktree_path_str}), but got:\n{subagent_prompt}"
+            );
+            assert!(
+                !subagent_prompt.contains("`\\host`") && !subagent_prompt.contains("`/host`"),
+                "isolated thread system prompt must NOT contain host root directory, but got:\n{subagent_prompt}"
+            );
+            assert!(
+                subagent_prompt.contains("ISOLATED BRANCH RULES"),
+                "isolated thread system prompt must contain branch rules, but got:\n{subagent_prompt}"
+            );
+            assert!(
+                !subagent_prompt.contains("HOST RULES"),
+                "isolated thread system prompt must NOT contain host rules, but got:\n{subagent_prompt}"
+            );
+
+            // Verify: Non-isolated (interactive) subagent prompt is unchanged (contains host root and host rules)
+            let non_isolated_messages = non_isolated_thread.read_with(cx, |thread, cx| {
+                thread.build_request_messages(Vec::new(), cx)
+            });
+            let non_isolated_prompt = non_isolated_messages[0].string_contents();
+
+            assert!(
+                non_isolated_prompt.contains("HOST RULES"),
+                "non-isolated subagent must keep host rules"
+            );
+            assert!(
+                !non_isolated_prompt.contains("ISOLATED BRANCH RULES"),
+                "non-isolated subagent must not contain task branch rules"
+            );
+            assert!(
+                !non_isolated_prompt.contains(&*worktree_path_str),
+                "non-isolated subagent must not list the task worktree"
+            );
+
+            // Interactive (non-worktree) subagent threads keep inherited project context entity
+            assert_eq!(
+                non_isolated_thread.read_with(cx, |t, _| t.project_context().clone()),
+                parent_thread.read_with(cx, |t, _| t.project_context().clone()),
+                "interactive subagent must keep inherited project context"
+            );
+
+            // Parent thread prompt is unchanged
+            let parent_messages = parent_thread.read_with(cx, |thread, cx| {
+                thread.build_request_messages(Vec::new(), cx)
+            });
+            let parent_prompt = parent_messages[0].string_contents();
+            assert!(parent_prompt.contains("HOST RULES"));
+            assert!(!parent_prompt.contains("ISOLATED BRANCH RULES"));
+            assert!(!parent_prompt.contains(&*worktree_path_str));
+
+            // Verify resume path preserves isolated project context
+            let resumed_handle = cx
+                .update(|cx| {
+                    environment.resume_subagent_thread(
+                        subagent_handle.id(),
+                        None,
+                        Some(worktree_path.clone()),
+                        cx,
+                    )
+                })
+                .expect("resuming isolated subagent should succeed");
+            cx.run_until_parked();
+
+            let resumed_thread = agent.read_with(cx, |agent, _| {
+                agent.sessions.get(&resumed_handle.id()).unwrap().thread.clone()
+            });
+            let resumed_messages = resumed_thread.read_with(cx, |thread, cx| {
+                thread.build_request_messages(Vec::new(), cx)
+            });
+            let resumed_prompt = resumed_messages[0].string_contents();
+            assert!(resumed_prompt.contains(&*worktree_path_str));
+            assert!(resumed_prompt.contains("ISOLATED BRANCH RULES"));
+            assert!(!resumed_prompt.contains("HOST RULES"));
+        }
+        #[gpui::test]
+        async fn test_isolated_subagent_cold_resume_confines_to_worktree(cx: &mut TestAppContext) {
+            init_test(cx);
+            let fs = FakeFs::new(cx.executor());
+            fs.insert_tree(
+                path!("/host"),
+                json!({
+                    ".git": {},
+                    ".rules": "HOST RULES"
+                }),
+            )
+            .await;
+
+            let project = Project::test(fs.clone(), [path!("/host").as_ref()], cx).await;
+            let thread_store = cx.new(|cx| ThreadStore::new(cx));
+            let agent = cx.update(|cx| NativeAgent::new(thread_store, Templates::new(), fs.clone(), cx));
+            let connection = Rc::new(NativeAgentConnection(agent.clone()));
+            let provider = Arc::new(FakeLanguageModelProvider::new(
+                LanguageModelProviderId::from("fake-corp".to_string()),
+                LanguageModelProviderName::from("Fake Corp".to_string()),
+            ));
+            let model = provider.update_model("test-model", |model| {
+                model.name = LanguageModelName::from("Test Model".to_string());
+            });
+            cx.update(|cx| {
+                LanguageModelRegistry::global(cx).update(cx, |registry, cx| {
+                    registry.register_provider(provider, cx);
+                    registry.set_default_model(Some(model), cx);
+                });
+            });
+
+            cx.run_until_parked();
+
+            let acp_thread = cx
+                .update(|cx| connection.new_session(project.clone(), PathList::new(&[Path::new("")]), cx))
+                .await
+                .unwrap();
+            let parent_session_id = acp_thread.read_with(cx, |thread, _| thread.session_id().clone());
+            let parent_thread = cx.update(|cx| native_thread_for_session(&agent, &parent_session_id, cx));
+            let environment = NativeThreadEnvironment {
+                agent: agent.downgrade(),
+                thread: parent_thread.downgrade(),
+                acp_thread: acp_thread.downgrade(),
+            };
+
+            let task_id = "TASK-COLD-RESUME";
+            let worktree_path = environment
+                .ensure_subagent_worktree(task_id, None, None, None, None, &mut cx.to_async())
+                .await
+                .expect("ensuring task worktree should succeed");
+
+            fs.insert_file(
+                worktree_path.join(".rules"),
+                "COLD RESUME ISOLATED RULES".as_bytes().to_vec(),
+            )
+            .await;
+            cx.run_until_parked();
+
+            // Create the isolated subagent thread with task_worktree.
+            let subagent_handle = cx
+                .update(|cx| {
+                    environment.create_subagent_thread(
+                        "isolated-worker".to_string(),
+                        None,
+                        None,
+                        Some(worktree_path.clone()),
+                        cx,
+                    )
+                })
+                .expect("creating isolated subagent should succeed");
+            cx.run_until_parked();
+
+            let subagent_thread = agent.read_with(cx, |agent, _| {
+                agent.sessions.get(&subagent_handle.id()).unwrap().thread.clone()
+            });
+
+            // Simulate cold resume from DB: task_worktree is None, task_id is preserved
+            subagent_thread.update(cx, |thread, _cx| {
+                thread.set_task_worktree(None);
+                thread.set_task_id(Some(task_id.to_string()));
+            });
+
+            // Registry knows the task and its session
+            let task_id_typed = crate::AgentTaskId::from(task_id);
+            crate::task_worktree::register_task_session(&task_id_typed, subagent_handle.id().to_string());
+
+            // Cold resume: caller passes task_worktree: None
+            let resumed_handle = cx
+                .update(|cx| {
+                    environment.resume_subagent_thread(
+                        subagent_handle.id(),
+                        None,
+                        None,
+                        cx,
+                    )
+                })
+                .expect("cold-resuming isolated subagent should succeed");
+            cx.run_until_parked();
+
+            let resumed_thread = agent.read_with(cx, |agent, _| {
+                agent.sessions.get(&resumed_handle.id()).unwrap().thread.clone()
+            });
+
+            // Verify confinement: worktree_root_path returns task worktree, NOT host
+            let root_path = resumed_thread.read_with(cx, |t, cx| t.worktree_root_path(cx));
+            assert_eq!(
+                root_path.as_deref(),
+                Some(worktree_path.as_path()),
+                "cold-resumed thread must confine reads to the task worktree"
+            );
+
+            // Verify system prompt: lists ONLY task worktree root and branch rules, not host
+            let resumed_messages = resumed_thread.read_with(cx, |thread, cx| {
+                thread.build_request_messages(Vec::new(), cx)
+            });
+            let resumed_prompt = resumed_messages[0].string_contents();
+            let worktree_path_str = worktree_path.to_string_lossy();
+            assert!(
+                resumed_prompt.contains(&*worktree_path_str),
+                "cold-resumed thread system prompt must list task worktree root"
+            );
+            assert!(
+                !resumed_prompt.contains(r"`\host`") && !resumed_prompt.contains("`/host`"),
+                "cold-resumed thread system prompt must NOT contain host root"
+            );
+            assert!(
+                resumed_prompt.contains("COLD RESUME ISOLATED RULES"),
+                "cold-resumed thread system prompt must contain branch rules"
+            );
+            assert!(
+                !resumed_prompt.contains("HOST RULES"),
+                "cold-resumed thread system prompt must NOT contain host rules"
+            );
+        }
 }
 
 fn mcp_message_content_to_acp_content_block(

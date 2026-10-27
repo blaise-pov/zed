@@ -24,32 +24,33 @@
 //! }
 //! ```
 
+use anyhow::Context as _;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use agent::{
-    AgentGoalStatus, AgentGoalSummary, AgentTaskArtifact, AgentTaskDetail, AgentTaskEvent,
-    AgentTaskEventKind, AgentTaskId, AgentTaskStatus, AgentTaskStore, AgentTaskSummary,
-    DiffShortStat, GoalGitState, OrphanWorktree, TaskWorktreeStatus,
+    AgentGoalStatus, AgentGoalSummary, AgentTaskArtifact, AgentTaskDetail, AgentTaskEventKind,
+    AgentTaskId, AgentTaskMetrics, AgentTaskStatus, AgentTaskStore, AgentTaskSummary, GoalGitState,
+    OrphanWorktree, TaskWorktreeStatus,
 };
 use agent_settings::AgentSettings;
 use editor::Editor;
 use fs::Fs;
 use gpui::{
-    Action, App, Context, DismissEvent, Div, Entity, EventEmitter, FocusHandle, Focusable,
-    KeyContext, MouseButton, MouseDownEvent, Pixels, Point, Subscription, Task, WeakEntity, Window,
-    actions, anchored, deferred, prelude::*, px,
+    Action, App, Context, DismissEvent, Div, ElementId, Entity, EventEmitter, FocusHandle,
+    Focusable, KeyContext, MouseButton, MouseDownEvent, Pixels, Point, Subscription, Task,
+    WeakEntity, Window, actions, anchored, deferred, prelude::*, px,
 };
 use multi_buffer::MultiBuffer;
 use project::{Project, git_store::Repository};
 use settings::{Settings, SettingsStore};
 use ui::{
-    Color, CommonAnimationExt, ContextMenu, Icon, IconButton, IconName, IconPosition, IconSize,
-    Label, LabelSize, PopoverMenu, Tooltip, prelude::*,
+    Color, CommonAnimationExt, ContextMenu, ContextMenuEntry, DiffStat, Icon, IconButton, IconName,
+    IconPosition, IconSize, Label, LabelSize, PopoverMenu, Tooltip, prelude::*,
 };
 use util::ResultExt;
-use workspace::Workspace;
 use workspace::dock::{DockPosition, Panel, PanelEvent};
+use workspace::{PathList, ToggleZoom, Workspace};
 use zed_actions::SwitchWorktree;
 
 #[allow(dead_code)]
@@ -173,7 +174,7 @@ pub(crate) fn find_repository_for_worktree_path(
         .cloned()
 }
 
-actions!(agent_tasks, [ToggleAgentTaskPanel]);
+actions!(agent, [ToggleAgentTaskPanel]);
 
 pub const AGENT_TASK_PANEL_KEY: &str = "AgentTaskPanel";
 
@@ -191,7 +192,8 @@ pub fn init(file_system: Arc<dyn Fs>, cx: &mut App) {
             context_server_store,
             server_id,
         ));
-        let store = cx.new(|cx| agent::AgentTaskStore::new(provider, cx));
+        let store = cx
+            .new(|cx| agent::AgentTaskStore::new_with_project(provider, Some(project.clone()), cx));
 
         let panel = cx.new(|cx| {
             AgentTaskPanel::new(
@@ -234,6 +236,22 @@ pub struct DeployedContextMenu {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RenamingTarget {
+    Goal(String),
+    Task(AgentTaskId),
+}
+
+struct TaskOperationErrorToast;
+pub(crate) struct WorktreeDeletedToast;
+
+pub struct RenamingItem {
+    pub target: RenamingTarget,
+    pub editor: Entity<Editor>,
+    pub initial_title: String,
+    pub _subscription: Subscription,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PreviewItem {
     Task(AgentTaskId),
     Goal(String),
@@ -256,6 +274,8 @@ pub struct AgentTaskPanel {
     pub hovered_row: Option<HoveredRow>,
     pub context_menu: Option<DeployedContextMenu>,
     pub goal_cleanup_result: Option<agent::task_worktree::GoalCleanupResult>,
+    pub zoomed: bool,
+    pub editing_item: Option<RenamingItem>,
     focus_handle: FocusHandle,
     workspace: WeakEntity<Workspace>,
     project: Entity<Project>,
@@ -264,6 +284,227 @@ pub struct AgentTaskPanel {
 }
 
 impl AgentTaskPanel {
+    pub fn show_error_toast(
+        workspace: WeakEntity<Workspace>,
+        message: impl Into<std::borrow::Cow<'static, str>>,
+        cx: &mut App,
+    ) {
+        if let Some(workspace) = workspace.upgrade() {
+            workspace.update(cx, |workspace, cx| {
+                workspace.show_toast(
+                    workspace::Toast::new(
+                        workspace::notifications::NotificationId::unique::<TaskOperationErrorToast>(
+                        ),
+                        message,
+                    ),
+                    cx,
+                );
+            });
+        }
+    }
+
+    pub fn humanize_error(error: &anyhow::Error) -> String {
+        let err_str = format!("{error:#}");
+        Self::humanize_error_str(&err_str)
+    }
+
+    pub fn humanize_error_str(err_str: &str) -> String {
+        let lower = err_str.to_lowercase();
+        if lower.contains("database is locked") || lower.contains("database locked") {
+            "Database is locked by another process. Please wait and try again.".to_string()
+        } else if lower.contains("index.lock")
+            || lower.contains("file is locked")
+            || lower.contains("being used by another process")
+            || lower.contains("could not lock config file")
+            || lower.contains("resource temporarily unavailable")
+        {
+            "Git index or file is locked by another process. Please wait and try again.".to_string()
+        } else if lower.contains("not a valid object name")
+            || (lower.contains("branch") && lower.contains("not found"))
+            || lower.contains("did not match any file")
+            || (lower.contains("reference") && lower.contains("not found"))
+            || lower.contains("no such branch")
+        {
+            format!("Git branch not found: {err_str}")
+        } else {
+            err_str.to_string()
+        }
+    }
+
+    pub fn format_task_panel_error(action: Option<&str>, error: &anyhow::Error) -> String {
+        let humanized = Self::humanize_error(error);
+        if let Some(action) = action {
+            format!("Task Panel: {action}: {humanized}")
+        } else if humanized.starts_with("Task Panel: ") {
+            humanized
+        } else {
+            format!("Task Panel: {humanized}")
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn spawn_with_error_toast<F>(&self, task: F, _window: &mut Window, cx: &mut Context<Self>)
+    where
+        F: Future<Output = anyhow::Result<()>> + 'static,
+    {
+        Self::spawn_task_with_error_toast(task, self.workspace.clone(), cx);
+    }
+
+    pub fn spawn_with_action_error_toast<F>(
+        &self,
+        task: F,
+        action: &'static str,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) where
+        F: Future<Output = anyhow::Result<()>> + 'static,
+    {
+        Self::spawn_task_with_action_error_toast(task, Some(action), self.workspace.clone(), cx);
+    }
+
+    #[allow(dead_code)]
+    pub fn spawn_task_with_error_toast<F>(task: F, workspace: WeakEntity<Workspace>, cx: &mut App)
+    where
+        F: Future<Output = anyhow::Result<()>> + 'static,
+    {
+        Self::spawn_task_with_action_error_toast(task, None, workspace, cx);
+    }
+
+    pub fn spawn_task_with_action_error_toast<F>(
+        task: F,
+        action: Option<&'static str>,
+        workspace: WeakEntity<Workspace>,
+        cx: &mut App,
+    ) where
+        F: Future<Output = anyhow::Result<()>> + 'static,
+    {
+        cx.spawn(async move |cx| {
+            if let Err(error) = task.await {
+                let message = Self::format_task_panel_error(action, &error);
+                cx.update(|cx| {
+                    Self::show_error_toast(workspace, message, cx);
+                });
+            }
+        })
+        .detach();
+    }
+
+    pub fn toggle_zoom(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.zoomed {
+            cx.emit(PanelEvent::ZoomOut);
+        } else {
+            if !self.focus_handle(cx).contains_focused(window, cx) {
+                self.activation_focus_handle(cx).focus(window, cx);
+            }
+            cx.emit(PanelEvent::ZoomIn);
+        }
+    }
+
+    pub fn start_renaming(
+        &mut self,
+        target: RenamingTarget,
+        initial_title: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.editing_item.is_some() {
+            self.confirm_renaming(window, cx);
+        }
+
+        let editor = cx.new(|cx| {
+            let mut editor = Editor::single_line(window, cx);
+            editor.set_text(initial_title.clone(), window, cx);
+            editor
+        });
+
+        let subscription = cx.subscribe_in(
+            &editor,
+            window,
+            move |this, _editor, event: &editor::EditorEvent, window, cx| {
+                if matches!(event, editor::EditorEvent::Blurred) {
+                    this.confirm_renaming(window, cx);
+                }
+            },
+        );
+
+        editor.update(cx, |editor, cx| {
+            editor.select_all(&editor::actions::SelectAll, window, cx);
+            editor.focus_handle(cx).focus(window, cx);
+        });
+
+        self.editing_item = Some(RenamingItem {
+            target,
+            editor,
+            initial_title,
+            _subscription: subscription,
+        });
+        cx.notify();
+    }
+
+    pub fn confirm_renaming(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(renaming) = self.editing_item.take() else {
+            return;
+        };
+        self.focus_handle.focus(window, cx);
+        let new_title = renaming.editor.read(cx).text(cx).trim().to_string();
+        if new_title.is_empty() || new_title == renaming.initial_title {
+            cx.notify();
+            return;
+        }
+        match renaming.target {
+            RenamingTarget::Goal(goal_id) => {
+                let store = self.store.clone();
+                let task = store.update(cx, |store, cx| {
+                    store.update_goal_title(&goal_id, &new_title, cx)
+                });
+                self.spawn_with_action_error_toast(task, "Rename Goal", window, cx);
+            }
+            RenamingTarget::Task(task_id) => {
+                let store = self.store.clone();
+                let task = store.update(cx, |store, cx| {
+                    store.update_task_title(&task_id, &new_title, cx)
+                });
+                self.spawn_with_action_error_toast(task, "Rename Task", window, cx);
+            }
+        }
+        cx.notify();
+    }
+
+    pub fn cancel_renaming(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.editing_item.take().is_some() {
+            self.focus_handle.focus(window, cx);
+            cx.notify();
+        }
+    }
+
+    fn render_rename_editor(
+        &self,
+        editor: &Entity<Editor>,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        div()
+            .flex_1()
+            .min_w_0()
+            .on_action(
+                cx.listener(|this, _: &editor::actions::Newline, window, cx| {
+                    this.confirm_renaming(window, cx);
+                }),
+            )
+            .on_action(cx.listener(|this, _: &menu::Confirm, window, cx| {
+                this.confirm_renaming(window, cx);
+            }))
+            .on_action(
+                cx.listener(|this, _: &editor::actions::Cancel, window, cx| {
+                    this.cancel_renaming(window, cx);
+                }),
+            )
+            .on_action(cx.listener(|this, _: &menu::Cancel, window, cx| {
+                this.cancel_renaming(window, cx);
+            }))
+            .child(editor.clone())
+            .into_any_element()
+    }
+
     pub fn new(
         store: Entity<AgentTaskStore>,
         workspace: WeakEntity<Workspace>,
@@ -346,6 +587,8 @@ impl AgentTaskPanel {
             hovered_row: None,
             context_menu: None,
             goal_cleanup_result: None,
+            zoomed: false,
+            editing_item: None,
             focus_handle: cx.focus_handle(),
             workspace,
             project,
@@ -582,11 +825,119 @@ impl AgentTaskPanel {
                         });
                     }
 
+                    let goal_session_id = goal_summary
+                        .as_ref()
+                        .and_then(|g| g.session_id.as_deref())
+                        .filter(|s| !s.trim().is_empty())
+                        .map(ToString::to_string);
+
+                    if let Some(session_id) = goal_session_id {
+                        let workspace_for_open_thread = workspace.clone();
+                        let goal_title_for_open_thread = goal_summary
+                            .as_ref()
+                            .map(|g| SharedString::from(g.title.clone()));
+                        let session_id_for_open_thread = session_id.clone();
+                        menu = menu.entry("Open Thread", None, move |window, cx| {
+                            if let Some(workspace) = workspace_for_open_thread.upgrade() {
+                                workspace.update(cx, |workspace, cx| {
+                                    if let Some(panel) = workspace.panel::<crate::AgentPanel>(cx) {
+                                        let session_id =
+                                            agent_client_protocol::schema::v1::SessionId::new(
+                                                session_id_for_open_thread.clone(),
+                                            );
+                                        let title = goal_title_for_open_thread.clone();
+                                        panel.update(cx, |panel, cx| {
+                                            panel.open_thread_standalone(
+                                                session_id, None, title, window, cx,
+                                            );
+                                        });
+                                    }
+                                    workspace.focus_panel::<crate::AgentPanel>(window, cx);
+                                });
+                            }
+                        });
+
+                        let workspace_for_view_thread = workspace.clone();
+                        let goal_title_for_view_thread = goal_summary
+                            .as_ref()
+                            .map(|g| SharedString::from(g.title.clone()));
+                        let session_id_for_view_thread = session_id.clone();
+                        menu = menu.entry("View Thread", None, move |window, cx| {
+                            if let Some(workspace) = workspace_for_view_thread.upgrade() {
+                                workspace.update(cx, |workspace, cx| {
+                                    if let Some(panel) = workspace.panel::<crate::AgentPanel>(cx) {
+                                        let session_id =
+                                            agent_client_protocol::schema::v1::SessionId::new(
+                                                session_id_for_view_thread.clone(),
+                                            );
+                                        let title = goal_title_for_view_thread.clone();
+                                        panel.update(cx, |panel, cx| {
+                                            panel.view_thread_readonly(
+                                                session_id, title, window, cx,
+                                            );
+                                        });
+                                    }
+                                    workspace.focus_panel::<crate::AgentPanel>(window, cx);
+                                });
+                            }
+                        });
+
+                        let workspace_for_transcript = workspace.clone();
+                        let goal_id_for_preview = goal_id.clone();
+                        let session_id_for_transcript = session_id;
+                        menu = menu.entry("View Thread as Markdown", None, move |window, cx| {
+                            let db_task = agent::ThreadsDatabase::connect(cx);
+                            let session_id_acp = agent_client_protocol::schema::v1::SessionId::new(
+                                session_id_for_transcript.clone(),
+                            );
+                            let workspace = workspace_for_transcript.clone();
+                            let goal_id_for_preview = goal_id_for_preview.clone();
+                            let task = window.spawn(cx, async move |cx| {
+                                let database = db_task.await.map_err(|e| anyhow::anyhow!("{e}"))?;
+                                let thread = database.load_thread(session_id_acp).await?;
+                                let markdown = if let Some(thread) = thread {
+                                    thread.to_markdown()
+                                } else {
+                                    format!(
+                                        "No saved transcript found for goal {}.",
+                                        goal_id_for_preview
+                                    )
+                                };
+                                if let Some(workspace) = workspace.upgrade() {
+                                    let preview_task = cx.update(|window, cx| {
+                                        open_markdown_preview(
+                                            format!("Goal {} Thread", goal_id_for_preview),
+                                            markdown,
+                                            workspace,
+                                            window,
+                                            cx,
+                                        )
+                                    })?;
+                                    preview_task.await?;
+                                }
+                                Ok(())
+                            });
+                            Self::spawn_task_with_action_error_toast(
+                                task,
+                                Some("View Thread as Markdown"),
+                                workspace_for_transcript.clone(),
+                                cx,
+                            );
+                        });
+                    }
+
                     if branch_exists {
                         let branch = branch_name.clone();
                         let project = project.clone();
+                        let workspace = workspace.clone();
                         menu = menu.entry("Go to Branch", None, move |window, cx| {
-                            Self::go_to_branch(branch.clone(), project.clone(), window, cx);
+                            Self::go_to_branch(
+                                branch.clone(),
+                                project.clone(),
+                                workspace.clone(),
+                                window,
+                                cx,
+                            );
                         });
                     }
 
@@ -605,39 +956,79 @@ impl AgentTaskPanel {
                         });
                     }
 
+                    {
+                        let view = view.clone();
+                        let goal_id = goal_id.clone();
+                        let title = goal_summary
+                            .as_ref()
+                            .map(|g| g.title.clone())
+                            .unwrap_or_else(|| goal_id.clone());
+                        menu = menu.entry("Rename", None, move |window, cx| {
+                            if let Some(panel) = view.upgrade() {
+                                panel.update(cx, |panel, cx| {
+                                    panel.start_renaming(
+                                        RenamingTarget::Goal(goal_id.clone()),
+                                        title.clone(),
+                                        window,
+                                        cx,
+                                    );
+                                });
+                            }
+                        });
+                    }
+
                     menu = menu.separator();
 
                     if !is_archived {
                         let store = store.clone();
                         let goal_id = goal_id.clone();
+                        let workspace = workspace.clone();
                         menu = menu.entry("Archive", None, move |_window, cx| {
-                            store
-                                .update(cx, |store, cx| store.archive_goal(&goal_id, cx))
-                                .detach_and_log_err(cx);
+                            let task =
+                                store.update(cx, |store, cx| store.archive_goal(&goal_id, cx));
+                            Self::spawn_task_with_action_error_toast(
+                                task,
+                                Some("Archive Goal"),
+                                workspace.clone(),
+                                cx,
+                            );
                         });
                     } else {
                         let store = store.clone();
                         let goal_id = goal_id.clone();
+                        let workspace = workspace.clone();
                         menu = menu.entry("Unarchive", None, move |_window, cx| {
-                            store
-                                .update(cx, |store, cx| store.unarchive_goal(&goal_id, cx))
-                                .detach_and_log_err(cx);
+                            let task =
+                                store.update(cx, |store, cx| store.unarchive_goal(&goal_id, cx));
+                            Self::spawn_task_with_action_error_toast(
+                                task,
+                                Some("Unarchive Goal"),
+                                workspace.clone(),
+                                cx,
+                            );
                         });
                     }
 
                     if is_archived {
                         let store = store.clone();
                         let goal_id = goal_id.clone();
+                        let workspace = workspace.clone();
                         menu = menu.entry("Delete", None, move |_window, cx| {
-                            store
-                                .update(cx, |store, cx| store.delete_goal(&goal_id, cx))
-                                .detach_and_log_err(cx);
+                            let task =
+                                store.update(cx, |store, cx| store.delete_goal(&goal_id, cx));
+                            Self::spawn_task_with_action_error_toast(
+                                task,
+                                Some("Delete Goal"),
+                                workspace.clone(),
+                                cx,
+                            );
                         });
                     }
 
                     {
                         let store = store.clone();
                         let goal_id = goal_id.clone();
+                        let workspace = workspace.clone();
                         menu = menu.submenu_with_colored_icon(
                             "Change Status",
                             IconName::Circle,
@@ -656,6 +1047,7 @@ impl AgentTaskPanel {
                                     let store = store.clone();
                                     let goal_id = goal_id.clone();
                                     let target_status_for_action = target_status.clone();
+                                    let workspace = workspace.clone();
                                     sub = sub.toggleable_entry_disabled_when(
                                         label,
                                         is_active,
@@ -663,15 +1055,19 @@ impl AgentTaskPanel {
                                         IconPosition::Start,
                                         None,
                                         move |_window, cx| {
-                                            store
-                                                .update(cx, |store, cx| {
-                                                    store.set_goal_status(
-                                                        &goal_id,
-                                                        &target_status_for_action,
-                                                        cx,
-                                                    )
-                                                })
-                                                .detach_and_log_err(cx);
+                                            let task = store.update(cx, |store, cx| {
+                                                store.set_goal_status(
+                                                    &goal_id,
+                                                    &target_status_for_action,
+                                                    cx,
+                                                )
+                                            });
+                                            Self::spawn_task_with_action_error_toast(
+                                                task,
+                                                Some("Set Goal Status"),
+                                                workspace.clone(),
+                                                cx,
+                                            );
                                         },
                                     );
                                 }
@@ -683,6 +1079,7 @@ impl AgentTaskPanel {
                     if can_cleanup {
                         let project = project.clone();
                         let view = view.clone();
+                        let workspace = workspace.clone();
                         menu = menu.separator().entry(
                             "Cleanup Goal Branches",
                             None,
@@ -690,16 +1087,18 @@ impl AgentTaskPanel {
                                 let project = project.clone();
                                 let goal_id = goal_id.clone();
                                 let view = view.clone();
+                                let workspace = workspace.clone();
                                 let cleanup_task = agent::task_worktree::cleanup_graduated_goal(
                                     project, &goal_id, cx,
                                 );
                                 cx.spawn(async move |cx| match cleanup_task.await {
                                     Ok(result) => {
                                         log::info!(
-                                            "Cleaned up goal {}: {} branches deleted, {} failed",
+                                            "Cleaned up goal {}: {} branches deleted, {} failed, {} skipped",
                                             result.goal_id,
                                             result.deleted_branches.len(),
-                                            result.failed_branches.len()
+                                            result.failed_branches.len(),
+                                            result.skipped_branches.len()
                                         );
                                         if let Some(panel) = view.upgrade() {
                                             panel.update(cx, |this, cx| {
@@ -711,6 +1110,14 @@ impl AgentTaskPanel {
                                     }
                                     Err(e) => {
                                         log::warn!("Failed to clean up goal {goal_id}: {e}");
+                                        let humanized = Self::humanize_error(&e);
+                                        cx.update(|cx| {
+                                            Self::show_error_toast(
+                                                workspace,
+                                                format!("Task Panel: Clean up Goal: {humanized}"),
+                                                cx,
+                                            );
+                                        });
                                     }
                                 })
                                 .detach();
@@ -769,6 +1176,220 @@ impl AgentTaskPanel {
                         });
                     }
 
+                    {
+                        let view = view.clone();
+                        let task_id = task_id.clone();
+                        let title = task
+                            .as_ref()
+                            .map(|t| t.title.clone())
+                            .unwrap_or_else(|| task_id.to_string());
+                        menu = menu.entry("Rename", None, move |window, cx| {
+                            if let Some(panel) = view.upgrade() {
+                                panel.update(cx, |panel, cx| {
+                                    panel.start_renaming(
+                                        RenamingTarget::Task(task_id.clone()),
+                                        title.clone(),
+                                        window,
+                                        cx,
+                                    );
+                                });
+                            }
+                        });
+                    }
+
+                    if let Some(session_id) = agent::task_worktree::task_session_id_for_id(&task_id)
+                    {
+                        let workspace_for_transcript = workspace.clone();
+                        let task_id_for_preview = task_id.clone();
+                        let session_id_for_transcript = session_id.clone();
+                        menu = menu.entry("View Thread as Markdown", None, move |window, cx| {
+                            let db_task = agent::ThreadsDatabase::connect(cx);
+                            let session_id_acp = agent_client_protocol::schema::v1::SessionId::new(
+                                session_id_for_transcript.clone(),
+                            );
+                            let workspace = workspace_for_transcript.clone();
+                            let task_id_for_preview = task_id_for_preview.clone();
+                            let task = window.spawn(cx, async move |cx| {
+                                let database = db_task.await.map_err(|e| anyhow::anyhow!("{e}"))?;
+                                let thread = database.load_thread(session_id_acp).await?;
+                                let markdown = if let Some(thread) = thread {
+                                    thread.to_markdown()
+                                } else {
+                                    format!(
+                                        "No saved transcript found for task {}.",
+                                        task_id_for_preview
+                                    )
+                                };
+                                if let Some(workspace) = workspace.upgrade() {
+                                    let preview_task = cx.update(|window, cx| {
+                                        open_markdown_preview(
+                                            format!("Task {} Transcript", task_id_for_preview),
+                                            markdown,
+                                            workspace,
+                                            window,
+                                            cx,
+                                        )
+                                    })?;
+                                    preview_task.await?;
+                                }
+                                Ok(())
+                            });
+                            Self::spawn_task_with_action_error_toast(
+                                task,
+                                Some("View Thread as Markdown"),
+                                workspace_for_transcript.clone(),
+                                cx,
+                            );
+                        });
+
+                        let workspace_for_panel = workspace.clone();
+                        let task_title = task.as_ref().map(|t| SharedString::from(t.title.clone()));
+                        let session_id_for_view = session_id.clone();
+                        menu = menu.entry("View Thread", None, move |window, cx| {
+                            if let Some(workspace) = workspace_for_panel.upgrade() {
+                                workspace.update(cx, |workspace, cx| {
+                                    if let Some(panel) = workspace.panel::<crate::AgentPanel>(cx) {
+                                        let session_id =
+                                            agent_client_protocol::schema::v1::SessionId::new(
+                                                session_id_for_view.clone(),
+                                            );
+                                        let title = task_title.clone();
+                                        panel.update(cx, |panel, cx| {
+                                            panel.view_thread_readonly(
+                                                session_id, title, window, cx,
+                                            );
+                                        });
+                                    }
+                                    workspace.focus_panel::<crate::AgentPanel>(window, cx);
+                                });
+                            }
+                        });
+
+                        let workspace_for_open_thread = workspace.clone();
+                        let task_title_for_open_thread =
+                            task.as_ref().map(|t| SharedString::from(t.title.clone()));
+                        let session_id_for_open_thread = session_id;
+                        let project_for_open_thread = project.clone();
+                        let task_id_for_open_thread = task_id.clone();
+                        let task_for_open_thread = task.clone();
+                        let branch_name_for_open_thread = branch_name.clone();
+                        let branch_exists_for_open_thread = branch_exists;
+                        let exists_on_disk_for_open_thread = exists_on_disk;
+                        let worktree_path_for_open_thread = worktree_path.clone();
+                        let goal_id_for_open_thread = goal_id.clone();
+                        let view_for_open_thread = view.clone();
+
+                        menu = menu.entry("Open Thread", None, move |window, cx| {
+                            let session_id = agent_client_protocol::schema::v1::SessionId::new(
+                                session_id_for_open_thread.clone(),
+                            );
+                            let title = task_title_for_open_thread.clone();
+                            let workspace = workspace_for_open_thread.clone();
+
+                            if exists_on_disk_for_open_thread {
+                                if let Some(workspace) = workspace.upgrade() {
+                                    workspace.update(cx, |workspace, cx| {
+                                        if let Some(panel) =
+                                            workspace.panel::<crate::AgentPanel>(cx)
+                                        {
+                                            panel.update(cx, |panel, cx| {
+                                                panel.open_thread_standalone(
+                                                    session_id,
+                                                    worktree_path_for_open_thread
+                                                        .as_ref()
+                                                        .map(|p| PathList::new(&[p.as_path()])),
+                                                    title,
+                                                    window,
+                                                    cx,
+                                                );
+                                            });
+                                        }
+                                        workspace.focus_panel::<crate::AgentPanel>(window, cx);
+                                    });
+                                }
+                            } else if !branch_exists_for_open_thread {
+                                let task_id = task_id_for_open_thread.clone();
+                                let branch_name = branch_name_for_open_thread.clone();
+                                Self::show_error_toast(
+                                    workspace,
+                                    format!(
+                                        "Task Panel: Open Thread: Cannot open thread for task {task_id}: branch '{branch_name}' was not found in git repository; worktree cannot be restored."
+                                    ),
+                                    cx,
+                                );
+                            } else {
+                                let task_id = task_id_for_open_thread.clone();
+                                let task_summary = task_for_open_thread
+                                    .clone()
+                                    .unwrap_or_else(|| agent::AgentTaskSummary {
+                                        id: task_id_for_open_thread.clone(),
+                                        title: task_id_for_open_thread.to_string(),
+                                        ..Default::default()
+                                    });
+                                let ensure_task =
+                                    agent::task_worktree::ensure_task_worktree_with_options(
+                                        project_for_open_thread.clone(),
+                                        &task_summary,
+                                        goal_id_for_open_thread.clone(),
+                                        None,
+                                        None,
+                                        true,
+                                        cx,
+                                    );
+                                let view = view_for_open_thread.clone();
+                                window
+                                    .spawn(cx, async move |cx| -> anyhow::Result<()> {
+                                        let path = match ensure_task.await {
+                                            Ok(path) => path,
+                                            Err(err) => {
+                                                let humanized = Self::humanize_error(&err);
+                                                cx.update(|_window, cx| {
+                                                    Self::show_error_toast(
+                                                        workspace,
+                                                        format!(
+                                                            "Task Panel: Open Thread: Failed to restore worktree for task {task_id}: {humanized}"
+                                                        ),
+                                                        cx,
+                                                    );
+                                                })
+                                                .log_err();
+                                                return Ok(());
+                                            }
+                                        };
+                                        cx.update(|window, cx| {
+                                            if let Some(panel) = view.upgrade() {
+                                                panel.update(cx, |panel, cx| {
+                                                    panel.refresh_worktree_status(cx);
+                                                });
+                                            }
+                                            if let Some(workspace) = workspace.upgrade() {
+                                                workspace.update(cx, |workspace, cx| {
+                                                    if let Some(panel) =
+                                                        workspace.panel::<crate::AgentPanel>(cx)
+                                                    {
+                                                        panel.update(cx, |panel, cx| {
+                                                            panel.open_thread_standalone(
+                                                                session_id,
+                                                                Some(PathList::new(&[path.as_path()])),
+                                                                title,
+                                                                window,
+                                                                cx,
+                                                            );
+                                                        });
+                                                    }
+                                                    workspace.focus_panel::<crate::AgentPanel>(
+                                                        window, cx,
+                                                    );
+                                                });
+                                            }
+                                        })?;
+                                        Ok(())
+                                    })
+                                    .detach();
+                            }
+                        });
+                    }
+
                     if exists_on_disk {
                         if let Some(path) = worktree_path.clone() {
                             let task_id = task_id.clone();
@@ -788,8 +1409,15 @@ impl AgentTaskPanel {
                     if branch_exists {
                         let branch = branch_name.clone();
                         let project = project.clone();
+                        let workspace = workspace.clone();
                         menu = menu.entry("Go to Branch", None, move |window, cx| {
-                            Self::go_to_branch(branch.clone(), project.clone(), window, cx);
+                            Self::go_to_branch(
+                                branch.clone(),
+                                project.clone(),
+                                workspace.clone(),
+                                window,
+                                cx,
+                            );
                         });
                     }
 
@@ -798,6 +1426,8 @@ impl AgentTaskPanel {
                             let project = project.clone();
                             let branch = branch_name;
                             let view = view.clone();
+                            let workspace = workspace.clone();
+                            let goal_id = goal_id.clone();
                             menu = menu.entry(
                                 "Restore Worktree from Branch",
                                 None,
@@ -805,13 +1435,15 @@ impl AgentTaskPanel {
                                     let task_id = task.id.clone();
                                     let branch_for_switch = branch.clone();
                                     let view = view.clone();
+                                    let workspace = workspace.clone();
                                     let ensure_task =
-                                        agent::task_worktree::ensure_task_worktree_with_policy(
+                                        agent::task_worktree::ensure_task_worktree_with_options(
                                             project.clone(),
                                             &task,
+                                            goal_id.clone(),
                                             None,
                                             None,
-                                            Some(branch.clone()),
+                                            true,
                                             cx,
                                         );
                                     window.spawn(cx, async move |cx| {
@@ -834,12 +1466,23 @@ impl AgentTaskPanel {
                                                         });
                                                     }
                                                 })
-                                                .ok();
+                                                .log_err();
                                             }
                                             Err(e) => {
                                                 log::warn!(
                                                     "failed to restore worktree from branch {branch_for_switch}: {e:?}"
                                                 );
+                                                let humanized = Self::humanize_error(&e);
+                                                cx.update(|_window, cx| {
+                                                    Self::show_error_toast(
+                                                        workspace,
+                                                        format!(
+                                                            "Task Panel: Restore Worktree: {humanized}"
+                                                        ),
+                                                        cx,
+                                                    );
+                                                })
+                                                .log_err();
                                             }
                                         }
                                     })
@@ -853,25 +1496,46 @@ impl AgentTaskPanel {
                         let project = project.clone();
                         let task_id = task_id.clone();
                         let view = view.clone();
+                        let workspace = workspace.clone();
                         menu = menu.entry("Delete Worktree", None, move |_window, cx| {
                             let project = project.clone();
-                            let task_id_for_async = task_id.clone();
+                            let task_id = task_id.clone();
                             let view = view.clone();
+                            let workspace_for_task = workspace.clone();
                             let remove_task =
                                 agent::task_worktree::remove_task_worktree(project, &task_id, cx);
-                            cx.spawn(async move |cx| {
-                                if let Err(e) = remove_task.await {
-                                    log::warn!(
-                                        "Failed to remove worktree for {task_id_for_async}: {e}"
-                                    );
-                                }
+                            let task = cx.spawn(async move |cx| {
+                                let remove_result = remove_task.await;
                                 if let Some(panel) = view.upgrade() {
                                     panel.update(cx, |this, cx| {
                                         this.refresh_worktree_status(cx);
                                     });
                                 }
-                            })
-                            .detach();
+                                remove_result.with_context(|| {
+                                    format!("failed to remove worktree for {task_id}")
+                                })?;
+                                if let Some(workspace) = workspace_for_task.upgrade() {
+                                    workspace.update(cx, |workspace, cx| {
+                                        workspace.show_toast(
+                                            workspace::Toast::new(
+                                                workspace::notifications::NotificationId::unique::<
+                                                    WorktreeDeletedToast,
+                                                >(),
+                                                format!("Worktree for {task_id} deleted"),
+                                            )
+                                            .autohide(),
+                                            cx,
+                                        );
+                                    });
+                                }
+                                Ok(())
+                            });
+                            Self::spawn_task_with_action_error_toast(
+                                task,
+                                Some("Delete Worktree"),
+                                workspace.clone(),
+                                cx,
+                            );
                         });
                     }
 
@@ -896,36 +1560,71 @@ impl AgentTaskPanel {
 
                     menu = menu.separator();
 
+                    if current_status != AgentTaskStatus::Completed {
+                        let store = store.clone();
+                        let task_id = task_id.clone();
+                        let workspace = workspace.clone();
+                        menu = menu.entry("Complete", None, move |_window, cx| {
+                            let task =
+                                store.update(cx, |store, cx| store.complete_task(&task_id, cx));
+                            Self::spawn_task_with_action_error_toast(
+                                task,
+                                Some("Complete Task"),
+                                workspace.clone(),
+                                cx,
+                            );
+                        });
+                    }
+
                     if !is_archived {
                         let store = store.clone();
                         let task_id = task_id.clone();
+                        let workspace = workspace.clone();
                         menu = menu.entry("Archive", None, move |_window, cx| {
-                            store
-                                .update(cx, |store, cx| store.archive_task(&task_id, cx))
-                                .detach_and_log_err(cx);
+                            let task =
+                                store.update(cx, |store, cx| store.archive_task(&task_id, cx));
+                            Self::spawn_task_with_action_error_toast(
+                                task,
+                                Some("Archive Task"),
+                                workspace.clone(),
+                                cx,
+                            );
                         });
                     } else {
                         let store = store.clone();
                         let task_id = task_id.clone();
+                        let workspace = workspace.clone();
                         menu = menu.entry("Unarchive", None, move |_window, cx| {
-                            store
-                                .update(cx, |store, cx| store.unarchive_task(&task_id, cx))
-                                .detach_and_log_err(cx);
+                            let task =
+                                store.update(cx, |store, cx| store.unarchive_task(&task_id, cx));
+                            Self::spawn_task_with_action_error_toast(
+                                task,
+                                Some("Unarchive Task"),
+                                workspace.clone(),
+                                cx,
+                            );
                         });
                     }
 
                     if is_archived {
                         let store = store.clone();
                         let task_id = task_id.clone();
+                        let workspace = workspace.clone();
                         menu = menu.entry("Delete", None, move |_window, cx| {
-                            store
-                                .update(cx, |store, cx| store.delete_task(&task_id, cx))
-                                .detach_and_log_err(cx);
+                            let task =
+                                store.update(cx, |store, cx| store.delete_task(&task_id, cx));
+                            Self::spawn_task_with_action_error_toast(
+                                task,
+                                Some("Delete Task"),
+                                workspace.clone(),
+                                cx,
+                            );
                         });
                     }
 
                     {
                         let store = store.clone();
+                        let workspace = workspace.clone();
                         menu = menu.submenu_with_colored_icon(
                             "Change Status",
                             IconName::Circle,
@@ -944,6 +1643,7 @@ impl AgentTaskPanel {
                                     let store = store.clone();
                                     let task_id = task_id.clone();
                                     let target_status_for_action = target_status.clone();
+                                    let workspace = workspace.clone();
                                     sub = sub.toggleable_entry_disabled_when(
                                         label,
                                         is_active,
@@ -951,15 +1651,19 @@ impl AgentTaskPanel {
                                         IconPosition::Start,
                                         None,
                                         move |_window, cx| {
-                                            store
-                                                .update(cx, |store, cx| {
-                                                    store.set_task_status(
-                                                        &task_id,
-                                                        &target_status_for_action,
-                                                        cx,
-                                                    )
-                                                })
-                                                .detach_and_log_err(cx);
+                                            let task = store.update(cx, |store, cx| {
+                                                store.set_task_status(
+                                                    &task_id,
+                                                    &target_status_for_action,
+                                                    cx,
+                                                )
+                                            });
+                                            Self::spawn_task_with_action_error_toast(
+                                                task,
+                                                Some("Set Task Status"),
+                                                workspace.clone(),
+                                                cx,
+                                            );
                                         },
                                     );
                                 }
@@ -987,7 +1691,13 @@ impl AgentTaskPanel {
         cx.notify();
     }
 
-    fn go_to_branch(branch: String, project: Entity<Project>, window: &mut Window, cx: &mut App) {
+    fn go_to_branch(
+        branch: String,
+        project: Entity<Project>,
+        workspace: WeakEntity<Workspace>,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
         let existing_repo = project
             .read(cx)
             .repositories(cx)
@@ -1031,23 +1741,52 @@ impl AgentTaskPanel {
                                 cx,
                             );
                         })
-                        .ok();
+                        .log_err();
                     }
                     Ok(Err(err)) => {
                         log::warn!("failed to checkout branch {branch}: {err:?}");
+                        let humanized = Self::humanize_error_str(&err.to_string());
+                        cx.update(|_window, cx| {
+                            Self::show_error_toast(
+                                workspace,
+                                format!(
+                                    "Task Panel: Go to Branch: Failed to checkout '{branch}': {humanized}"
+                                ),
+                                cx,
+                            );
+                        })
+                        .log_err();
                     }
                     Err(err) => {
                         log::warn!("checkout receiver cancelled for branch {branch}: {err:?}");
+                        let humanized = Self::humanize_error_str(&err.to_string());
+                        cx.update(|_window, cx| {
+                            Self::show_error_toast(
+                                workspace,
+                                format!(
+                                    "Task Panel: Go to Branch: Checkout cancelled for '{branch}': {humanized}"
+                                ),
+                                cx,
+                            );
+                        })
+                        .log_err();
                     }
                 })
                 .detach();
         } else {
             log::warn!("could not find repository to checkout branch {branch}");
+            Self::show_error_toast(
+                workspace,
+                format!(
+                    "Task Panel: Go to Branch: Could not find repository to checkout branch '{branch}'"
+                ),
+                cx,
+            );
         }
     }
 
     fn deploy_task_diff(
-        goal_id: String,
+        _goal_id: String,
         worktree_path: std::path::PathBuf,
         project: Entity<Project>,
         workspace: WeakEntity<Workspace>,
@@ -1055,14 +1794,28 @@ impl AgentTaskPanel {
         window: &mut Window,
         cx: &mut App,
     ) {
-        let base_ref: SharedString = format!("agent-goal/{goal_id}").into();
-
-        if let Some(task_repo) = find_repository_for_worktree_path(&project, &worktree_path, cx) {
+        if let Some(_task_repo) = find_repository_for_worktree_path(&project, &worktree_path, cx) {
+            let worktree_id = project.read(cx).worktrees(cx).find_map(|worktree| {
+                if paths_match(worktree.read(cx).abs_path().as_ref(), &worktree_path) {
+                    Some(worktree.read(cx).id())
+                } else {
+                    None
+                }
+            });
+            if let Some(worktree_id) = worktree_id {
+                let git_store = project.read(cx).git_store().clone();
+                git_store.update(cx, |git_store, cx| {
+                    git_store.set_active_repo_for_worktree(worktree_id, cx);
+                });
+            }
             if let Some(workspace) = workspace.upgrade() {
-                workspace.update(cx, |workspace, cx| {
-                    git_ui::branch_diff::BranchDiff::deploy_branch_diff_with_base_ref(
-                        workspace, project, task_repo, base_ref, None, window, cx,
-                    );
+                workspace.update(cx, |_workspace, cx| {
+                    match cx.build_action("git::DiffBranch", None) {
+                        Ok(action) => window.dispatch_action(action, cx),
+                        Err(error) => {
+                            log::error!("failed to resolve git::DiffBranch action: {error:?}");
+                        }
+                    }
                 });
             }
             return;
@@ -1075,6 +1828,17 @@ impl AgentTaskPanel {
                         "failed to find worktree at {}: not a directory",
                         worktree_path.display()
                     );
+                    cx.update(|_window, cx| {
+                        Self::show_error_toast(
+                            workspace,
+                            format!(
+                                "Task Panel: Open Diff: Worktree path '{}' is not a directory",
+                                worktree_path.display()
+                            ),
+                            cx,
+                        );
+                    })
+                    .log_err();
                     return;
                 }
 
@@ -1089,6 +1853,18 @@ impl AgentTaskPanel {
                             "failed to find worktree at {}: {err:?}",
                             worktree_path.display()
                         );
+                        let humanized = Self::humanize_error(&err);
+                        cx.update(|_window, cx| {
+                            Self::show_error_toast(
+                                workspace,
+                                format!(
+                                    "Task Panel: Open Diff: Failed to find worktree at '{}': {humanized}",
+                                    worktree_path.display()
+                                ),
+                                cx,
+                            );
+                        })
+                        .log_err();
                         return;
                     }
                 };
@@ -1099,7 +1875,7 @@ impl AgentTaskPanel {
                             .as_local()
                             .map(|local| local.scan_complete())
                     })
-                    .ok()
+                    .log_err()
                     .flatten();
                 if let Some(scan) = scan_complete {
                     scan.await;
@@ -1108,22 +1884,57 @@ impl AgentTaskPanel {
                     .update(|_window, cx| {
                         find_repository_for_worktree_path(&project, &worktree_path, cx)
                     })
-                    .ok()
+                    .log_err()
                     .flatten();
-                let Some(task_repo) = task_repo else {
+                let Some(_task_repo) = task_repo else {
                     log::warn!(
                         "could not resolve repository for worktree at {}",
                         worktree_path.display()
                     );
+                    cx.update(|_window, cx| {
+                        Self::show_error_toast(
+                            workspace,
+                            format!(
+                                "Task Panel: Open Diff: Could not resolve repository for worktree at '{}'",
+                                worktree_path.display()
+                            ),
+                            cx,
+                        );
+                    })
+                    .log_err();
                     return;
                 };
+                let worktree_id = cx.update(|_window, cx| worktree.read(cx).id()).log_err();
+                if let Some(worktree_id) = worktree_id {
+                    cx.update(|_window, cx| {
+                        let git_store = project.read(cx).git_store().clone();
+                        git_store.update(cx, |git_store, cx| {
+                            git_store.set_active_repo_for_worktree(worktree_id, cx);
+                        });
+                    })
+                    .log_err();
+                }
                 if let Some(workspace) = workspace.upgrade() {
-                    if let Err(err) = workspace.update_in(cx, |workspace, window, cx| {
-                        git_ui::branch_diff::BranchDiff::deploy_branch_diff_with_base_ref(
-                            workspace, project, task_repo, base_ref, None, window, cx,
-                        );
+                    if let Err(err) = workspace.update_in(cx, |_workspace, window, cx| {
+                        match cx.build_action("git::DiffBranch", None) {
+                            Ok(action) => window.dispatch_action(action, cx),
+                            Err(error) => {
+                                log::error!("failed to resolve git::DiffBranch action: {error:?}");
+                            }
+                        }
                     }) {
                         log::warn!("failed to deploy branch diff in workspace: {err:?}");
+                        let humanized = Self::humanize_error(&err);
+                        cx.update(|_window, cx| {
+                            Self::show_error_toast(
+                                workspace.downgrade(),
+                                format!(
+                                    "Task Panel: Open Diff: Failed to deploy branch diff: {humanized}"
+                                ),
+                                cx,
+                            );
+                        })
+                        .log_err();
                     }
                 }
             })
@@ -1137,28 +1948,34 @@ impl AgentTaskPanel {
         window: &mut Window,
         cx: &mut App,
     ) {
-        let base_ref: SharedString = branch.into();
         let repo = project
             .read(cx)
             .active_repository(cx)
             .or_else(|| project.read(cx).repositories(cx).values().next().cloned());
-        if let (Some(repo), Some(workspace)) = (repo, workspace.upgrade()) {
-            workspace.update(cx, |workspace, cx| {
-                git_ui::branch_diff::BranchDiff::deploy_branch_diff_with_base_ref(
-                    workspace, project, repo, base_ref, None, window, cx,
-                );
+        if let (Some(_repo), Some(workspace)) = (repo, workspace.upgrade()) {
+            workspace.update(cx, |_workspace, cx| {
+                match cx.build_action("git::DiffBranch", None) {
+                    Ok(action) => window.dispatch_action(action, cx),
+                    Err(error) => {
+                        log::error!("failed to resolve git::DiffBranch action: {error:?}");
+                    }
+                }
             });
+        } else {
+            Self::show_error_toast(
+                workspace,
+                format!("Task Panel: Open Diff: Could not find repository for branch '{branch}'"),
+                cx,
+            );
         }
     }
 
     fn render_task_tree(&self, cx: &mut Context<Self>) -> Div {
         let store = self.store.read(cx);
         let graph = store.graph();
-        let events = store.events();
         let groups = build_goal_groups(
             &graph.tasks,
             &graph.goals,
-            events,
             &self.category_filters,
             &self.other_status_filters,
             &self.search_query,
@@ -1213,6 +2030,7 @@ impl AgentTaskPanel {
                     let project = this.project.clone();
                     let path = path.clone();
                     let task_id_hint_for_async = task_id_hint.clone();
+                    let workspace = this.workspace.clone();
                     let remove_task =
                         agent::task_worktree::remove_orphan_worktree(project, path, cx);
                     cx.spawn(async move |this, cx| {
@@ -1220,11 +2038,19 @@ impl AgentTaskPanel {
                             log::warn!(
                                 "Failed to remove orphan worktree for {task_id_hint_for_async}: {e}"
                             );
+                            let humanized = Self::humanize_error(&e);
+                            cx.update(|cx| {
+                                Self::show_error_toast(
+                                    workspace,
+                                    format!("Task Panel: Delete Orphan Worktree: {humanized}"),
+                                    cx,
+                                );
+                            });
                         }
                         this.update(cx, |this, cx| {
                             this.refresh_worktree_status(cx);
                         })
-                        .ok();
+                        .log_err();
                     })
                     .detach();
                 }
@@ -1362,14 +2188,27 @@ impl AgentTaskPanel {
                 .as_ref()
                 .filter(|res| res.goal_id == goal_id)
                 .map(|res| {
-                    let text = if res.failed_branches.is_empty() {
-                        format!("Cleaned ({} deleted)", res.deleted_branches.len())
-                    } else {
-                        format!(
+                    let text = match (
+                        res.failed_branches.is_empty(),
+                        res.skipped_branches.is_empty(),
+                    ) {
+                        (true, true) => format!("Cleaned ({} deleted)", res.deleted_branches.len()),
+                        (true, false) => format!(
+                            "Cleaned ({} deleted, {} skipped)",
+                            res.deleted_branches.len(),
+                            res.skipped_branches.len()
+                        ),
+                        (false, true) => format!(
                             "Cleaned ({} deleted, {} failed)",
                             res.deleted_branches.len(),
                             res.failed_branches.len()
-                        )
+                        ),
+                        (false, false) => format!(
+                            "Cleaned ({} deleted, {} failed, {} skipped)",
+                            res.deleted_branches.len(),
+                            res.failed_branches.len(),
+                            res.skipped_branches.len()
+                        ),
                     };
                     let color = if res.failed_branches.is_empty() {
                         Color::Success
@@ -1445,6 +2284,11 @@ impl AgentTaskPanel {
                 .on_click(cx.listener({
                     let goal_id = goal_id.clone();
                     move |this, _event, window, cx| {
+                        if this.editing_item.as_ref().is_some_and(|item| {
+                            item.target == RenamingTarget::Goal(goal_id.clone())
+                        }) {
+                            return;
+                        }
                         this.open_item_preview(PreviewItem::Goal(goal_id.clone()), window, cx);
                     }
                 }))
@@ -1478,7 +2322,19 @@ impl AgentTaskPanel {
                                 .overflow_hidden()
                                 .child(chevron_or_spacer)
                                 .child(render_goal_status_icon(&goal_status))
-                                .child(Label::new(title).size(LabelSize::Default).truncate()),
+                                .map(|this| {
+                                    if let Some(renaming) =
+                                        self.editing_item.as_ref().filter(|item| {
+                                            item.target == RenamingTarget::Goal(goal_id.clone())
+                                        })
+                                    {
+                                        this.child(self.render_rename_editor(&renaming.editor, cx))
+                                    } else {
+                                        this.child(
+                                            Label::new(title).size(LabelSize::Default).truncate(),
+                                        )
+                                    }
+                                }),
                         )
                         .child(h_flex().items_center().when(is_hovered, |this| {
                             this.child(
@@ -1512,63 +2368,96 @@ impl AgentTaskPanel {
                             move || format!("goal-meta-{}", goal_id)
                         })
                         .h_5()
+                        .w_full()
                         .items_center()
-                        .gap_1p5()
-                        .child(if has_children && !is_collapsed {
-                            div()
-                                .w_4()
-                                .h_4()
-                                .flex_shrink_0()
-                                .flex()
+                        .justify_between()
+                        .child(
+                            h_flex()
                                 .items_center()
-                                .child(
-                                    Label::new("│")
+                                .gap_1p5()
+                                .min_w_0()
+                                .overflow_hidden()
+                                .child(if has_children && !is_collapsed {
+                                    div()
+                                        .w_4()
+                                        .h_4()
+                                        .flex_shrink_0()
+                                        .flex()
+                                        .items_center()
+                                        .child(
+                                            Label::new("│")
+                                                .size(LabelSize::Small)
+                                                .color(Color::Muted)
+                                                .buffer_font(cx),
+                                        )
+                                        .into_any_element()
+                                } else {
+                                    div().w_4().h_4().flex_shrink_0().into_any_element()
+                                })
+                                .child({
+                                    let goal_label = if goal_id.starts_with("GOAL-") {
+                                        goal_id.clone()
+                                    } else {
+                                        format!("GOAL-{goal_id}")
+                                    };
+                                    Label::new(goal_label)
                                         .size(LabelSize::Small)
                                         .color(Color::Muted)
-                                        .buffer_font(cx),
+                                })
+                                .child(dot_separator())
+                                .child(
+                                    Label::new(format!("{tasks_done} / {tasks_total}"))
+                                        .size(LabelSize::Small)
+                                        .color(if tasks_done == tasks_total && tasks_total > 0 {
+                                            Color::Success
+                                        } else {
+                                            Color::Muted
+                                        }),
                                 )
-                                .into_any_element()
-                        } else {
-                            div().w_4().h_4().flex_shrink_0().into_any_element()
-                        })
-                        .child(
-                            Label::new(goal_status_label(&goal_status))
-                                .size(LabelSize::Small)
-                                .color(goal_status_text_color(&goal_status)),
-                        )
-                        .child(dot_separator())
-                        .child(
-                            Label::new(format!("{tasks_done} / {tasks_total} tasks"))
-                                .size(LabelSize::Small)
-                                .color(if tasks_done == tasks_total && tasks_total > 0 {
-                                    Color::Success
-                                } else {
-                                    Color::Muted
+                                .child(dot_separator())
+                                .child({
+                                    let priority = group
+                                        .goal_summary
+                                        .as_ref()
+                                        .map(|g| g.priority)
+                                        .unwrap_or(0);
+                                    Label::new(format!("P{priority}"))
+                                        .size(LabelSize::Small)
+                                        .color(priority_color(priority))
+                                })
+                                .when_some(
+                                    group.goal_summary.as_ref().and_then(|g| g.metrics.as_ref()),
+                                    |mut this, metrics| {
+                                        for element in render_metrics_elements(
+                                            (ElementId::from("diff-stat"), goal_id.clone()).into(),
+                                            Some(metrics),
+                                            false,
+                                        ) {
+                                            this = this.child(dot_separator()).child(element);
+                                        }
+                                        this
+                                    },
+                                )
+                                .when_some(cleanup_summary, |this, (text, color)| {
+                                    this.child(dot_separator())
+                                        .child(Label::new(text).size(LabelSize::Small).color(color))
                                 }),
                         )
-                        .child(dot_separator())
-                        .child({
-                            let priority =
-                                group.goal_summary.as_ref().map(|g| g.priority).unwrap_or(0);
-                            Label::new(format!("P{priority}"))
-                                .size(LabelSize::Small)
-                                .color(priority_color(priority))
-                        })
-                        .child(dot_separator())
-                        .child({
-                            let goal_label = if goal_id.starts_with("GOAL-") {
-                                goal_id
-                            } else {
-                                format!("GOAL-{goal_id}")
-                            };
-                            Label::new(goal_label)
-                                .size(LabelSize::Small)
-                                .color(Color::Muted)
-                        })
-                        .when_some(cleanup_summary, |this, (text, color)| {
-                            this.child(dot_separator())
-                                .child(Label::new(text).size(LabelSize::Small).color(color))
-                        }),
+                        .when_some(
+                            group
+                                .goal_summary
+                                .as_ref()
+                                .and_then(|g| g.metrics.as_ref())
+                                .and_then(|m| m.duration_ms),
+                            |this, ms| {
+                                this.child(
+                                    Label::new(format_duration_ms(ms))
+                                        .size(LabelSize::Small)
+                                        .color(Color::Muted)
+                                        .flex_shrink_0(),
+                                )
+                            },
+                        ),
                 );
 
             let mut group_div = v_flex().w_full().child(header);
@@ -1676,11 +2565,15 @@ impl AgentTaskPanel {
 
         let is_hovered = self.hovered_row == Some(HoveredRow::Task(task.id.clone()));
 
-        let policy_denied = self
-            .store
+        let policy_denied: Option<agent::AgentTaskEvent> = None;
+
+        let exists_on_disk = self
+            .worktree_status
             .read(cx)
-            .policy_denied_event_for_task(&task.id)
-            .cloned();
+            .snapshot()
+            .as_ref()
+            .and_then(|s| s.tasks.get(&task.id))
+            .map_or(false, |g| g.exists_on_disk);
 
         let hover_color = cx
             .theme()
@@ -1718,6 +2611,13 @@ impl AgentTaskPanel {
             .on_click(cx.listener({
                 let task_id = task.id.clone();
                 move |this, _event, window, cx| {
+                    if this
+                        .editing_item
+                        .as_ref()
+                        .is_some_and(|item| item.target == RenamingTarget::Task(task_id.clone()))
+                    {
+                        return;
+                    }
                     this.select_task(task_id.clone(), window, cx);
                     this.open_item_preview(PreviewItem::Task(task_id.clone()), window, cx);
                 }
@@ -1800,11 +2700,19 @@ impl AgentTaskPanel {
                                 this.child(div().w_4().h_4().flex_shrink_0())
                             })
                             .child(render_status_icon(&task.status))
-                            .child(
-                                Label::new(task.title.clone())
-                                    .size(LabelSize::Default)
-                                    .truncate(),
-                            )
+                            .map(|this| {
+                                if let Some(renaming) = self.editing_item.as_ref().filter(|item| {
+                                    item.target == RenamingTarget::Task(task.id.clone())
+                                }) {
+                                    this.child(self.render_rename_editor(&renaming.editor, cx))
+                                } else {
+                                    this.child(
+                                        Label::new(task.title.clone())
+                                            .size(LabelSize::Default)
+                                            .truncate(),
+                                    )
+                                }
+                            })
                             .when(task.attempt > 1, |this| {
                                 this.child(
                                     Label::new(format!("#{}", task.attempt))
@@ -1866,79 +2774,121 @@ impl AgentTaskPanel {
                         move || format!("task-meta-{}", task_id)
                     })
                     .h_5()
+                    .w_full()
                     .items_center()
-                    .gap_1p5()
-                    .when(!row.continuation_prefix.is_empty(), |this| {
-                        this.child(
-                            Label::new(row.continuation_prefix.clone())
-                                .size(LabelSize::Small)
-                                .color(Color::Muted)
-                                .buffer_font(cx),
-                        )
-                    })
-                    .when(row.has_children && !row.is_collapsed, |this| {
-                        this.child(
-                            div()
-                                .w_4()
-                                .h_4()
-                                .flex_shrink_0()
-                                .flex()
-                                .items_center()
-                                .child(
-                                    Label::new("│")
+                    .justify_between()
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_1p5()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .when(!row.continuation_prefix.is_empty(), |this| {
+                                this.child(
+                                    Label::new(row.continuation_prefix.clone())
                                         .size(LabelSize::Small)
                                         .color(Color::Muted)
                                         .buffer_font(cx),
-                                ),
-                        )
-                    })
-                    .when(
-                        (row.has_children && row.is_collapsed)
-                            || (!row.has_children && row.prefix.is_empty()),
-                        |this| this.child(div().w_4().h_4().flex_shrink_0()),
-                    )
-                    .child(
-                        Label::new(status_label(&task.status))
-                            .size(LabelSize::Small)
-                            .color(task_status_text_color(&task.status)),
-                    )
-                    .child(dot_separator())
-                    .child({
-                        let (profile_str, profile_color) = if let Some(p) = task
-                            .assigned_profile
-                            .as_deref()
-                            .or(task.assignee.as_deref())
-                            .filter(|s| !s.is_empty())
-                        {
-                            (p.to_string(), Color::Default)
-                        } else {
-                            ("no profile".to_string(), Color::Muted)
-                        };
-                        Label::new(profile_str)
-                            .size(LabelSize::Small)
-                            .color(profile_color)
-                    })
-                    .when_some(
-                        task.model.as_ref().filter(|m| !m.is_empty()),
-                        |this, model| {
-                            this.child(dot_separator()).child(
-                                Label::new(model.to_string())
+                                )
+                            })
+                            .when(row.has_children && !row.is_collapsed, |this| {
+                                this.child(
+                                    div()
+                                        .w_4()
+                                        .h_4()
+                                        .flex_shrink_0()
+                                        .flex()
+                                        .items_center()
+                                        .child(
+                                            Label::new("│")
+                                                .size(LabelSize::Small)
+                                                .color(Color::Muted)
+                                                .buffer_font(cx),
+                                        ),
+                                )
+                            })
+                            .when(
+                                (row.has_children && row.is_collapsed)
+                                    || (!row.has_children && row.prefix.is_empty()),
+                                |this| this.child(div().w_4().h_4().flex_shrink_0()),
+                            )
+                            .when(exists_on_disk, |this| {
+                                this.child(
+                                    div()
+                                        .id(SharedString::from(format!(
+                                            "task-worktree-icon-{}",
+                                            task.id
+                                        )))
+                                        .debug_selector({
+                                            let task_id = task.id.clone();
+                                            move || format!("task-worktree-icon-{}", task_id)
+                                        })
+                                        .child(
+                                            Icon::new(IconName::GitWorktree)
+                                                .size(IconSize::Small)
+                                                .color(Color::Muted),
+                                        )
+                                        .tooltip(Tooltip::text("Worktree on disk")),
+                                )
+                            })
+                            .child(
+                                Label::new({
+                                    if task.id.starts_with("TASK-") {
+                                        task.id.to_string()
+                                    } else {
+                                        format!("TASK-{}", task.id)
+                                    }
+                                })
+                                .size(LabelSize::Small)
+                                .color(Color::Muted),
+                            )
+                            .child(dot_separator())
+                            .child({
+                                let (profile_str, profile_color) = if let Some(p) = task
+                                    .assigned_profile
+                                    .as_deref()
+                                    .or(task.assignee.as_deref())
+                                    .filter(|s| !s.is_empty())
+                                {
+                                    (p.to_string(), Color::Default)
+                                } else {
+                                    ("no profile".to_string(), Color::Muted)
+                                };
+                                Label::new(profile_str)
                                     .size(LabelSize::Small)
-                                    .color(Color::Muted),
+                                    .color(profile_color)
+                            })
+                            .when_some(
+                                task.model.as_ref().filter(|m| !m.is_empty()),
+                                |this, model| {
+                                    this.child(dot_separator()).child(
+                                        Label::new(model.to_string())
+                                            .size(LabelSize::Small)
+                                            .color(Color::Muted),
+                                    )
+                                },
+                            )
+                            .when_some(task.metrics.as_ref(), |mut this, metrics| {
+                                for element in render_metrics_elements(
+                                    (ElementId::from("diff-stat"), task.id.to_string()).into(),
+                                    Some(metrics),
+                                    true,
+                                ) {
+                                    this = this.child(dot_separator()).child(element);
+                                }
+                                this
+                            }),
+                    )
+                    .when_some(
+                        task.metrics.as_ref().and_then(|m| m.duration_ms),
+                        |this, ms| {
+                            this.child(
+                                Label::new(format_duration_ms(ms))
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted)
+                                    .flex_shrink_0(),
                             )
                         },
-                    )
-                    .child(dot_separator())
-                    .child(
-                        Label::new({
-                            if task.id.starts_with("TASK-") {
-                                task.id.to_string()
-                            } else {
-                                format!("TASK-{}", task.id)
-                            }
-                        })
-                        .size(LabelSize::Small)
-                        .color(Color::Muted),
                     ),
             )
             .into_any_element()
@@ -1947,6 +2897,168 @@ impl AgentTaskPanel {
 
 fn dot_separator() -> impl IntoElement {
     Label::new("·").size(LabelSize::Small).color(Color::Muted)
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct FormattedMetricItem {
+    pub text: String,
+    pub color: Color,
+}
+
+pub fn format_duration_ms(ms: u64) -> String {
+    let s = ms / 1000;
+    if ms < 60_000 {
+        format!("{s}s")
+    } else {
+        let m = s / 60;
+        let rem_s = s % 60;
+        format!("{m}m {rem_s}s")
+    }
+}
+
+pub fn format_compact_tokens(n: u64) -> String {
+    if n >= 1000 {
+        let k = n as f64 / 1000.0;
+        if ((k * 10.0).round() as u64).is_multiple_of(10) {
+            format!("{:.0}k", k)
+        } else {
+            format!("{:.1}k", k)
+        }
+    } else {
+        n.to_string()
+    }
+}
+
+pub fn format_turns(turns_count: u32) -> String {
+    format!("{turns_count}")
+}
+
+pub fn format_cost(cost_usd: f64) -> String {
+    format!("${cost_usd:.2}")
+}
+
+pub fn render_metrics_elements(
+    id: ElementId,
+    metrics: Option<&AgentTaskMetrics>,
+    include_turns: bool,
+) -> Vec<gpui::AnyElement> {
+    let Some(metrics) = metrics else {
+        return Vec::new();
+    };
+    let mut elements = Vec::new();
+
+    if metrics.input_tokens.is_some()
+        || metrics.output_tokens.is_some()
+        || metrics.cache_read_tokens.is_some()
+        || metrics.cache_creation_tokens.is_some()
+    {
+        let in_tok = format_compact_tokens(metrics.input_tokens.unwrap_or(0));
+        let out_tok = format_compact_tokens(metrics.output_tokens.unwrap_or(0));
+        let cache_tok = format_compact_tokens(
+            metrics.cache_read_tokens.unwrap_or(0) + metrics.cache_creation_tokens.unwrap_or(0),
+        );
+        let tokens_str = format!("{in_tok}/{out_tok}/{cache_tok}");
+        elements.push(
+            Label::new(tokens_str)
+                .size(LabelSize::Small)
+                .color(Color::Muted)
+                .into_any_element(),
+        );
+    }
+
+    if include_turns {
+        if let Some(turns) = metrics.turns_count {
+            elements.push(
+                h_flex()
+                    .items_center()
+                    .gap_0p5()
+                    .child(
+                        Icon::new(IconName::RotateCw)
+                            .size(IconSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .child(
+                        Label::new(format!("{turns}"))
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .into_any_element(),
+            );
+        }
+    }
+
+    if let Some(diff) = &metrics.diff {
+        elements.push(
+            DiffStat::new(id, diff.insertions as usize, diff.deletions as usize)
+                .tooltip(format!("{} files changed", diff.files_changed))
+                .into_any_element(),
+        );
+    }
+
+    if let Some(cost) = metrics.cost_usd {
+        let cost_str = format_cost(cost);
+        elements.push(
+            Label::new(cost_str)
+                .size(LabelSize::Small)
+                .color(Color::Success)
+                .into_any_element(),
+        );
+    }
+
+    elements
+}
+
+pub fn format_metrics_items(metrics: Option<&AgentTaskMetrics>) -> Vec<FormattedMetricItem> {
+    let Some(metrics) = metrics else {
+        return Vec::new();
+    };
+    let mut items = Vec::new();
+
+    if let Some(ms) = metrics.duration_ms {
+        items.push(FormattedMetricItem {
+            text: format_duration_ms(ms),
+            color: Color::Muted,
+        });
+    }
+
+    if metrics.input_tokens.is_some()
+        || metrics.output_tokens.is_some()
+        || metrics.cache_read_tokens.is_some()
+        || metrics.cache_creation_tokens.is_some()
+    {
+        let in_tok = format_compact_tokens(metrics.input_tokens.unwrap_or(0));
+        let out_tok = format_compact_tokens(metrics.output_tokens.unwrap_or(0));
+        let cache_tok = format_compact_tokens(
+            metrics.cache_read_tokens.unwrap_or(0) + metrics.cache_creation_tokens.unwrap_or(0),
+        );
+        items.push(FormattedMetricItem {
+            text: format!("{in_tok}/{out_tok}/{cache_tok}"),
+            color: Color::Muted,
+        });
+    }
+
+    if let Some(turns) = metrics.turns_count {
+        items.push(FormattedMetricItem {
+            text: format_turns(turns),
+            color: Color::Muted,
+        });
+    }
+
+    if let Some(diff) = &metrics.diff {
+        items.push(FormattedMetricItem {
+            text: format!("+{} -{}", diff.insertions, diff.deletions),
+            color: Color::Muted,
+        });
+    }
+
+    if let Some(cost) = metrics.cost_usd {
+        items.push(FormattedMetricItem {
+            text: format_cost(cost),
+            color: Color::Success,
+        });
+    }
+
+    items
 }
 
 impl Focusable for AgentTaskPanel {
@@ -2006,8 +3118,50 @@ impl Panel for AgentTaskPanel {
         px(320.0)
     }
 
-    fn icon(&self, _window: &Window, _cx: &App) -> Option<IconName> {
-        Some(IconName::ListTodo)
+    fn supports_flexible_size(&self) -> bool {
+        true
+    }
+
+    fn has_flexible_size(&self, _window: &Window, cx: &App) -> bool {
+        AgentSettings::get_global(cx).task_flexible
+    }
+
+    fn set_flexible_size(&mut self, flexible: bool, _window: &mut Window, cx: &mut Context<Self>) {
+        let completion = settings::update_settings_file_with_completion(
+            self.file_system.clone(),
+            cx,
+            move |settings, _| {
+                settings
+                    .agent
+                    .get_or_insert_default()
+                    .set_task_flexible_size(flexible);
+            },
+        );
+        cx.spawn(async move |_this, _cx| {
+            if let Err(error) = completion.await {
+                log::error!("Failed to update agent task panel flexible size: {error:?}");
+            }
+        })
+        .detach();
+    }
+
+    fn hide_button_setting(&self, _: &App) -> Option<workspace::HideStatusItem> {
+        Some(workspace::HideStatusItem::new(|settings| {
+            settings.agent.get_or_insert_default().task_button = Some(false);
+        }))
+    }
+
+    fn is_zoomed(&self, _window: &Window, _cx: &App) -> bool {
+        self.zoomed
+    }
+
+    fn set_zoomed(&mut self, zoomed: bool, _window: &mut Window, cx: &mut Context<Self>) {
+        self.zoomed = zoomed;
+        cx.notify();
+    }
+
+    fn icon(&self, _window: &Window, cx: &App) -> Option<IconName> {
+        (AgentSettings::get_global(cx).task_button).then_some(IconName::ListTodo)
     }
 
     fn icon_tooltip(&self, _window: &Window, _cx: &App) -> Option<&'static str> {
@@ -2064,6 +3218,9 @@ impl Render for AgentTaskPanel {
         v_flex()
             .key_context(key_context)
             .track_focus(&self.focus_handle)
+            .on_action(cx.listener(|this, _: &ToggleZoom, window, cx| {
+                this.toggle_zoom(window, cx);
+            }))
             .size_full()
             .bg(cx.theme().colors().panel_background)
             .child(
@@ -2165,27 +3322,51 @@ impl Render for AgentTaskPanel {
                                                     let is_selected =
                                                         current_categories.contains(&category);
                                                     let view = view.clone();
-                                                    menu = menu.toggleable_entry(
-                                                        category.label(),
-                                                        is_selected,
-                                                        IconPosition::Start,
-                                                        None,
-                                                        move |_window, cx| {
-                                                            view.update(cx, |this, cx| {
-                                                                if this
-                                                                    .category_filters
-                                                                    .contains(&category)
-                                                                {
-                                                                    this.category_filters
-                                                                        .remove(&category);
-                                                                } else {
-                                                                    this.category_filters
-                                                                        .insert(category);
-                                                                }
-                                                                cx.notify();
-                                                            })
-                                                            .log_err();
-                                                        },
+                                                    let (icon, color) = match category {
+                                                        FilterCategory::Ready => {
+                                                            (IconName::Check, Color::Muted)
+                                                        }
+                                                        FilterCategory::Running => {
+                                                            (IconName::PlayFilled, Color::Accent)
+                                                        }
+                                                        FilterCategory::Blocked => {
+                                                            (IconName::Stop, Color::Warning)
+                                                        }
+                                                        FilterCategory::Failed => {
+                                                            (IconName::Close, Color::Error)
+                                                        }
+                                                        FilterCategory::Done => {
+                                                            (IconName::Check, Color::Success)
+                                                        }
+                                                        FilterCategory::Cancelled => {
+                                                            (IconName::Close, Color::Muted)
+                                                        }
+                                                        FilterCategory::Archived => {
+                                                            (IconName::Archive, Color::Muted)
+                                                        }
+                                                    };
+                                                    menu = menu.item(
+                                                        ContextMenuEntry::new(category.label())
+                                                            .icon(icon)
+                                                            .icon_color(color)
+                                                            .icon_position(IconPosition::Start)
+                                                            .toggle(IconPosition::End, is_selected)
+                                                            .handler(move |_window, cx| {
+                                                                view.update(cx, |this, cx| {
+                                                                    if this
+                                                                        .category_filters
+                                                                        .contains(&category)
+                                                                    {
+                                                                        this.category_filters
+                                                                            .remove(&category);
+                                                                    } else {
+                                                                        this.category_filters
+                                                                            .insert(category);
+                                                                    }
+                                                                    cx.notify();
+                                                                })
+                                                                .log_err();
+                                                            }),
                                                     );
                                                 }
 
@@ -2196,12 +3377,17 @@ impl Render for AgentTaskPanel {
                                                             current_others.contains(&other_status);
                                                         let view = view.clone();
                                                         let filter_status = other_status.clone();
-                                                        menu = menu.toggleable_entry(
-                                                            status_label(&other_status),
-                                                            is_selected,
-                                                            IconPosition::Start,
-                                                            None,
-                                                            move |_window, cx| {
+                                                        let icon = status_icon(&other_status);
+                                                        let color = status_color(&other_status);
+                                                        menu = menu.item(
+                                                            ContextMenuEntry::new(status_label(
+                                                                &other_status,
+                                                            ))
+                                                            .icon(icon)
+                                                            .icon_color(color)
+                                                            .icon_position(IconPosition::Start)
+                                                            .toggle(IconPosition::End, is_selected)
+                                                            .handler(move |_window, cx| {
                                                                 view.update(cx, |this, cx| {
                                                                     if this
                                                                         .other_status_filters
@@ -2219,7 +3405,7 @@ impl Render for AgentTaskPanel {
                                                                     cx.notify();
                                                                 })
                                                                 .log_err();
-                                                            },
+                                                            }),
                                                         );
                                                     }
                                                 }
@@ -2235,12 +3421,32 @@ impl Render for AgentTaskPanel {
                                     .tooltip(Tooltip::text("Refresh Tasks"))
                                     .on_click(cx.listener(|this, _event, _window, cx| {
                                         let store = this.store.clone();
-                                        store
-                                            .update(cx, |store, cx| store.refresh(cx))
-                                            .detach_and_log_err(cx);
+                                        let task = store.update(cx, |store, cx| store.refresh(cx));
+                                        Self::spawn_task_with_action_error_toast(
+                                            task,
+                                            Some("Refresh"),
+                                            this.workspace.clone(),
+                                            cx,
+                                        );
                                         this.refresh_worktree_status(cx);
                                     })),
-                            ),
+                            )
+                            .child({
+                                let is_zoomed = self.zoomed;
+                                let (zoom_icon, zoom_tooltip) = if is_zoomed {
+                                    (IconName::Minimize, "Disable Full Screen")
+                                } else {
+                                    (IconName::Maximize, "Enable Full Screen")
+                                };
+                                IconButton::new("toggle_zoom", zoom_icon)
+                                    .icon_size(IconSize::Small)
+                                    .tooltip(move |_window, cx| {
+                                        Tooltip::for_action(zoom_tooltip, &ToggleZoom, cx)
+                                    })
+                                    .on_click(cx.listener(|this, _event, window, cx| {
+                                        this.toggle_zoom(window, cx);
+                                    }))
+                            }),
                     ),
             )
             .when(is_offline, |this| {
@@ -2347,44 +3553,6 @@ pub fn render_goal_status_icon(status: &AgentGoalStatus) -> impl IntoElement {
     }
 }
 
-pub fn goal_status_label(status: &AgentGoalStatus) -> &str {
-    match status {
-        AgentGoalStatus::Running => "Running",
-        AgentGoalStatus::Blocked => "Blocked",
-        AgentGoalStatus::Failed => "Failed",
-        AgentGoalStatus::Completed => "Completed",
-        AgentGoalStatus::Cancelled => "Cancelled",
-        AgentGoalStatus::Archived => "Archived",
-        AgentGoalStatus::Other(name) => name.as_ref(),
-    }
-}
-
-pub fn goal_status_text_color(status: &AgentGoalStatus) -> Color {
-    match status {
-        AgentGoalStatus::Running => Color::Accent,
-        AgentGoalStatus::Completed => Color::Success,
-        AgentGoalStatus::Failed => Color::Error,
-        AgentGoalStatus::Blocked => Color::Warning,
-        AgentGoalStatus::Cancelled | AgentGoalStatus::Archived | AgentGoalStatus::Other(_) => {
-            Color::Muted
-        }
-    }
-}
-
-pub fn task_status_text_color(status: &AgentTaskStatus) -> Color {
-    match status {
-        AgentTaskStatus::Ready | AgentTaskStatus::Running | AgentTaskStatus::Review => {
-            Color::Accent
-        }
-        AgentTaskStatus::Completed => Color::Success,
-        AgentTaskStatus::Blocked | AgentTaskStatus::Stale => Color::Warning,
-        AgentTaskStatus::Failed => Color::Error,
-        AgentTaskStatus::Cancelled | AgentTaskStatus::Archived | AgentTaskStatus::Other(_) => {
-            Color::Muted
-        }
-    }
-}
-
 pub fn priority_color(priority: i64) -> Color {
     match priority {
         0 | 1 => Color::Error,
@@ -2487,19 +3655,17 @@ pub fn render_goal_markdown(goal: &AgentGoalSummary, goal_git: Option<&GoalGitSt
         doc.push_str(&format!("- **Created At:** {}\n", created_at));
     }
 
+    if let Some(metrics) = &goal.metrics {
+        render_metrics_markdown(&mut doc, metrics);
+    }
+
     if let Some(git) = goal_git {
         doc.push_str("\n## Git\n\n");
         doc.push_str(&format!("- **Branch:** `{}`\n", git.branch));
         doc.push_str(&format!("- **Branch Exists:** {}\n", git.branch_exists));
         if let Some(sha) = &git.tip_sha {
-            let short_sha = &sha[..7.min(sha.len())];
+            let short_sha: String = sha.chars().take(7).collect();
             doc.push_str(&format!("- **Tip SHA:** `{short_sha}` ({sha})\n"));
-        }
-        if let Some(diff) = &git.diff {
-            doc.push_str(&format!(
-                "- **Diff:** {} file(s) +{} -{}\n",
-                diff.files, diff.added, diff.removed
-            ));
         }
     }
 
@@ -2519,11 +3685,26 @@ pub fn render_task_markdown(
         status_label(&detail.summary.status)
     ));
     doc.push_str(&format!("- **Task ID:** {}\n", detail.summary.id));
+    if let Some(profile) = detail
+        .summary
+        .assigned_profile
+        .as_deref()
+        .filter(|s| !s.is_empty())
+    {
+        doc.push_str(&format!("- **Profile:** {}\n", profile));
+    }
+    if let Some(model) = detail.summary.model.as_deref().filter(|s| !s.is_empty()) {
+        doc.push_str(&format!("- **Model:** {}\n", model));
+    }
     if let Some(assignee) = &detail.summary.assignee {
         doc.push_str(&format!("- **Assignee:** {}\n", assignee));
     }
     if detail.summary.attempt > 1 {
         doc.push_str(&format!("- **Attempt:** {}\n", detail.summary.attempt));
+    }
+
+    if let Some(metrics) = &detail.summary.metrics {
+        render_metrics_markdown(&mut doc, metrics);
     }
 
     doc.push_str("\n## Description\n\n");
@@ -2575,7 +3756,7 @@ pub fn render_task_markdown(
             .and_then(|g| g.tip_sha.as_deref())
             .or_else(|| task_ref.as_ref().and_then(|tr| tr.head_sha.as_deref()));
         if let Some(sha) = tip_sha {
-            let short_sha = &sha[..7.min(sha.len())];
+            let short_sha: String = sha.chars().take(7).collect();
             doc.push_str(&format!("- **Tip SHA:** `{short_sha}` ({sha})\n"));
         }
         if let Some(g) = goal {
@@ -2607,9 +3788,47 @@ pub fn render_task_markdown(
     doc
 }
 
+pub fn render_metrics_markdown(doc: &mut String, metrics: &AgentTaskMetrics) {
+    doc.push_str("\n## Metrics\n\n");
+    if let Some(ms) = metrics.duration_ms {
+        let duration_s = ms / 1000;
+        doc.push_str(&format!("- **Duration:** {duration_s}s\n"));
+    }
+    let in_tok = metrics.input_tokens.unwrap_or(0);
+    let out_tok = metrics.output_tokens.unwrap_or(0);
+    let cache_tok =
+        metrics.cache_read_tokens.unwrap_or(0) + metrics.cache_creation_tokens.unwrap_or(0);
+    if metrics.input_tokens.is_some()
+        || metrics.output_tokens.is_some()
+        || metrics.cache_read_tokens.is_some()
+        || metrics.cache_creation_tokens.is_some()
+    {
+        doc.push_str(&format!(
+            "- **Tokens:** {in_tok} in / {out_tok} out / {cache_tok} cache\n"
+        ));
+    }
+    if let Some(turns) = metrics.turns_count {
+        doc.push_str(&format!("- **Turns:** {turns}\n"));
+    }
+    if let Some(cost) = metrics.cost_usd {
+        doc.push_str(&format!("- **Cost:** ${cost:.2}\n"));
+    }
+    if let Some(diff) = &metrics.diff {
+        doc.push_str(&format!(
+            "- **Diff:** {} file(s) changed (+{}, -{})\n",
+            diff.files_changed, diff.insertions, diff.deletions
+        ));
+    }
+}
+
 #[allow(dead_code)]
-pub fn format_task_meta_line(task: &AgentTaskSummary, _diff: Option<&DiffShortStat>) -> String {
-    let mut parts = vec![status_label(&task.status).to_string()];
+pub fn format_task_meta_line(task: &AgentTaskSummary) -> String {
+    let task_seg = if task.id.starts_with("TASK-") {
+        task.id.to_string()
+    } else {
+        format!("TASK-{}", task.id)
+    };
+    let mut parts = vec![task_seg];
     let profile = task
         .assigned_profile
         .as_deref()
@@ -2620,12 +3839,9 @@ pub fn format_task_meta_line(task: &AgentTaskSummary, _diff: Option<&DiffShortSt
     if let Some(model) = task.model.as_ref().filter(|m| !m.is_empty()) {
         parts.push(model.to_string());
     }
-    let task_seg = if task.id.starts_with("TASK-") {
-        task.id.to_string()
-    } else {
-        format!("TASK-{}", task.id)
-    };
-    parts.push(task_seg);
+    for item in format_metrics_items(task.metrics.as_ref()) {
+        parts.push(item.text);
+    }
 
     parts.join(" · ")
 }
@@ -2633,23 +3849,25 @@ pub fn format_task_meta_line(task: &AgentTaskSummary, _diff: Option<&DiffShortSt
 #[allow(dead_code)]
 pub fn format_goal_meta_line(
     goal_id: &str,
-    status: &AgentGoalStatus,
+    _status: &AgentGoalStatus,
     priority: i64,
     tasks_done: u64,
     tasks_total: u64,
-    _diff: Option<&DiffShortStat>,
+    metrics: Option<&AgentTaskMetrics>,
 ) -> String {
     let goal_seg = if goal_id.starts_with("GOAL-") {
         goal_id.to_string()
     } else {
         format!("GOAL-{goal_id}")
     };
-    let parts = [
-        goal_status_label(status).to_string(),
-        format!("{tasks_done} / {tasks_total} tasks"),
-        format!("P{priority}"),
+    let mut parts = vec![
         goal_seg,
+        format!("{tasks_done} / {tasks_total}"),
+        format!("P{priority}"),
     ];
+    for item in format_metrics_items(metrics) {
+        parts.push(item.text);
+    }
     parts.join(" · ")
 }
 
@@ -2700,23 +3918,6 @@ pub fn open_markdown_preview(
     })
 }
 
-pub fn compute_task_creation_timestamps<'a>(
-    events: impl IntoIterator<Item = &'a AgentTaskEvent>,
-) -> HashMap<AgentTaskId, u64> {
-    let mut timestamps = HashMap::new();
-    for event in events {
-        if let Some(task_id) = &event.task_id {
-            timestamps
-                .entry(task_id.clone())
-                .and_modify(|existing: &mut u64| {
-                    *existing = (*existing).min(event.timestamp_millis)
-                })
-                .or_insert(event.timestamp_millis);
-        }
-    }
-    timestamps
-}
-
 pub fn filter_visible_tasks(
     tasks: &[AgentTaskSummary],
     category_filters: &HashSet<FilterCategory>,
@@ -2734,26 +3935,16 @@ pub fn filter_visible_tasks(
         .collect()
 }
 
-pub fn sort_tasks_newest_first(
-    tasks: &mut [AgentTaskSummary],
-    timestamps: &HashMap<AgentTaskId, u64>,
-) {
-    tasks.sort_by(|a, b| {
-        let time_a = a.created_at.or_else(|| timestamps.get(&a.id).copied());
-        let time_b = b.created_at.or_else(|| timestamps.get(&b.id).copied());
-        match (time_a, time_b) {
-            (Some(ta), Some(tb)) => tb.cmp(&ta).then_with(|| a.id.cmp(&b.id)),
-            (Some(_), None) => std::cmp::Ordering::Less,
-            (None, Some(_)) => std::cmp::Ordering::Greater,
-            (None, None) => a.id.cmp(&b.id),
-        }
+pub fn sort_tasks_by_created_at(tasks: &mut [AgentTaskSummary]) {
+    tasks.sort_by(|a, b| match (a.created_at, b.created_at) {
+        (Some(ta), Some(tb)) => ta.cmp(&tb).then_with(|| a.id.cmp(&b.id)),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => a.id.cmp(&b.id),
     });
 }
 
-pub fn visible_roots(
-    visible_tasks: &[AgentTaskSummary],
-    timestamps: &HashMap<AgentTaskId, u64>,
-) -> Vec<AgentTaskSummary> {
+pub fn visible_roots(visible_tasks: &[AgentTaskSummary]) -> Vec<AgentTaskSummary> {
     let visible_ids: HashSet<AgentTaskId> =
         visible_tasks.iter().map(|task| task.id.clone()).collect();
     let mut roots: Vec<AgentTaskSummary> = visible_tasks
@@ -2765,7 +3956,7 @@ pub fn visible_roots(
         })
         .cloned()
         .collect();
-    sort_tasks_newest_first(&mut roots, timestamps);
+    sort_tasks_by_created_at(&mut roots);
     roots
 }
 
@@ -2773,14 +3964,13 @@ pub fn visible_roots(
 pub fn visible_children(
     parent_id: &AgentTaskId,
     visible_tasks: &[AgentTaskSummary],
-    timestamps: &HashMap<AgentTaskId, u64>,
 ) -> Vec<AgentTaskSummary> {
     let mut children: Vec<AgentTaskSummary> = visible_tasks
         .iter()
         .filter(|task| task.parent_id.as_ref().map_or(false, |id| id == parent_id))
         .cloned()
         .collect();
-    sort_tasks_newest_first(&mut children, timestamps);
+    sort_tasks_by_created_at(&mut children);
     children
 }
 
@@ -2803,11 +3993,10 @@ pub struct GoalGroup {
 
 pub fn build_task_tree_rows(
     visible_tasks: &[AgentTaskSummary],
-    timestamps: &HashMap<AgentTaskId, u64>,
     collapsed_tasks: &HashSet<AgentTaskId>,
     under_goal: bool,
 ) -> Vec<TaskRow> {
-    let roots = visible_roots(visible_tasks, timestamps);
+    let roots = visible_roots(visible_tasks);
     let num_roots = roots.len();
     let mut rows = Vec::new();
     let mut visited = HashSet::new();
@@ -2822,7 +4011,7 @@ pub fn build_task_tree_rows(
         }
     }
     for children in children_by_parent.values_mut() {
-        sort_tasks_newest_first(children, timestamps);
+        sort_tasks_by_created_at(children);
     }
 
     fn collect_node(
@@ -2912,16 +4101,14 @@ pub fn build_task_tree_rows(
     rows
 }
 
-pub fn build_goal_groups<'a>(
+pub fn build_goal_groups(
     tasks: &[AgentTaskSummary],
     goals: &[AgentGoalSummary],
-    events: impl IntoIterator<Item = &'a AgentTaskEvent>,
     category_filters: &HashSet<FilterCategory>,
     other_status_filters: &HashSet<AgentTaskStatus>,
     search_query: &str,
     collapsed_tasks: &HashSet<AgentTaskId>,
 ) -> Vec<GoalGroup> {
-    let timestamps = compute_task_creation_timestamps(events);
     let visible_tasks = filter_visible_tasks(tasks, category_filters, other_status_filters);
 
     let trimmed_search = search_query.trim().to_lowercase();
@@ -3045,7 +4232,7 @@ pub fn build_goal_groups<'a>(
 
         if !filtered_tasks.is_empty() || goal_title_matches || (!has_search && goal_status_matches)
         {
-            let rows = build_task_tree_rows(&filtered_tasks, &timestamps, collapsed_tasks, true);
+            let rows = build_task_tree_rows(&filtered_tasks, collapsed_tasks, true);
             result.push(GoalGroup {
                 goal_id: Some(goal_id),
                 goal_summary: summary,
@@ -3057,7 +4244,7 @@ pub fn build_goal_groups<'a>(
     if let Some(no_goal_tasks) = tasks_by_goal.remove(&None) {
         let filtered_no_goal = filter_task_set_by_search(no_goal_tasks);
         if !filtered_no_goal.is_empty() {
-            let rows = build_task_tree_rows(&filtered_no_goal, &timestamps, collapsed_tasks, false);
+            let rows = build_task_tree_rows(&filtered_no_goal, collapsed_tasks, false);
             result.push(GoalGroup {
                 goal_id: None,
                 goal_summary: None,
@@ -3070,24 +4257,22 @@ pub fn build_goal_groups<'a>(
 }
 
 #[allow(dead_code)]
-pub fn build_task_rows<'a>(
+pub fn build_task_rows(
     tasks: &[AgentTaskSummary],
-    events: impl IntoIterator<Item = &'a AgentTaskEvent>,
     category_filters: &HashSet<FilterCategory>,
 ) -> Vec<TaskRow> {
-    let timestamps = compute_task_creation_timestamps(events);
     let empty_others = HashSet::new();
     let empty_collapsed = HashSet::new();
     let visible = filter_visible_tasks(tasks, category_filters, &empty_others);
-    build_task_tree_rows(&visible, &timestamps, &empty_collapsed, false)
+    build_task_tree_rows(&visible, &empty_collapsed, false)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use agent::{
-        AgentTaskEvent, AgentTaskGraph, AgentTaskProvider, AgentTaskStatus, GoalGitState,
-        OrphanWorktree, TaskGitSnapshot, TaskGitState,
+        AgentDiffShortstat, AgentTaskEvent, AgentTaskGraph, AgentTaskProvider, AgentTaskStatus,
+        GoalGitState, OrphanWorktree, TaskGitSnapshot, TaskGitState,
     };
     use context_server::ContextServerId;
     use fs::FakeFs;
@@ -3105,12 +4290,16 @@ mod tests {
         delete_goal_calls: Vec<String>,
         set_task_status_calls: Vec<(AgentTaskId, AgentTaskStatus)>,
         set_goal_status_calls: Vec<(String, AgentGoalStatus)>,
+        complete_calls: Vec<AgentTaskId>,
+        update_task_title_calls: Vec<(AgentTaskId, String)>,
+        update_goal_title_calls: Vec<(String, String)>,
     }
 
     struct TestProvider {
         offline: bool,
         tasks: Vec<AgentTaskSummary>,
         goals: Vec<AgentGoalSummary>,
+        #[allow(dead_code)]
         events: Vec<AgentTaskEvent>,
         calls: Arc<std::sync::Mutex<CallCounts>>,
     }
@@ -3128,6 +4317,8 @@ mod tests {
                         tasks_total: 1,
                         tasks_done: 0,
                         created_at: Some(100),
+                        metrics: None,
+                        session_id: None,
                     },
                     AgentGoalSummary {
                         goal_id: "GOAL-2".to_string(),
@@ -3137,6 +4328,8 @@ mod tests {
                         tasks_total: 0,
                         tasks_done: 0,
                         created_at: Some(200),
+                        metrics: None,
+                        session_id: None,
                     },
                 ],
                 tasks: vec![
@@ -3152,6 +4345,8 @@ mod tests {
                         created_at: Some(150),
                         assigned_profile: Some("agent_engineer".into()),
                         model: Some("glm-5.3".into()),
+                        session_id: None,
+                        metrics: None,
                     },
                     AgentTaskSummary {
                         id: AgentTaskId::from("TASK-2"),
@@ -3165,6 +4360,8 @@ mod tests {
                         created_at: Some(250),
                         assigned_profile: None,
                         model: None,
+                        session_id: None,
+                        metrics: None,
                     },
                 ],
                 events: vec![],
@@ -3211,6 +4408,8 @@ mod tests {
                     created_at: None,
                     assigned_profile: None,
                     model: None,
+                    session_id: None,
+                    metrics: None,
                 });
             Task::ready(Ok(AgentTaskDetail {
                 summary: task,
@@ -3220,7 +4419,36 @@ mod tests {
             }))
         }
 
-        fn complete_task(&self, _id: &AgentTaskId, _cx: &mut App) -> Task<anyhow::Result<()>> {
+        fn complete_task(&self, id: &AgentTaskId, _cx: &mut App) -> Task<anyhow::Result<()>> {
+            self.calls.lock().unwrap().complete_calls.push(id.clone());
+            Task::ready(Ok(()))
+        }
+
+        fn update_task_title(
+            &self,
+            id: &AgentTaskId,
+            title: &str,
+            _cx: &mut App,
+        ) -> Task<anyhow::Result<()>> {
+            self.calls
+                .lock()
+                .unwrap()
+                .update_task_title_calls
+                .push((id.clone(), title.to_string()));
+            Task::ready(Ok(()))
+        }
+
+        fn update_goal_title(
+            &self,
+            goal_id: &str,
+            title: &str,
+            _cx: &mut App,
+        ) -> Task<anyhow::Result<()>> {
+            self.calls
+                .lock()
+                .unwrap()
+                .update_goal_title_calls
+                .push((goal_id.to_string(), title.to_string()));
             Task::ready(Ok(()))
         }
 
@@ -3301,14 +4529,6 @@ mod tests {
                 .set_goal_status_calls
                 .push((id.to_string(), status.clone()));
             Task::ready(Ok(()))
-        }
-
-        fn list_events(
-            &self,
-            _limit: u32,
-            _cx: &mut App,
-        ) -> Task<anyhow::Result<Vec<AgentTaskEvent>>> {
-            Task::ready(Ok(self.events.clone()))
         }
 
         fn list_artifacts(
@@ -3453,6 +4673,8 @@ mod tests {
             created_at: Some(10),
             assigned_profile: None,
             model: None,
+            session_id: None,
+            metrics: None,
         };
         let child_failed = AgentTaskSummary {
             id: AgentTaskId::from("TASK-FAILED-CHILD"),
@@ -3466,6 +4688,8 @@ mod tests {
             created_at: Some(20),
             assigned_profile: None,
             model: None,
+            session_id: None,
+            metrics: None,
         };
         let standalone_ready = AgentTaskSummary {
             id: AgentTaskId::from("TASK-READY"),
@@ -3479,6 +4703,8 @@ mod tests {
             created_at: Some(30),
             assigned_profile: None,
             model: None,
+            session_id: None,
+            metrics: None,
         };
 
         let tasks = vec![root_completed, child_failed, standalone_ready];
@@ -3506,23 +4732,17 @@ mod tests {
             );
             assert_eq!(visible.len(), 3);
 
-            let timestamps = HashMap::new();
-            let roots = visible_roots(&visible, &timestamps);
+            let roots = visible_roots(&visible);
             assert_eq!(roots.len(), 2);
             let root_ids: Vec<&str> = roots.iter().map(|t| t.id.0.as_ref()).collect();
             assert!(root_ids.contains(&"TASK-COMPLETED"));
             assert!(root_ids.contains(&"TASK-READY"));
 
-            let children =
-                visible_children(&AgentTaskId::from("TASK-COMPLETED"), &visible, &timestamps);
+            let children = visible_children(&AgentTaskId::from("TASK-COMPLETED"), &visible);
             assert_eq!(children.len(), 1);
             assert_eq!(children[0].id.0.as_ref(), "TASK-FAILED-CHILD");
 
-            let rows = build_task_rows(
-                &store.graph().tasks,
-                store.events(),
-                &panel.category_filters,
-            );
+            let rows = build_task_rows(&store.graph().tasks, &panel.category_filters);
             assert_eq!(rows.len(), 3);
             let row_info: Vec<(&str, &str, usize)> = rows
                 .iter()
@@ -3531,9 +4751,9 @@ mod tests {
             assert_eq!(
                 row_info,
                 vec![
-                    ("TASK-READY", "", 0),
                     ("TASK-COMPLETED", "", 0),
                     ("TASK-FAILED-CHILD", "└── ", 1),
+                    ("TASK-READY", "", 0),
                 ]
             );
         });
@@ -3559,18 +4779,13 @@ mod tests {
                     .all(|t| t.status != AgentTaskStatus::Completed)
             );
 
-            let timestamps = HashMap::new();
-            let roots = visible_roots(&visible, &timestamps);
+            let roots = visible_roots(&visible);
             assert_eq!(roots.len(), 2);
             let root_ids: Vec<&str> = roots.iter().map(|t| t.id.0.as_ref()).collect();
             assert!(root_ids.contains(&"TASK-FAILED-CHILD"));
             assert!(root_ids.contains(&"TASK-READY"));
 
-            let rows = build_task_rows(
-                &store.graph().tasks,
-                store.events(),
-                &panel.category_filters,
-            );
+            let rows = build_task_rows(&store.graph().tasks, &panel.category_filters);
             assert_eq!(rows.len(), 2);
             assert_eq!(rows[0].prefix, "");
             assert_eq!(rows[0].depth, 0);
@@ -3610,6 +4825,8 @@ mod tests {
             tasks_total: 2,
             tasks_done: 0,
             created_at: Some(100),
+            metrics: None,
+            session_id: None,
         };
         let goal_2 = AgentGoalSummary {
             goal_id: "GOAL-2".to_string(),
@@ -3619,6 +4836,8 @@ mod tests {
             tasks_total: 2,
             tasks_done: 0,
             created_at: Some(200),
+            metrics: None,
+            session_id: None,
         };
 
         let task_1a = AgentTaskSummary {
@@ -3633,6 +4852,8 @@ mod tests {
             created_at: Some(110),
             assigned_profile: None,
             model: None,
+            session_id: None,
+            metrics: None,
         };
         let task_1b = AgentTaskSummary {
             id: AgentTaskId::from("TASK-1B"),
@@ -3646,6 +4867,8 @@ mod tests {
             created_at: Some(120),
             assigned_profile: None,
             model: None,
+            session_id: None,
+            metrics: None,
         };
         let task_2_parent = AgentTaskSummary {
             id: AgentTaskId::from("TASK-2P"),
@@ -3659,6 +4882,8 @@ mod tests {
             created_at: Some(210),
             assigned_profile: None,
             model: None,
+            session_id: None,
+            metrics: None,
         };
         let task_2_child = AgentTaskSummary {
             id: AgentTaskId::from("TASK-2C"),
@@ -3672,11 +4897,12 @@ mod tests {
             created_at: Some(220),
             assigned_profile: None,
             model: None,
+            session_id: None,
+            metrics: None,
         };
 
         let goals = vec![goal_1, goal_2];
         let tasks = vec![task_1a, task_1b, task_2_parent, task_2_child];
-        let empty_events: Vec<AgentTaskEvent> = vec![];
         let cat_filters = default_category_filters();
         let other_filters = HashSet::new();
         let collapsed = HashSet::new();
@@ -3684,7 +4910,6 @@ mod tests {
         let groups_by_goal_match = build_goal_groups(
             &tasks,
             &goals,
-            &empty_events,
             &cat_filters,
             &other_filters,
             "Database",
@@ -3697,7 +4922,6 @@ mod tests {
         let groups_by_task_match = build_goal_groups(
             &tasks,
             &goals,
-            &empty_events,
             &cat_filters,
             &other_filters,
             "Tailwind",
@@ -3717,6 +4941,60 @@ mod tests {
     }
 
     #[test]
+    fn test_agent_task_panel_created_at_ordering() {
+        let task_1 = AgentTaskSummary {
+            id: AgentTaskId::from("TASK-1"),
+            parent_id: None,
+            goal_id: None,
+            title: "Task 1".to_string(),
+            status: AgentTaskStatus::Ready,
+            attempt: 1,
+            assignee: None,
+            write_scopes: vec![],
+            created_at: Some(200),
+            assigned_profile: None,
+            model: None,
+            session_id: None,
+            metrics: None,
+        };
+        let task_2 = AgentTaskSummary {
+            id: AgentTaskId::from("TASK-2"),
+            parent_id: None,
+            goal_id: None,
+            title: "Task 2".to_string(),
+            status: AgentTaskStatus::Ready,
+            attempt: 1,
+            assignee: None,
+            write_scopes: vec![],
+            created_at: Some(100),
+            assigned_profile: None,
+            model: None,
+            session_id: None,
+            metrics: None,
+        };
+        let task_none = AgentTaskSummary {
+            id: AgentTaskId::from("TASK-NONE"),
+            parent_id: None,
+            goal_id: None,
+            title: "Task None".to_string(),
+            status: AgentTaskStatus::Ready,
+            attempt: 1,
+            assignee: None,
+            write_scopes: vec![],
+            created_at: None,
+            assigned_profile: None,
+            model: None,
+            session_id: None,
+            metrics: None,
+        };
+
+        let tasks = vec![task_1, task_2, task_none];
+        let rows = build_task_rows(&tasks, &default_category_filters());
+        let ids: Vec<&str> = rows.iter().map(|r| r.task.id.0.as_ref()).collect();
+        assert_eq!(ids, vec!["TASK-2", "TASK-1", "TASK-NONE"]);
+    }
+
+    #[test]
     fn test_agent_task_panel_newest_first_ordering() {
         let task_a = AgentTaskSummary {
             id: AgentTaskId::from("TASK-A"),
@@ -3730,6 +5008,8 @@ mod tests {
             created_at: Some(1000),
             assigned_profile: None,
             model: None,
+            session_id: None,
+            metrics: None,
         };
         let task_b = AgentTaskSummary {
             id: AgentTaskId::from("TASK-B"),
@@ -3743,6 +5023,8 @@ mod tests {
             created_at: Some(3000),
             assigned_profile: None,
             model: None,
+            session_id: None,
+            metrics: None,
         };
         let task_b_child_1 = AgentTaskSummary {
             id: AgentTaskId::from("TASK-B-CHILD-1"),
@@ -3756,6 +5038,8 @@ mod tests {
             created_at: Some(3500),
             assigned_profile: None,
             model: None,
+            session_id: None,
+            metrics: None,
         };
         let task_b_grandchild = AgentTaskSummary {
             id: AgentTaskId::from("TASK-B-GRANDCHILD"),
@@ -3769,6 +5053,8 @@ mod tests {
             created_at: Some(3400),
             assigned_profile: None,
             model: None,
+            session_id: None,
+            metrics: None,
         };
         let task_b_child_2 = AgentTaskSummary {
             id: AgentTaskId::from("TASK-B-CHILD-2"),
@@ -3782,6 +5068,8 @@ mod tests {
             created_at: Some(3100),
             assigned_profile: None,
             model: None,
+            session_id: None,
+            metrics: None,
         };
         let task_c = AgentTaskSummary {
             id: AgentTaskId::from("TASK-C"),
@@ -3795,6 +5083,8 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
+            session_id: None,
+            metrics: None,
         };
         let task_no_events = AgentTaskSummary {
             id: AgentTaskId::from("TASK-NO-EVENTS"),
@@ -3808,6 +5098,8 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
+            session_id: None,
+            metrics: None,
         };
         let tasks = vec![
             task_a,
@@ -3818,14 +5110,7 @@ mod tests {
             task_c,
             task_no_events,
         ];
-        let events = vec![AgentTaskEvent {
-            seq: 7,
-            timestamp_millis: 2000,
-            task_id: Some(AgentTaskId::from("TASK-C")),
-            kind: AgentTaskEventKind::StatusChanged,
-            message: "created C".to_string(),
-        }];
-        let rows = build_task_rows(&tasks, &events, &default_category_filters());
+        let rows = build_task_rows(&tasks, &default_category_filters());
         let extracted: Vec<(&str, &str, usize)> = rows
             .iter()
             .map(|r| (r.task.id.0.as_ref(), r.prefix.as_str(), r.depth))
@@ -3833,12 +5118,12 @@ mod tests {
         assert_eq!(
             extracted,
             vec![
-                ("TASK-B", "", 0),
-                ("TASK-B-CHILD-1", "├── ", 1),
-                ("TASK-B-GRANDCHILD", "│   └── ", 2),
-                ("TASK-B-CHILD-2", "└── ", 1),
-                ("TASK-C", "", 0),
                 ("TASK-A", "", 0),
+                ("TASK-B", "", 0),
+                ("TASK-B-CHILD-2", "├── ", 1),
+                ("TASK-B-CHILD-1", "└── ", 1),
+                ("TASK-B-GRANDCHILD", "    └── ", 2),
+                ("TASK-C", "", 0),
                 ("TASK-NO-EVENTS", "", 0),
             ]
         );
@@ -3859,6 +5144,8 @@ mod tests {
                 created_at: Some(100),
                 assigned_profile: Some("agent_engineer".into()),
                 model: Some("glm-5.3".into()),
+                session_id: None,
+                metrics: None,
             },
             description: "Detailed description of the rework.".to_string(),
             acceptance_criteria: vec![
@@ -3894,6 +5181,8 @@ mod tests {
         assert!(md.contains("# Rework Task Panel"));
         assert!(md.contains("- **Status:** Running"));
         assert!(md.contains("- **Task ID:** TASK-35"));
+        assert!(md.contains("- **Profile:** agent_engineer"));
+        assert!(md.contains("- **Model:** glm-5.3"));
         assert!(md.contains("- **Assignee:** ui_engineer"));
         assert!(md.contains("- **Attempt:** 2"));
         assert!(md.contains("## Description\n\nDetailed description of the rework."));
@@ -3905,6 +5194,19 @@ mod tests {
         assert!(md.contains("## Events"));
         assert!(md.contains("- `#159` [STATUS] task.created"));
         assert!(md.contains("- `#160` [TOOL] run terminal"));
+        assert!(!md.contains("- **Diff:**"));
+
+        let mut detail_with_diff = detail;
+        detail_with_diff.summary.metrics = Some(AgentTaskMetrics {
+            diff: Some(AgentDiffShortstat {
+                files_changed: 4,
+                insertions: 25,
+                deletions: 12,
+            }),
+            ..Default::default()
+        });
+        let md_with_diff = render_task_markdown(&detail_with_diff, &artifacts, None, None);
+        assert!(md_with_diff.contains("- **Diff:** 4 file(s) changed (+25, -12)"));
     }
 
     #[test]
@@ -3929,16 +5231,13 @@ mod tests {
             tasks_total: 2,
             tasks_done: 1,
             created_at: Some(12345),
+            metrics: None,
+            session_id: None,
         };
         let goal_git = GoalGitState {
             branch: "agent-goal/GOAL-UI-1".to_string(),
             branch_exists: true,
             tip_sha: Some("1234567890abcdef".to_string()),
-            diff: Some(agent::DiffShortStat {
-                files: 3,
-                added: 120,
-                removed: 15,
-            }),
         };
 
         let md = render_goal_markdown(&goal_summary, Some(&goal_git));
@@ -3949,7 +5248,6 @@ mod tests {
         assert!(md.contains("- **Tasks:** 1/2 completed"));
         assert!(md.contains("- **Branch:** `agent-goal/GOAL-UI-1`"));
         assert!(md.contains("- **Tip SHA:** `1234567` (1234567890abcdef)"));
-        assert!(md.contains("- **Diff:** 3 file(s) +120 -15"));
     }
 
     #[gpui::test]
@@ -3974,7 +5272,6 @@ mod tests {
                         branch: "agent-goal/GOAL-1".to_string(),
                         branch_exists: true,
                         tip_sha: Some("1234567890abcdef".to_string()),
-                        diff: None,
                     },
                 );
                 snap.goals.insert(
@@ -3983,7 +5280,6 @@ mod tests {
                         branch: "agent-goal/GOAL-2".to_string(),
                         branch_exists: false,
                         tip_sha: None,
-                        diff: None,
                     },
                 );
                 status.set_snapshot_for_test(snap, cx);
@@ -4071,47 +5367,90 @@ mod tests {
             created_at: None,
             assigned_profile: Some("agent_engineer".into()),
             model: Some("claude-3-7-sonnet".into()),
+            session_id: None,
+            metrics: None,
         };
-        let diff = DiffShortStat {
-            files: 2,
-            added: 15,
-            removed: 3,
-        };
-        let meta = format_task_meta_line(&task_full, Some(&diff));
-        assert_eq!(
-            meta,
-            "Running · agent_engineer · claude-3-7-sonnet · TASK-1"
-        );
+        let meta = format_task_meta_line(&task_full);
+        assert_eq!(meta, "TASK-1 · agent_engineer · claude-3-7-sonnet");
 
-        let goal_meta =
-            format_goal_meta_line("GOAL-1", &AgentGoalStatus::Running, 2, 1, 3, Some(&diff));
-        assert_eq!(goal_meta, "Running · 1 / 3 tasks · P2 · GOAL-1");
+        let goal_meta = format_goal_meta_line("GOAL-1", &AgentGoalStatus::Running, 2, 1, 3, None);
+        assert_eq!(goal_meta, "GOAL-1 · 1 / 3 · P2");
 
-        let single_diff = DiffShortStat {
-            files: 1,
-            added: 4,
-            removed: 0,
-        };
         assert_eq!(
-            format_goal_meta_line(
-                "GOAL-1",
-                &AgentGoalStatus::Running,
-                1,
-                0,
-                1,
-                Some(&single_diff)
-            ),
-            "Running · 0 / 1 tasks · P1 · GOAL-1"
+            format_goal_meta_line("GOAL-1", &AgentGoalStatus::Running, 1, 0, 1, None,),
+            "GOAL-1 · 0 / 1 · P1"
         );
 
         assert_eq!(
-            format_task_meta_line(&task_full, None),
-            "Running · agent_engineer · claude-3-7-sonnet · TASK-1"
+            format_task_meta_line(&task_full),
+            "TASK-1 · agent_engineer · claude-3-7-sonnet"
         );
         assert_eq!(
             format_goal_meta_line("GOAL-1", &AgentGoalStatus::Completed, 1, 2, 2, None),
-            "Completed · 2 / 2 tasks · P1 · GOAL-1"
+            "GOAL-1 · 2 / 2 · P1"
         );
+
+        let sample_metrics = AgentTaskMetrics {
+            duration_ms: Some(14_000),
+            input_tokens: Some(5100),
+            output_tokens: Some(1300),
+            cache_read_tokens: Some(15100),
+            cache_creation_tokens: None,
+            total_tokens: Some(21500),
+            cost_usd: Some(0.04),
+            turns_count: Some(1),
+            diff: None,
+        };
+        let mut task_with_metrics = task_full;
+        task_with_metrics.metrics = Some(sample_metrics.clone());
+        let task_meta_no_diff = format_task_meta_line(&task_with_metrics);
+        assert_eq!(
+            task_meta_no_diff,
+            "TASK-1 · agent_engineer · claude-3-7-sonnet · 14s · 5.1k/1.3k/15.1k · 1 · $0.04"
+        );
+        assert!(!task_meta_no_diff.contains(" ·  · "));
+
+        let goal_meta_no_diff = format_goal_meta_line(
+            "GOAL-10",
+            &AgentGoalStatus::Running,
+            1,
+            3,
+            3,
+            Some(&sample_metrics),
+        );
+        assert_eq!(
+            goal_meta_no_diff,
+            "GOAL-10 · 3 / 3 · P1 · 14s · 5.1k/1.3k/15.1k · 1 · $0.04"
+        );
+        assert!(!goal_meta_no_diff.contains(" ·  · "));
+
+        let mut metrics_with_diff = sample_metrics;
+        metrics_with_diff.diff = Some(AgentDiffShortstat {
+            files_changed: 2,
+            insertions: 15,
+            deletions: 4,
+        });
+        task_with_metrics.metrics = Some(metrics_with_diff.clone());
+        let task_meta_with_diff = format_task_meta_line(&task_with_metrics);
+        assert_eq!(
+            task_meta_with_diff,
+            "TASK-1 · agent_engineer · claude-3-7-sonnet · 14s · 5.1k/1.3k/15.1k · 1 · +15 -4 · $0.04"
+        );
+        assert!(!task_meta_with_diff.contains(" ·  · "));
+
+        let goal_meta_with_diff = format_goal_meta_line(
+            "GOAL-10",
+            &AgentGoalStatus::Running,
+            1,
+            3,
+            3,
+            Some(&metrics_with_diff),
+        );
+        assert_eq!(
+            goal_meta_with_diff,
+            "GOAL-10 · 3 / 3 · P1 · 14s · 5.1k/1.3k/15.1k · 1 · +15 -4 · $0.04"
+        );
+        assert!(!goal_meta_with_diff.contains(" ·  · "));
     }
 
     #[test]
@@ -4128,10 +5467,12 @@ mod tests {
             created_at: None,
             assigned_profile: Some("code_mechanic".into()),
             model: Some("gemini-2.5-pro".into()),
+            session_id: None,
+            metrics: None,
         };
         assert_eq!(
-            format_task_meta_line(&task_no_goal, None),
-            "Ready · code_mechanic · gemini-2.5-pro · TASK-2"
+            format_task_meta_line(&task_no_goal),
+            "TASK-2 · code_mechanic · gemini-2.5-pro"
         );
 
         let task_assignee_fallback = AgentTaskSummary {
@@ -4146,10 +5487,12 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
+            session_id: None,
+            metrics: None,
         };
         assert_eq!(
-            format_task_meta_line(&task_assignee_fallback, None),
-            "Ready · backend_profile · TASK-3"
+            format_task_meta_line(&task_assignee_fallback),
+            "TASK-3 · backend_profile"
         );
 
         let task_no_profile = AgentTaskSummary {
@@ -4164,10 +5507,12 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
+            session_id: None,
+            metrics: None,
         };
         assert_eq!(
-            format_task_meta_line(&task_no_profile, None),
-            "Ready · no profile · TASK-4"
+            format_task_meta_line(&task_no_profile),
+            "TASK-4 · no profile"
         );
 
         let task_both = AgentTaskSummary {
@@ -4182,10 +5527,12 @@ mod tests {
             created_at: None,
             assigned_profile: Some("primary_profile".into()),
             model: None,
+            session_id: None,
+            metrics: None,
         };
         assert_eq!(
-            format_task_meta_line(&task_both, None),
-            "Ready · primary_profile · TASK-5"
+            format_task_meta_line(&task_both),
+            "TASK-5 · primary_profile"
         );
     }
 
@@ -4207,6 +5554,8 @@ mod tests {
             created_at: Some(10),
             assigned_profile: None,
             model: None,
+            session_id: None,
+            metrics: None,
         };
         let task_child = AgentTaskSummary {
             id: AgentTaskId::from("TASK-CHILD"),
@@ -4220,6 +5569,8 @@ mod tests {
             created_at: Some(20),
             assigned_profile: None,
             model: None,
+            session_id: None,
+            metrics: None,
         };
 
         let provider = Arc::new(TestProvider {
@@ -4368,8 +5719,11 @@ mod tests {
         .await;
 
         let calls = Arc::new(std::sync::Mutex::new(CallCounts::default()));
+        let mut goals = TestProvider::default().goals;
+        goals[1].session_id = Some("session-goal-2".to_string());
         let provider = Arc::new(TestProvider {
             calls: calls.clone(),
+            goals,
             ..Default::default()
         });
         let store = cx.update(|cx| cx.new(|cx| AgentTaskStore::new(provider, cx)));
@@ -4390,6 +5744,20 @@ mod tests {
         });
         cx.run_until_parked();
 
+        assert!(
+            cx.debug_bounds("MENU_ITEM-Open Thread").is_none(),
+            "Open Thread should not be present when no session is registered"
+        );
+        assert!(
+            cx.debug_bounds("MENU_ITEM-View Thread").is_none(),
+            "View Thread should not be present when no session is registered"
+        );
+        assert!(
+            cx.debug_bounds("MENU_ITEM-View Thread as Markdown")
+                .is_none(),
+            "View Thread as Markdown should not be present when no session is registered"
+        );
+
         let archive_item = cx
             .debug_bounds("MENU_ITEM-Archive")
             .expect("Archive menu item should be in context menu");
@@ -4399,6 +5767,96 @@ mod tests {
         assert_eq!(
             calls.lock().unwrap().archive_calls,
             vec![AgentTaskId::from("TASK-1")]
+        );
+
+        agent::task_worktree::register_task_session(
+            &AgentTaskId::from("TASK-1"),
+            "session-task-1".to_string(),
+        );
+
+        panel.update_in(cx, |panel, window, cx| {
+            panel.deploy_context_menu(
+                ContextMenuTarget::Task(AgentTaskId::from("TASK-1")),
+                Point::new(px(100.0), px(100.0)),
+                None,
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        assert!(
+            cx.debug_bounds("MENU_ITEM-Open Thread").is_some(),
+            "Open Thread should be present when a session is registered for the task"
+        );
+        assert!(
+            cx.debug_bounds("MENU_ITEM-View Thread").is_some(),
+            "View Thread should be present when a session is registered for the task"
+        );
+        assert!(
+            cx.debug_bounds("MENU_ITEM-View Thread as Markdown")
+                .is_some(),
+            "View Thread as Markdown should be present when a session is registered for the task"
+        );
+        assert!(
+            cx.debug_bounds("MENU_ITEM-Rename").is_some(),
+            "Rename should be present in context menu"
+        );
+        assert!(
+            cx.debug_bounds("MENU_ITEM-Complete").is_some(),
+            "Complete should be present in context menu"
+        );
+
+        // Goal context menu without session_id (GOAL-1)
+        panel.update_in(cx, |panel, window, cx| {
+            panel.deploy_context_menu(
+                ContextMenuTarget::Goal("GOAL-1".to_string()),
+                Point::new(px(100.0), px(100.0)),
+                None,
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        assert!(
+            cx.debug_bounds("MENU_ITEM-Open Thread").is_none(),
+            "Open Thread should not be present for goal when session_id is None"
+        );
+        assert!(
+            cx.debug_bounds("MENU_ITEM-View Thread").is_none(),
+            "View Thread should not be present for goal when session_id is None"
+        );
+        assert!(
+            cx.debug_bounds("MENU_ITEM-View Thread as Markdown")
+                .is_none(),
+            "View Thread as Markdown should not be present for goal when session_id is None"
+        );
+
+        // Goal context menu with session_id (GOAL-2)
+        panel.update_in(cx, |panel, window, cx| {
+            panel.deploy_context_menu(
+                ContextMenuTarget::Goal("GOAL-2".to_string()),
+                Point::new(px(100.0), px(100.0)),
+                None,
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        assert!(
+            cx.debug_bounds("MENU_ITEM-Open Thread").is_some(),
+            "Open Thread should be present for goal when session_id is Some"
+        );
+        assert!(
+            cx.debug_bounds("MENU_ITEM-View Thread").is_some(),
+            "View Thread should be present for goal when session_id is Some"
+        );
+        assert!(
+            cx.debug_bounds("MENU_ITEM-View Thread as Markdown")
+                .is_some(),
+            "View Thread as Markdown should be present for goal when session_id is Some"
         );
     }
 
@@ -4567,6 +6025,8 @@ mod tests {
                 tasks_total: 1,
                 tasks_done: 0,
                 created_at: Some(10),
+                metrics: None,
+                session_id: None,
             }],
             tasks: vec![AgentTaskSummary {
                 id: AgentTaskId::from("TASK-1"),
@@ -4580,6 +6040,8 @@ mod tests {
                 created_at: Some(10),
                 assigned_profile: None,
                 model: None,
+                session_id: None,
+                metrics: None,
             }],
             ..Default::default()
         });
@@ -4604,7 +6066,6 @@ mod tests {
                         branch: "agent-goal/GOAL-1".to_string(),
                         branch_exists: true,
                         tip_sha: Some("1234567890abcdef".to_string()),
-                        diff: None,
                     },
                 );
                 status.set_snapshot_for_test(snap, cx);
@@ -4638,6 +6099,8 @@ mod tests {
                 tasks_total: 1,
                 tasks_done: 1,
                 created_at: Some(10),
+                metrics: None,
+                session_id: None,
             }],
             tasks: vec![AgentTaskSummary {
                 id: AgentTaskId::from("TASK-1"),
@@ -4651,6 +6114,8 @@ mod tests {
                 created_at: Some(10),
                 assigned_profile: None,
                 model: None,
+                session_id: None,
+                metrics: None,
             }],
             ..Default::default()
         });
@@ -4671,7 +6136,6 @@ mod tests {
                         branch: "agent-goal/GOAL-1".to_string(),
                         branch_exists: true,
                         tip_sha: Some("1234567890abcdef".to_string()),
-                        diff: None,
                     },
                 );
                 status.set_snapshot_for_test(snap, cx);
@@ -4724,6 +6188,8 @@ mod tests {
                 created_at: Some(10),
                 assigned_profile: None,
                 model: None,
+                session_id: None,
+                metrics: None,
             }],
             ..Default::default()
         });
@@ -4782,13 +6248,15 @@ mod tests {
             cx,
         )
         .await;
+        let (workspace, _) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
         let provider = Arc::new(TestProvider::default());
         let store = cx.update(|cx| cx.new(|cx| AgentTaskStore::new(provider, cx)));
 
         let (panel, cx) = cx.add_window_view(|_window, cx| {
             AgentTaskPanel::new(
                 store,
-                WeakEntity::new_invalid(),
+                workspace.downgrade(),
                 project.clone(),
                 file_system.clone(),
                 cx,
@@ -4806,7 +6274,7 @@ mod tests {
                         exists_on_disk: true,
                         branch: Some("agent-task/TASK-1".to_string()),
                         branch_exists: true,
-                        diff: None,
+                        retention_reason: None,
                     },
                 );
                 snap.goals.insert(
@@ -4815,7 +6283,6 @@ mod tests {
                         branch: "agent-goal/GOAL-1".to_string(),
                         branch_exists: true,
                         tip_sha: Some("1234567890abcdef".to_string()),
-                        diff: None,
                     },
                 );
                 status.set_snapshot_for_test(snap, cx);
@@ -4842,6 +6309,83 @@ mod tests {
             .expect("Delete Worktree should be in context menu when worktree exists");
         cx.simulate_click(remove_item.center(), gpui::Modifiers::default());
         cx.run_until_parked();
+
+        assert!(
+            workspace.read_with(cx, |workspace, _cx| {
+                workspace.has_notification(&workspace::notifications::NotificationId::unique::<
+                    WorktreeDeletedToast,
+                >())
+            }),
+            "Success toast should be shown on worktree deletion"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_agent_task_panel_context_menu_delete_worktree_error_toast(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let file_system = FakeFs::new(cx.executor());
+        let project = Project::test(file_system.clone(), [], cx).await;
+        let (workspace, _) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
+        let provider = Arc::new(TestProvider::default());
+        let store = cx.update(|cx| cx.new(|cx| AgentTaskStore::new(provider, cx)));
+
+        let (panel, cx) = cx.add_window_view(|_window, cx| {
+            AgentTaskPanel::new(
+                store,
+                workspace.downgrade(),
+                project.clone(),
+                file_system.clone(),
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        panel.update(cx, |panel, cx| {
+            panel.worktree_status.update(cx, |status, cx| {
+                let mut snap = TaskGitSnapshot::default();
+                snap.tasks.insert(
+                    AgentTaskId::from("TASK-1"),
+                    TaskGitState {
+                        worktree_path: std::path::PathBuf::from("/fake/task-1"),
+                        exists_on_disk: true,
+                        branch: Some("agent-task/TASK-1".to_string()),
+                        branch_exists: true,
+                        retention_reason: None,
+                    },
+                );
+                status.set_snapshot_for_test(snap, cx);
+            });
+        });
+        cx.run_until_parked();
+
+        panel.update_in(cx, |panel, window, cx| {
+            panel.deploy_context_menu(
+                ContextMenuTarget::Task(AgentTaskId::from("TASK-1")),
+                Point::new(px(100.0), px(100.0)),
+                None,
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        let remove_item = cx
+            .debug_bounds("MENU_ITEM-Delete Worktree")
+            .expect("Delete Worktree should be in context menu when worktree exists");
+        cx.simulate_click(remove_item.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+
+        assert!(
+            workspace.read_with(cx, |workspace, _cx| {
+                workspace.has_notification(&workspace::notifications::NotificationId::unique::<
+                    TaskOperationErrorToast,
+                >())
+            }),
+            "Error toast should be shown when worktree deletion fails"
+        );
     }
 
     #[test]
@@ -4857,12 +6401,13 @@ mod tests {
             tasks_total: 2,
             tasks_done: 0,
             created_at: Some(10),
+            metrics: None,
+            session_id: None,
         };
         let goal_git = GoalGitState {
             branch: format!("agent-goal/{goal_id}"),
             branch_exists: true,
             tip_sha: Some("1234567890abcdef".to_string()),
-            diff: None,
         };
 
         let detail = AgentTaskDetail {
@@ -4878,6 +6423,8 @@ mod tests {
                 created_at: Some(10),
                 assigned_profile: None,
                 model: None,
+                session_id: None,
+                metrics: None,
             },
             description: "Task description".to_string(),
             acceptance_criteria: vec![],
@@ -4929,6 +6476,8 @@ mod tests {
                 created_at: Some(10),
                 assigned_profile: None,
                 model: None,
+                session_id: None,
+                metrics: None,
             },
             AgentTaskSummary {
                 id: AgentTaskId::from("TASK-CHILD-1"),
@@ -4942,6 +6491,8 @@ mod tests {
                 created_at: Some(20),
                 assigned_profile: None,
                 model: None,
+                session_id: None,
+                metrics: None,
             },
             AgentTaskSummary {
                 id: AgentTaskId::from("TASK-GRANDCHILD-1"),
@@ -4955,6 +6506,8 @@ mod tests {
                 created_at: Some(30),
                 assigned_profile: None,
                 model: None,
+                session_id: None,
+                metrics: None,
             },
             AgentTaskSummary {
                 id: AgentTaskId::from("TASK-CHILD-2"),
@@ -4968,6 +6521,8 @@ mod tests {
                 created_at: Some(40),
                 assigned_profile: None,
                 model: None,
+                session_id: None,
+                metrics: None,
             },
             AgentTaskSummary {
                 id: AgentTaskId::from("TASK-ROOT-2"),
@@ -4981,6 +6536,8 @@ mod tests {
                 created_at: Some(50),
                 assigned_profile: None,
                 model: None,
+                session_id: None,
+                metrics: None,
             },
             AgentTaskSummary {
                 id: AgentTaskId::from("TASK-CHILD-3"),
@@ -4994,21 +6551,15 @@ mod tests {
                 created_at: Some(60),
                 assigned_profile: None,
                 model: None,
+                session_id: None,
+                metrics: None,
             },
         ];
-
-        let mut timestamps = HashMap::new();
-        timestamps.insert(AgentTaskId::from("TASK-ROOT-1"), 10);
-        timestamps.insert(AgentTaskId::from("TASK-CHILD-1"), 20);
-        timestamps.insert(AgentTaskId::from("TASK-GRANDCHILD-1"), 30);
-        timestamps.insert(AgentTaskId::from("TASK-CHILD-2"), 40);
-        timestamps.insert(AgentTaskId::from("TASK-ROOT-2"), 50);
-        timestamps.insert(AgentTaskId::from("TASK-CHILD-3"), 60);
 
         let collapsed = HashSet::new();
 
         // Under goal: roots receive ├── / └── and subtasks inherit continuation prefix
-        let under_goal_rows = build_task_tree_rows(&tasks, &timestamps, &collapsed, true);
+        let under_goal_rows = build_task_tree_rows(&tasks, &collapsed, true);
         let under_goal_info: Vec<(&str, &str, &str)> = under_goal_rows
             .iter()
             .map(|r| {
@@ -5023,17 +6574,17 @@ mod tests {
         assert_eq!(
             under_goal_info,
             vec![
-                ("TASK-ROOT-2", "├── ", "│   "),
-                ("TASK-CHILD-3", "│   └── ", "│       "),
-                ("TASK-ROOT-1", "└── ", "    "),
-                ("TASK-CHILD-2", "    ├── ", "    │   "),
-                ("TASK-CHILD-1", "    └── ", "        "),
-                ("TASK-GRANDCHILD-1", "        └── ", "            "),
+                ("TASK-ROOT-1", "├── ", "│   "),
+                ("TASK-CHILD-1", "│   ├── ", "│   │   "),
+                ("TASK-GRANDCHILD-1", "│   │   └── ", "│   │       "),
+                ("TASK-CHILD-2", "│   └── ", "│       "),
+                ("TASK-ROOT-2", "└── ", "    "),
+                ("TASK-CHILD-3", "    └── ", "        "),
             ]
         );
 
         // No goal: roots have "" and subtasks receive ├── / └──
-        let no_goal_rows = build_task_tree_rows(&tasks, &timestamps, &collapsed, false);
+        let no_goal_rows = build_task_tree_rows(&tasks, &collapsed, false);
         let no_goal_info: Vec<(&str, &str, &str)> = no_goal_rows
             .iter()
             .map(|r| {
@@ -5048,79 +6599,18 @@ mod tests {
         assert_eq!(
             no_goal_info,
             vec![
+                ("TASK-ROOT-1", "", ""),
+                ("TASK-CHILD-1", "├── ", "│   "),
+                ("TASK-GRANDCHILD-1", "│   └── ", "│       "),
+                ("TASK-CHILD-2", "└── ", "    "),
                 ("TASK-ROOT-2", "", ""),
                 ("TASK-CHILD-3", "└── ", "    "),
-                ("TASK-ROOT-1", "", ""),
-                ("TASK-CHILD-2", "├── ", "│   "),
-                ("TASK-CHILD-1", "└── ", "    "),
-                ("TASK-GRANDCHILD-1", "    └── ", "        "),
             ]
         );
     }
 
     #[test]
     fn test_status_and_priority_colors_and_labels() {
-        assert_eq!(goal_status_label(&AgentGoalStatus::Running), "Running");
-        assert_eq!(goal_status_label(&AgentGoalStatus::Completed), "Completed");
-        assert_eq!(goal_status_label(&AgentGoalStatus::Failed), "Failed");
-        assert_eq!(goal_status_label(&AgentGoalStatus::Blocked), "Blocked");
-        assert_eq!(goal_status_label(&AgentGoalStatus::Cancelled), "Cancelled");
-        assert_eq!(goal_status_label(&AgentGoalStatus::Archived), "Archived");
-
-        assert_eq!(
-            goal_status_text_color(&AgentGoalStatus::Running),
-            Color::Accent
-        );
-        assert_eq!(
-            goal_status_text_color(&AgentGoalStatus::Completed),
-            Color::Success
-        );
-        assert_eq!(
-            goal_status_text_color(&AgentGoalStatus::Failed),
-            Color::Error
-        );
-        assert_eq!(
-            goal_status_text_color(&AgentGoalStatus::Blocked),
-            Color::Warning
-        );
-        assert_eq!(
-            goal_status_text_color(&AgentGoalStatus::Cancelled),
-            Color::Muted
-        );
-        assert_eq!(
-            goal_status_text_color(&AgentGoalStatus::Archived),
-            Color::Muted
-        );
-
-        assert_eq!(
-            task_status_text_color(&AgentTaskStatus::Ready),
-            Color::Accent
-        );
-        assert_eq!(
-            task_status_text_color(&AgentTaskStatus::Running),
-            Color::Accent
-        );
-        assert_eq!(
-            task_status_text_color(&AgentTaskStatus::Completed),
-            Color::Success
-        );
-        assert_eq!(
-            task_status_text_color(&AgentTaskStatus::Blocked),
-            Color::Warning
-        );
-        assert_eq!(
-            task_status_text_color(&AgentTaskStatus::Failed),
-            Color::Error
-        );
-        assert_eq!(
-            task_status_text_color(&AgentTaskStatus::Cancelled),
-            Color::Muted
-        );
-        assert_eq!(
-            task_status_text_color(&AgentTaskStatus::Archived),
-            Color::Muted
-        );
-
         assert_eq!(priority_color(0), Color::Error);
         assert_eq!(priority_color(1), Color::Error);
         assert_eq!(priority_color(2), Color::Warning);
@@ -5146,6 +6636,8 @@ mod tests {
             created_at: Some(10),
             assigned_profile: None,
             model: None,
+            session_id: None,
+            metrics: None,
         };
         let task_child = AgentTaskSummary {
             id: AgentTaskId::from("TASK-C1"),
@@ -5159,6 +6651,8 @@ mod tests {
             created_at: Some(20),
             assigned_profile: None,
             model: None,
+            session_id: None,
+            metrics: None,
         };
 
         let provider = Arc::new(TestProvider {
@@ -5216,5 +6710,766 @@ mod tests {
         });
         // Child is now collapsed
         assert!(cx.debug_bounds("task-node-TASK-C1").is_none());
+    }
+
+    #[test]
+    fn test_markdown_preview_metrics() {
+        let sample_metrics = AgentTaskMetrics {
+            duration_ms: Some(14_000),
+            input_tokens: Some(5100),
+            output_tokens: Some(1300),
+            cache_read_tokens: Some(15000),
+            cache_creation_tokens: Some(100),
+            total_tokens: Some(21500),
+            cost_usd: Some(0.04),
+            turns_count: Some(1),
+            diff: None,
+        };
+        let goal = AgentGoalSummary {
+            goal_id: "GOAL-10".to_string(),
+            title: "Goal 10".to_string(),
+            status: AgentGoalStatus::Completed,
+            priority: 1,
+            tasks_total: 3,
+            tasks_done: 3,
+            created_at: Some(10),
+            metrics: Some(sample_metrics.clone()),
+            session_id: None,
+        };
+        let goal_md = render_goal_markdown(&goal, None);
+        assert!(goal_md.contains("## Metrics"));
+        assert!(goal_md.contains("- **Duration:** 14s"));
+        assert!(goal_md.contains("- **Tokens:** 5100 in / 1300 out / 15100 cache"));
+        assert!(goal_md.contains("- **Turns:** 1"));
+        assert!(goal_md.contains("- **Cost:** $0.04"));
+
+        let detail = AgentTaskDetail {
+            summary: AgentTaskSummary {
+                id: AgentTaskId::from("TASK-1"),
+                parent_id: None,
+                goal_id: Some("GOAL-10".to_string()),
+                title: "Task 1".to_string(),
+                status: AgentTaskStatus::Completed,
+                attempt: 1,
+                assignee: None,
+                write_scopes: vec![],
+                created_at: Some(10),
+                assigned_profile: Some("agent_engineer".into()),
+                model: Some("glm-5.3".into()),
+                session_id: None,
+                metrics: Some(sample_metrics.clone()),
+            },
+            description: "Desc".to_string(),
+            acceptance_criteria: vec![],
+            events_tail: vec![],
+        };
+        let task_md = render_task_markdown(&detail, &[], Some(&goal), None);
+        assert!(task_md.contains("- **Profile:** agent_engineer"));
+        assert!(task_md.contains("- **Model:** glm-5.3"));
+        assert!(task_md.contains("## Metrics"));
+        assert!(task_md.contains("- **Duration:** 14s"));
+        assert!(task_md.contains("- **Tokens:** 5100 in / 1300 out / 15100 cache"));
+        assert!(task_md.contains("- **Turns:** 1"));
+        assert!(task_md.contains("- **Cost:** $0.04"));
+        assert!(!goal_md.contains("- **Diff:**"));
+        assert!(!task_md.contains("- **Diff:**"));
+
+        let mut metrics_with_diff = sample_metrics;
+        metrics_with_diff.diff = Some(AgentDiffShortstat {
+            files_changed: 3,
+            insertions: 42,
+            deletions: 7,
+        });
+
+        let mut goal_with_diff = goal;
+        goal_with_diff.metrics = Some(metrics_with_diff.clone());
+        let goal_with_diff_md = render_goal_markdown(&goal_with_diff, None);
+        assert!(goal_with_diff_md.contains("- **Diff:** 3 file(s) changed (+42, -7)"));
+
+        let mut detail_with_diff = detail;
+        detail_with_diff.summary.metrics = Some(metrics_with_diff);
+        let task_with_diff_md =
+            render_task_markdown(&detail_with_diff, &[], Some(&goal_with_diff), None);
+        assert!(task_with_diff_md.contains("- **Diff:** 3 file(s) changed (+42, -7)"));
+    }
+
+    #[gpui::test]
+    async fn test_agent_task_panel_zoom_and_flex_properties(cx: &mut TestAppContext) {
+        init_test(cx);
+        let file_system = FakeFs::new(cx.executor());
+        let project = Project::test(file_system.clone(), [], cx).await;
+        let provider = Arc::new(TestProvider::default());
+        let store = cx.update(|cx| cx.new(|cx| AgentTaskStore::new(provider, cx)));
+
+        let (panel, cx) = cx.add_window_view(|_window, cx| {
+            AgentTaskPanel::new(store, WeakEntity::new_invalid(), project, file_system, cx)
+        });
+        cx.run_until_parked();
+
+        panel.update_in(cx, |panel, window, cx| {
+            assert!(!panel.is_zoomed(window, cx));
+            panel.set_zoomed(true, window, cx);
+            assert!(panel.is_zoomed(window, cx));
+            panel.set_zoomed(false, window, cx);
+            assert!(!panel.is_zoomed(window, cx));
+
+            assert!(panel.supports_flexible_size());
+            assert!(!panel.has_flexible_size(window, cx));
+
+            assert_eq!(panel.icon(window, cx), Some(IconName::ListTodo));
+            assert!(panel.hide_button_setting(cx).is_some());
+        });
+    }
+
+    #[gpui::test]
+    async fn test_agent_task_panel_inline_renaming(cx: &mut TestAppContext) {
+        init_test(cx);
+        let file_system = FakeFs::new(cx.executor());
+        let project = Project::test(file_system.clone(), [], cx).await;
+
+        let calls = Arc::new(std::sync::Mutex::new(CallCounts::default()));
+        let provider = Arc::new(TestProvider {
+            calls: calls.clone(),
+            ..Default::default()
+        });
+        let store = cx.update(|cx| cx.new(|cx| AgentTaskStore::new(provider, cx)));
+
+        let (panel, cx) = cx.add_window_view(|_window, cx| {
+            AgentTaskPanel::new(store, WeakEntity::new_invalid(), project, file_system, cx)
+        });
+        cx.run_until_parked();
+
+        panel.update_in(cx, |panel, window, cx| {
+            panel.start_renaming(
+                RenamingTarget::Task(AgentTaskId::from("TASK-1")),
+                "Initial Title".to_string(),
+                window,
+                cx,
+            );
+            assert!(panel.editing_item.is_some());
+
+            panel
+                .editing_item
+                .as_ref()
+                .unwrap()
+                .editor
+                .update(cx, |editor, cx| {
+                    editor.set_text("Updated Task Title", window, cx);
+                });
+
+            panel.confirm_renaming(window, cx);
+            assert!(panel.editing_item.is_none());
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            calls.lock().unwrap().update_task_title_calls,
+            vec![(
+                AgentTaskId::from("TASK-1"),
+                "Updated Task Title".to_string()
+            )]
+        );
+
+        panel.update_in(cx, |panel, window, cx| {
+            panel.start_renaming(
+                RenamingTarget::Task(AgentTaskId::from("TASK-1")),
+                "Initial Title".to_string(),
+                window,
+                cx,
+            );
+            assert!(panel.editing_item.is_some());
+            panel.cancel_renaming(window, cx);
+            assert!(panel.editing_item.is_none());
+        });
+        cx.run_until_parked();
+        assert_eq!(calls.lock().unwrap().update_task_title_calls.len(), 1);
+
+        panel.update_in(cx, |panel, window, cx| {
+            panel.start_renaming(
+                RenamingTarget::Goal("GOAL-1".to_string()),
+                "Goal 1".to_string(),
+                window,
+                cx,
+            );
+            assert!(panel.editing_item.is_some());
+
+            panel
+                .editing_item
+                .as_ref()
+                .unwrap()
+                .editor
+                .update(cx, |editor, cx| {
+                    editor.set_text("Updated Goal Title", window, cx);
+                });
+
+            panel.confirm_renaming(window, cx);
+            assert!(panel.editing_item.is_none());
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            calls.lock().unwrap().update_goal_title_calls,
+            vec![("GOAL-1".to_string(), "Updated Goal Title".to_string())]
+        );
+    }
+
+    #[gpui::test]
+    async fn test_agent_task_panel_error_toast(cx: &mut TestAppContext) {
+        init_test(cx);
+        let file_system = FakeFs::new(cx.executor());
+        let project = Project::test(file_system.clone(), [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
+
+        let provider = Arc::new(TestProvider::default());
+        let store = cx.update(|_window, cx| cx.new(|cx| AgentTaskStore::new(provider, cx)));
+
+        let panel = cx
+            .new(|cx| AgentTaskPanel::new(store, workspace.downgrade(), project, file_system, cx));
+
+        panel.update_in(cx, |panel, window, cx| {
+            let failed_task = Task::ready(Err(anyhow::anyhow!("Invalid status transition")));
+            panel.spawn_with_error_toast(failed_task, window, cx);
+        });
+        cx.run_until_parked();
+
+        assert!(
+            workspace.read_with(cx, |workspace, _cx| {
+                workspace.has_notification(&workspace::notifications::NotificationId::unique::<
+                    TaskOperationErrorToast,
+                >())
+            }),
+            "Error toast should be shown on operation failure"
+        );
+
+        // Advance executor past the 5-second autohide threshold; error toast must remain persistent.
+        cx.background_executor
+            .advance_clock(std::time::Duration::from_secs(10));
+        cx.run_until_parked();
+
+        assert!(
+            workspace.read_with(cx, |workspace, _cx| {
+                workspace.has_notification(&workspace::notifications::NotificationId::unique::<
+                    TaskOperationErrorToast,
+                >())
+            }),
+            "Error toast must not autohide after 10s"
+        );
+    }
+
+    #[test]
+    fn test_format_task_panel_error_humanization_and_prefix() {
+        let err = anyhow::anyhow!("sqlite error: database is locked");
+        let formatted = AgentTaskPanel::format_task_panel_error(Some("Archive Goal"), &err);
+        assert_eq!(
+            formatted,
+            "Task Panel: Archive Goal: Database is locked by another process. Please wait and try again."
+        );
+        assert!(!formatted.contains("TGS: "));
+
+        let err = anyhow::anyhow!("fatal: Unable to create '.git/index.lock': File exists");
+        let formatted = AgentTaskPanel::format_task_panel_error(Some("Restore Worktree"), &err);
+        assert_eq!(
+            formatted,
+            "Task Panel: Restore Worktree: Git index or file is locked by another process. Please wait and try again."
+        );
+        assert!(!formatted.contains("TGS: "));
+
+        let err = anyhow::anyhow!("fatal: branch 'agent-task/TASK-99' not found");
+        let formatted = AgentTaskPanel::format_task_panel_error(Some("Go to Branch"), &err);
+        assert_eq!(
+            formatted,
+            "Task Panel: Go to Branch: Git branch not found: fatal: branch 'agent-task/TASK-99' not found"
+        );
+        assert!(!formatted.contains("TGS: "));
+
+        let err = anyhow::anyhow!("operation timeout");
+        let formatted = AgentTaskPanel::format_task_panel_error(None, &err);
+        assert_eq!(formatted, "Task Panel: operation timeout");
+        assert!(!formatted.contains("TGS: "));
+    }
+
+    #[test]
+    fn test_open_thread_error_toast_strings() {
+        let task_id = AgentTaskId::from("TASK-123");
+        let branch_name = "agent-task/TASK-123";
+        let missing_branch_message = format!(
+            "Task Panel: Open Thread: Cannot open thread for task {task_id}: branch '{branch_name}' was not found in git repository; worktree cannot be restored."
+        );
+        assert_eq!(
+            missing_branch_message,
+            "Task Panel: Open Thread: Cannot open thread for task TASK-123: branch 'agent-task/TASK-123' was not found in git repository; worktree cannot be restored."
+        );
+
+        let err = anyhow::anyhow!("fatal: branch 'agent-task/TASK-123' not found");
+        let humanized = AgentTaskPanel::humanize_error(&err);
+        let restore_error_message = format!(
+            "Task Panel: Open Thread: Failed to restore worktree for task {task_id}: {humanized}"
+        );
+        assert_eq!(
+            restore_error_message,
+            "Task Panel: Open Thread: Failed to restore worktree for task TASK-123: Git branch not found: fatal: branch 'agent-task/TASK-123' not found"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_open_thread_missing_branch_shows_persistent_error_toast_immediately(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let file_system = FakeFs::new(cx.executor());
+        let project = Project::test(file_system.clone(), [], cx).await;
+        let (workspace, _) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
+
+        let task_id = AgentTaskId::from("TASK-NO-BRANCH");
+        let provider = Arc::new(TestProvider {
+            tasks: vec![AgentTaskSummary {
+                id: task_id.clone(),
+                title: "Task without branch".to_string(),
+                status: AgentTaskStatus::Ready,
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        let store = cx.update(|cx| cx.new(|cx| AgentTaskStore::new(provider, cx)));
+
+        let (panel, cx) = cx.add_window_view(|_window, cx| {
+            AgentTaskPanel::new(
+                store,
+                workspace.downgrade(),
+                project.clone(),
+                file_system.clone(),
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        agent::task_worktree::register_task_session(&task_id, "session-no-branch".to_string());
+
+        panel.update(cx, |panel, cx| {
+            panel.worktree_status.update(cx, |status, cx| {
+                let mut snap = TaskGitSnapshot::default();
+                snap.tasks.insert(
+                    task_id.clone(),
+                    TaskGitState {
+                        worktree_path: std::path::PathBuf::from("/fake/task-no-branch"),
+                        exists_on_disk: false,
+                        branch: Some("agent-task/TASK-NO-BRANCH".to_string()),
+                        branch_exists: false,
+                        retention_reason: None,
+                    },
+                );
+                status.set_snapshot_for_test(snap, cx);
+            });
+        });
+        cx.run_until_parked();
+
+        panel.update_in(cx, |panel, window, cx| {
+            panel.deploy_context_menu(
+                ContextMenuTarget::Task(task_id.clone()),
+                Point::new(px(100.0), px(100.0)),
+                None,
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        let open_thread_item = cx
+            .debug_bounds("MENU_ITEM-Open Thread")
+            .expect("Open Thread should be present in context menu");
+        cx.simulate_click(open_thread_item.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+
+        assert!(
+            workspace.read_with(cx, |workspace, _cx| {
+                workspace.has_notification(&workspace::notifications::NotificationId::unique::<
+                    TaskOperationErrorToast,
+                >())
+            }),
+            "Persistent error toast should be shown immediately when branch is missing"
+        );
+
+        cx.background_executor
+            .advance_clock(std::time::Duration::from_secs(10));
+        cx.run_until_parked();
+
+        assert!(
+            workspace.read_with(cx, |workspace, _cx| {
+                workspace.has_notification(&workspace::notifications::NotificationId::unique::<
+                    TaskOperationErrorToast,
+                >())
+            }),
+            "Missing branch error toast must remain persistent"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_open_thread_existing_branch_restores_worktree(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            "/root",
+            serde_json::json!({
+                ".git": {
+                    "HEAD": "ref: refs/heads/main\n"
+                }
+            }),
+        )
+        .await;
+
+        let dot_git = std::path::Path::new("/root/.git");
+        fs.with_git_state(dot_git, true, |state| {
+            state
+                .refs
+                .insert("refs/heads/main".into(), "main-sha".into());
+            state.refs.insert("HEAD".into(), "main-sha".into());
+            state.branches.insert("main".into());
+            state.refs.insert(
+                "refs/heads/agent-task/TASK-RESTORE".into(),
+                "main-sha".into(),
+            );
+            state.branches.insert("agent-task/TASK-RESTORE".into());
+        })
+        .unwrap();
+
+        let project = Project::test(fs.clone(), [std::path::Path::new("/root")], cx).await;
+        let (workspace, _) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
+
+        let task_id = AgentTaskId::from("TASK-RESTORE");
+        let provider = Arc::new(TestProvider {
+            tasks: vec![AgentTaskSummary {
+                id: task_id.clone(),
+                title: "Task with branch".to_string(),
+                status: AgentTaskStatus::Ready,
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        let store = cx.update(|cx| cx.new(|cx| AgentTaskStore::new(provider, cx)));
+
+        let (panel, cx) = cx.add_window_view(|_window, cx| {
+            AgentTaskPanel::new(
+                store,
+                workspace.downgrade(),
+                project.clone(),
+                fs.clone(),
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        agent::task_worktree::register_task_session(&task_id, "session-restore".to_string());
+
+        panel.update(cx, |panel, cx| {
+            panel.worktree_status.update(cx, |status, cx| {
+                let mut snap = TaskGitSnapshot::default();
+                snap.tasks.insert(
+                    task_id.clone(),
+                    TaskGitState {
+                        worktree_path: std::path::PathBuf::from(
+                            "/root/.zed/worktrees/agent-task-TASK-RESTORE",
+                        ),
+                        exists_on_disk: false,
+                        branch: Some("agent-task/TASK-RESTORE".to_string()),
+                        branch_exists: true,
+                        retention_reason: None,
+                    },
+                );
+                status.set_snapshot_for_test(snap, cx);
+            });
+        });
+        cx.run_until_parked();
+
+        panel.update_in(cx, |panel, window, cx| {
+            panel.deploy_context_menu(
+                ContextMenuTarget::Task(task_id.clone()),
+                Point::new(px(100.0), px(100.0)),
+                None,
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        let open_thread_item = cx
+            .debug_bounds("MENU_ITEM-Open Thread")
+            .expect("Open Thread should be present in context menu");
+        cx.simulate_click(open_thread_item.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+
+        assert!(
+            !workspace.read_with(cx, |workspace, _cx| {
+                workspace.has_notification(&workspace::notifications::NotificationId::unique::<
+                    TaskOperationErrorToast,
+                >())
+            }),
+            "No error toast should be shown when worktree is restored successfully"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_open_thread_exists_on_disk(cx: &mut TestAppContext) {
+        init_test(cx);
+        let file_system = FakeFs::new(cx.executor());
+        let project = Project::test(file_system.clone(), [], cx).await;
+        let (workspace, _) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
+
+        let task_id = AgentTaskId::from("TASK-DISK");
+        let provider = Arc::new(TestProvider {
+            tasks: vec![AgentTaskSummary {
+                id: task_id.clone(),
+                title: "Task on disk".to_string(),
+                status: AgentTaskStatus::Ready,
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        let store = cx.update(|cx| cx.new(|cx| AgentTaskStore::new(provider, cx)));
+
+        let (panel, cx) = cx.add_window_view(|_window, cx| {
+            AgentTaskPanel::new(
+                store,
+                workspace.downgrade(),
+                project.clone(),
+                file_system.clone(),
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        agent::task_worktree::register_task_session(&task_id, "session-disk".to_string());
+
+        panel.update(cx, |panel, cx| {
+            panel.worktree_status.update(cx, |status, cx| {
+                let mut snap = TaskGitSnapshot::default();
+                snap.tasks.insert(
+                    task_id.clone(),
+                    TaskGitState {
+                        worktree_path: std::path::PathBuf::from("/fake/task-disk"),
+                        exists_on_disk: true,
+                        branch: Some("agent-task/TASK-DISK".to_string()),
+                        branch_exists: true,
+                        retention_reason: None,
+                    },
+                );
+                status.set_snapshot_for_test(snap, cx);
+            });
+        });
+        cx.run_until_parked();
+
+        panel.update_in(cx, |panel, window, cx| {
+            panel.deploy_context_menu(
+                ContextMenuTarget::Task(task_id.clone()),
+                Point::new(px(100.0), px(100.0)),
+                None,
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        let open_thread_item = cx
+            .debug_bounds("MENU_ITEM-Open Thread")
+            .expect("Open Thread should be present in context menu");
+        cx.simulate_click(open_thread_item.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+
+        assert!(
+            !workspace.read_with(cx, |workspace, _cx| {
+                workspace.has_notification(&workspace::notifications::NotificationId::unique::<
+                    TaskOperationErrorToast,
+                >())
+            }),
+            "No error toast when opening existing thread on disk"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_agent_task_panel_worktree_icon_and_goal_turns_and_duration(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let file_system = FakeFs::new(cx.executor());
+        let project = Project::test(file_system.clone(), [], cx).await;
+
+        let sample_metrics = AgentTaskMetrics {
+            duration_ms: Some(15_000),
+            input_tokens: Some(1000),
+            output_tokens: Some(500),
+            cache_read_tokens: Some(2000),
+            cache_creation_tokens: None,
+            total_tokens: Some(3500),
+            cost_usd: Some(0.05),
+            turns_count: Some(7),
+            diff: Some(AgentDiffShortstat {
+                files_changed: 2,
+                insertions: 15,
+                deletions: 4,
+            }),
+        };
+
+        // Check render_metrics_elements directly: duration is omitted, turns controlled by flag
+        let goal_elements = render_metrics_elements(
+            (ElementId::from("diff-stat"), "goal-1").into(),
+            Some(&sample_metrics),
+            false,
+        );
+        let task_elements = render_metrics_elements(
+            (ElementId::from("diff-stat"), "task-1").into(),
+            Some(&sample_metrics),
+            true,
+        );
+        assert_eq!(
+            goal_elements.len(),
+            3,
+            "Goal elements should have tokens, diff, and cost, but no duration or turns"
+        );
+        assert_eq!(
+            task_elements.len(),
+            4,
+            "Task elements should have tokens, turns, diff, and cost, but no duration"
+        );
+
+        let mut sample_metrics_no_diff = sample_metrics.clone();
+        sample_metrics_no_diff.diff = None;
+        assert_eq!(
+            render_metrics_elements(
+                (ElementId::from("diff-stat"), "goal-no-diff").into(),
+                Some(&sample_metrics_no_diff),
+                false,
+            )
+            .len(),
+            2,
+        );
+        assert_eq!(
+            render_metrics_elements(
+                (ElementId::from("diff-stat"), "task-no-diff").into(),
+                Some(&sample_metrics_no_diff),
+                true,
+            )
+            .len(),
+            3,
+        );
+
+        let mut provider_inner = TestProvider::default();
+        provider_inner.goals = vec![AgentGoalSummary {
+            goal_id: "GOAL-1".to_string(),
+            title: "Goal 1".to_string(),
+            status: AgentGoalStatus::Running,
+            priority: 1,
+            tasks_total: 1,
+            tasks_done: 0,
+            created_at: Some(10),
+            metrics: Some(sample_metrics.clone()),
+            session_id: None,
+        }];
+        provider_inner.tasks = vec![AgentTaskSummary {
+            id: AgentTaskId::from("TASK-1"),
+            parent_id: None,
+            goal_id: Some("GOAL-1".to_string()),
+            title: "Task 1".to_string(),
+            status: AgentTaskStatus::Running,
+            attempt: 1,
+            assignee: None,
+            write_scopes: vec![],
+            created_at: Some(10),
+            assigned_profile: Some("agent_engineer".into()),
+            model: Some("test-model".into()),
+            session_id: None,
+            metrics: Some(sample_metrics),
+        }];
+        let provider = Arc::new(provider_inner);
+        let store = cx.update(|cx| cx.new(|cx| AgentTaskStore::new(provider, cx)));
+
+        let (panel, cx) = cx.add_window_view(|_window, cx| {
+            AgentTaskPanel::new(
+                store,
+                WeakEntity::new_invalid(),
+                project.clone(),
+                file_system.clone(),
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        // Expand GOAL-1
+        let goal_chevron = cx.debug_bounds("goal-chevron-GOAL-1").unwrap();
+        cx.simulate_click(goal_chevron.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+
+        // Goal meta and task meta are rendered
+        cx.debug_bounds("goal-meta-GOAL-1")
+            .expect("goal-meta should be rendered");
+        cx.debug_bounds("task-meta-TASK-1")
+            .expect("task-meta should be rendered");
+
+        // Initially exists_on_disk is false: no worktree icon
+        assert!(
+            cx.debug_bounds("task-worktree-icon-TASK-1").is_none(),
+            "Worktree icon should not be present when exists_on_disk is false"
+        );
+
+        // Update snapshot to exists_on_disk = true
+        panel.update(cx, |panel, cx| {
+            panel.worktree_status.update(cx, |status, cx| {
+                let mut snap = TaskGitSnapshot::default();
+                snap.tasks.insert(
+                    AgentTaskId::from("TASK-1"),
+                    TaskGitState {
+                        worktree_path: std::path::PathBuf::from("/fake/task-1"),
+                        exists_on_disk: true,
+                        branch: Some("agent-task/TASK-1".to_string()),
+                        branch_exists: true,
+                        retention_reason: None,
+                    },
+                );
+                status.set_snapshot_for_test(snap, cx);
+            });
+        });
+        cx.run_until_parked();
+
+        assert!(
+            cx.debug_bounds("task-worktree-icon-TASK-1").is_some(),
+            "Worktree icon should be present when exists_on_disk is true"
+        );
+
+        let icon_bounds = cx
+            .debug_bounds("task-worktree-icon-TASK-1")
+            .expect("worktree icon should be present");
+        let meta_bounds = cx
+            .debug_bounds("task-meta-TASK-1")
+            .expect("task-meta should be present");
+        assert!(
+            icon_bounds.top() >= meta_bounds.top() && icon_bounds.bottom() <= meta_bounds.bottom(),
+            "Worktree icon should be in task-meta row"
+        );
+
+        // Update snapshot to exists_on_disk = false
+        panel.update(cx, |panel, cx| {
+            panel.worktree_status.update(cx, |status, cx| {
+                let mut snap = TaskGitSnapshot::default();
+                snap.tasks.insert(
+                    AgentTaskId::from("TASK-1"),
+                    TaskGitState {
+                        worktree_path: std::path::PathBuf::from("/fake/task-1"),
+                        exists_on_disk: false,
+                        branch: Some("agent-task/TASK-1".to_string()),
+                        branch_exists: true,
+                        retention_reason: None,
+                    },
+                );
+                status.set_snapshot_for_test(snap, cx);
+            });
+        });
+        cx.run_until_parked();
+
+        assert!(
+            cx.debug_bounds("task-worktree-icon-TASK-1").is_none(),
+            "Worktree icon should disappear when exists_on_disk becomes false"
+        );
     }
 }

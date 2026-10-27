@@ -1,70 +1,94 @@
 {
   "languages": {
     "Docker Compose": {
-      "tab_size": 2,
+      "tab_size": 2
     },
     "Markdown": {
       "tab_size": 2,
-      "formatter": "prettier",
+      "formatter": "prettier"
     },
     "TOML": {
       "formatter": "prettier",
-      "format_on_save": "off",
+      "format_on_save": "off"
     },
     "YAML": {
       "tab_size": 2,
-      "formatter": "prettier",
+      "formatter": "prettier"
     },
     "JSON": {
       "tab_size": 2,
       "preferred_line_length": 120,
-      "formatter": "prettier",
+      "formatter": "prettier"
     },
     "JSONC": {
       "tab_size": 2,
       "preferred_line_length": 120,
-      "formatter": "prettier",
+      "formatter": "prettier"
     },
     "JavaScript": {
       "tab_size": 2,
-      "formatter": "prettier",
+      "formatter": "prettier"
     },
     "TypeScript": {
       "tab_size": 2,
-      "formatter": "prettier",
+      "formatter": "prettier"
     },
     "CSS": {
       "tab_size": 2,
-      "formatter": "prettier",
+      "formatter": "prettier"
     },
     "Rust": {
       "tasks": {
         "variables": {
-          "RUST_DEFAULT_PACKAGE_RUN": "zed",
-        },
-      },
-    },
+          "RUST_DEFAULT_PACKAGE_RUN": "zed"
+        }
+      }
+    }
   },
   "lsp": {
     "rust-analyzer": {
       "initialization_options": {
         "procMacro": {
-          "processes": 4,
-        },
-      },
-    },
+          "processes": 4
+        }
+      }
+    }
   },
   "file_types": {
-    "Dockerfile": ["Dockerfile*[!dockerignore]"],
-    "JSONC": ["**/assets/**/*.json", "renovate.json"],
-    "Git Ignore": ["dockerignore"],
+    "Dockerfile": [
+      "Dockerfile*[!dockerignore]"
+    ],
+    "JSONC": [
+      "**/assets/**/*.json",
+      "renovate.json"
+    ],
+    "Git Ignore": [
+      "dockerignore"
+    ]
   },
   "hard_tabs": false,
   "formatter": "auto",
   "remove_trailing_whitespace_on_save": true,
   "ensure_final_newline_on_save": true,
-  "file_scan_exclusions": ["...", "crates/agent/src/tools/evals/fixtures"],
-  "read_only_files": ["**/.rustup/**", "**/.cargo/registry/**", "**/.cargo/git/**", "target/**/*.rs", "**/*.lock"],
+  "file_scan_exclusions": [
+    "...",
+    "crates/agent/src/tools/evals/fixtures",
+    "**/target",
+    "**/target/**",
+    "**/.git/**"
+  ],
+  "read_only_files": [
+    "**/.rustup/**",
+    "**/.cargo/registry/**",
+    "**/.cargo/git/**",
+    "target/**/*.rs",
+    "**/*.lock"
+  ],
+  "git": {
+    "inline_blame": {
+      "enabled": false
+    }
+  },
   "context_servers": {
     "skills-hub": {
       "command": "npx",
@@ -82,25 +106,51 @@
     },
     "github": {
       "command": "github-mcp-server",
-      "args": ["stdio"],
+      "args": [
+        "stdio"
+      ],
       "env": {
         "GITHUB_PERSONAL_ACCESS_TOKEN": "${GITHUB_PERSONAL_ACCESS_TOKEN}",
         "GITHUB_TOOLSETS": "repos,issues,pull_requests",
         "GITHUB_READ_ONLY": "1"
       },
       "platforms": {
-        "darwin-arm64": { "command": ".zed/mcp/github/bin/github-mcp-server-darwin-arm64" },
-        "darwin-amd64": { "command": ".zed/mcp/github/bin/github-mcp-server-darwin-amd64" },
-        "darwin-x64": { "command": ".zed/mcp/github/bin/github-mcp-server-darwin-amd64" },
-        "linux-arm64": { "command": ".zed/mcp/github/bin/github-mcp-server-linux-arm64" },
-        "linux-amd64": { "command": ".zed/mcp/github/bin/github-mcp-server-linux-amd64" },
-        "linux-x64": { "command": ".zed/mcp/github/bin/github-mcp-server-linux-amd64" },
-        "windows-arm64": { "command": ".zed/mcp/github/bin/github-mcp-server-windows-arm64.exe" },
-        "windows-amd64": { "command": ".zed/mcp/github/bin/github-mcp-server-windows-amd64.exe" },
-        "windows-x64": { "command": ".zed/mcp/github/bin/github-mcp-server-windows-amd64.exe" },
-        "macos": { "command": ".zed/mcp/github/bin/github-mcp-server-darwin-arm64" },
-        "linux": { "command": ".zed/mcp/github/bin/github-mcp-server-linux-amd64" },
-        "windows": { "command": ".zed/mcp/github/bin/github-mcp-server-windows-amd64.exe" }
+        "darwin-arm64": {
+          "command": ".zed/mcp/github/bin/github-mcp-server-darwin-arm64"
+        },
+        "darwin-amd64": {
+          "command": ".zed/mcp/github/bin/github-mcp-server-darwin-amd64"
+        },
+        "darwin-x64": {
+          "command": ".zed/mcp/github/bin/github-mcp-server-darwin-amd64"
+        },
+        "linux-arm64": {
+          "command": ".zed/mcp/github/bin/github-mcp-server-linux-arm64"
+        },
+        "linux-amd64": {
+          "command": ".zed/mcp/github/bin/github-mcp-server-linux-amd64"
+        },
+        "linux-x64": {
+          "command": ".zed/mcp/github/bin/github-mcp-server-linux-amd64"
+        },
+        "windows-arm64": {
+          "command": ".zed/mcp/github/bin/github-mcp-server-windows-arm64.exe"
+        },
+        "windows-amd64": {
+          "command": ".zed/mcp/github/bin/github-mcp-server-windows-amd64.exe"
+        },
+        "windows-x64": {
+          "command": ".zed/mcp/github/bin/github-mcp-server-windows-amd64.exe"
+        },
+        "macos": {
+          "command": ".zed/mcp/github/bin/github-mcp-server-darwin-arm64"
+        },
+        "linux": {
+          "command": ".zed/mcp/github/bin/github-mcp-server-linux-amd64"
+        },
+        "windows": {
+          "command": ".zed/mcp/github/bin/github-mcp-server-windows-amd64.exe"
+        }
       }
     },
     "agent-bus": {
@@ -120,18 +170,42 @@
         "AGENT_BUS_PROJECT_ID": "zed"
       },
       "platforms": {
-        "darwin-arm64": { "command": ".zed/mcp/agent-bus/bin/agent-bus-darwin-arm64" },
-        "darwin-amd64": { "command": ".zed/mcp/agent-bus/bin/agent-bus-darwin-amd64" },
-        "darwin-x64": { "command": ".zed/mcp/agent-bus/bin/agent-bus-darwin-amd64" },
-        "linux-arm64": { "command": ".zed/mcp/agent-bus/bin/agent-bus-linux-arm64" },
-        "linux-amd64": { "command": ".zed/mcp/agent-bus/bin/agent-bus-linux-amd64" },
-        "linux-x64": { "command": ".zed/mcp/agent-bus/bin/agent-bus-linux-amd64" },
-        "windows-arm64": { "command": ".zed/mcp/agent-bus/bin/agent-bus-windows-arm64.exe" },
-        "windows-amd64": { "command": ".zed/mcp/agent-bus/bin/agent-bus-windows-amd64.exe" },
-        "windows-x64": { "command": ".zed/mcp/agent-bus/bin/agent-bus-windows-amd64.exe" },
-        "macos": { "command": ".zed/mcp/agent-bus/bin/agent-bus-darwin-arm64" },
-        "linux": { "command": ".zed/mcp/agent-bus/bin/agent-bus-linux-amd64" },
-        "windows": { "command": ".zed/mcp/agent-bus/bin/agent-bus-windows-amd64.exe" }
+        "darwin-arm64": {
+          "command": ".zed/mcp/agent-bus/bin/agent-bus-darwin-arm64"
+        },
+        "darwin-amd64": {
+          "command": ".zed/mcp/agent-bus/bin/agent-bus-darwin-amd64"
+        },
+        "darwin-x64": {
+          "command": ".zed/mcp/agent-bus/bin/agent-bus-darwin-amd64"
+        },
+        "linux-arm64": {
+          "command": ".zed/mcp/agent-bus/bin/agent-bus-linux-arm64"
+        },
+        "linux-amd64": {
+          "command": ".zed/mcp/agent-bus/bin/agent-bus-linux-amd64"
+        },
+        "linux-x64": {
+          "command": ".zed/mcp/agent-bus/bin/agent-bus-linux-amd64"
+        },
+        "windows-arm64": {
+          "command": ".zed/mcp/agent-bus/bin/agent-bus-windows-arm64.exe"
+        },
+        "windows-amd64": {
+          "command": ".zed/mcp/agent-bus/bin/agent-bus-windows-amd64.exe"
+        },
+        "windows-x64": {
+          "command": ".zed/mcp/agent-bus/bin/agent-bus-windows-amd64.exe"
+        },
+        "macos": {
+          "command": ".zed/mcp/agent-bus/bin/agent-bus-darwin-arm64"
+        },
+        "linux": {
+          "command": ".zed/mcp/agent-bus/bin/agent-bus-linux-amd64"
+        },
+        "windows": {
+          "command": ".zed/mcp/agent-bus/bin/agent-bus-windows-amd64.exe"
+        }
       }
     },
     "taskgraph": {
@@ -144,23 +218,57 @@
         "TGS_LOG_FILE": ".zed/mcp/taskgraph/taskgraph.log"
       },
       "platforms": {
-        "darwin-arm64": { "command": ".zed/mcp/taskgraph/bin/taskgraph-darwin-arm64" },
-        "darwin-amd64": { "command": ".zed/mcp/taskgraph/bin/taskgraph-darwin-amd64" },
-        "darwin-x64": { "command": ".zed/mcp/taskgraph/bin/taskgraph-darwin-amd64" },
-        "linux-arm64": { "command": ".zed/mcp/taskgraph/bin/taskgraph-linux-arm64" },
-        "linux-amd64": { "command": ".zed/mcp/taskgraph/bin/taskgraph-linux-amd64" },
-        "linux-x64": { "command": ".zed/mcp/taskgraph/bin/taskgraph-linux-amd64" },
-        "windows-arm64": { "command": ".zed/mcp/taskgraph/bin/taskgraph-windows-arm64.exe" },
-        "windows-amd64": { "command": ".zed/mcp/taskgraph/bin/taskgraph-windows-amd64.exe" },
-        "windows-x64": { "command": ".zed/mcp/taskgraph/bin/taskgraph-windows-amd64.exe" },
-        "macos": { "command": ".zed/mcp/taskgraph/bin/taskgraph-darwin-arm64" },
-        "linux": { "command": ".zed/mcp/taskgraph/bin/taskgraph-linux-amd64" },
-        "windows": { "command": ".zed/mcp/taskgraph/bin/taskgraph-windows-amd64.exe" }
+        "darwin-arm64": {
+          "command": ".zed/mcp/taskgraph/bin/taskgraph-darwin-arm64"
+        },
+        "darwin-amd64": {
+          "command": ".zed/mcp/taskgraph/bin/taskgraph-darwin-amd64"
+        },
+        "darwin-x64": {
+          "command": ".zed/mcp/taskgraph/bin/taskgraph-darwin-amd64"
+        },
+        "linux-arm64": {
+          "command": ".zed/mcp/taskgraph/bin/taskgraph-linux-arm64"
+        },
+        "linux-amd64": {
+          "command": ".zed/mcp/taskgraph/bin/taskgraph-linux-amd64"
+        },
+        "linux-x64": {
+          "command": ".zed/mcp/taskgraph/bin/taskgraph-linux-amd64"
+        },
+        "windows-arm64": {
+          "command": ".zed/mcp/taskgraph/bin/taskgraph-windows-arm64.exe"
+        },
+        "windows-amd64": {
+          "command": ".zed/mcp/taskgraph/bin/taskgraph-windows-amd64.exe"
+        },
+        "windows-x64": {
+          "command": ".zed/mcp/taskgraph/bin/taskgraph-windows-amd64.exe"
+        },
+        "macos": {
+          "command": ".zed/mcp/taskgraph/bin/taskgraph-darwin-arm64"
+        },
+        "linux": {
+          "command": ".zed/mcp/taskgraph/bin/taskgraph-linux-amd64"
+        },
+        "windows": {
+          "command": ".zed/mcp/taskgraph/bin/taskgraph-windows-amd64.exe"
+        }
       }
     }
   },
   "agent": {
     "task_graph_server_id": "taskgraph",
+    "task_worktree_limit": 18,
+    "commit_message_instructions": "Include tracking lines when available (Goal: <goal_id>, Task: <task_id>) before the Release Notes section.",
+    "spawn_step_timeout_seconds": {
+      "task_graph": 120,
+      "commit": 300,
+      "cleanup": 60,
+      "diff": 30
+    },
+    "send_watchdog_seconds": 30,
+    "turn_watchdog_seconds": 120,
     "tool_permissions": {
       "default": "deny",
       "tools": {
@@ -442,30 +550,11 @@
           "taskgraph": {
             "tools": {
               "goal_create": true,
-              "goal_get": true,
               "goal_update": true,
-              "goal_tasks": true,
-              "goal_list": true,
               "task_create": true,
-              "task_get": true,
               "task_update": true,
-              "task_list": true,
-              "task_children": true,
-              "task_start": true,
-              "task_complete": true,
-              "task_fail": true,
-              "task_cancel": true,
-              "task_retry": true,
-              "task_add_dependency": true,
-              "task_remove_dependency": true,
-              "task_dependencies": true,
-              "task_dependents": true,
-              "task_ready": true,
               "task_graph": true,
-              "artifact_publish": true,
-              "artifact_get": true,
-              "artifact_list": true,
-              "events_list": true
+              "task_get": true
             }
           }
         },
@@ -480,6 +569,7 @@
             "git_merger",
             "fork_merger",
             "ci_release",
+            "ci_verifier",
             "researcher",
             "github_researcher",
             "code_mechanic"
@@ -508,8 +598,7 @@
                 "specs/**",
                 "ARCHITECTURE.md",
                 "README.md",
-                ".gitignore",
-                ".zed/**"
+                ".gitignore"
               ]
             },
             "write_file": {
@@ -534,76 +623,19 @@
             "mcp:taskgraph:goal_create": {
               "default": "allow"
             },
-            "mcp:taskgraph:goal_get": {
-              "default": "allow"
-            },
             "mcp:taskgraph:goal_update": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:goal_tasks": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:goal_list": {
               "default": "allow"
             },
             "mcp:taskgraph:task_create": {
               "default": "allow"
             },
-            "mcp:taskgraph:task_get": {
-              "default": "allow"
-            },
             "mcp:taskgraph:task_update": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_list": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_children": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_start": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_complete": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_fail": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_cancel": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_retry": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_add_dependency": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_remove_dependency": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_dependencies": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_dependents": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_ready": {
               "default": "allow"
             },
             "mcp:taskgraph:task_graph": {
               "default": "allow"
             },
-            "mcp:taskgraph:artifact_publish": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:artifact_get": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:artifact_list": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:events_list": {
+            "mcp:taskgraph:task_get": {
               "default": "allow"
             }
           }
@@ -644,14 +676,6 @@
           "agent-bus": {
             "tools": {
               "send_feedback": true
-            }
-          },
-          "taskgraph": {
-            "tools": {
-              "task_get": true,
-              "task_start": true,
-              "task_complete": true,
-              "task_fail": true
             }
           }
         },
@@ -736,18 +760,6 @@
             },
             "mcp:skills-hub:get_skill_detail": {
               "default": "allow"
-            },
-            "mcp:taskgraph:task_get": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_start": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_complete": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_fail": {
-              "default": "allow"
             }
           }
         }
@@ -768,14 +780,6 @@
           "agent-bus": {
             "tools": {
               "send_feedback": true
-            }
-          },
-          "taskgraph": {
-            "tools": {
-              "task_get": true,
-              "task_start": true,
-              "task_complete": true,
-              "task_fail": true
             }
           }
         },
@@ -805,18 +809,6 @@
               "default": "allow"
             },
             "mcp:agent-bus:send_feedback": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_get": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_start": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_complete": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_fail": {
               "default": "allow"
             }
           }
@@ -859,22 +851,13 @@
               "resolve_feedback": true,
               "send_feedback": true
             }
-          },
-          "taskgraph": {
-            "tools": {
-              "task_get": true,
-              "task_start": true,
-              "task_complete": true,
-              "task_fail": true
-            }
           }
         },
         "delegation": {
           "allowed": [
             "agent_architect",
             "agent_fleet_planner",
-            "agent_engineer",
-            "e2e_tester"
+            "agent_engineer"
           ],
           "max_depth": 1
         },
@@ -900,6 +883,8 @@
                 ".zed/prompts/**",
                 ".zed/mcp/**",
                 ".agents/skills/**",
+                ".rules",
+                ".factory/**",
                 "README.md",
                 "docs/*",
                 "docs/**"
@@ -912,6 +897,8 @@
                 ".zed/prompts/**",
                 ".zed/mcp/**",
                 ".agents/skills/**",
+                ".rules",
+                ".factory/**",
                 "README.md",
                 "docs/**"
               ]
@@ -947,18 +934,6 @@
               "default": "allow"
             },
             "mcp:skills-hub:get_skill_detail": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_get": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_start": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_complete": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_fail": {
               "default": "allow"
             }
           }
@@ -996,15 +971,7 @@
               "get_server_details": true
             }
           },
-          "agent-bus": true,
-          "taskgraph": {
-            "tools": {
-              "task_get": true,
-              "task_start": true,
-              "task_complete": true,
-              "task_fail": true
-            }
-          }
+          "agent-bus": true
         },
         "tool_permissions": {
           "default": "deny",
@@ -1065,18 +1032,6 @@
             },
             "mcp:skills-hub:get_skill_detail": {
               "default": "allow"
-            },
-            "mcp:taskgraph:task_get": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_start": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_complete": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_fail": {
-              "default": "allow"
             }
           }
         }
@@ -1084,6 +1039,7 @@
       "agent_engineer": {
         "name": "Agent Runtime Engineer",
         "task_isolation": "required",
+        "task_worktree_language_servers": false,
         "custom_prompt_path": ".zed/prompts/agents/agent_engineer.md",
         "description": "Implements agent runtime, ACP thread handling, task graph integration, and LLM integrations",
         "default_model": {
@@ -1107,22 +1063,14 @@
           ],
           "max_depth": 1
         },
-        "skills": ["gpui-test"],
+        "skills": [
+          "gpui-test",
+          "rust-conventions"
+        ],
         "context_servers": {
           "agent-bus": {
             "tools": {
               "send_feedback": true
-            }
-          },
-          "taskgraph": {
-            "tools": {
-              "task_get": true,
-              "task_start": true,
-              "task_complete": true,
-              "task_fail": true,
-              "artifact_publish": true,
-              "artifact_get": true,
-              "artifact_list": true
             }
           }
         },
@@ -1154,6 +1102,8 @@
                 "crates/prompt_store/**",
                 "crates/language_model/**",
                 "crates/language_models/**",
+                "crates/language_model_core/**",
+                "crates/google_ai/**",
                 "crates/project/**",
                 "crates/settings_content/**",
                 "crates/git/**",
@@ -1174,6 +1124,8 @@
                 "crates/prompt_store/**",
                 "crates/language_model/**",
                 "crates/language_models/**",
+                "crates/language_model_core/**",
+                "crates/google_ai/**",
                 "crates/project/**",
                 "crates/settings_content/**",
                 "crates/git/**",
@@ -1189,27 +1141,6 @@
             },
             "mcp:agent-bus:send_feedback": {
               "default": "allow"
-            },
-            "mcp:taskgraph:task_get": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_start": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_complete": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_fail": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:artifact_publish": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:artifact_get": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:artifact_list": {
-              "default": "allow"
             }
           }
         }
@@ -1217,6 +1148,7 @@
       "editor_engineer": {
         "name": "Editor & Language Engineer",
         "task_isolation": "required",
+        "task_worktree_language_servers": false,
         "custom_prompt_path": ".zed/prompts/agents/editor_engineer.md",
         "description": "Implements core editor buffers, display maps, project worktrees, and LSP integrations",
         "default_model": {
@@ -1242,23 +1174,14 @@
         },
         "skills": [
           "gpui-test",
-          "gpui-bench"
+          "gpui-bench",
+          "rust-conventions",
+          "gpui-traps"
         ],
         "context_servers": {
           "agent-bus": {
             "tools": {
               "send_feedback": true
-            }
-          },
-          "taskgraph": {
-            "tools": {
-              "task_get": true,
-              "task_start": true,
-              "task_complete": true,
-              "task_fail": true,
-              "artifact_publish": true,
-              "artifact_get": true,
-              "artifact_list": true
             }
           }
         },
@@ -1317,27 +1240,6 @@
             },
             "mcp:agent-bus:send_feedback": {
               "default": "allow"
-            },
-            "mcp:taskgraph:task_get": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_start": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_complete": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_fail": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:artifact_publish": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:artifact_get": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:artifact_list": {
-              "default": "allow"
             }
           }
         }
@@ -1345,6 +1247,7 @@
       "ui_engineer": {
         "name": "GPUI & UI Engineer",
         "task_isolation": "required",
+        "task_worktree_language_servers": false,
         "custom_prompt_path": ".zed/prompts/agents/ui_engineer.md",
         "description": "Implements GPUI framework features, UI components, themes, and platform renderers",
         "default_model": {
@@ -1371,23 +1274,14 @@
         "skills": [
           "gpui-test",
           "gpui-bench",
-          "lint-creator"
+          "lint-creator",
+          "rust-conventions",
+          "gpui-traps"
         ],
         "context_servers": {
           "agent-bus": {
             "tools": {
               "send_feedback": true
-            }
-          },
-          "taskgraph": {
-            "tools": {
-              "task_get": true,
-              "task_start": true,
-              "task_complete": true,
-              "task_fail": true,
-              "artifact_publish": true,
-              "artifact_get": true,
-              "artifact_list": true
             }
           }
         },
@@ -1444,27 +1338,6 @@
             },
             "mcp:agent-bus:send_feedback": {
               "default": "allow"
-            },
-            "mcp:taskgraph:task_get": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_start": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_complete": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_fail": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:artifact_publish": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:artifact_get": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:artifact_list": {
-              "default": "allow"
             }
           }
         }
@@ -1472,6 +1345,7 @@
       "collab_engineer": {
         "name": "Collab & Network Engineer",
         "task_isolation": "required",
+        "task_worktree_language_servers": false,
         "custom_prompt_path": ".zed/prompts/agents/collab_engineer.md",
         "description": "Implements collaboration backend server, RPC protocol, network sync, and database migrations",
         "default_model": {
@@ -1495,22 +1369,13 @@
           ],
           "max_depth": 1
         },
-        "skills": [],
+        "skills": [
+          "rust-conventions"
+        ],
         "context_servers": {
           "agent-bus": {
             "tools": {
               "send_feedback": true
-            }
-          },
-          "taskgraph": {
-            "tools": {
-              "task_get": true,
-              "task_start": true,
-              "task_complete": true,
-              "task_fail": true,
-              "artifact_publish": true,
-              "artifact_get": true,
-              "artifact_list": true
             }
           }
         },
@@ -1561,27 +1426,6 @@
             },
             "mcp:agent-bus:send_feedback": {
               "default": "allow"
-            },
-            "mcp:taskgraph:task_get": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_start": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_complete": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_fail": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:artifact_publish": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:artifact_get": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:artifact_list": {
-              "default": "allow"
             }
           }
         }
@@ -1604,7 +1448,8 @@
         },
         "skills": [
           "lint-creator",
-          "gpui-test"
+          "gpui-test",
+          "rust-conventions"
         ],
         "context_servers": {
           "agent-bus": {
@@ -1614,17 +1459,7 @@
           },
           "taskgraph": {
             "tools": {
-              "goal_get": true,
-              "goal_tasks": true,
-              "goal_list": true,
               "task_get": true,
-              "task_list": true,
-              "task_children": true,
-              "task_start": true,
-              "task_complete": true,
-              "task_fail": true,
-              "task_dependencies": true,
-              "task_dependents": true,
               "task_graph": true,
               "artifact_get": true,
               "artifact_list": true
@@ -1647,42 +1482,17 @@
               "default": "allow"
             },
             "terminal": {
-              "default": "allow"
+              "default": "deny",
+              "always_allow": [
+                {
+                  "pattern": "^([A-Z_]+=\\S+\\s+)*git\\s+(-C\\s+\\S+\\s+)?(--no-pager\\s+|--no-optional-locks\\s+)*(status|diff|log|rev-parse|show|branch|describe|merge-base)\\b.*"
+                }
+              ]
             },
             "mcp:agent-bus:send_feedback": {
               "default": "allow"
             },
-            "mcp:taskgraph:goal_get": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:goal_tasks": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:goal_list": {
-              "default": "allow"
-            },
             "mcp:taskgraph:task_get": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_list": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_children": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_start": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_complete": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_fail": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_dependencies": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_dependents": {
               "default": "allow"
             },
             "mcp:taskgraph:task_graph": {
@@ -1719,14 +1529,6 @@
             "tools": {
               "send_feedback": true
             }
-          },
-          "taskgraph": {
-            "tools": {
-              "task_get": true,
-              "task_start": true,
-              "task_complete": true,
-              "task_fail": true
-            }
           }
         },
         "tool_permissions": {
@@ -1753,18 +1555,6 @@
               ]
             },
             "mcp:agent-bus:send_feedback": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_get": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_start": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_complete": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_fail": {
               "default": "allow"
             }
           }
@@ -1793,16 +1583,6 @@
             "tools": {
               "send_feedback": true
             }
-          },
-          "taskgraph": {
-            "tools": {
-              "goal_get": true,
-              "goal_tasks": true,
-              "task_get": true,
-              "task_start": true,
-              "task_complete": true,
-              "task_fail": true
-            }
           }
         },
         "delegation": {
@@ -1830,7 +1610,7 @@
               "default": "deny",
               "always_allow": [
                 {
-                  "pattern": "^([A-Z_]+=\\S+\\s+)*git\\s+(-C\\s+\\S+\\s+)?(--no-pager\\s+|--no-optional-locks\\s+)*(status|diff|log|show|branch|rev-parse|merge-base|switch|merge|reset|commit)\\b.*"
+                  "pattern": "^([A-Z_]+=\\S+\\s+)*git\\s+(-C\\s+\\S+\\s+)?(--no-pager\\s+|--no-optional-locks\\s+)*(status|diff|add|log|show|branch|rev-parse|merge-base|switch|merge|reset|commit|checkout|restore)\\b.*"
                 }
               ]
             },
@@ -1838,24 +1618,6 @@
               "default": "allow"
             },
             "mcp:agent-bus:send_feedback": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:goal_get": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:goal_tasks": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_get": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_start": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_complete": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_fail": {
               "default": "allow"
             }
           }
@@ -1881,19 +1643,13 @@
           "terminal": true,
           "diagnostics": true
         },
-        "skills": [],
+        "skills": [
+          "rust-conventions"
+        ],
         "context_servers": {
           "agent-bus": {
             "tools": {
               "send_feedback": true
-            }
-          },
-          "taskgraph": {
-            "tools": {
-              "task_get": true,
-              "task_start": true,
-              "task_complete": true,
-              "task_fail": true
             }
           }
         },
@@ -1975,18 +1731,6 @@
             },
             "mcp:agent-bus:send_feedback": {
               "default": "allow"
-            },
-            "mcp:taskgraph:task_get": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_start": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_complete": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_fail": {
-              "default": "allow"
             }
           }
         }
@@ -2012,19 +1756,13 @@
           "fetch": true,
           "spawn_agent": true
         },
-        "skills": [],
+        "skills": [
+          "rust-conventions"
+        ],
         "context_servers": {
           "agent-bus": {
             "tools": {
               "send_feedback": true
-            }
-          },
-          "taskgraph": {
-            "tools": {
-              "task_get": true,
-              "task_start": true,
-              "task_complete": true,
-              "task_fail": true
             }
           }
         },
@@ -2086,25 +1824,13 @@
             },
             "mcp:agent-bus:send_feedback": {
               "default": "allow"
-            },
-            "mcp:taskgraph:task_get": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_start": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_complete": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_fail": {
-              "default": "allow"
             }
           }
         }
       },
       "ci_release": {
         "name": "CI Release",
-        "task_isolation": "optional",
+        "task_isolation": "disabled",
         "custom_prompt_path": ".zed/prompts/agents/ci_release.md",
         "description": "Dispatches build-release.yml at repo HEAD on GitHub Actions, waits via gh run watch until green, delegates build-breaking code fixes to agent_engineer, and verifies all 8 release artifacts",
         "default_model": {
@@ -2120,14 +1846,6 @@
           "agent-bus": {
             "tools": {
               "send_feedback": true
-            }
-          },
-          "taskgraph": {
-            "tools": {
-              "task_get": true,
-              "task_start": true,
-              "task_complete": true,
-              "task_fail": true
             }
           }
         },
@@ -2148,17 +1866,45 @@
             },
             "mcp:agent-bus:send_feedback": {
               "default": "allow"
+            }
+          }
+        }
+      },
+      "ci_verifier": {
+        "name": "CI Verifier",
+        "task_isolation": "disabled",
+        "custom_prompt_path": ".zed/prompts/agents/ci_verifier.md",
+        "description": "Pushes the integrated branch and verifies it on GitHub Actions via agent_verify.yml (clippy + tests), waits with gh run watch, and returns structured failure triage; never runs local cargo or tests",
+        "default_model": {
+          "provider": "${MID_TIER_MODEL_PROVIDER}",
+          "model": "${MID_TIER_MODEL}"
+        },
+        "tools": {
+          "terminal": true
+        },
+        "skills": [],
+        "context_servers": {
+          "agent-bus": {
+            "tools": {
+              "send_feedback": true
+            }
+          }
+        },
+        "tool_permissions": {
+          "default": "deny",
+          "tools": {
+            "terminal": {
+              "default": "deny",
+              "always_allow": [
+                {
+                  "pattern": "^([A-Z_]+=\\S+\\s+)*git\\s+(-C\\s+\\S+\\s+)?(--no-pager\\s+|--no-optional-locks\\s+)*(push|fetch|ls-remote|rev-parse|status|log|branch)\\b.*"
+                },
+                {
+                  "pattern": "^([A-Z_]+=\\S+\\s+)*gh\\s+.*"
+                }
+              ]
             },
-            "mcp:taskgraph:task_get": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_start": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_complete": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_fail": {
+            "mcp:agent-bus:send_feedback": {
               "default": "allow"
             }
           }
@@ -2167,7 +1913,6 @@
       "e2e_tester": {
         "name": "Live Runtime & Agent E2E Tester",
         "task_isolation": "optional",
-        "system_prompt_template": ".zed/prompts/core/e2e_tester_system_prompt.md",
         "custom_prompt_path": ".zed/prompts/agents/e2e_tester.md",
         "description": "Manual-only black-box runtime verification, agent settings hypothesis testing, and E2E test suite authoring",
         "default_model": {
@@ -2185,20 +1930,13 @@
           "spawn_agent": true
         },
         "skills": [
-          "blackbox-github-researcher"
+          "blackbox-github-researcher",
+          "rust-conventions"
         ],
         "context_servers": {
           "agent-bus": {
             "tools": {
               "send_feedback": true
-            }
-          },
-          "taskgraph": {
-            "tools": {
-              "task_get": true,
-              "task_start": true,
-              "task_complete": true,
-              "task_fail": true
             }
           }
         },
@@ -2250,18 +1988,6 @@
             },
             "mcp:agent-bus:send_feedback": {
               "default": "allow"
-            },
-            "mcp:taskgraph:task_get": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_start": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_complete": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_fail": {
-              "default": "allow"
             }
           }
         }
@@ -2291,10 +2017,6 @@
           },
           "taskgraph": {
             "tools": {
-              "task_get": true,
-              "task_start": true,
-              "task_complete": true,
-              "task_fail": true,
               "artifact_publish": true,
               "artifact_get": true,
               "artifact_list": true
@@ -2323,18 +2045,6 @@
               "default": "allow"
             },
             "mcp:agent-bus:send_feedback": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_get": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_start": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_complete": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_fail": {
               "default": "allow"
             },
             "mcp:taskgraph:artifact_publish": {
@@ -2396,10 +2106,6 @@
           },
           "taskgraph": {
             "tools": {
-              "task_get": true,
-              "task_start": true,
-              "task_complete": true,
-              "task_fail": true,
               "artifact_publish": true,
               "artifact_get": true,
               "artifact_list": true
@@ -2484,18 +2190,6 @@
             "mcp:agent-bus:send_feedback": {
               "default": "allow"
             },
-            "mcp:taskgraph:task_get": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_start": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_complete": {
-              "default": "allow"
-            },
-            "mcp:taskgraph:task_fail": {
-              "default": "allow"
-            },
             "mcp:taskgraph:artifact_publish": {
               "default": "allow"
             },
@@ -2524,9 +2218,12 @@
           "find_path": true,
           "list_directory": true,
           "edit_file": true,
+          "write_file": true,
           "diagnostics": true
         },
-        "skills": [],
+        "skills": [
+          "rust-conventions"
+        ],
         "context_servers": {
           "agent-bus": {
             "tools": {
@@ -2556,6 +2253,13 @@
                 "script/**"
               ]
             },
+            "write_file": {
+              "default": "allow",
+              "write_scopes": [
+                "crates/**",
+                "script/**"
+              ]
+            },
             "diagnostics": {
               "default": "allow"
             },
@@ -2575,6 +2279,7 @@
           "model": "${MID_TIER_MODEL}"
         },
         "tools": {
+          "fetch": true,
           "read_file": true,
           "grep": true,
           "find_path": true,
@@ -2584,6 +2289,7 @@
         },
         "skills": [],
         "context_servers": {
+          "taskgraph": true,
           "agent-bus": {
             "tools": {
               "send_feedback": true
@@ -2617,6 +2323,15 @@
               ]
             },
             "mcp:agent-bus:send_feedback": {
+              "default": "allow"
+            },
+            "mcp:taskgraph:task_graph": {
+              "default": "allow"
+            },
+            "mcp:taskgraph:task_get": {
+              "default": "allow"
+            },
+            "fetch": {
               "default": "allow"
             }
           }

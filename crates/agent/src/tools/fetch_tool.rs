@@ -10,6 +10,7 @@ use html_to_markdown::{TagHandler, convert_html_to_markdown, markdown};
 use http_client::{AsyncBody, HttpClientWithUrl};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use settings::Settings;
 use ui::SharedString;
 use util::markdown::{MarkdownEscaped, MarkdownInlineCode};
 
@@ -242,6 +243,7 @@ impl AgentTool for FetchTool {
         event_stream: ToolCallEventStream,
         cx: &mut App,
     ) -> Task<Result<Self::Output, Self::Output>> {
+        let fetch_max_bytes = agent_settings::AgentSettings::get_global(cx).fetch_max_bytes;
         let http_client = self.http_client.clone();
         cx.spawn(async move |cx| {
             let input: FetchToolInput = input.recv().await.map_err(|e| e.to_string())?;
@@ -366,8 +368,21 @@ impl AgentTool for FetchTool {
             if text.trim().is_empty() {
                 return Err("no textual content found".to_string());
             }
-            Ok(text)
+
+            Ok(truncate_fetch_output(text, fetch_max_bytes))
         })
+    }
+}
+
+pub fn truncate_fetch_output(text: String, fetch_max_bytes: usize) -> String {
+    if text.len() > fetch_max_bytes {
+        let cutoff = text.floor_char_boundary(fetch_max_bytes);
+        format!(
+            "{}\n\n[Output truncated: fetch exceeded limit of {fetch_max_bytes} bytes]",
+            &text[..cutoff]
+        )
+    } else {
+        text
     }
 }
 
@@ -410,5 +425,35 @@ mod tests {
     fn verify_host_allows_public_literal() {
         verify_host_not_forbidden("https://93.184.215.14/")
             .expect("a public address must be allowed through the gate");
+    }
+
+    #[test]
+    fn test_truncate_fetch_output_under_limit() {
+        let text = "hello world".to_string();
+        assert_eq!(truncate_fetch_output(text.clone(), 100), text);
+        assert_eq!(truncate_fetch_output(text.clone(), text.len()), text);
+    }
+
+    #[test]
+    fn test_truncate_fetch_output_over_limit() {
+        let text = "abcdefghij".to_string(); // 10 bytes
+        let truncated = truncate_fetch_output(text, 5);
+        assert_eq!(
+            truncated,
+            "abcde\n\n[Output truncated: fetch exceeded limit of 5 bytes]"
+        );
+    }
+
+    #[test]
+    fn test_truncate_fetch_output_multibyte_utf8_boundary() {
+        // '👋' is 4 bytes: 0xF0, 0x9F, 0x91, 0x8B
+        let text = "hi 👋 world".to_string(); // 3 ("hi ") + 4 (wave) + 6 (" world") = 13 bytes
+        // Cutting at 5 bytes would fall inside '👋' (byte indices 3..7).
+        // floor_char_boundary(5) should be 3 ("hi ").
+        let truncated = truncate_fetch_output(text, 5);
+        assert_eq!(
+            truncated,
+            "hi \n\n[Output truncated: fetch exceeded limit of 5 bytes]"
+        );
     }
 }

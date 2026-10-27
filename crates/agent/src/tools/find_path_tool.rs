@@ -1,3 +1,4 @@
+use crate::tools::tool_permissions::is_inside_task_worktree;
 use crate::{AgentTool, ToolCallEventStream, ToolInput};
 use acp_thread::MentionUri;
 use agent_client_protocol::schema::v1 as acp;
@@ -132,7 +133,9 @@ impl AgentTool for FindPathTool {
                 error: e.to_string(),
             })?;
 
-            let search_paths_task = cx.update(|cx| search_paths(&input.glob, project, cx));
+            let task_worktree = cx.update(|cx| event_stream.task_worktree(cx));
+            let search_paths_task =
+                cx.update(|cx| search_paths(&input.glob, project, task_worktree, cx));
 
             let matches = futures::select! {
                 result = search_paths_task.fuse() => result.map_err(|e| FindPathToolOutput::Error { error: e.to_string() })?,
@@ -179,7 +182,12 @@ impl AgentTool for FindPathTool {
     }
 }
 
-fn search_paths(glob: &str, project: Entity<Project>, cx: &mut App) -> Task<Result<Vec<PathBuf>>> {
+fn search_paths(
+    glob: &str,
+    project: Entity<Project>,
+    task_worktree: Option<PathBuf>,
+    cx: &mut App,
+) -> Task<Result<Vec<PathBuf>>> {
     let path_style = project.read(cx).path_style(cx);
     let path_matcher = match PathMatcher::new(
         [
@@ -194,6 +202,13 @@ fn search_paths(glob: &str, project: Entity<Project>, cx: &mut App) -> Task<Resu
     let snapshots: Vec<_> = project
         .read(cx)
         .worktrees(cx)
+        .filter(|worktree| {
+            if let Some(task_worktree) = &task_worktree {
+                is_inside_task_worktree(worktree.read(cx).abs_path().as_ref(), task_worktree)
+            } else {
+                true
+            }
+        })
         .map(|worktree| worktree.read(cx).snapshot())
         .collect();
 
@@ -202,7 +217,13 @@ fn search_paths(glob: &str, project: Entity<Project>, cx: &mut App) -> Task<Resu
         for snapshot in snapshots {
             for entry in snapshot.entries(false, 0) {
                 if path_matcher.is_match(&snapshot.root_name().join(&entry.path)) {
-                    results.push(snapshot.absolutize(&entry.path));
+                    let abs_path = snapshot.absolutize(&entry.path);
+                    if let Some(ref task_worktree) = task_worktree {
+                        if !is_inside_task_worktree(&abs_path, task_worktree) {
+                            continue;
+                        }
+                    }
+                    results.push(abs_path);
                 }
             }
         }
@@ -242,7 +263,7 @@ mod test {
         let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
 
         let matches = cx
-            .update(|cx| search_paths("root/**/car*", project.clone(), cx))
+            .update(|cx| search_paths("root/**/car*", project.clone(), None, cx))
             .await
             .unwrap();
         assert_eq!(
@@ -254,7 +275,7 @@ mod test {
         );
 
         let matches = cx
-            .update(|cx| search_paths("**/car*", project.clone(), cx))
+            .update(|cx| search_paths("**/car*", project.clone(), None, cx))
             .await
             .unwrap();
         assert_eq!(
@@ -264,6 +285,97 @@ mod test {
                 PathBuf::from(path!("/root/apple/bandana/carbonara"))
             ]
         );
+    }
+
+    #[gpui::test]
+    async fn test_find_path_isolated_task_worktree(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let host_root = path!("/host_root");
+        let task_worktree_path = path!("/worktrees/agent-task-3");
+
+        fs.insert_tree(
+            host_root,
+            serde_json::json!({
+                "match_file.rs": "1",
+                "other.rs": "2",
+            }),
+        )
+        .await;
+
+        fs.insert_tree(
+            task_worktree_path,
+            serde_json::json!({
+                "match_file.rs": "1",
+                "task_only.rs": "3",
+            }),
+        )
+        .await;
+
+        let project = Project::test(fs.clone(), [host_root.as_ref()], cx).await;
+        let (tree, _) = project
+            .update(cx, |project, cx| {
+                project.find_or_create_worktree(std::path::Path::new(task_worktree_path), false, cx)
+            })
+            .await
+            .unwrap();
+        tree.read_with(cx, |tree, _| tree.as_local().unwrap().scan_complete())
+            .await;
+        cx.run_until_parked();
+
+        let tool = Arc::new(FindPathTool::new(project.clone()));
+
+        let thread = cx.update(|cx| {
+            let project_context = cx.new(|_cx| crate::ProjectContext::default());
+            let context_server_store = project.read(cx).context_server_store();
+            let context_server_registry =
+                cx.new(|cx| crate::tools::ContextServerRegistry::new(context_server_store, cx));
+            cx.new(|cx| {
+                let mut t = crate::Thread::new(
+                    project.clone(),
+                    project_context,
+                    context_server_registry,
+                    crate::Templates::new(),
+                    None,
+                    cx,
+                );
+                t.set_task_worktree(Some(std::path::PathBuf::from(task_worktree_path)));
+                t
+            })
+        });
+
+        let (event_stream, _) = ToolCallEventStream::test_with_thread(&thread);
+
+        // Run find_path tool with glob "**/*match*"
+        let result = cx
+            .update(|cx| {
+                let input = FindPathToolInput {
+                    glob: "**/*match*".to_string(),
+                    offset: 0,
+                };
+                tool.run(ToolInput::resolved(input), event_stream, cx)
+            })
+            .await
+            .unwrap();
+
+        match result {
+            FindPathToolOutput::Success {
+                current_matches_page,
+                all_matches_len,
+                ..
+            } => {
+                assert_eq!(all_matches_len, 1, "should find exactly 1 match in task worktree");
+                assert_eq!(current_matches_page.len(), 1);
+                let matched_path = &current_matches_page[0];
+                assert!(
+                    matched_path.starts_with(task_worktree_path),
+                    "match must be inside task worktree, got: {}",
+                    matched_path.display()
+                );
+            }
+            FindPathToolOutput::Error { error } => panic!("find_path failed: {error}"),
+        }
     }
 
     fn init_test(cx: &mut TestAppContext) {

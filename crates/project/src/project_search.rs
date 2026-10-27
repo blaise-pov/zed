@@ -49,6 +49,7 @@ enum SearchKind {
     Local {
         fs: Arc<dyn Fs>,
         worktrees: Vec<Entity<Worktree>>,
+        searches_unnamed_buffers: bool,
     },
     /// Query remote host for candidates. As of writing, the host runs a local search in "buffers with matches only" mode.
     Remote {
@@ -126,7 +127,51 @@ impl Search {
             .collect::<Vec<_>>();
         worktrees.sort_by_key(|worktree| worktree.read(cx).id());
         Self {
-            kind: SearchKind::Local { fs, worktrees },
+            kind: SearchKind::Local {
+                fs,
+                worktrees,
+                searches_unnamed_buffers: true,
+            },
+            buffer_store,
+            worktree_store,
+            limit,
+        }
+    }
+
+    pub fn local_with_worktrees(
+        fs: Arc<dyn Fs>,
+        buffer_store: Entity<BufferStore>,
+        worktree_store: Entity<WorktreeStore>,
+        mut worktrees: Vec<Entity<Worktree>>,
+        limit: usize,
+        cx: &App,
+    ) -> Self {
+        worktrees.sort_by_key(|worktree| worktree.read(cx).id());
+        Self {
+            kind: SearchKind::Local {
+                fs,
+                worktrees,
+                searches_unnamed_buffers: false,
+            },
+            buffer_store,
+            worktree_store,
+            limit,
+        }
+    }
+
+    pub fn local_for_worktree(
+        fs: Arc<dyn Fs>,
+        buffer_store: Entity<BufferStore>,
+        worktree_store: Entity<WorktreeStore>,
+        worktree: Entity<Worktree>,
+        limit: usize,
+    ) -> Self {
+        Self {
+            kind: SearchKind::Local {
+                fs,
+                worktrees: vec![worktree],
+                searches_unnamed_buffers: false,
+            },
             buffer_store,
             worktree_store,
             limit,
@@ -172,7 +217,6 @@ impl Search {
         let mut unnamed_buffers = Vec::new();
         let mut entryless_file_buffers = Vec::new();
         const MAX_CONCURRENT_BUFFER_OPENS: usize = 64;
-        let searches_all_unnamed_buffers = !matches!(self.kind, SearchKind::OpenBuffersOnly);
         let buffers = self.buffer_store.read(cx);
         for handle in buffers.buffers() {
             let buffer = handle.read(cx);
@@ -184,18 +228,43 @@ impl Search {
             {
                 continue;
             } else if let Some(entry_id) = buffer.entry_id(cx) {
-                open_buffers.insert(entry_id, buffer.as_rope().clone());
-            } else if searches_all_unnamed_buffers {
+                let belongs_to_search_scope = match &self.kind {
+                    SearchKind::Local { worktrees, .. } => {
+                        if let Some(file) = buffer.file() {
+                            let file_worktree_id = file.worktree_id(cx);
+                            worktrees.iter().any(|w| w.read(cx).id() == file_worktree_id)
+                        } else {
+                            false
+                        }
+                    }
+                    _ => true,
+                };
+                if belongs_to_search_scope {
+                    open_buffers.insert(entry_id, buffer.as_rope().clone());
+                }
+            } else if !matches!(self.kind, SearchKind::OpenBuffersOnly) {
                 match (&self.kind, buffer.file()) {
-                    (SearchKind::Local { .. }, Some(file)) => {
-                        self.limit = self.limit.saturating_sub(1);
-                        let sort_key = (file.worktree_id(cx).to_proto(), file.path().clone());
-                        entryless_file_buffers.push((sort_key, handle));
+                    (SearchKind::Local { worktrees, .. }, Some(file)) => {
+                        let file_worktree_id = file.worktree_id(cx);
+                        if worktrees.iter().any(|w| w.read(cx).id() == file_worktree_id) {
+                            self.limit = self.limit.saturating_sub(1);
+                            let sort_key = (file_worktree_id.to_proto(), file.path().clone());
+                            entryless_file_buffers.push((sort_key, handle));
+                        }
                     }
                     (SearchKind::Remote { .. }, _) => {}
                     _ => {
-                        self.limit = self.limit.saturating_sub(1);
-                        unnamed_buffers.push(handle);
+                        let searches_unnamed = match &self.kind {
+                            SearchKind::Local {
+                                searches_unnamed_buffers,
+                                ..
+                            } => *searches_unnamed_buffers,
+                            _ => true,
+                        };
+                        if searches_unnamed {
+                            self.limit = self.limit.saturating_sub(1);
+                            unnamed_buffers.push(handle);
+                        }
                     }
                 }
             };
@@ -239,6 +308,7 @@ impl Search {
                     SearchKind::Local {
                         fs,
                         ref mut worktrees,
+                        ..
                     } => {
                         let (get_buffer_for_full_scan_tx, get_buffer_for_full_scan_rx) =
                             unbounded();

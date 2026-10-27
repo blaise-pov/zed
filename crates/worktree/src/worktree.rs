@@ -5522,19 +5522,14 @@ impl BackgroundScanner {
             let child_metadata = match self.fs.metadata(&child_abs_path).await {
                 Ok(Some(metadata)) => metadata,
                 Ok(None) => continue,
-                Err(err) => {
-                    let is_sharing_violation = err
-                        .root_cause()
-                        .downcast_ref::<std::io::Error>()
-                        .and_then(|err| err.raw_os_error())
-                        == Some(32);
-                    if is_sharing_violation {
+                Err(error) => {
+                    if is_transient_scan_error(&error) {
                         log::debug!(
-                            "skipping locked file during scan {:?}: {err:#}",
+                            "skipping locked file during scan {:?}: {error:#}",
                             child_abs_path.display()
                         );
                     } else {
-                        log::error!("error processing {:?}: {err:#}", child_abs_path.display());
+                        log::error!("error processing {:?}: {error:#}", child_abs_path.display());
                     }
                     continue;
                 }
@@ -6564,6 +6559,28 @@ fn is_beyond_scan_depth(file_scan_depth: Option<u32>, path: &RelPath) -> bool {
     file_scan_depth.is_some_and(|depth| path.components().count() >= depth as usize)
 }
 
+// Transient filesystem errors encountered when scanning directories concurrently mutated by compilers/tools:
+// On Windows:
+// - 2: ERROR_FILE_NOT_FOUND (file deleted between read_dir and metadata)
+// - 5: ERROR_ACCESS_DENIED (temporarily locked by another process)
+// - 32: ERROR_SHARING_VIOLATION (sharing violation while open by another process)
+// On Unix:
+// - 2: ENOENT (file deleted between read_dir and metadata)
+// Note: On Unix, errno 5 is EIO and 32 is EPIPE, which are not transient scan skips.
+fn is_transient_scan_error(error: &anyhow::Error) -> bool {
+    let raw_os_error = error
+        .root_cause()
+        .downcast_ref::<std::io::Error>()
+        .and_then(|io_error| io_error.raw_os_error());
+
+    #[cfg(windows)]
+    let is_transient = matches!(raw_os_error, Some(2 | 5 | 32));
+    #[cfg(not(windows))]
+    let is_transient = matches!(raw_os_error, Some(2));
+
+    is_transient
+}
+
 fn swap_to_front(child_paths: &mut Vec<PathBuf>, file: &str) {
     let position = child_paths
         .iter()
@@ -7441,7 +7458,7 @@ mod tests {
     use super::{
         BackgroundScanner, BackgroundScannerPhase, BackgroundScannerState, IgnoreStack,
         NullWatcher, RemovedEntries, STREAM_BLOCK_BYTES, ScanRequest, UpdateIgnoreStatusJob,
-        Worktree, stream_utf8_into_rope,
+        Worktree, is_transient_scan_error, stream_utf8_into_rope,
     };
     use collections::{HashMap, HashSet};
     use fs::{FakeFs, Fs, RemoveOptions, RenameOptions};
@@ -7726,5 +7743,34 @@ mod tests {
         assert_eq!(stream(b"hello \xff\xfeA").await, None, "invalid utf-8");
         assert_eq!(stream(b"hello \xe2\x82").await, None, "truncated at eof");
         assert_eq!(stream(b"plain \x1b$B text").await, None, "iso-2022 escape");
+    }
+
+    #[test]
+    fn test_is_transient_scan_error() {
+        use std::io;
+
+        let error_file_not_found = anyhow::anyhow!(io::Error::from_raw_os_error(2));
+        let error_access_denied_or_eio = anyhow::anyhow!(io::Error::from_raw_os_error(5));
+        let error_sharing_violation_or_epipe = anyhow::anyhow!(io::Error::from_raw_os_error(32));
+        let other_io_error = anyhow::anyhow!(io::Error::from_raw_os_error(13));
+        let non_io_error = anyhow::anyhow!("non-io error");
+
+        assert!(is_transient_scan_error(&error_file_not_found));
+        #[cfg(windows)]
+        {
+            assert!(is_transient_scan_error(&error_access_denied_or_eio));
+            assert!(is_transient_scan_error(&error_sharing_violation_or_epipe));
+        }
+        #[cfg(not(windows))]
+        {
+            assert!(!is_transient_scan_error(&error_access_denied_or_eio));
+            assert!(!is_transient_scan_error(&error_sharing_violation_or_epipe));
+        }
+        assert!(!is_transient_scan_error(&other_io_error));
+        assert!(!is_transient_scan_error(&non_io_error));
+
+        let wrapped_transient_error =
+            anyhow::Error::new(io::Error::from_raw_os_error(2)).context("wrapped context");
+        assert!(is_transient_scan_error(&wrapped_transient_error));
     }
 }
