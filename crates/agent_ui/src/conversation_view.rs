@@ -17872,6 +17872,7 @@ pub(crate) mod tests {
 
         let (conversation_view, cx) =
             setup_conversation_view(StubAgentServer::new(connection), cx).await;
+        add_to_workspace(conversation_view.clone(), cx);
         let thread_view = active_thread(&conversation_view, cx);
 
         thread_view.update(cx, |view, cx| {
@@ -17879,7 +17880,7 @@ pub(crate) mod tests {
             assert!(callout.is_none());
         });
 
-        thread_view.update(cx, |view, _| {
+        thread_view.update(cx, |view, cx| {
             view.thread_retry_status = Some(RetryStatus {
                 attempt: 1,
                 max_attempts: 3,
@@ -17888,6 +17889,7 @@ pub(crate) mod tests {
                 last_error: "Rate limited".into(),
                 meta: Default::default(),
             });
+            cx.notify();
         });
 
         cx.run_until_parked();

@@ -3576,11 +3576,15 @@ impl ThreadView {
                 .title(state.last_error.clone())
                 .description(retry_message)
                 .actions_slot(
-                    Button::new("retry-now", "Retry Now")
-                        .label_size(LabelSize::Small)
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.retry_waiting(cx);
-                        })),
+                    div()
+                        .debug_selector(|| "retry-now".into())
+                        .child(
+                            Button::new("retry-now", "Retry Now")
+                                .label_size(LabelSize::Small)
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.retry_waiting(cx);
+                                })),
+                        ),
                 ),
         )
     }
