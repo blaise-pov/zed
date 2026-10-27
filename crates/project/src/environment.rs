@@ -6,7 +6,7 @@ use rpc::proto::{self, REMOTE_SERVER_PROJECT_ID};
 use std::{collections::VecDeque, path::Path, sync::Arc};
 use task::{Shell, shell_to_proto};
 use util::{ResultExt, command::new_command};
-use worktree::Worktree;
+use worktree::{Worktree, WorktreeId};
 
 use collections::HashMap;
 use gpui::{App, AppContext as _, Context, Entity, EventEmitter, Task, WeakEntity};
@@ -26,6 +26,7 @@ pub struct ProjectEnvironment {
     worktree_store: WeakEntity<WorktreeStore>,
     remote_client: Option<WeakEntity<RemoteClient>>,
     is_remote_project: bool,
+    dot_envs: collections::HashMap<WorktreeId, collections::HashMap<String, String>>,
     _tasks: Vec<Task<()>>,
 }
 
@@ -53,6 +54,12 @@ impl ProjectEnvironment {
                 .ok();
             }
         });
+        if let Some(store) = worktree_store.upgrade() {
+            let this_env = cx.entity().downgrade();
+            store.update(cx, |store, _| {
+                store.set_environment(this_env);
+            });
+        }
         Self {
             cli_environment,
             local_environments: Default::default(),
@@ -62,6 +69,7 @@ impl ProjectEnvironment {
             worktree_store,
             remote_client,
             is_remote_project,
+            dot_envs: Default::default(),
             _tasks: vec![task],
         }
     }
@@ -79,24 +87,38 @@ impl ProjectEnvironment {
         }
     }
 
+    pub fn set_worktree_dot_env(
+        &mut self,
+        id: WorktreeId,
+        env: collections::HashMap<String, String>,
+    ) {
+        self.dot_envs.insert(id, env);
+    }
+
+    pub fn remove_worktree_dot_env(&mut self, id: WorktreeId) {
+        self.dot_envs.remove(&id);
+    }
+
+    pub fn get_worktree_dot_env(
+        &self,
+        id: WorktreeId,
+    ) -> Option<&collections::HashMap<String, String>> {
+        self.dot_envs.get(&id)
+    }
+
     pub fn buffer_environment(
         &mut self,
         buffer: &Entity<Buffer>,
         worktree_store: &Entity<WorktreeStore>,
         cx: &mut Context<Self>,
     ) -> Shared<Task<Option<HashMap<String, String>>>> {
-        if let Some(cli_environment) = self.get_cli_environment() {
-            log::debug!("using project environment variables from CLI");
-            return Task::ready(Some(cli_environment)).shared();
-        }
-
         let Some(worktree) = buffer
             .read(cx)
             .file()
             .map(|f| f.worktree_id(cx))
             .and_then(|worktree_id| worktree_store.read(cx).worktree_for_id(worktree_id, cx))
         else {
-            return Task::ready(None).shared();
+            return Task::ready(self.get_cli_environment()).shared();
         };
         self.worktree_environment(worktree, cx)
     }
@@ -106,36 +128,44 @@ impl ProjectEnvironment {
         worktree: Entity<Worktree>,
         cx: &mut App,
     ) -> Shared<Task<Option<HashMap<String, String>>>> {
-        if let Some(cli_environment) = self.get_cli_environment() {
+        let worktree_id = worktree.read(cx).id();
+        let dot_env = self.get_worktree_dot_env(worktree_id).cloned();
+
+        let base_env_task = if let Some(mut cli_environment) = self.get_cli_environment() {
             log::debug!("using project environment variables from CLI");
-            return Task::ready(Some(cli_environment)).shared();
-        }
-
-        let worktree = worktree.read(cx);
-        let mut abs_path = worktree.abs_path();
-        if worktree.is_single_file() {
-            let Some(parent) = abs_path.parent() else {
-                return Task::ready(None).shared();
-            };
-            abs_path = parent.into();
-        }
-
-        let remote_client = self.remote_client.as_ref().and_then(|it| it.upgrade());
-        match remote_client {
-            Some(remote_client) => remote_client.clone().read(cx).shell().map(|shell| {
-                self.remote_directory_environment(
-                    &Shell::Program(shell),
-                    abs_path,
-                    remote_client,
-                    cx,
-                )
-            }),
-            None if self.is_remote_project => {
-                Some(self.local_directory_environment(&Shell::System, abs_path, cx))
+            if let Some(dot_env) = dot_env {
+                cli_environment.extend(dot_env);
             }
-            None => Some(self.local_directory_environment(&Shell::System, abs_path, cx)),
-        }
-        .unwrap_or_else(|| Task::ready(None).shared())
+            return Task::ready(Some(cli_environment)).shared();
+        } else {
+            let worktree = worktree.read(cx);
+            let mut abs_path = worktree.abs_path();
+            if worktree.is_single_file() {
+                let Some(parent) = abs_path.parent() else {
+                    return Task::ready(None).shared();
+                };
+                abs_path = parent.into();
+            }
+
+            let remote_client = self.remote_client.as_ref().and_then(|it| it.upgrade());
+            match remote_client {
+                Some(remote_client) => remote_client.clone().read(cx).shell().map(|shell| {
+                    self.remote_directory_environment(
+                        &Shell::Program(shell),
+                        abs_path,
+                        remote_client,
+                        cx,
+                    )
+                }),
+                None if self.is_remote_project => {
+                    Some(self.local_directory_environment(&Shell::System, abs_path, cx))
+                }
+                None => Some(self.local_directory_environment(&Shell::System, abs_path, cx)),
+            }
+            .unwrap_or_else(|| Task::ready(None).shared())
+        };
+
+        self.merge_dot_env(base_env_task, dot_env, cx)
     }
 
     pub fn directory_environment(
@@ -143,8 +173,32 @@ impl ProjectEnvironment {
         abs_path: Arc<Path>,
         cx: &mut App,
     ) -> Shared<Task<Option<HashMap<String, String>>>> {
+        let worktree_id = self
+            .worktree_store
+            .read_with(cx, |worktree_store, cx| {
+                worktree_store
+                    .find_worktree(&abs_path, cx)
+                    .map(|(tree, _)| tree.read(cx).id())
+            })
+            .ok()
+            .flatten();
+        let dot_env = worktree_id.and_then(|id| self.get_worktree_dot_env(id).cloned());
+
+        if let Some(mut cli_environment) = self.get_cli_environment() {
+            if self.remote_client.is_none() && !self.is_remote_project {
+                if worktree_id.is_none() {
+                    return Task::ready(None).shared();
+                }
+                log::debug!("using project environment variables from CLI");
+                if let Some(dot_env) = dot_env {
+                    cli_environment.extend(dot_env);
+                }
+                return Task::ready(Some(cli_environment)).shared();
+            }
+        }
+
         let remote_client = self.remote_client.as_ref().and_then(|it| it.upgrade());
-        match remote_client {
+        let base_env_task = match remote_client {
             Some(remote_client) => remote_client.clone().read(cx).shell().map(|shell| {
                 self.remote_directory_environment(
                     &Shell::Program(shell),
@@ -156,15 +210,35 @@ impl ProjectEnvironment {
             None if self.is_remote_project => {
                 Some(self.local_directory_environment(&Shell::System, abs_path, cx))
             }
-            None => self
-                .worktree_store
-                .read_with(cx, |worktree_store, cx| {
-                    worktree_store.find_worktree(&abs_path, cx)
-                })
-                .ok()
-                .map(|_| self.local_directory_environment(&Shell::System, abs_path, cx)),
+            None => {
+                if worktree_id.is_some() {
+                    Some(self.local_directory_environment(&Shell::System, abs_path, cx))
+                } else {
+                    None
+                }
+            }
         }
-        .unwrap_or_else(|| Task::ready(None).shared())
+        .unwrap_or_else(|| Task::ready(None).shared());
+
+        self.merge_dot_env(base_env_task, dot_env, cx)
+    }
+
+    fn merge_dot_env(
+        &self,
+        base_env_task: Shared<Task<Option<HashMap<String, String>>>>,
+        dot_env: Option<HashMap<String, String>>,
+        cx: &App,
+    ) -> Shared<Task<Option<HashMap<String, String>>>> {
+        if let Some(dot_env) = dot_env {
+            cx.background_spawn(async move {
+                let mut env = base_env_task.await.unwrap_or_default();
+                env.extend(dot_env);
+                Some(env)
+            })
+            .shared()
+        } else {
+            base_env_task
+        }
     }
 
     /// Returns the project environment using the default worktree path.
@@ -420,4 +494,55 @@ async fn load_direnv_environment(
     }
 
     serde_json::from_str(&output).context("parsing direnv json")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::TestAppContext;
+
+    #[gpui::test]
+    fn test_worktree_dot_env_isolation(cx: &mut TestAppContext) {
+        let project_env = cx.update(|cx| {
+            cx.new(|cx| {
+                ProjectEnvironment::new(
+                    None,
+                    WeakEntity::new_invalid(),
+                    None,
+                    false,
+                    cx,
+                )
+            })
+        });
+
+        let id1 = WorktreeId::from_usize(1);
+        let id2 = WorktreeId::from_usize(2);
+
+        let mut env1 = HashMap::default();
+        env1.insert("KEY_A".to_string(), "val1".to_string());
+
+        let mut env2 = HashMap::default();
+        env2.insert("KEY_A".to_string(), "val2".to_string());
+        env2.insert("KEY_B".to_string(), "unique".to_string());
+
+        project_env.update(cx, |env, _| {
+            assert!(env.get_worktree_dot_env(id1).is_none());
+            assert!(env.get_worktree_dot_env(id2).is_none());
+
+            env.set_worktree_dot_env(id1, env1.clone());
+            assert_eq!(env.get_worktree_dot_env(id1), Some(&env1));
+            assert!(env.get_worktree_dot_env(id2).is_none());
+
+            env.set_worktree_dot_env(id2, env2.clone());
+            assert_eq!(env.get_worktree_dot_env(id1), Some(&env1));
+            assert_eq!(env.get_worktree_dot_env(id2), Some(&env2));
+
+            env.remove_worktree_dot_env(id1);
+            assert!(env.get_worktree_dot_env(id1).is_none());
+            assert_eq!(env.get_worktree_dot_env(id2), Some(&env2));
+
+            env.remove_worktree_dot_env(id2);
+            assert!(env.get_worktree_dot_env(id2).is_none());
+        });
+    }
 }

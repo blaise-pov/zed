@@ -2006,7 +2006,7 @@ impl AgentTaskPanel {
             }
         }
 
-        v_flex().gap_2().children(group_elements)
+        v_flex().children(group_elements)
     }
 
     fn render_orphan_worktrees(&self, orphans: &[OrphanWorktree], cx: &mut Context<Self>) -> Div {

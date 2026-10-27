@@ -1331,13 +1331,15 @@ impl Project {
             });
 
             let settings_observer = cx.new(|cx| {
-                SettingsObserver::new_local(
+                let mut observer = SettingsObserver::new_local(
                     fs.clone(),
                     worktree_store.clone(),
                     task_store.clone(),
                     flags.watch_global_configs,
                     cx,
-                )
+                );
+                observer.set_environment(environment.downgrade());
+                observer
             });
             cx.subscribe(&settings_observer, Self::on_settings_observer_event)
                 .detach();
@@ -1578,14 +1580,16 @@ impl Project {
             });
 
             let settings_observer = cx.new(|cx| {
-                SettingsObserver::new_remote(
+                let mut observer = SettingsObserver::new_remote(
                     fs.clone(),
                     worktree_store.clone(),
                     task_store.clone(),
                     Some(remote_proto.clone()),
                     false,
                     cx,
-                )
+                );
+                observer.set_environment(environment.downgrade());
+                observer
             });
             cx.subscribe(&settings_observer, Self::on_settings_observer_event)
                 .detach();
@@ -1856,14 +1860,16 @@ impl Project {
         });
 
         let settings_observer = cx.new(|cx| {
-            SettingsObserver::new_remote(
+            let mut observer = SettingsObserver::new_remote(
                 fs.clone(),
                 worktree_store.clone(),
                 task_store.clone(),
                 None,
                 true,
                 cx,
-            )
+            );
+            observer.set_environment(environment.downgrade());
+            observer
         });
 
         let agent_server_store = cx.new(|_cx| AgentServerStore::collab());
