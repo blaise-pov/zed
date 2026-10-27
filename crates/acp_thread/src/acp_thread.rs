@@ -3556,6 +3556,7 @@ pub enum AcpThreadEvent {
     ModeUpdated(acp_v1::SessionModeId),
     ConfigOptionsUpdated(Vec<acp_v2::SessionConfigOption>),
     WorkingDirectoriesUpdated,
+    DiffStatsUpdated,
 }
 
 impl EventEmitter<AcpThreadEvent> for AcpThread {}
@@ -3695,7 +3696,8 @@ impl AcpThread {
                 | AcpThreadEvent::AvailableCommandsUpdated(_)
                 | AcpThreadEvent::ModeUpdated(_)
                 | AcpThreadEvent::ConfigOptionsUpdated(_)
-                | AcpThreadEvent::WorkingDirectoriesUpdated => {}
+                | AcpThreadEvent::WorkingDirectoriesUpdated
+                | AcpThreadEvent::DiffStatsUpdated => {}
             });
 
         let git_store = project.read(cx).git_store().clone();

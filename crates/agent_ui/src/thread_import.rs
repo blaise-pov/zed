@@ -884,6 +884,7 @@ fn collect_importable_threads(
                 archived: true,
                 model: None,
                 agent_label: None,
+                diff_stats: None,
             });
         }
     }

@@ -355,6 +355,7 @@ impl Conversation {
                     | AcpThreadEvent::ModeUpdated(_)
                     | AcpThreadEvent::ConfigOptionsUpdated(_)
                     | AcpThreadEvent::WorkingDirectoriesUpdated
+                    | AcpThreadEvent::DiffStatsUpdated
                     | AcpThreadEvent::PromptUpdated => {}
                 }
                 this.updated_at = Some(Instant::now());
@@ -753,7 +754,8 @@ fn affects_thread_metadata(event: &AcpThreadEvent) -> bool {
         | AcpThreadEvent::Error
         | AcpThreadEvent::LoadError(_)
         | AcpThreadEvent::Refusal
-        | AcpThreadEvent::WorkingDirectoriesUpdated => true,
+        | AcpThreadEvent::WorkingDirectoriesUpdated
+        | AcpThreadEvent::DiffStatsUpdated => true,
         // --
         AcpThreadEvent::EntryUpdated(_)
         | AcpThreadEvent::StatusChanged
@@ -2209,7 +2211,7 @@ impl ConversationView {
                 // The watch task in ConfigOptionsView handles rebuilding selectors
                 cx.notify();
             }
-            AcpThreadEvent::WorkingDirectoriesUpdated => {
+            AcpThreadEvent::WorkingDirectoriesUpdated | AcpThreadEvent::DiffStatsUpdated => {
                 cx.notify();
             }
             AcpThreadEvent::NoticesUpdated => {
@@ -6074,6 +6076,7 @@ pub(crate) mod tests {
                             archived: false,
                             model: None,
                             agent_label: None,
+                            diff_stats: None,
                         },
                         cx,
                     );
@@ -6309,6 +6312,7 @@ pub(crate) mod tests {
                         archived: false,
                         model: None,
                         agent_label: None,
+                        diff_stats: None,
                     },
                     cx,
                 );

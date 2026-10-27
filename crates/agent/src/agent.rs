@@ -4186,6 +4186,15 @@ impl ThreadEnvironment for NativeThreadEnvironment {
         })
     }
 
+    fn flush_diff_stats(&self, cx: &mut AsyncApp) -> Task<Result<()>> {
+        if let Some(acp_thread) = self.acp_thread.upgrade() {
+            acp_thread.update(cx, |_thread, cx| {
+                cx.emit(acp_thread::AcpThreadEvent::DiffStatsUpdated);
+            });
+        }
+        Task::ready(Ok(()))
+    }
+
     fn fail_task_registered(
         &self,
         task_id: &str,

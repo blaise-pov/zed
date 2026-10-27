@@ -394,7 +394,9 @@ impl ThreadEntry {
         self.is_live = true;
         self.is_background = info.is_background;
         self.is_title_generating = info.is_title_generating;
-        self.diff_stats = info.diff_stats;
+        if info.diff_stats != DiffStats::default() || self.diff_stats == DiffStats::default() {
+            self.diff_stats = info.diff_stats;
+        }
         self.agent_label = info.agent_label.clone().or_else(|| self.agent_label.clone());
         self.model = info.model.clone().or_else(|| self.model.clone());
     }
@@ -1634,6 +1636,7 @@ impl Sidebar {
                         // pass below downgrades them to `Empty` if no draft
                         // label can be derived.
                         let draft = row.is_draft().then_some(DraftKind::WithContent);
+                        let diff_stats = row.diff_stats.unwrap_or_default();
                         Arc::new(ThreadEntry {
                             agent_label: row.agent_label.clone(),
                             model: row.model.clone(),
@@ -1648,7 +1651,7 @@ impl Sidebar {
                             draft,
                             highlight_positions: Vec::new(),
                             worktrees,
-                            diff_stats: DiffStats::default(),
+                            diff_stats,
                         })
                     };
 

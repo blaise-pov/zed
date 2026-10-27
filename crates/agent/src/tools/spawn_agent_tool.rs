@@ -16,6 +16,7 @@ use crate::task_worktree::SubagentIsolationDetails;
 use crate::{AgentTool, Template as _, ThreadEnvironment, ToolCallEventStream, ToolInput};
 use acp_thread::AgentModelId;
 use settings::Settings as _;
+use util::ResultExt as _;
 
 /// Spawn a sub-agent for a well-scoped task.
 ///
@@ -1594,6 +1595,7 @@ impl AgentTool for SpawnAgentTool {
                     if crate::task_worktree::task_worktree_commit_error(&task_id_typed).is_none()
                         && crate::task_worktree::task_worktree_merge_conflict(&task_id_typed).is_none()
                     {
+                        self.environment.flush_diff_stats(&mut cx).await.log_err();
                         let cleanup_fut = self
                             .environment
                             .auto_cleanup_subagent_worktree(task_id, &mut cx);
