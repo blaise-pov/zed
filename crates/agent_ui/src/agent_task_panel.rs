@@ -5473,7 +5473,7 @@ mod tests {
         );
         assert!(!goal_meta_with_diff.contains(" ·  · "));
 
-        let mut metrics_no_cost = sample_metrics.clone();
+        let mut metrics_no_cost = sample_metrics;
         metrics_no_cost.cost_usd = None;
         task_with_metrics.metrics = Some(metrics_no_cost.clone());
         let task_meta_no_cost = format_task_meta_line(&task_with_metrics);
