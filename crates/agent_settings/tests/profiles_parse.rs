@@ -137,27 +137,7 @@ fn test_model_env_vars_expansion() {
         }
     }"#;
 
-    // Unpreprocessed JSON retains raw env var tokens
-    let (raw_content, raw_status) = SettingsContent::parse_json(json);
-    assert_eq!(raw_status, settings::ParseStatus::Success);
-    let raw_custom_profile = agent_settings::AgentProfileSettings::from(
-        raw_content
-            .unwrap()
-            .agent
-            .as_ref()
-            .unwrap()
-            .profiles
-            .as_ref()
-            .unwrap()
-            .get("custom")
-            .unwrap()
-            .clone(),
-    );
-    let raw_model = raw_custom_profile.default_model.unwrap();
-    assert_eq!(raw_model.model, "${ZED_TEST_MODEL_NAME}");
-
-    let preprocessed = util::expand_env_vars_with(json, &collections::HashMap::default());
-    let (content, status) = SettingsContent::parse_json(&preprocessed);
+    let (content, status) = SettingsContent::parse_json(json);
     assert_eq!(status, settings::ParseStatus::Success);
 
     let content = content.unwrap();

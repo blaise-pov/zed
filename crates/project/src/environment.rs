@@ -165,7 +165,16 @@ impl ProjectEnvironment {
             .unwrap_or_else(|| Task::ready(None).shared())
         };
 
-        self.merge_dot_env(base_env_task, dot_env, cx)
+        if let Some(dot_env) = dot_env {
+            cx.background_spawn(async move {
+                let mut env = base_env_task.await.unwrap_or_default();
+                env.extend(dot_env);
+                Some(env)
+            })
+            .shared()
+        } else {
+            base_env_task
+        }
     }
 
     pub fn directory_environment(
@@ -220,15 +229,6 @@ impl ProjectEnvironment {
         }
         .unwrap_or_else(|| Task::ready(None).shared());
 
-        self.merge_dot_env(base_env_task, dot_env, cx)
-    }
-
-    fn merge_dot_env(
-        &self,
-        base_env_task: Shared<Task<Option<HashMap<String, String>>>>,
-        dot_env: Option<HashMap<String, String>>,
-        cx: &App,
-    ) -> Shared<Task<Option<HashMap<String, String>>>> {
         if let Some(dot_env) = dot_env {
             cx.background_spawn(async move {
                 let mut env = base_env_task.await.unwrap_or_default();

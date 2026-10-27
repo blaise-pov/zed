@@ -1258,6 +1258,9 @@ impl Project {
             let environment = cx.new(|cx| {
                 ProjectEnvironment::new(env, worktree_store.downgrade(), None, false, cx)
             });
+            worktree_store.update(cx, |worktree_store, _| {
+                worktree_store.set_environment(environment.downgrade());
+            });
             let manifest_tree = ManifestTree::new(worktree_store.clone(), cx);
             let toolchain_store = cx.new(|cx| {
                 ToolchainStore::local(
@@ -1517,6 +1520,9 @@ impl Project {
                     false,
                     cx,
                 )
+            });
+            worktree_store.update(cx, |worktree_store, _| {
+                worktree_store.set_environment(environment.downgrade());
             });
 
             let lsp_store = cx.new(|cx| {
@@ -1798,6 +1804,9 @@ impl Project {
 
         let environment =
             cx.new(|cx| ProjectEnvironment::new(None, worktree_store.downgrade(), None, true, cx));
+        worktree_store.update(&mut cx, |worktree_store, _| {
+            worktree_store.set_environment(environment.downgrade());
+        });
 
         let bookmark_store =
             cx.new(|cx| BookmarkStore::new(worktree_store.clone(), buffer_store.clone(), cx));

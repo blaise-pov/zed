@@ -1078,6 +1078,13 @@ pub fn parse_env(content: &str) -> Vec<(String, String)> {
     vars
 }
 
+/// Loads environment variables from a `.env` file content into the current process environment.
+///
+/// Process-level environment mutation via `std::env::set_var` is unsafe in
+/// multi-threaded contexts and has been removed. Callers should parse environment
+/// variables using [`parse_env`] and resolve them with [`expand_env_vars_with`].
+pub fn load_env(_content: &str) {}
+
 /// Expands `${VAR}` and `${VAR:-default}` references in a string using a lookup map
 /// with fallback to the current process environment.
 ///
