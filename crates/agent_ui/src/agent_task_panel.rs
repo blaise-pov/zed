@@ -2854,20 +2854,20 @@ impl AgentTaskPanel {
                                 } else {
                                     ("no profile".to_string(), Color::Muted)
                                 };
-                                Label::new(profile_str)
-                                    .size(LabelSize::Small)
-                                    .color(profile_color)
-                            })
-                            .when_some(
-                                task.model.as_ref().filter(|m| !m.is_empty()),
-                                |this, model| {
-                                    this.child(dot_separator()).child(
-                                        Label::new(model.to_string())
+                                div()
+                                    .id((ElementId::from("task-profile"), task.id.to_string()))
+                                    .child(
+                                        Label::new(profile_str)
                                             .size(LabelSize::Small)
-                                            .color(Color::Muted),
+                                            .color(profile_color),
                                     )
-                                },
-                            )
+                                    .when_some(
+                                        task.model.as_ref().filter(|m| !m.is_empty()),
+                                        |this, model| {
+                                            this.tooltip(Tooltip::text(format!("Model: {model}")))
+                                        },
+                                    )
+                            })
                             .when_some(task.metrics.as_ref(), |mut this, metrics| {
                                 for element in render_metrics_elements(
                                     (ElementId::from("diff-stat"), task.id.to_string()).into(),
@@ -2937,6 +2937,15 @@ pub fn format_cost(cost_usd: f64) -> String {
     format!("${cost_usd:.2}")
 }
 
+pub fn format_tokens_tooltip(metrics: &AgentTaskMetrics) -> String {
+    let in_tok = format_compact_tokens(metrics.input_tokens.unwrap_or(0));
+    let out_tok = format_compact_tokens(metrics.output_tokens.unwrap_or(0));
+    let cache_tok = format_compact_tokens(
+        metrics.cache_read_tokens.unwrap_or(0) + metrics.cache_creation_tokens.unwrap_or(0),
+    );
+    format!("Tokens: {in_tok} in / {out_tok} out / {cache_tok} cache")
+}
+
 pub fn render_metrics_elements(
     id: ElementId,
     metrics: Option<&AgentTaskMetrics>,
@@ -2947,24 +2956,16 @@ pub fn render_metrics_elements(
     };
     let mut elements = Vec::new();
 
-    if metrics.input_tokens.is_some()
+    let has_tokens = metrics.input_tokens.is_some()
         || metrics.output_tokens.is_some()
         || metrics.cache_read_tokens.is_some()
-        || metrics.cache_creation_tokens.is_some()
-    {
-        let in_tok = format_compact_tokens(metrics.input_tokens.unwrap_or(0));
-        let out_tok = format_compact_tokens(metrics.output_tokens.unwrap_or(0));
-        let cache_tok = format_compact_tokens(
-            metrics.cache_read_tokens.unwrap_or(0) + metrics.cache_creation_tokens.unwrap_or(0),
-        );
-        let tokens_str = format!("{in_tok}/{out_tok}/{cache_tok}");
-        elements.push(
-            Label::new(tokens_str)
-                .size(LabelSize::Small)
-                .color(Color::Muted)
-                .into_any_element(),
-        );
-    }
+        || metrics.cache_creation_tokens.is_some();
+
+    let tokens_tooltip = if has_tokens {
+        Some(format_tokens_tooltip(metrics))
+    } else {
+        None
+    };
 
     if include_turns {
         if let Some(turns) = metrics.turns_count {
@@ -2989,20 +2990,30 @@ pub fn render_metrics_elements(
 
     if let Some(diff) = &metrics.diff {
         elements.push(
-            DiffStat::new(id, diff.insertions as usize, diff.deletions as usize)
+            DiffStat::new(id.clone(), diff.insertions as usize, diff.deletions as usize)
                 .tooltip(format!("{} files changed", diff.files_changed))
                 .into_any_element(),
         );
     }
 
-    if let Some(cost) = metrics.cost_usd {
-        let cost_str = format_cost(cost);
-        elements.push(
+    let cost_label = if let Some(cost) = metrics.cost_usd {
+        Some(format_cost(cost))
+    } else if has_tokens {
+        Some("$0.00".to_string())
+    } else {
+        None
+    };
+
+    if let Some(cost_str) = cost_label {
+        let mut cost_element = div().id((id, "cost")).child(
             Label::new(cost_str)
                 .size(LabelSize::Small)
-                .color(Color::Success)
-                .into_any_element(),
+                .color(Color::Success),
         );
+        if let Some(tooltip) = tokens_tooltip {
+            cost_element = cost_element.tooltip(Tooltip::text(tooltip));
+        }
+        elements.push(cost_element.into_any_element());
     }
 
     elements
@@ -3021,22 +3032,6 @@ pub fn format_metrics_items(metrics: Option<&AgentTaskMetrics>) -> Vec<Formatted
         });
     }
 
-    if metrics.input_tokens.is_some()
-        || metrics.output_tokens.is_some()
-        || metrics.cache_read_tokens.is_some()
-        || metrics.cache_creation_tokens.is_some()
-    {
-        let in_tok = format_compact_tokens(metrics.input_tokens.unwrap_or(0));
-        let out_tok = format_compact_tokens(metrics.output_tokens.unwrap_or(0));
-        let cache_tok = format_compact_tokens(
-            metrics.cache_read_tokens.unwrap_or(0) + metrics.cache_creation_tokens.unwrap_or(0),
-        );
-        items.push(FormattedMetricItem {
-            text: format!("{in_tok}/{out_tok}/{cache_tok}"),
-            color: Color::Muted,
-        });
-    }
-
     if let Some(turns) = metrics.turns_count {
         items.push(FormattedMetricItem {
             text: format_turns(turns),
@@ -3051,9 +3046,19 @@ pub fn format_metrics_items(metrics: Option<&AgentTaskMetrics>) -> Vec<Formatted
         });
     }
 
+    let has_tokens = metrics.input_tokens.is_some()
+        || metrics.output_tokens.is_some()
+        || metrics.cache_read_tokens.is_some()
+        || metrics.cache_creation_tokens.is_some();
+
     if let Some(cost) = metrics.cost_usd {
         items.push(FormattedMetricItem {
             text: format_cost(cost),
+            color: Color::Success,
+        });
+    } else if has_tokens {
+        items.push(FormattedMetricItem {
+            text: "$0.00".to_string(),
             color: Color::Success,
         });
     }
@@ -3836,9 +3841,6 @@ pub fn format_task_meta_line(task: &AgentTaskSummary) -> String {
         .filter(|s| !s.is_empty())
         .unwrap_or("no profile");
     parts.push(profile.to_string());
-    if let Some(model) = task.model.as_ref().filter(|m| !m.is_empty()) {
-        parts.push(model.to_string());
-    }
     for item in format_metrics_items(task.metrics.as_ref()) {
         parts.push(item.text);
     }
@@ -5354,6 +5356,25 @@ mod tests {
     }
 
     #[test]
+    fn test_format_tokens_tooltip() {
+        let metrics = AgentTaskMetrics {
+            duration_ms: None,
+            input_tokens: Some(5100),
+            output_tokens: Some(1300),
+            cache_read_tokens: Some(15000),
+            cache_creation_tokens: Some(100),
+            total_tokens: None,
+            cost_usd: None,
+            turns_count: None,
+            diff: None,
+        };
+        assert_eq!(
+            format_tokens_tooltip(&metrics),
+            "Tokens: 5.1k in / 1.3k out / 15.1k cache"
+        );
+    }
+
+    #[test]
     fn test_format_task_and_goal_meta_lines() {
         let task_full = AgentTaskSummary {
             id: AgentTaskId::from("TASK-1"),
@@ -5371,7 +5392,7 @@ mod tests {
             metrics: None,
         };
         let meta = format_task_meta_line(&task_full);
-        assert_eq!(meta, "TASK-1 · agent_engineer · claude-3-7-sonnet");
+        assert_eq!(meta, "TASK-1 · agent_engineer");
 
         let goal_meta = format_goal_meta_line("GOAL-1", &AgentGoalStatus::Running, 2, 1, 3, None);
         assert_eq!(goal_meta, "GOAL-1 · 1 / 3 · P2");
@@ -5383,7 +5404,7 @@ mod tests {
 
         assert_eq!(
             format_task_meta_line(&task_full),
-            "TASK-1 · agent_engineer · claude-3-7-sonnet"
+            "TASK-1 · agent_engineer"
         );
         assert_eq!(
             format_goal_meta_line("GOAL-1", &AgentGoalStatus::Completed, 1, 2, 2, None),
@@ -5406,7 +5427,7 @@ mod tests {
         let task_meta_no_diff = format_task_meta_line(&task_with_metrics);
         assert_eq!(
             task_meta_no_diff,
-            "TASK-1 · agent_engineer · claude-3-7-sonnet · 14s · 5.1k/1.3k/15.1k · 1 · $0.04"
+            "TASK-1 · agent_engineer · 14s · 1 · $0.04"
         );
         assert!(!task_meta_no_diff.contains(" ·  · "));
 
@@ -5420,11 +5441,11 @@ mod tests {
         );
         assert_eq!(
             goal_meta_no_diff,
-            "GOAL-10 · 3 / 3 · P1 · 14s · 5.1k/1.3k/15.1k · 1 · $0.04"
+            "GOAL-10 · 3 / 3 · P1 · 14s · 1 · $0.04"
         );
         assert!(!goal_meta_no_diff.contains(" ·  · "));
 
-        let mut metrics_with_diff = sample_metrics;
+        let mut metrics_with_diff = sample_metrics.clone();
         metrics_with_diff.diff = Some(AgentDiffShortstat {
             files_changed: 2,
             insertions: 15,
@@ -5434,7 +5455,7 @@ mod tests {
         let task_meta_with_diff = format_task_meta_line(&task_with_metrics);
         assert_eq!(
             task_meta_with_diff,
-            "TASK-1 · agent_engineer · claude-3-7-sonnet · 14s · 5.1k/1.3k/15.1k · 1 · +15 -4 · $0.04"
+            "TASK-1 · agent_engineer · 14s · 1 · +15 -4 · $0.04"
         );
         assert!(!task_meta_with_diff.contains(" ·  · "));
 
@@ -5448,9 +5469,33 @@ mod tests {
         );
         assert_eq!(
             goal_meta_with_diff,
-            "GOAL-10 · 3 / 3 · P1 · 14s · 5.1k/1.3k/15.1k · 1 · +15 -4 · $0.04"
+            "GOAL-10 · 3 / 3 · P1 · 14s · 1 · +15 -4 · $0.04"
         );
         assert!(!goal_meta_with_diff.contains(" ·  · "));
+
+        let mut metrics_no_cost = sample_metrics;
+        metrics_no_cost.cost_usd = None;
+        task_with_metrics.metrics = Some(metrics_no_cost.clone());
+        let task_meta_no_cost = format_task_meta_line(&task_with_metrics);
+        assert_eq!(
+            task_meta_no_cost,
+            "TASK-1 · agent_engineer · 14s · 1 · $0.00"
+        );
+        assert!(!task_meta_no_cost.contains(" ·  · "));
+
+        let goal_meta_no_cost = format_goal_meta_line(
+            "GOAL-10",
+            &AgentGoalStatus::Running,
+            1,
+            3,
+            3,
+            Some(&metrics_no_cost),
+        );
+        assert_eq!(
+            goal_meta_no_cost,
+            "GOAL-10 · 3 / 3 · P1 · 14s · 1 · $0.00"
+        );
+        assert!(!goal_meta_no_cost.contains(" ·  · "));
     }
 
     #[test]
@@ -5472,7 +5517,7 @@ mod tests {
         };
         assert_eq!(
             format_task_meta_line(&task_no_goal),
-            "TASK-2 · code_mechanic · gemini-2.5-pro"
+            "TASK-2 · code_mechanic"
         );
 
         let task_assignee_fallback = AgentTaskSummary {
@@ -7325,13 +7370,13 @@ mod tests {
         );
         assert_eq!(
             goal_elements.len(),
-            3,
-            "Goal elements should have tokens, diff, and cost, but no duration or turns"
+            2,
+            "Goal elements should have diff and cost, but no duration or turns"
         );
         assert_eq!(
             task_elements.len(),
-            4,
-            "Task elements should have tokens, turns, diff, and cost, but no duration"
+            3,
+            "Task elements should have turns, diff, and cost, but no duration"
         );
 
         let mut sample_metrics_no_diff = sample_metrics.clone();
@@ -7343,7 +7388,7 @@ mod tests {
                 false,
             )
             .len(),
-            2,
+            1,
         );
         assert_eq!(
             render_metrics_elements(
@@ -7352,7 +7397,20 @@ mod tests {
                 true,
             )
             .len(),
-            3,
+            2,
+        );
+
+        let mut sample_metrics_no_cost = sample_metrics.clone();
+        sample_metrics_no_cost.cost_usd = None;
+        assert_eq!(
+            render_metrics_elements(
+                (ElementId::from("diff-stat"), "goal-no-cost").into(),
+                Some(&sample_metrics_no_cost),
+                false,
+            )
+            .len(),
+            2,
+            "Goal elements with tokens but no cost_usd should still render diff and $0.00 cost"
         );
 
         let mut provider_inner = TestProvider::default();
