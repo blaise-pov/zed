@@ -4876,6 +4876,31 @@ impl Thread {
             .any(|suffix| tool_name.ends_with(suffix))
     }
 
+    pub(crate) fn inject_goal_create_session_id(
+        tool_name: &str,
+        input: &mut serde_json::Value,
+        session_id: &str,
+    ) {
+        if !tool_name.ends_with("goal_create") {
+            return;
+        }
+
+        if let serde_json::Value::Object(map) = input {
+            let should_inject = match map.get("session_id") {
+                None | Some(serde_json::Value::Null) => true,
+                Some(serde_json::Value::String(s)) => s.trim().is_empty(),
+                _ => false,
+            };
+
+            if should_inject {
+                map.insert(
+                    "session_id".to_string(),
+                    serde_json::Value::String(session_id.to_string()),
+                );
+            }
+        }
+    }
+
     fn handle_tool_use_event(
         &mut self,
         tool_use: LanguageModelToolUse,
@@ -4914,7 +4939,7 @@ impl Thread {
 
         // Agent tools are JSON-schema tools. Custom text-tool deltas are rejected
         // before considering partial-vs-complete input for these local tools.
-        let input = match tool_use.input.clone().into_json() {
+        let mut input = match tool_use.input.clone().into_json() {
             Ok(input) => input,
             Err(error) => {
                 return Some(Task::ready((
@@ -4931,6 +4956,8 @@ impl Thread {
                 )));
             }
         };
+
+        Self::inject_goal_create_session_id(&tool_use.name, &mut input, &self.id.to_string());
 
         let terminal_task_id =
             Self::extract_terminal_task_id(&tool_use.name, &input, self.task_id.as_deref());
@@ -9811,6 +9838,225 @@ mod tests {
         assert!(!Thread::is_mutating_task_or_goal_tool(
             "mcp__taskgraph__task_query"
         ));
+    }
+
+    #[test]
+    fn test_inject_goal_create_session_id() {
+        // Absent session_id
+        let mut input = json!({"title": "Create goal"});
+        Thread::inject_goal_create_session_id("goal_create", &mut input, "session-123");
+        assert_eq!(input["session_id"], "session-123");
+
+        // Null session_id
+        let mut input = json!({"title": "Create goal", "session_id": null});
+        Thread::inject_goal_create_session_id("goal_create", &mut input, "session-123");
+        assert_eq!(input["session_id"], "session-123");
+
+        // Empty string session_id
+        let mut input = json!({"title": "Create goal", "session_id": ""});
+        Thread::inject_goal_create_session_id("goal_create", &mut input, "session-123");
+        assert_eq!(input["session_id"], "session-123");
+
+        // Whitespace string session_id
+        let mut input = json!({"title": "Create goal", "session_id": "   "});
+        Thread::inject_goal_create_session_id("goal_create", &mut input, "session-123");
+        assert_eq!(input["session_id"], "session-123");
+
+        // Explicit session_id preserved
+        let mut input = json!({"title": "Create goal", "session_id": "existing-session"});
+        Thread::inject_goal_create_session_id("goal_create", &mut input, "session-123");
+        assert_eq!(input["session_id"], "existing-session");
+
+        // MCP prefix
+        let mut input = json!({"title": "Create goal"});
+        Thread::inject_goal_create_session_id(
+            "mcp__taskgraph__goal_create",
+            &mut input,
+            "session-123",
+        );
+        assert_eq!(input["session_id"], "session-123");
+
+        // Non-matching tools
+        let mut input = json!({"title": "Create task"});
+        Thread::inject_goal_create_session_id("task_create", &mut input, "session-123");
+        assert_eq!(input.get("session_id"), None);
+
+        let mut input = json!({"title": "Update goal"});
+        Thread::inject_goal_create_session_id("goal_update", &mut input, "session-123");
+        assert_eq!(input.get("session_id"), None);
+
+        let mut input = json!({"title": "List goals"});
+        Thread::inject_goal_create_session_id(
+            "mcp__taskgraph__goal_list",
+            &mut input,
+            "session-123",
+        );
+        assert_eq!(input.get("session_id"), None);
+
+        // Non-object input is preserved without panicking
+        let mut input = json!("not an object");
+        Thread::inject_goal_create_session_id("goal_create", &mut input, "session-123");
+        assert_eq!(input, json!("not an object"));
+    }
+
+    #[gpui::test]
+    async fn test_thread_goal_create_execution_receives_injected_session_id(
+        cx: &mut TestAppContext,
+    ) {
+        crate::task_worktree::reset_registry_for_tests();
+        crate::agent_task_store::reset_registry_for_tests();
+        let (thread, event_stream, _fake) = setup_thread_for_test(cx).await;
+        let thread_session_id = thread.read_with(cx, |t, _| t.id().to_string());
+
+        struct MockGoalCreateTool {
+            received_inputs: Arc<parking_lot::Mutex<Vec<serde_json::Value>>>,
+        }
+
+        impl AnyAgentTool for MockGoalCreateTool {
+            fn name(&self) -> SharedString {
+                "mcp__taskgraph__goal_create".into()
+            }
+            fn description(&self) -> SharedString {
+                "Create goal".into()
+            }
+            fn kind(&self) -> acp::ToolKind {
+                acp::ToolKind::Execute
+            }
+            fn initial_title(&self, _input: serde_json::Value, _cx: &mut App) -> SharedString {
+                "Creating goal".into()
+            }
+            fn input_schema(&self) -> serde_json::Value {
+                json!({})
+            }
+            fn run(
+                self: Arc<Self>,
+                input: ToolInput<serde_json::Value>,
+                _event_stream: ToolCallEventStream,
+                cx: &mut App,
+            ) -> Task<Result<AgentToolOutput, AgentToolOutput>> {
+                let received = self.received_inputs.clone();
+                cx.spawn(async move |_cx| {
+                    if let Ok(val) = input.recv().await {
+                        received.lock().push(val);
+                    }
+                    Ok(AgentToolOutput {
+                        llm_output: vec![LanguageModelToolResultContent::Text(
+                            "Goal created".into(),
+                        )],
+                        raw_output: json!({"status": "created"}),
+                    })
+                })
+            }
+            fn replay(
+                &self,
+                _input: serde_json::Value,
+                _output: serde_json::Value,
+                _event_stream: ToolCallEventStream,
+                _cx: &mut App,
+            ) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        let received_inputs = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let tool = Arc::new(MockGoalCreateTool {
+            received_inputs: received_inputs.clone(),
+        });
+
+        let mut tools = BTreeMap::new();
+        tools.insert(
+            SharedString::from("mcp__taskgraph__goal_create"),
+            tool.clone() as Arc<dyn AnyAgentTool>,
+        );
+
+        let (cancellation_tx, cancellation_rx) = watch::channel(false);
+        let cancellation_tx = Arc::new(parking_lot::Mutex::new(cancellation_tx));
+        let (retry_now_tx, _retry_now_rx) = watch::channel(());
+        let retry_now_tx = Arc::new(parking_lot::Mutex::new(retry_now_tx));
+        let (watchdog_handle, _activity_rx) = WatchdogHandle::new();
+
+        thread.update(cx, |thread, _cx| {
+            thread.running_turn = Some(RunningTurn::new(
+                thread.id.clone(),
+                event_stream.clone(),
+                tools,
+                cancellation_tx,
+                retry_now_tx,
+                Task::ready(()),
+                Task::ready(()),
+                watchdog_handle,
+            ));
+        });
+
+        // 1. Tool call without session_id: receives injected thread session_id
+        let tool_use_1 = LanguageModelToolUse {
+            id: LanguageModelToolUseId::from("call_goal_create_1"),
+            name: "mcp__taskgraph__goal_create".into(),
+            raw_input: "{\"title\":\"Build feature\"}".into(),
+            input: language_model::LanguageModelToolUseInput::Json(json!({
+                "title": "Build feature"
+            })),
+            is_input_complete: true,
+            thought_signature: None,
+        };
+
+        let task_1 = thread.update(cx, |thread, cx| {
+            thread.handle_tool_use_event(
+                tool_use_1,
+                &event_stream,
+                cancellation_rx.clone(),
+                cx,
+            )
+        });
+
+        let task_1 = task_1.expect("expected task from handle_tool_use_event");
+        let (_msg_ix, result_1) = task_1.await;
+        assert!(!result_1.is_error);
+
+        // 2. Tool call with explicit session_id: preserves explicit session_id
+        let tool_use_2 = LanguageModelToolUse {
+            id: LanguageModelToolUseId::from("call_goal_create_2"),
+            name: "mcp__taskgraph__goal_create".into(),
+            raw_input: "{\"title\":\"Another goal\",\"session_id\":\"explicit-session\"}".into(),
+            input: language_model::LanguageModelToolUseInput::Json(json!({
+                "title": "Another goal",
+                "session_id": "explicit-session"
+            })),
+            is_input_complete: true,
+            thought_signature: None,
+        };
+
+        let task_2 = thread.update(cx, |thread, cx| {
+            thread.handle_tool_use_event(
+                tool_use_2,
+                &event_stream,
+                cancellation_rx,
+                cx,
+            )
+        });
+
+        let task_2 = task_2.expect("expected task from handle_tool_use_event");
+        let (_msg_ix, result_2) = task_2.await;
+        assert!(!result_2.is_error);
+
+        let inputs = received_inputs.lock().clone();
+        assert_eq!(inputs.len(), 2);
+        assert_eq!(
+            inputs[0].get("session_id").and_then(|v| v.as_str()),
+            Some(thread_session_id.as_str())
+        );
+        assert_eq!(
+            inputs[0].get("title").and_then(|v| v.as_str()),
+            Some("Build feature")
+        );
+        assert_eq!(
+            inputs[1].get("session_id").and_then(|v| v.as_str()),
+            Some("explicit-session")
+        );
+        assert_eq!(
+            inputs[1].get("title").and_then(|v| v.as_str()),
+            Some("Another goal")
+        );
     }
 
     #[gpui::test]
