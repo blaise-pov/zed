@@ -32,6 +32,7 @@ description: >-
       }
   });
   ```
+* Do not hardcode ecosystem- or toolchain-specific assumptions (e.g., build output directories like `target/`, package caches like `node_modules/`, or compiler flags) into generic logic. Resolve them dynamically from project manifests, configuration, `.gitignore`, or environment detectors.
 
 ## Build
 
