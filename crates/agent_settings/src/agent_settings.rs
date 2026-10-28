@@ -425,7 +425,7 @@ impl SpawnStepTimeoutSettings {
     }
 }
 
-pub const DEFAULT_TASK_WORKTREE_RETENTION_TIMEOUT_SECONDS: u64 = 1800;
+pub const DEFAULT_TASK_WORKTREE_RETENTION_TIMEOUT_SECONDS: u64 = 0;
 pub const MIN_TASK_WORKTREE_RETENTION_TIMEOUT_SECONDS: u64 = 60;
 
 /// Clamps a configured task worktree retention timeout in seconds to a `Duration`.
@@ -433,7 +433,7 @@ pub const MIN_TASK_WORKTREE_RETENTION_TIMEOUT_SECONDS: u64 = 60;
 /// A value of 0 disables the retention window (returns `Duration::ZERO`).
 /// Values between 1 and 59 seconds are below the minimum of 60 seconds and will be clamped to 60 seconds with a warning.
 /// Values 60 seconds and above are preserved.
-/// `None` defaults to `DEFAULT_TASK_WORKTREE_RETENTION_TIMEOUT_SECONDS` (1800 seconds).
+/// `None` defaults to `DEFAULT_TASK_WORKTREE_RETENTION_TIMEOUT_SECONDS` (0 seconds).
 pub fn clamp_task_worktree_retention_timeout_seconds(value: Option<u64>) -> Duration {
     match value {
         Some(0) => Duration::ZERO,
@@ -627,7 +627,7 @@ pub struct AgentSettings {
     /// A value of 0 disables the retention window (returns Duration::ZERO).
     /// Values between 1 and 59 seconds are below the minimum of 60 seconds and will be clamped to 60 seconds.
     ///
-    /// Default: 1800 (30 minutes)
+    /// Default: 0
     pub task_worktree_retention_timeout_seconds: Duration,
 }
 
@@ -1489,8 +1489,8 @@ impl Settings for AgentSettings {
             goal_graduation_base_branch: agent
                 .goal_graduation_base_branch
                 .filter(|branch| !branch.trim().is_empty()),
-            task_worktree_retention_timeout_seconds: Duration::from_secs(
-                DEFAULT_TASK_WORKTREE_RETENTION_TIMEOUT_SECONDS,
+            task_worktree_retention_timeout_seconds: clamp_task_worktree_retention_timeout_seconds(
+                agent.task_worktree_retention_timeout_seconds,
             ),
         }
     }
@@ -1806,6 +1806,10 @@ mod tests {
             settings.turn_watchdog_seconds,
             Duration::from_secs(DEFAULT_TURN_WATCHDOG_SECONDS)
         );
+        assert_eq!(
+            settings.task_worktree_retention_timeout_seconds,
+            Duration::from_secs(DEFAULT_TASK_WORKTREE_RETENTION_TIMEOUT_SECONDS)
+        );
 
         SettingsStore::update_global(cx, |store, cx| {
             store
@@ -1819,7 +1823,8 @@ mod tests {
                                 "diff": 45
                             },
                             "send_watchdog_seconds": 0,
-                            "turn_watchdog_seconds": 2
+                            "turn_watchdog_seconds": 2,
+                            "task_worktree_retention_timeout_seconds": 90
                         }
                     }"#,
                     cx,
@@ -1843,6 +1848,10 @@ mod tests {
         );
         assert_eq!(settings.send_watchdog_seconds, Duration::ZERO);
         assert_eq!(settings.turn_watchdog_seconds, Duration::from_secs(5));
+        assert_eq!(
+            settings.task_worktree_retention_timeout_seconds,
+            Duration::from_secs(90)
+        );
     }
 
     #[test]
@@ -1964,6 +1973,10 @@ mod tests {
             Duration::from_secs(DEFAULT_TASK_WORKTREE_RETENTION_TIMEOUT_SECONDS)
         );
         assert_eq!(
+            clamp_task_worktree_retention_timeout_seconds(None),
+            Duration::ZERO
+        );
+        assert_eq!(
             clamp_task_worktree_retention_timeout_seconds(Some(0)),
             Duration::ZERO
         );
@@ -1984,6 +1997,44 @@ mod tests {
         assert_eq!(
             clamp_task_worktree_retention_timeout_seconds(Some(3600)),
             Duration::from_secs(3600)
+        );
+    }
+
+    #[test]
+    fn test_task_worktree_retention_timeout_seconds_parse_from_json() {
+        let custom: settings::AgentSettingsContent =
+            serde_json::from_str(r#"{"task_worktree_retention_timeout_seconds": 120}"#).unwrap();
+        assert_eq!(
+            clamp_task_worktree_retention_timeout_seconds(
+                custom.task_worktree_retention_timeout_seconds
+            ),
+            Duration::from_secs(120)
+        );
+
+        let zero: settings::AgentSettingsContent =
+            serde_json::from_str(r#"{"task_worktree_retention_timeout_seconds": 0}"#).unwrap();
+        assert_eq!(
+            clamp_task_worktree_retention_timeout_seconds(
+                zero.task_worktree_retention_timeout_seconds
+            ),
+            Duration::ZERO
+        );
+
+        let clamped: settings::AgentSettingsContent =
+            serde_json::from_str(r#"{"task_worktree_retention_timeout_seconds": 30}"#).unwrap();
+        assert_eq!(
+            clamp_task_worktree_retention_timeout_seconds(
+                clamped.task_worktree_retention_timeout_seconds
+            ),
+            Duration::from_secs(60)
+        );
+
+        let omitted: settings::AgentSettingsContent = serde_json::from_str(r#"{}"#).unwrap();
+        assert_eq!(
+            clamp_task_worktree_retention_timeout_seconds(
+                omitted.task_worktree_retention_timeout_seconds
+            ),
+            Duration::ZERO
         );
     }
 
