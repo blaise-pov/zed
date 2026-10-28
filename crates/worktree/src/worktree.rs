@@ -5695,6 +5695,19 @@ impl BackgroundScanner {
         abs_paths: Vec<PathBuf>,
         scan_queue_tx: Option<Sender<ScanJob>>,
     ) {
+        let (relative_paths, abs_paths): (Vec<_>, Vec<_>) = relative_paths
+            .iter()
+            .cloned()
+            .zip(abs_paths)
+            .filter(|(rel_path, _)| {
+                rel_path.is_empty() || !self.settings.is_path_excluded(rel_path)
+            })
+            .unzip();
+
+        if relative_paths.is_empty() {
+            return;
+        }
+
         // grab metadata for all requested paths
         let metadata = futures::future::join_all(
             abs_paths
@@ -7463,9 +7476,10 @@ mod tests {
     use collections::{HashMap, HashSet};
     use fs::{FakeFs, Fs, RemoveOptions, RenameOptions};
     use futures::{FutureExt as _, channel::mpsc};
-    use gpui::TestAppContext;
+    use gpui::{BorrowAppContext, TestAppContext};
+    use postage::stream::Stream;
     use serde_json::json;
-    use settings::{SettingsStore, WorktreeId};
+    use settings::{SettingsStore, SplicingVec, WorktreeId};
     use smallvec::SmallVec;
     use std::{path::Path, sync::Arc};
     use text::LineEnding;
@@ -7772,5 +7786,82 @@ mod tests {
         let wrapped_transient_error =
             anyhow::Error::new(io::Error::from_raw_os_error(2)).context("wrapped context");
         assert!(is_transient_scan_error(&wrapped_transient_error));
+    }
+
+    #[gpui::test]
+    async fn test_refresh_entries_for_paths_filters_excluded_paths(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            cx.update_global::<SettingsStore, _>(|store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings.project.worktree.file_scan_exclusions = Some(SplicingVec::from(vec![
+                        "**/excluded/**".to_string(),
+                        "**/excluded".to_string(),
+                    ]));
+                });
+            });
+        });
+
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree(
+            path!("/root"),
+            json!({
+                "included.txt": "content",
+                "excluded": {
+                    "file.txt": "locked"
+                }
+            }),
+        )
+        .await;
+
+        let tree = Worktree::local(
+            Path::new(path!("/root")),
+            true,
+            fs.clone(),
+            Arc::default(),
+            true,
+            WorktreeId::from_proto(0),
+            &mut cx.to_async(),
+        )
+        .await
+        .unwrap();
+
+        tree.read_with(cx, |tree, _| tree.as_local().unwrap().scan_complete())
+            .await;
+
+        tree.read_with(cx, |tree, _| {
+            assert!(tree.entry_for_path(rel_path("included.txt")).is_some());
+            assert!(tree.entry_for_path(rel_path("excluded")).is_none());
+            assert!(tree.entry_for_path(rel_path("excluded/file.txt")).is_none());
+        });
+
+        let mut refresh = tree.update(cx, |tree, _| {
+            tree.as_local().unwrap().refresh_entries_for_paths(vec![
+                rel_path("").into_arc(),
+                rel_path("excluded/file.txt").into_arc(),
+                rel_path("included.txt").into_arc(),
+            ])
+        });
+        refresh.recv().await;
+
+        tree.read_with(cx, |tree, _| {
+            assert!(
+                tree.entry_for_path(rel_path("excluded/file.txt")).is_none(),
+                "excluded path should not get a snapshot entry"
+            );
+            assert!(
+                tree.entry_for_path(rel_path("excluded")).is_none(),
+                "excluded dir should not get a snapshot entry"
+            );
+            assert!(
+                tree.entry_for_path(rel_path("included.txt")).is_some(),
+                "included path should have a snapshot entry"
+            );
+            assert!(
+                tree.entry_for_path(rel_path("")).is_some(),
+                "root path should never be filtered"
+            );
+        });
     }
 }
