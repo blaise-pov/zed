@@ -1,7 +1,8 @@
 use crate::{CommonAnimationExt, DiffStat, GradientFade, HighlightedLabel, Tooltip, prelude::*};
 
 use gpui::{
-    Animation, AnimationExt, ClickEvent, Hsla, MouseButton, SharedString, Styled,
+    Styled,
+    Animation, AnimationExt, ClickEvent, Hsla, MouseButton, SharedString,
     WindowBackgroundAppearance, pulsating_between,
 };
 use itertools::Itertools as _;
@@ -274,9 +275,7 @@ impl ThreadItem {
 /// (up to the last colon if no slash or after the last separator).
 pub fn strip_model_provider(name: &str) -> &str {
     let after_slash = name.rsplit_once('/').map_or(name, |(_, model)| model);
-    after_slash
-        .rsplit_once(':')
-        .map_or(after_slash, |(_, model)| model)
+    after_slash.rsplit_once(':').map_or(after_slash, |(_, model)| model)
 }
 
 impl RenderOnce for ThreadItem {
@@ -440,11 +439,29 @@ impl RenderOnce for ThreadItem {
             AgentThreadStatus::Error | AgentThreadStatus::WaitingForConfirmation
         );
 
-        let worktree_chips: Vec<ThreadItemWorktreeInfo> = self
+        let mut worktree_chips: Vec<ThreadItemWorktreeInfo> = self
             .worktrees
-            .into_iter()
-            .filter(|wt| wt.kind == WorktreeKind::Linked && wt.worktree_name.is_some())
+            .iter()
+            .filter(|wt| wt.kind == WorktreeKind::Linked)
+            .filter(|wt| wt.worktree_name.is_some() || wt.branch_name.is_some())
+            .cloned()
             .collect();
+
+        if worktree_chips.is_empty() {
+            if let Some(main_wt) = self
+                .worktrees
+                .iter()
+                .find(|wt| wt.kind == WorktreeKind::Main && wt.branch_name.is_some())
+            {
+                worktree_chips.push(ThreadItemWorktreeInfo {
+                    worktree_name: None,
+                    branch_name: main_wt.branch_name.clone(),
+                    full_path: main_wt.full_path.clone(),
+                    highlight_positions: Vec::new(),
+                    kind: WorktreeKind::Main,
+                });
+            }
+        }
 
         let has_worktree = !worktree_chips.is_empty();
         let has_worktree_section = has_project_name || has_project_paths || has_worktree;
@@ -456,21 +473,24 @@ impl RenderOnce for ThreadItem {
         let mut metadata_segments: Vec<AnyElement> = Vec::new();
 
         if let Some(agent_name) = self.agent_name.filter(|s| !s.is_empty()) {
-            metadata_segments.push(
-                h_flex()
-                    .min_w_0()
-                    .flex_shrink(1.0)
-                    .child(
-                        Label::new(agent_name)
-                            .size(LabelSize::Small)
-                            .color(Color::Muted)
-                            .truncate(),
-                    )
-                    .into_any_element(),
-            );
-        }
+            let mut agent_container = div()
+                .id((self.id.clone(), "thread-item-agent"))
+                .child(
+                    Label::new(agent_name)
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                );
 
-        if let Some(model_name) = self.model_name.filter(|s| !s.is_empty()) {
+            if let Some(model_name) = self.model_name.as_ref().filter(|s| !s.is_empty()) {
+                let model_name = strip_model_provider(model_name);
+                if !model_name.is_empty() {
+                    agent_container = agent_container
+                        .tooltip(Tooltip::text(format!("Model: {model_name}")));
+                }
+            }
+
+            metadata_segments.push(agent_container.into_any_element());
+        } else if let Some(model_name) = self.model_name.filter(|s| !s.is_empty()) {
             let model_name = strip_model_provider(&model_name);
             if !model_name.is_empty() {
                 metadata_segments.push(
@@ -480,8 +500,7 @@ impl RenderOnce for ThreadItem {
                         .child(
                             Label::new(model_name)
                                 .size(LabelSize::Small)
-                                .color(Color::Muted)
-                                .truncate(),
+                                .color(Color::Muted),
                         )
                         .into_any_element(),
                 );
@@ -493,46 +512,88 @@ impl RenderOnce for ThreadItem {
                 .min_w_0()
                 .gap_1p5()
                 .when_some(self.project_name, |this, name| {
-                    this.child(Label::new(name).size(LabelSize::Small).color(Color::Muted))
+                    this.child(
+                        Label::new(name).size(LabelSize::Small).color(Color::Muted),
+                    )
                 })
                 .when(
                     has_project_name && (has_project_paths || has_worktree),
                     |this| this.child(dot_separator()),
                 )
                 .when_some(project_paths, |this, paths| {
-                    this.child(Label::new(paths).size(LabelSize::Small).color(Color::Muted))
+                    this.child(
+                        Label::new(paths)
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    )
                 })
                 .when(has_project_paths && has_worktree, |this| {
                     this.child(dot_separator())
                 })
-                .children(worktree_chips.into_iter().filter_map(|wt| {
-                    let name = wt.worktree_name?;
-                    let worktree_label = if wt.highlight_positions.is_empty() {
-                        Label::new(name)
-                            .size(LabelSize::Small)
-                            .color(Color::Muted)
-                            .truncate()
-                            .into_any_element()
-                    } else {
-                        HighlightedLabel::new(name, wt.highlight_positions)
-                            .size(LabelSize::Small)
-                            .color(Color::Muted)
-                            .truncate()
-                            .into_any_element()
-                    };
+                .children(
+                    worktree_chips.into_iter().map(|wt| {
+                        let worktree_label = wt.worktree_name.clone().map(|name| {
+                            if wt.highlight_positions.is_empty() {
+                                Label::new(name)
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted)
+                                    .truncate()
+                                    .into_any_element()
+                            } else {
+                                HighlightedLabel::new(
+                                    name,
+                                    wt.highlight_positions.clone(),
+                                )
+                                .size(LabelSize::Small)
+                                .color(Color::Muted)
+                                .truncate()
+                                .into_any_element()
+                            }
+                        });
 
-                    Some(
+                        let chip_icon = if wt.worktree_name.is_none()
+                            && wt.branch_name.is_some()
+                        {
+                            IconName::GitBranch
+                        } else {
+                            IconName::GitWorktree
+                        };
+
+                        let branch_label = wt.branch_name.map(|branch| {
+                            Label::new(branch)
+                                .size(LabelSize::Small)
+                                .color(Color::Muted)
+                                .truncate()
+                                .into_any_element()
+                        });
+
+                        let show_separator =
+                            worktree_label.is_some() && branch_label.is_some();
+
                         h_flex()
                             .min_w_0()
                             .gap_0p5()
                             .child(
-                                Icon::new(IconName::GitWorktree)
+                                Icon::new(chip_icon)
                                     .size(IconSize::XSmall)
                                     .color(Color::Muted),
                             )
-                            .child(worktree_label),
-                    )
-                }));
+                            .when_some(worktree_label, |this, label| {
+                                this.child(label)
+                            })
+                            .when(show_separator, |this| {
+                                this.child(
+                                    Label::new("/")
+                                        .size(LabelSize::Small)
+                                        .color(separator_color)
+                                        .flex_shrink_0(),
+                                )
+                            })
+                            .when_some(branch_label, |this, label| {
+                                this.child(label)
+                            })
+                    }),
+                );
             metadata_segments.push(worktree_section.into_any_element());
         }
 
@@ -546,7 +607,11 @@ impl RenderOnce for ThreadItem {
                     } else {
                         format!("{} files", files_changed_count)
                     };
-                    this.child(Label::new(label).size(LabelSize::Small).color(Color::Muted))
+                    this.child(
+                        Label::new(label)
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    )
                 })
                 .when(has_diff_stats, |this| {
                     this.child(DiffStat::new(diff_stat_id, added_count, removed_count))
@@ -624,9 +689,9 @@ impl RenderOnce for ThreadItem {
                     .child(icon_container()) // Icon Spacing
                     .when(self.archived, |this| {
                         this.child(
-                            Icon::new(IconName::Archive)
-                                .size(IconSize::XSmall)
-                                .color(Color::Custom(cx.theme().colors().icon_muted.opacity(0.5))),
+                            Icon::new(IconName::Archive).size(IconSize::XSmall).color(
+                                Color::Custom(cx.theme().colors().icon_muted.opacity(0.5)),
+                            ),
                         )
                     });
 
@@ -639,17 +704,20 @@ impl RenderOnce for ThreadItem {
                     first = false;
                 }
 
-                this.child(h_flex().w_full().justify_between().child(left).when(
-                    has_timestamp,
-                    |this| {
-                        this.child(
-                            Label::new(timestamp)
-                                .size(LabelSize::Small)
-                                .color(Color::Muted)
-                                .flex_shrink_0(),
-                        )
-                    },
-                ))
+                this.child(
+                    h_flex()
+                        .w_full()
+                        .justify_between()
+                        .child(left)
+                        .when(has_timestamp, |this| {
+                            this.child(
+                                Label::new(timestamp)
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted)
+                                    .flex_shrink_0(),
+                            )
+                        }),
+                )
             })
             .when(show_tooltip, |this| {
                 let status = self.status;
@@ -794,17 +862,17 @@ impl Component for ThreadItem {
                     .into_any_element(),
             ),
             single_example(
-                "Worktree + Changes + Timestamp (alternative)",
+                "Worktree + Branch + Changes + Timestamp",
                 container()
                     .child(
-                        ThreadItem::new("ti-5c", "Full metadata example")
+                        ThreadItem::new("ti-5c", "Full metadata with branch")
                             .icon(IconName::AiClaude)
                             .worktrees(vec![ThreadItemWorktreeInfo {
                                 worktree_name: Some("my-project".into()),
                                 full_path: "/worktrees/my-project/zed".into(),
                                 highlight_positions: Vec::new(),
                                 kind: WorktreeKind::Linked,
-                                branch_name: None,
+                                branch_name: Some("feature-branch".into()),
                             }])
                             .added(42)
                             .removed(17)
@@ -813,17 +881,17 @@ impl Component for ThreadItem {
                     .into_any_element(),
             ),
             single_example(
-                "Long Worktree Name + Changes (truncation)",
+                "Long Branch + Changes (truncation)",
                 container()
                     .child(
-                        ThreadItem::new("ti-5d", "Metadata overflow with long worktree name")
+                        ThreadItem::new("ti-5d", "Metadata overflow with long branch name")
                             .icon(IconName::AiClaude)
                             .worktrees(vec![ThreadItemWorktreeInfo {
-                                worktree_name: Some("fix-very-long-worktree-name-here".into()),
+                                worktree_name: Some("my-project".into()),
                                 full_path: "/worktrees/my-project/zed".into(),
                                 highlight_positions: Vec::new(),
                                 kind: WorktreeKind::Linked,
-                                branch_name: None,
+                                branch_name: Some("fix-very-long-branch-name-here".into()),
                             }])
                             .added(108)
                             .removed(53)
@@ -841,11 +909,11 @@ impl Component for ThreadItem {
                             .agent_name(Some("agent_engineer".into()))
                             .model_name(Some("glm-5.3".into()))
                             .worktrees(vec![ThreadItemWorktreeInfo {
-                                worktree_name: Some("zed".into()),
+                                worktree_name: None,
                                 full_path: "/projects/zed".into(),
                                 highlight_positions: Vec::new(),
-                                kind: WorktreeKind::Linked,
-                                branch_name: None,
+                                kind: WorktreeKind::Main,
+                                branch_name: Some("main".into()),
                             }])
                             .files_changed(Some(1))
                             .added(65)
@@ -854,7 +922,7 @@ impl Component for ThreadItem {
                     .into_any_element(),
             ),
             single_example(
-                "Main Worktree (hidden) + Changes + Timestamp",
+                "Main Worktree Branch + Changes + Timestamp",
                 container()
                     .child(
                         ThreadItem::new("ti-5e", "Main worktree branch with diff stats")
@@ -864,7 +932,7 @@ impl Component for ThreadItem {
                                 full_path: "/projects/zed".into(),
                                 highlight_positions: Vec::new(),
                                 kind: WorktreeKind::Main,
-                                branch_name: None,
+                                branch_name: Some("sidebar-show-branch-name".into()),
                             }])
                             .added(23)
                             .removed(8)
@@ -902,7 +970,7 @@ impl Component for ThreadItem {
                                 full_path: "/worktrees/jade-glen/zed".into(),
                                 highlight_positions: vec![0, 1, 2, 3],
                                 kind: WorktreeKind::Linked,
-                                branch_name: None,
+                                branch_name: Some("fix-scrolling".into()),
                             }])
                             .timestamp("3d"),
                     )
@@ -935,10 +1003,10 @@ impl Component for ThreadItem {
                     .into_any_element(),
             ),
             single_example(
-                "Multiple Worktrees",
+                "Multiple Worktrees with Branches",
                 container()
                     .child(
-                        ThreadItem::new("ti-5i", "Multi-root with per-worktree chips")
+                        ThreadItem::new("ti-5i", "Multi-root with per-worktree branches")
                             .icon(IconName::ZedAgent)
                             .worktrees(vec![
                                 ThreadItemWorktreeInfo {
@@ -946,14 +1014,14 @@ impl Component for ThreadItem {
                                     full_path: "/worktrees/jade-glen/zed".into(),
                                     highlight_positions: Vec::new(),
                                     kind: WorktreeKind::Linked,
-                                    branch_name: None,
+                                    branch_name: Some("fix".into()),
                                 },
                                 ThreadItemWorktreeInfo {
                                     worktree_name: Some("fawn-otter".into()),
                                     full_path: "/worktrees/fawn-otter/zed-slides".into(),
                                     highlight_positions: Vec::new(),
                                     kind: WorktreeKind::Linked,
-                                    branch_name: None,
+                                    branch_name: Some("main".into()),
                                 },
                             ])
                             .timestamp("15m"),
@@ -961,7 +1029,7 @@ impl Component for ThreadItem {
                     .into_any_element(),
             ),
             single_example(
-                "Project Name + Worktree",
+                "Project Name + Worktree + Branch",
                 container()
                     .child(
                         ThreadItem::new("ti-5j", "Thread with project context")
@@ -972,7 +1040,7 @@ impl Component for ThreadItem {
                                 full_path: "/worktrees/jade-glen/zed".into(),
                                 highlight_positions: Vec::new(),
                                 kind: WorktreeKind::Linked,
-                                branch_name: None,
+                                branch_name: Some("feature-branch".into()),
                             }])
                             .timestamp("1d"),
                     )
@@ -993,7 +1061,7 @@ impl Component for ThreadItem {
                                 full_path: "/worktrees/jade-glen/zed".into(),
                                 highlight_positions: Vec::new(),
                                 kind: WorktreeKind::Linked,
-                                branch_name: None,
+                                branch_name: Some("feature".into()),
                             }])
                             .timestamp("2mo"),
                     )
@@ -1011,7 +1079,7 @@ impl Component for ThreadItem {
                                 full_path: "/worktrees/my-worktree/zed".into(),
                                 highlight_positions: Vec::new(),
                                 kind: WorktreeKind::Linked,
-                                branch_name: None,
+                                branch_name: Some("main".into()),
                             }])
                             .added(15)
                             .removed(4)
@@ -1057,6 +1125,7 @@ impl Component for ThreadItem {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gpui::TestAppContext;
 
     #[test]
     fn test_strip_model_provider() {
@@ -1072,7 +1141,10 @@ mod tests {
             strip_model_provider("anthropic:claude-3.7-sonnet"),
             "claude-3.7-sonnet"
         );
-        assert_eq!(strip_model_provider("provider:subprovider:model"), "model");
+        assert_eq!(
+            strip_model_provider("provider:subprovider:model"),
+            "model"
+        );
         assert_eq!(
             strip_model_provider("openrouter/anthropic:claude-3.7-sonnet"),
             "claude-3.7-sonnet"
@@ -1082,5 +1154,74 @@ mod tests {
             "claude-3-7-sonnet"
         );
         assert_eq!(strip_model_provider(""), "");
+    }
+
+    #[gpui::test]
+    async fn test_thread_item_agent_and_model_metadata(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+
+        // 1. Both agent_name and model_name present
+        let (_view, cx) = cx.add_window_view(|_, _| {
+            TestItemWrapper(
+                ThreadItem::new("thread-1", "Thread Title")
+                    .agent_name(Some("agent_engineer".into()))
+                    .model_name(Some("anthropic/claude-3-5-sonnet".into())),
+            )
+        });
+        cx.run_until_parked();
+
+        // 2. Fallback: agent_name absent, model_name present
+        let (_view, cx) = cx.add_window_view(|_, _| {
+            TestItemWrapper(
+                ThreadItem::new("thread-2", "Thread Title")
+                    .model_name(Some("anthropic/claude-3-5-sonnet".into())),
+            )
+        });
+        cx.run_until_parked();
+
+        // 3. Fallback: agent_name empty, model_name present
+        let (_view, cx) = cx.add_window_view(|_, _| {
+            TestItemWrapper(
+                ThreadItem::new("thread-3", "Thread Title")
+                    .agent_name(Some("".into()))
+                    .model_name(Some("anthropic/claude-3-5-sonnet".into())),
+            )
+        });
+        cx.run_until_parked();
+
+        // 4. agent_name present, model_name empty
+        let (_view, cx) = cx.add_window_view(|_, _| {
+            TestItemWrapper(
+                ThreadItem::new("thread-4", "Thread Title")
+                    .agent_name(Some("agent_engineer".into()))
+                    .model_name(Some("".into())),
+            )
+        });
+        cx.run_until_parked();
+
+        // 5. agent_name present, model_name None
+        let (_view, cx) = cx.add_window_view(|_, _| {
+            TestItemWrapper(
+                ThreadItem::new("thread-5", "Thread Title")
+                    .agent_name(Some("agent_engineer".into())),
+            )
+        });
+        cx.run_until_parked();
+    }
+
+    struct TestItemWrapper(ThreadItem);
+
+    impl Render for TestItemWrapper {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            // Reconstruct a thread item to render
+            std::mem::replace(
+                &mut self.0,
+                ThreadItem::new("dummy", "Dummy"),
+            )
+        }
     }
 }
