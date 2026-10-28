@@ -2175,6 +2175,32 @@ impl AgentTaskPanel {
                 (done, total)
             };
 
+            let worktree_tasks = {
+                let snapshot = self.worktree_status.read(cx).snapshot();
+                let store = self.store.read(cx);
+                let mut tasks: Vec<String> = store
+                    .graph()
+                    .tasks
+                    .iter()
+                    .filter(|t| {
+                        t.goal_id.as_deref() == Some(&goal_id)
+                            && snapshot
+                                .and_then(|s| s.tasks.get(&t.id))
+                                .is_some_and(|state| state.exists_on_disk)
+                    })
+                    .map(|t| {
+                        if t.id.starts_with("TASK-") {
+                            t.id.to_string()
+                        } else {
+                            format!("TASK-{}", t.id)
+                        }
+                    })
+                    .collect();
+                tasks.sort();
+                tasks.dedup();
+                tasks
+            };
+
             let goal_status = group
                 .goal_summary
                 .as_ref()
@@ -2393,6 +2419,27 @@ impl AgentTaskPanel {
                                         .into_any_element()
                                 } else {
                                     div().w_4().h_4().flex_shrink_0().into_any_element()
+                                })
+                                .when(!worktree_tasks.is_empty(), |this| {
+                                    this.child(
+                                        div()
+                                            .id(SharedString::from(format!(
+                                                "goal-worktree-icon-{}",
+                                                goal_id
+                                            )))
+                                            .debug_selector({
+                                                let goal_id = goal_id.clone();
+                                                move || format!("goal-worktree-icon-{}", goal_id)
+                                            })
+                                            .child(
+                                                Icon::new(IconName::GitWorktree)
+                                                    .size(IconSize::Small)
+                                                    .color(Color::Muted),
+                                            )
+                                            .tooltip(Tooltip::text(format_goal_worktree_tooltip(
+                                                &worktree_tasks,
+                                            ))),
+                                    )
                                 })
                                 .child({
                                     let goal_label = if goal_id.starts_with("GOAL-") {
@@ -2944,6 +2991,14 @@ pub fn format_tokens_tooltip(metrics: &AgentTaskMetrics) -> String {
         metrics.cache_read_tokens.unwrap_or(0) + metrics.cache_creation_tokens.unwrap_or(0),
     );
     format!("Tokens: {in_tok} in / {out_tok} out / {cache_tok} cache")
+}
+
+pub fn format_goal_worktree_tooltip(tasks: &[String]) -> String {
+    if tasks.len() == 1 {
+        format!("1 worktree on disk: {}", tasks[0])
+    } else {
+        format!("{} worktrees on disk: {}", tasks.len(), tasks.join(", "))
+    }
 }
 
 pub fn render_metrics_elements(
@@ -7528,6 +7583,199 @@ mod tests {
         assert!(
             cx.debug_bounds("task-worktree-icon-TASK-1").is_none(),
             "Worktree icon should disappear when exists_on_disk becomes false"
+        );
+    }
+
+    #[test]
+    fn test_format_goal_worktree_tooltip() {
+        let single = vec!["TASK-10".to_string()];
+        assert_eq!(
+            format_goal_worktree_tooltip(&single),
+            "1 worktree on disk: TASK-10"
+        );
+
+        let multiple = vec!["TASK-10".to_string(), "TASK-11".to_string()];
+        assert_eq!(
+            format_goal_worktree_tooltip(&multiple),
+            "2 worktrees on disk: TASK-10, TASK-11"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_agent_task_panel_goal_worktree_icon(cx: &mut TestAppContext) {
+        init_test(cx);
+        let file_system = FakeFs::new(cx.executor());
+        let project = Project::test(file_system.clone(), [], cx).await;
+
+        let provider = Arc::new(TestProvider {
+            goals: vec![AgentGoalSummary {
+                goal_id: "GOAL-1".to_string(),
+                title: "Goal 1".to_string(),
+                status: AgentGoalStatus::Running,
+                priority: 1,
+                tasks_total: 2,
+                tasks_done: 0,
+                created_at: Some(10),
+                metrics: None,
+                session_id: None,
+            }],
+            tasks: vec![
+                AgentTaskSummary {
+                    id: AgentTaskId::from("TASK-10"),
+                    parent_id: None,
+                    goal_id: Some("GOAL-1".to_string()),
+                    title: "Task 10".to_string(),
+                    status: AgentTaskStatus::Running,
+                    attempt: 1,
+                    assignee: None,
+                    write_scopes: vec![],
+                    created_at: Some(10),
+                    assigned_profile: None,
+                    model: None,
+                    session_id: None,
+                    metrics: None,
+                },
+                AgentTaskSummary {
+                    id: AgentTaskId::from("TASK-11"),
+                    parent_id: None,
+                    goal_id: Some("GOAL-1".to_string()),
+                    title: "Task 11".to_string(),
+                    status: AgentTaskStatus::Running,
+                    attempt: 1,
+                    assignee: None,
+                    write_scopes: vec![],
+                    created_at: Some(20),
+                    assigned_profile: None,
+                    model: None,
+                    session_id: None,
+                    metrics: None,
+                },
+            ],
+            ..Default::default()
+        });
+        let store = cx.update(|cx| cx.new(|cx| AgentTaskStore::new(provider, cx)));
+
+        let (panel, cx) = cx.add_window_view(|_window, cx| {
+            AgentTaskPanel::new(
+                store,
+                WeakEntity::new_invalid(),
+                project.clone(),
+                file_system.clone(),
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        // 1. Goal meta is rendered, but initially exists_on_disk is false: goal worktree icon is absent from DOM
+        cx.debug_bounds("goal-meta-GOAL-1")
+            .expect("goal-meta should be rendered");
+        assert!(
+            cx.debug_bounds("goal-worktree-icon-GOAL-1").is_none(),
+            "Goal worktree icon should not be present when exists_on_disk is false"
+        );
+
+        // 2. Update snapshot to exists_on_disk = true for TASK-10
+        panel.update(cx, |panel, cx| {
+            panel.worktree_status.update(cx, |status, cx| {
+                let mut snap = TaskGitSnapshot::default();
+                snap.tasks.insert(
+                    AgentTaskId::from("TASK-10"),
+                    TaskGitState {
+                        worktree_path: std::path::PathBuf::from("/fake/task-10"),
+                        exists_on_disk: true,
+                        branch: Some("agent-task/TASK-10".to_string()),
+                        branch_exists: true,
+                        retention_reason: None,
+                    },
+                );
+                status.set_snapshot_for_test(snap, cx);
+            });
+        });
+        cx.run_until_parked();
+
+        // Icon is now displayed before GOAL-1 in goal-meta-GOAL-1
+        assert!(
+            cx.debug_bounds("goal-worktree-icon-GOAL-1").is_some(),
+            "Goal worktree icon should be present when task exists_on_disk is true"
+        );
+
+        let icon_bounds = cx
+            .debug_bounds("goal-worktree-icon-GOAL-1")
+            .expect("goal worktree icon should be present");
+        let meta_bounds = cx
+            .debug_bounds("goal-meta-GOAL-1")
+            .expect("goal-meta should be present");
+        assert!(
+            icon_bounds.top() >= meta_bounds.top() && icon_bounds.bottom() <= meta_bounds.bottom(),
+            "Goal worktree icon should be rendered inside goal-meta row"
+        );
+
+        // Also test with multiple tasks having worktrees on disk
+        panel.update(cx, |panel, cx| {
+            panel.worktree_status.update(cx, |status, cx| {
+                let mut snap = TaskGitSnapshot::default();
+                snap.tasks.insert(
+                    AgentTaskId::from("TASK-10"),
+                    TaskGitState {
+                        worktree_path: std::path::PathBuf::from("/fake/task-10"),
+                        exists_on_disk: true,
+                        branch: Some("agent-task/TASK-10".to_string()),
+                        branch_exists: true,
+                        retention_reason: None,
+                    },
+                );
+                snap.tasks.insert(
+                    AgentTaskId::from("TASK-11"),
+                    TaskGitState {
+                        worktree_path: std::path::PathBuf::from("/fake/task-11"),
+                        exists_on_disk: true,
+                        branch: Some("agent-task/TASK-11".to_string()),
+                        branch_exists: true,
+                        retention_reason: None,
+                    },
+                );
+                status.set_snapshot_for_test(snap, cx);
+            });
+        });
+        cx.run_until_parked();
+
+        assert!(
+            cx.debug_bounds("goal-worktree-icon-GOAL-1").is_some(),
+            "Goal worktree icon should be present with multiple tasks on disk"
+        );
+
+        // 3. Update snapshot to exists_on_disk = false: icon is removed from DOM
+        panel.update(cx, |panel, cx| {
+            panel.worktree_status.update(cx, |status, cx| {
+                let mut snap = TaskGitSnapshot::default();
+                snap.tasks.insert(
+                    AgentTaskId::from("TASK-10"),
+                    TaskGitState {
+                        worktree_path: std::path::PathBuf::from("/fake/task-10"),
+                        exists_on_disk: false,
+                        branch: Some("agent-task/TASK-10".to_string()),
+                        branch_exists: true,
+                        retention_reason: None,
+                    },
+                );
+                snap.tasks.insert(
+                    AgentTaskId::from("TASK-11"),
+                    TaskGitState {
+                        worktree_path: std::path::PathBuf::from("/fake/task-11"),
+                        exists_on_disk: false,
+                        branch: Some("agent-task/TASK-11".to_string()),
+                        branch_exists: true,
+                        retention_reason: None,
+                    },
+                );
+                status.set_snapshot_for_test(snap, cx);
+            });
+        });
+        cx.run_until_parked();
+
+        assert!(
+            cx.debug_bounds("goal-worktree-icon-GOAL-1").is_none(),
+            "Goal worktree icon should disappear when exists_on_disk becomes false"
         );
     }
 }
