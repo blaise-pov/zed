@@ -173,6 +173,8 @@ impl AgentTaskStore {
 
                         if store.has_initial_refresh {
                             if let Some(project) = store.project.clone() {
+                                let mut retried_goals = std::collections::HashSet::new();
+
                                 for new_task in &graph.tasks {
                                     let old_task =
                                         store.graph.tasks.iter().find(|t| t.id == new_task.id);
@@ -180,19 +182,68 @@ impl AgentTaskStore {
                                         .map_or(false, |old| !old.status.is_terminal())
                                         && new_task.status.is_terminal();
 
-                                    if transitioned_to_terminal
-                                        && crate::task_worktree::task_worktree_path_for_id(
+                                    if transitioned_to_terminal {
+                                        if crate::task_worktree::task_worktree_path_for_id(
                                             &new_task.id,
                                         )
                                         .is_some()
                                         && !crate::task_worktree::has_active_subagent_session(
                                             &new_task.id,
                                         )
-                                    {
-                                        let project = project.clone();
-                                        let task_id = new_task.id.clone();
-                                        crate::task_worktree::auto_cleanup_task_worktree(
-                                            project, &task_id, cx,
+                                        {
+                                            let project = project.clone();
+                                            let task_id = new_task.id.clone();
+                                            crate::task_worktree::auto_cleanup_task_worktree(
+                                                project, &task_id, cx,
+                                            )
+                                            .detach_and_log_err(cx);
+                                        }
+
+                                        if let Some(goal_id) = &new_task.goal_id {
+                                            let goal_was_terminal = store
+                                                .graph
+                                                .goals
+                                                .iter()
+                                                .find(|g| &g.goal_id == goal_id)
+                                                .is_some_and(|g| g.status.is_terminal());
+                                            let goal_is_terminal = graph
+                                                .goals
+                                                .iter()
+                                                .find(|g| &g.goal_id == goal_id)
+                                                .map_or(goal_was_terminal, |g| {
+                                                    g.status.is_terminal()
+                                                });
+
+                                            if goal_was_terminal
+                                                && goal_is_terminal
+                                                && retried_goals.insert(goal_id.clone())
+                                            {
+                                                crate::task_worktree::cleanup_graduated_goal(
+                                                    project.clone(),
+                                                    goal_id,
+                                                    cx,
+                                                )
+                                                .detach_and_log_err(cx);
+                                            }
+                                        }
+                                    }
+                                }
+
+                                for new_goal in &graph.goals {
+                                    let old_goal = store
+                                        .graph
+                                        .goals
+                                        .iter()
+                                        .find(|g| g.goal_id == new_goal.goal_id);
+                                    let transitioned_to_terminal = old_goal
+                                        .map_or(false, |old| !old.status.is_terminal())
+                                        && new_goal.status.is_terminal();
+
+                                    if transitioned_to_terminal {
+                                        crate::task_worktree::cleanup_graduated_goal(
+                                            project.clone(),
+                                            &new_goal.goal_id,
+                                            cx,
                                         )
                                         .detach_and_log_err(cx);
                                     }
@@ -1310,6 +1361,292 @@ mod tests {
         assert!(
             !reg.contains_key(&project.entity_id()),
             "dead weak store handle should be pruned on refresh"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_goal_transition_to_completed_triggers_cleanup(cx: &mut TestAppContext) {
+        crate::task_worktree::reset_registry_for_tests();
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            project::project_settings::ProjectSettings::register(cx);
+            agent_settings::AgentSettings::register(cx);
+        });
+
+        let fs = fs::FakeFs::new(cx.executor());
+        fs.insert_tree(
+            "/root",
+            serde_json::json!({
+                ".git": {
+                    "HEAD": "ref: refs/heads/main\n"
+                }
+            }),
+        )
+        .await;
+
+        let dot_git = std::path::Path::new("/root/.git");
+        fs.with_git_state(dot_git, true, |state| {
+            state.refs.insert("refs/heads/main".into(), "main-sha".into());
+            state.refs.insert("HEAD".into(), "main-sha".into());
+            state.branches.insert("main".into());
+            state.refs.insert(
+                "refs/heads/agent-goal/GOAL-1".into(),
+                "goal-sha-1".into(),
+            );
+            state.branches.insert("agent-goal/GOAL-1".into());
+        })
+        .unwrap();
+
+        let project = Project::test(fs.clone(), ["/root".as_ref()], cx).await;
+        let initial_goal = AgentGoalSummary {
+            goal_id: "GOAL-1".to_string(),
+            title: "Goal 1".to_string(),
+            status: AgentGoalStatus::Running,
+            priority: 0,
+            tasks_total: 0,
+            tasks_done: 0,
+            created_at: None,
+            metrics: None,
+            session_id: None,
+        };
+
+        let initial_graph = AgentTaskGraph {
+            tasks: vec![],
+            goals: vec![initial_goal.clone()],
+        };
+        let provider = Arc::new(DynamicProvider {
+            graph: parking_lot::Mutex::new(initial_graph),
+            events: parking_lot::Mutex::new(Vec::new()),
+        });
+
+        let store = cx.update(|cx| {
+            cx.new(|cx| AgentTaskStore::new_with_project(provider.clone(), Some(project), cx))
+        });
+        cx.run_until_parked();
+
+        assert!(
+            fs.with_git_state(dot_git, false, |state| state
+                .branches
+                .contains("agent-goal/GOAL-1"))
+                .unwrap(),
+            "goal branch must exist before completion"
+        );
+
+        let mut completed_goal = initial_goal;
+        completed_goal.status = AgentGoalStatus::Completed;
+        *provider.graph.lock() = AgentTaskGraph {
+            tasks: vec![],
+            goals: vec![completed_goal],
+        };
+
+        let refresh_task = store.update(cx, |s, cx| s.refresh(cx));
+        refresh_task.await.ok();
+        cx.run_until_parked();
+
+        assert!(
+            !fs.with_git_state(dot_git, false, |state| state
+                .branches
+                .contains("agent-goal/GOAL-1"))
+                .unwrap(),
+            "goal branch should be cleaned up after transitioning to Completed"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_running_goal_triggers_no_cleanup(cx: &mut TestAppContext) {
+        crate::task_worktree::reset_registry_for_tests();
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            project::project_settings::ProjectSettings::register(cx);
+            agent_settings::AgentSettings::register(cx);
+        });
+
+        let fs = fs::FakeFs::new(cx.executor());
+        fs.insert_tree(
+            "/root",
+            serde_json::json!({
+                ".git": {
+                    "HEAD": "ref: refs/heads/main\n"
+                }
+            }),
+        )
+        .await;
+
+        let dot_git = std::path::Path::new("/root/.git");
+        fs.with_git_state(dot_git, true, |state| {
+            state.refs.insert("refs/heads/main".into(), "main-sha".into());
+            state.refs.insert("HEAD".into(), "main-sha".into());
+            state.branches.insert("main".into());
+            state.refs.insert(
+                "refs/heads/agent-goal/GOAL-RUNNING".into(),
+                "goal-sha-1".into(),
+            );
+            state.branches.insert("agent-goal/GOAL-RUNNING".into());
+        })
+        .unwrap();
+
+        let project = Project::test(fs.clone(), ["/root".as_ref()], cx).await;
+        let running_goal = AgentGoalSummary {
+            goal_id: "GOAL-RUNNING".to_string(),
+            title: "Running Goal".to_string(),
+            status: AgentGoalStatus::Running,
+            priority: 0,
+            tasks_total: 1,
+            tasks_done: 0,
+            created_at: None,
+            metrics: None,
+            session_id: None,
+        };
+
+        let initial_graph = AgentTaskGraph {
+            tasks: vec![],
+            goals: vec![running_goal.clone()],
+        };
+        let provider = Arc::new(DynamicProvider {
+            graph: parking_lot::Mutex::new(initial_graph),
+            events: parking_lot::Mutex::new(Vec::new()),
+        });
+
+        let store = cx.update(|cx| {
+            cx.new(|cx| AgentTaskStore::new_with_project(provider.clone(), Some(project), cx))
+        });
+        cx.run_until_parked();
+
+        let refresh_task = store.update(cx, |s, cx| s.refresh(cx));
+        refresh_task.await.ok();
+        cx.run_until_parked();
+
+        assert!(
+            fs.with_git_state(dot_git, false, |state| state
+                .branches
+                .contains("agent-goal/GOAL-RUNNING"))
+                .unwrap(),
+            "goal branch must NOT be cleaned up while goal is Running"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_task_terminal_transition_under_already_terminal_goal_triggers_retry(
+        cx: &mut TestAppContext,
+    ) {
+        crate::task_worktree::reset_registry_for_tests();
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            project::project_settings::ProjectSettings::register(cx);
+            agent_settings::AgentSettings::register(cx);
+        });
+
+        let fs = fs::FakeFs::new(cx.executor());
+        fs.insert_tree(
+            "/root",
+            serde_json::json!({
+                ".git": {
+                    "HEAD": "ref: refs/heads/main\n"
+                }
+            }),
+        )
+        .await;
+
+        let dot_git = std::path::Path::new("/root/.git");
+        fs.with_git_state(dot_git, true, |state| {
+            state.refs.insert("refs/heads/main".into(), "main-sha".into());
+            state.refs.insert("HEAD".into(), "main-sha".into());
+            state.branches.insert("main".into());
+            state.refs.insert(
+                "refs/heads/agent-goal/GOAL-RETRY".into(),
+                "goal-sha-1".into(),
+            );
+            state.branches.insert("agent-goal/GOAL-RETRY".into());
+            state.refs.insert(
+                "refs/heads/agent-task/TASK-RETRY-1".into(),
+                "task-sha-1".into(),
+            );
+            state.branches.insert("agent-task/TASK-RETRY-1".into());
+        })
+        .unwrap();
+
+        let project = Project::test(fs.clone(), ["/root".as_ref()], cx).await;
+        let task_id = AgentTaskId::from("TASK-RETRY-1");
+
+        crate::task_worktree::register_task_worktree_policy(
+            &task_id,
+            std::path::PathBuf::from("/fake/retry1"),
+            Some("agent-goal/GOAL-RETRY".to_string()),
+            None,
+            None,
+            None,
+        );
+
+        let terminal_goal = AgentGoalSummary {
+            goal_id: "GOAL-RETRY".to_string(),
+            title: "Already completed goal".to_string(),
+            status: AgentGoalStatus::Completed,
+            priority: 0,
+            tasks_total: 1,
+            tasks_done: 0,
+            created_at: None,
+            metrics: None,
+            session_id: None,
+        };
+
+        let running_task = AgentTaskSummary {
+            id: task_id.clone(),
+            parent_id: None,
+            goal_id: Some("GOAL-RETRY".to_string()),
+            title: "Running sibling task".to_string(),
+            status: AgentTaskStatus::Running,
+            ..Default::default()
+        };
+
+        let initial_graph = AgentTaskGraph {
+            tasks: vec![running_task.clone()],
+            goals: vec![terminal_goal.clone()],
+        };
+        let provider = Arc::new(DynamicProvider {
+            graph: parking_lot::Mutex::new(initial_graph),
+            events: parking_lot::Mutex::new(Vec::new()),
+        });
+
+        let store = cx.update(|cx| {
+            cx.new(|cx| AgentTaskStore::new_with_project(provider.clone(), Some(project), cx))
+        });
+        cx.run_until_parked();
+
+        assert!(fs
+            .with_git_state(dot_git, false, |state| {
+                state.branches.contains("agent-goal/GOAL-RETRY")
+                    && state.branches.contains("agent-task/TASK-RETRY-1")
+            })
+            .unwrap());
+
+        let mut completed_task = running_task;
+        completed_task.status = AgentTaskStatus::Completed;
+        crate::task_worktree::mark_task_terminal(&task_id);
+        *provider.graph.lock() = AgentTaskGraph {
+            tasks: vec![completed_task],
+            goals: vec![terminal_goal],
+        };
+
+        let refresh_task = store.update(cx, |s, cx| s.refresh(cx));
+        refresh_task.await.ok();
+        cx.run_until_parked();
+
+        assert!(
+            !fs.with_git_state(dot_git, false, |state| state
+                .branches
+                .contains("agent-goal/GOAL-RETRY"))
+                .unwrap(),
+            "goal branch should be cleaned up by retry when task transitions to terminal"
+        );
+        assert!(
+            !fs.with_git_state(dot_git, false, |state| state
+                .branches
+                .contains("agent-task/TASK-RETRY-1"))
+                .unwrap(),
+            "task branch should be cleaned up along with the goal"
         );
     }
 }
