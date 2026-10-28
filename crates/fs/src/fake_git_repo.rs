@@ -85,6 +85,8 @@ pub struct FakeGitRepositoryState {
     pub commit_template: Option<GitCommitTemplate>,
     pub simulated_merge_conflicts: HashMap<(String, String), Vec<String>>,
     pub blob_read_gate: Option<FakeBlobReadGate>,
+    pub author_name: Option<SharedString>,
+    pub author_email: Option<SharedString>,
 }
 
 impl FakeGitRepositoryState {
@@ -114,6 +116,8 @@ impl FakeGitRepositoryState {
             stash_entries: Default::default(),
             commit_template: None,
             simulated_merge_conflicts: Default::default(),
+            author_name: None,
+            author_email: None,
         }
     }
 }
@@ -1820,6 +1824,7 @@ impl GitRepository for FakeGitRepository {
         _tree_sha: String,
         parents: Vec<String>,
         message: String,
+        author: Option<(SharedString, SharedString)>,
     ) -> BoxFuture<'_, Result<String>> {
         let executor = self.executor.clone();
         self.with_state_async(true, move |state| {
@@ -1842,13 +1847,28 @@ impl GitRepository for FakeGitRepository {
                     ref_names: Vec::new(),
                 }));
 
+            let (author_name, author_email) = match author {
+                Some((name, email)) => (name, email),
+                None => {
+                    let name = state
+                        .author_name
+                        .clone()
+                        .unwrap_or_else(|| "Test User".into());
+                    let email = state
+                        .author_email
+                        .clone()
+                        .unwrap_or_else(|| "test@example.com".into());
+                    (name, email)
+                }
+            };
+
             state.commit_data.insert(
                 commit_oid,
                 FakeCommitDataEntry::Success(git::repository::CommitData {
                     sha: commit_oid,
                     parents: parent_oids,
-                    author_name: "Zed Agent".into(),
-                    author_email: "agent@zed.dev".into(),
+                    author_name,
+                    author_email,
                     commit_timestamp: 0,
                     subject: message.lines().next().unwrap_or("").to_string().into(),
                     message: message.into(),

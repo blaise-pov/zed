@@ -1,31 +1,25 @@
 #[cfg(any(test, feature = "test-support"))]
 use std::collections::HashSet;
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 #[cfg(not(any(test, feature = "test-support")))]
 use std::sync::LazyLock;
-use std::time::Duration;
 
-use agent_client_protocol::schema::v1 as acp;
 use anyhow::{Context as _, Result};
 use fs::Fs;
-use futures::FutureExt as _;
 use git::repository::{AskPassDelegate, CommitOptions, CreateWorktreeTarget, RepoPath};
-use gpui::{App, AsyncApp, BackgroundExecutor, Entity, Task, WeakEntity};
-use language_model::LanguageModelToolUseId;
+use gpui::{App, AsyncApp, Entity, SharedString, Task};
 use project::{
     Project, git_store::Repository, git_store::worktrees_directory_for_repo,
     project_settings::ProjectSettings,
 };
-use prompt_store::WorktreeContext;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use settings::Settings;
 use util::ResultExt;
 use util::paths::PathStyle;
 
-use crate::agent_task::{AgentTaskProvider, AgentTaskStatus};
 use crate::{AgentTaskId, AgentTaskSummary};
 
 #[derive(Debug, thiserror::Error)]
@@ -201,17 +195,6 @@ pub fn ensure_task_worktree(
     ensure_task_worktree_with_policy(project, task, None, None, None, cx)
 }
 
-pub fn ensure_task_worktree_interactive(
-    project: Entity<Project>,
-    task: &AgentTaskSummary,
-    goal_id: Option<String>,
-    base_branch: Option<String>,
-    on_branch: Option<String>,
-    cx: &mut App,
-) -> Task<Result<PathBuf>> {
-    ensure_task_worktree_with_options(project, task, goal_id, base_branch, on_branch, true, cx)
-}
-
 pub fn ensure_task_worktree_with_policy(
     project: Entity<Project>,
     task: &AgentTaskSummary,
@@ -220,22 +203,9 @@ pub fn ensure_task_worktree_with_policy(
     on_branch: Option<String>,
     cx: &mut App,
 ) -> Task<Result<PathBuf>> {
-    ensure_task_worktree_with_options(project, task, goal_id, base_branch, on_branch, false, cx)
-}
-
-pub fn ensure_task_worktree_with_options(
-    project: Entity<Project>,
-    task: &AgentTaskSummary,
-    goal_id: Option<String>,
-    base_branch: Option<String>,
-    on_branch: Option<String>,
-    allow_overflow: bool,
-    cx: &mut App,
-) -> Task<Result<PathBuf>> {
     let task_id = task.id.clone();
     let task_title = task.title.clone();
     let goal_id = goal_id.or_else(|| task.goal_id.clone());
-    let write_scopes = task.write_scopes.clone();
     cx.spawn(async move |cx| {
         record_task_title(&task_id, &task_title);
         if on_branch.is_some() && base_branch.is_some() {
@@ -331,9 +301,7 @@ pub fn ensure_task_worktree_with_options(
         impl Drop for ClaimBranchGuard {
             fn drop(&mut self) {
                 if !self.defused {
-                    unregister_subagent_session(&self.task_id);
                     let mut reg = REGISTRY.write();
-                    reg.active_guards.remove(&self.task_id);
                     reg.entries.remove(&self.task_id);
                 }
             }
@@ -366,13 +334,6 @@ pub fn ensure_task_worktree_with_options(
                         "cannot release worktree for task {stale_task_id} holding branch {branch_to_claim}: active subagent session running"
                     );
                 }
-                WorktreeReleaseSafety::Retained => {
-                    let reason = task_worktree_retention_reason(&stale_task_id)
-                        .unwrap_or_else(|| "retained".to_string());
-                    anyhow::bail!(
-                        "cannot release worktree for task {stale_task_id} holding branch {branch_to_claim}: worktree is retained ({reason})"
-                    );
-                }
                 WorktreeReleaseSafety::MergeConflict | WorktreeReleaseSafety::Safe => {
                     // Allowed per design B7: merge conflicts are safe to take over at claim-time.
                 }
@@ -387,7 +348,6 @@ pub fn ensure_task_worktree_with_options(
                 &stale_task_id,
                 &stale_path,
                 &log_reason,
-                false,
                 cx,
             )
             .await?;
@@ -408,7 +368,6 @@ pub fn ensure_task_worktree_with_options(
                 &anchor_path,
                 &base_dir,
                 &task_id,
-                allow_overflow,
                 cx,
             )
             .await?;
@@ -425,27 +384,22 @@ pub fn ensure_task_worktree_with_options(
                 create_task.await?
             } else {
                 let branch_name = format!("agent-task/{}", task_id);
-                let exists = resolve_ref_to_sha(&git_repo, &branch_name)
-                    .await?
-                    .is_some();
-                let target = if exists {
-                    CreateWorktreeTarget::ExistingBranch {
-                        branch_name: branch_name.clone(),
-                    }
-                } else {
-                    CreateWorktreeTarget::NewBranch {
-                        branch_name: branch_name.clone(),
-                        base_sha: base_sha_for_worktree.clone(),
-                    }
-                };
                 let create_task = repository.update(cx, |repository, _| {
-                    repository.create_worktree(target, worktree_path.clone())
+                    repository.create_worktree(
+                        CreateWorktreeTarget::NewBranch {
+                            branch_name: branch_name.clone(),
+                            base_sha: base_sha_for_worktree.clone(),
+                        },
+                        worktree_path.clone(),
+                    )
                 });
 
                 let mut res = create_task.await?;
                 if let Err(error) = res {
                     let error_message = error.to_string();
                     if error_message.contains("already exists") {
+                        // The branch survives an earlier crashed run; check it
+                        // out instead of creating it again.
                         let retry_task = repository.update(cx, |repository, _| {
                             repository.create_worktree(
                                 CreateWorktreeTarget::ExistingBranch { branch_name },
@@ -466,18 +420,19 @@ pub fn ensure_task_worktree_with_options(
             }
         }
 
+        if !file_system.is_fake() {
+            if let Err(error) = ensure_task_worktree_settings(&file_system, &worktree_path).await {
+                unregister_task_worktree(&task_id);
+                return Err(error);
+            }
+        }
+
         let find_task = project.update(cx, |project, cx| {
             project.find_or_create_worktree(&worktree_path, false, cx)
         });
         let (worktree_entity, _) = match find_task.await {
             Ok(res) => res,
             Err(e) => {
-                if !path_exists {
-                    let remove_task = repository.update(cx, |repository, _| {
-                        repository.remove_worktree(worktree_path.clone(), true)
-                    });
-                    remove_task.await.log_err();
-                }
                 unregister_task_worktree(&task_id);
                 return Err(e);
             }
@@ -532,7 +487,6 @@ pub fn ensure_task_worktree_with_options(
             base_sha_for_worktree.clone(),
             target_checkout_branch.clone(),
             Some(pool_key),
-            Some(write_scopes),
         );
         claim_guard.defused = true;
 
@@ -570,14 +524,9 @@ pub fn ensure_task_worktree_with_options(
                         }
                     }
                 }
-            } else {
-                let recorded = get_task_recorded_files(&task_id);
-                if !recorded.is_empty() {
-                    initial_files = recorded;
-                } else if let Some(ref g_branch) = goal_branch {
-                    let g_id = g_branch.strip_prefix("agent-goal/").unwrap_or(g_branch);
-                    initial_files = get_goal_files(g_id);
-                }
+            } else if let Some(ref g_branch) = goal_branch {
+                let g_id = g_branch.strip_prefix("agent-goal/").unwrap_or(g_branch);
+                initial_files = get_goal_files(g_id);
             }
 
             for (rel_path, content) in &initial_files {
@@ -611,31 +560,62 @@ pub fn ensure_task_worktree_with_options(
     })
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub struct DependentTask {
-    pub id: AgentTaskId,
-    pub depends_on: Vec<AgentTaskId>,
-    pub status: AgentTaskStatus,
-}
+async fn ensure_task_worktree_settings(
+    file_system: &Arc<dyn Fs>,
+    worktree_path: &Path,
+) -> Result<()> {
+    let zed_dir = worktree_path.join(".zed");
+    let settings_path = zed_dir.join("settings.json");
 
-fn is_ready_or_in_progress(status: &AgentTaskStatus) -> bool {
-    match status {
-        AgentTaskStatus::Ready | AgentTaskStatus::Running => true,
-        AgentTaskStatus::Other(custom) => {
-            let s = custom.as_ref();
-            s == "ready" || s == "running" || s == "in_progress"
+    let mut map = if file_system.is_file(&settings_path).await {
+        let content = file_system.load(&settings_path).await?;
+        if content.trim().is_empty() {
+            serde_json::Map::new()
+        } else {
+            let parsed = serde_json_lenient::from_str::<serde_json::Value>(&content)
+                .with_context(|| format!("parsing settings file {settings_path:?}"))?;
+            match parsed {
+                serde_json::Value::Object(map) => map,
+                _ => anyhow::bail!("expected JSON object in {settings_path:?}"),
+            }
         }
-        _ => false,
+    } else {
+        serde_json::Map::new()
+    };
+
+    let target_exclusions = ["**/target", "**/target/**", "**/.git/**"];
+    if let Some(existing_exclusions) = map.get_mut("file_scan_exclusions") {
+        if let serde_json::Value::Array(arr) = existing_exclusions {
+            for exclusion in target_exclusions {
+                if !arr.iter().any(|v| v.as_str() == Some(exclusion)) {
+                    arr.push(serde_json::Value::String(exclusion.to_string()));
+                }
+            }
+        } else {
+            map.insert(
+                "file_scan_exclusions".to_string(),
+                serde_json::json!(target_exclusions),
+            );
+        }
+    } else {
+        map.insert(
+            "file_scan_exclusions".to_string(),
+            serde_json::json!(target_exclusions),
+        );
     }
+
+    if !file_system.is_dir(&zed_dir).await {
+        file_system.create_dir(&zed_dir).await?;
+    }
+    let serialized = serde_json::to_string_pretty(&serde_json::Value::Object(map))?;
+    file_system.atomic_write(settings_path, serialized).await?;
+    Ok(())
 }
 
 #[derive(Default)]
 struct TaskWorktreeRegistry {
     entries: HashMap<AgentTaskId, TaskWorktreeState>,
-    active_guards: HashMap<AgentTaskId, HashMap<SubagentSessionGuardId, SubagentSessionOwner>>,
-    holders: HashMap<AgentTaskId, BTreeSet<String>>,
-    dependent_tasks: Vec<DependentTask>,
-    retention_timeout: Option<Duration>,
+    active_sessions: HashMap<AgentTaskId, usize>,
     goal_history: HashMap<String, Vec<GoalMergeEntry>>,
     #[cfg(any(test, feature = "test-support"))]
     goal_files: HashMap<String, HashMap<PathBuf, Vec<u8>>>,
@@ -644,7 +624,6 @@ struct TaskWorktreeRegistry {
     goal_tip_shas: HashMap<String, String>,
     goal_graduations: HashMap<String, GoalGraduationSummary>,
     task_titles: HashMap<AgentTaskId, String>,
-    task_sessions: HashMap<AgentTaskId, String>,
 }
 
 #[derive(Clone, Debug)]
@@ -677,7 +656,6 @@ struct TaskWorktreeState {
     commit_error: Option<String>,
     cleanup_error: Option<String>,
     is_terminal: bool,
-    terminal_at: Option<std::time::Instant>,
     goal_branch: Option<String>,
     base_ref: Option<String>,
     base_sha: Option<String>,
@@ -689,8 +667,6 @@ struct TaskWorktreeState {
     pool_key: Option<ProjectPoolKey>,
     slot_notified: bool,
     is_cleaning: bool,
-    pub session_id: Option<String>,
-    pub write_scopes: Vec<String>,
 }
 
 impl TaskWorktreeState {
@@ -706,7 +682,6 @@ impl TaskWorktreeState {
 /// Semantics:
 /// - `CommitError`: NEVER release or evict; manual inspection is required.
 /// - `ActiveSession`: NEVER release or evict while any subagent session is active.
-/// - `Retained`: NEVER release or evict while active holders, dependent tasks, or retention window exist.
 /// - `MergeConflict`: Claim-time branch takeover is ALLOWED (per design В7: conflict
 ///   state is re-derivable, commits are safe), but startup sweep and LRU pool eviction
 ///   MUST skip it (retained for inspection).
@@ -717,7 +692,6 @@ pub enum WorktreeReleaseSafety {
     ActiveSession,
     CommitError,
     MergeConflict,
-    Retained,
 }
 
 impl WorktreeReleaseSafety {
@@ -728,38 +702,16 @@ impl WorktreeReleaseSafety {
     pub fn is_claim_takeover_safe(&self) -> bool {
         matches!(self, Self::Safe | Self::MergeConflict)
     }
-
-    pub fn is_retained(&self) -> bool {
-        matches!(self, Self::Retained)
-    }
-}
-
-fn is_non_empty_error(err: &str) -> bool {
-    let trimmed = err.trim();
-    if trimmed.is_empty() {
-        return false;
-    }
-    if trimmed == "commit failed:" || trimmed == "staging failed:" {
-        return false;
-    }
-    true
 }
 
 fn worktree_release_safety_for_state(
-    task_id: &AgentTaskId,
+    _task_id: &AgentTaskId,
     state: &TaskWorktreeState,
     active_sessions: usize,
-    reg: &TaskWorktreeRegistry,
 ) -> WorktreeReleaseSafety {
     if active_sessions > 0 || state.is_cleaning {
         WorktreeReleaseSafety::ActiveSession
-    } else if reg.retention_reason(task_id).is_some() {
-        WorktreeReleaseSafety::Retained
-    } else if state
-        .commit_error
-        .as_deref()
-        .map_or(false, is_non_empty_error)
-    {
+    } else if state.commit_error.is_some() {
         WorktreeReleaseSafety::CommitError
     } else if state.merge_conflict.is_some() {
         WorktreeReleaseSafety::MergeConflict
@@ -768,34 +720,16 @@ fn worktree_release_safety_for_state(
     }
 }
 
-impl TaskWorktreeRegistry {
-    pub fn live_active_sessions_count(&self, task_id: &AgentTaskId) -> usize {
-        let Some(guards) = self.active_guards.get(task_id) else {
-            return 0;
-        };
-        guards
-            .values()
-            .filter(|owner| is_owner_alive(owner))
-            .count()
-    }
-
-    pub fn has_active_session(&self, task_id: &AgentTaskId) -> bool {
-        self.live_active_sessions_count(task_id) > 0
-    }
-}
-
 pub fn worktree_release_safety(task_id: &AgentTaskId) -> WorktreeReleaseSafety {
     let reg = REGISTRY.read();
-    let active_sessions = reg.live_active_sessions_count(task_id);
+    let active_sessions = reg.active_sessions.get(task_id).copied().unwrap_or(0);
     reg.entries.get(task_id).map_or(
         if active_sessions > 0 {
             WorktreeReleaseSafety::ActiveSession
-        } else if reg.retention_reason(task_id).is_some() {
-            WorktreeReleaseSafety::Retained
         } else {
             WorktreeReleaseSafety::Safe
         },
-        |state| worktree_release_safety_for_state(task_id, state, active_sessions, &reg),
+        |state| worktree_release_safety_for_state(task_id, state, active_sessions),
     )
 }
 
@@ -842,182 +776,9 @@ task_worktree_static!(
 );
 
 task_worktree_static!(
-    TASK_WORKTREE_CONTEXTS: parking_lot::RwLock<HashMap<PathBuf, WorktreeContext>> =
-        parking_lot::RwLock::new(HashMap::default())
-);
-
-pub fn cached_task_worktree_context(path: &Path) -> Option<WorktreeContext> {
-    TASK_WORKTREE_CONTEXTS.read().get(path).cloned()
-}
-
-pub fn cache_task_worktree_context(path: PathBuf, context: WorktreeContext) {
-    TASK_WORKTREE_CONTEXTS.write().insert(path, context);
-}
-
-pub fn task_worktree_entity_for_id(
-    project_id: gpui::EntityId,
-    task_id: &AgentTaskId,
-) -> Option<Entity<project::Worktree>> {
-    PROJECT_TASK_WORKTREES
-        .read()
-        .get(&project_id)
-        .and_then(|tasks| tasks.get(task_id).cloned())
-}
-
-pub fn task_worktree_entity_for_path(
-    project_id: gpui::EntityId,
-    path: &Path,
-    cx: &App,
-) -> Option<Entity<project::Worktree>> {
-    let map = PROJECT_TASK_WORKTREES.read();
-    let tasks = map.get(&project_id)?;
-    tasks.values().find(|wt| {
-        let abs = wt.read(cx).abs_path();
-        abs.as_ref() == path
-            || util::paths::normalize_lexically(abs.as_ref()).ok().as_deref()
-                == util::paths::normalize_lexically(path).ok().as_deref()
-    }).cloned()
-}
-
-task_worktree_static!(
     TASK_LSP_SUPPRESSION: parking_lot::RwLock<HashMap<AgentTaskId, bool>> =
         parking_lot::RwLock::new(HashMap::default())
 );
-
-task_worktree_static!(
-    TASK_PROVIDER: parking_lot::RwLock<Option<Arc<dyn AgentTaskProvider>>> =
-        parking_lot::RwLock::new(None)
-);
-
-pub fn register_task_provider(provider: Arc<dyn AgentTaskProvider>) {
-    *TASK_PROVIDER.write() = Some(provider);
-}
-
-pub fn unregister_task_provider() {
-    *TASK_PROVIDER.write() = None;
-}
-
-pub fn task_provider() -> Option<Arc<dyn AgentTaskProvider>> {
-    TASK_PROVIDER.read().clone()
-}
-
-pub fn set_task_worktree_retention_timeout(timeout: Option<Duration>) {
-    let mut reg = REGISTRY.write();
-    reg.retention_timeout = timeout;
-}
-
-pub fn task_worktree_retention_timeout() -> Duration {
-    let reg = REGISTRY.read();
-    reg.retention_timeout.unwrap_or(Duration::from_secs(
-        agent_settings::DEFAULT_TASK_WORKTREE_RETENTION_TIMEOUT_SECONDS,
-    ))
-}
-
-impl TaskWorktreeRegistry {
-    pub fn retention_reason(&self, task_id: &AgentTaskId) -> Option<String> {
-        if let Some(holders) = self.holders.get(task_id) {
-            if let Some(first_holder) = holders.iter().next() {
-                return Some(format!("holder:{first_holder}"));
-            }
-        }
-
-        if task_provider().is_some() {
-            for dep in &self.dependent_tasks {
-                if dep.depends_on.contains(task_id) && is_ready_or_in_progress(&dep.status) {
-                    return Some(format!("dependent:{}", dep.id));
-                }
-            }
-        }
-
-        if let Some(entry) = self.entries.get(task_id) {
-            if entry.is_terminal {
-                if let Some(terminal_at) = entry.terminal_at {
-                    let timeout = self.retention_timeout.unwrap_or(Duration::from_secs(
-                        agent_settings::DEFAULT_TASK_WORKTREE_RETENTION_TIMEOUT_SECONDS,
-                    ));
-                    if timeout > Duration::ZERO && terminal_at.elapsed() < timeout {
-                        return Some("retention-window".to_string());
-                    }
-                }
-            }
-        }
-
-        None
-    }
-}
-
-pub fn register_worktree_holder(host: &AgentTaskId, holder_session_id: impl Into<String>) {
-    let mut reg = REGISTRY.write();
-    reg.holders
-        .entry(host.clone())
-        .or_default()
-        .insert(holder_session_id.into());
-}
-
-pub fn unregister_worktree_holder(host: &AgentTaskId, holder_session_id: &str) {
-    let mut reg = REGISTRY.write();
-    if let Some(holders) = reg.holders.get_mut(host) {
-        holders.remove(holder_session_id);
-        if holders.is_empty() {
-            reg.holders.remove(host);
-        }
-    }
-}
-
-pub fn worktree_holders(host: &AgentTaskId) -> Vec<String> {
-    let reg = REGISTRY.read();
-    reg.holders
-        .get(host)
-        .map(|holders| holders.iter().cloned().collect())
-        .unwrap_or_default()
-}
-
-pub fn register_task_dependency(
-    dependent: impl Into<AgentTaskId>,
-    depends_on: impl Into<AgentTaskId>,
-    status: AgentTaskStatus,
-) {
-    let mut reg = REGISTRY.write();
-    let dep_id = dependent.into();
-    let host_id = depends_on.into();
-    if let Some(existing) = reg.dependent_tasks.iter_mut().find(|t| t.id == dep_id) {
-        if !existing.depends_on.contains(&host_id) {
-            existing.depends_on.push(host_id);
-        }
-        existing.status = status;
-    } else {
-        reg.dependent_tasks.push(DependentTask {
-            id: dep_id,
-            depends_on: vec![host_id],
-            status,
-        });
-    }
-}
-
-pub fn unregister_task_dependency(dependent: &AgentTaskId, depends_on: &AgentTaskId) {
-    let mut reg = REGISTRY.write();
-    if let Some(entry) = reg.dependent_tasks.iter_mut().find(|t| t.id == *dependent) {
-        entry.depends_on.retain(|id| id != depends_on);
-    }
-    reg.dependent_tasks.retain(|t| !t.depends_on.is_empty());
-}
-
-pub fn set_dependent_task_status(dependent: &AgentTaskId, status: AgentTaskStatus) {
-    let mut reg = REGISTRY.write();
-    if let Some(entry) = reg.dependent_tasks.iter_mut().find(|t| t.id == *dependent) {
-        entry.status = status;
-    }
-}
-
-pub fn clear_dependent_tasks() {
-    let mut reg = REGISTRY.write();
-    reg.dependent_tasks.clear();
-}
-
-pub fn task_worktree_retention_reason(task_id: &AgentTaskId) -> Option<String> {
-    let reg = REGISTRY.read();
-    reg.retention_reason(task_id)
-}
 
 pub fn set_task_lsp_suppressed(task_id: &AgentTaskId, suppressed: bool) {
     let mut map = TASK_LSP_SUPPRESSION.write();
@@ -1058,8 +819,6 @@ pub fn reset_registry_for_tests() {
     locks.clear();
     let mut project_worktrees = PROJECT_TASK_WORKTREES.write();
     project_worktrees.clear();
-    let mut contexts = TASK_WORKTREE_CONTEXTS.write();
-    contexts.clear();
     let mut in_flight = IN_FLIGHT_CREATIONS.lock();
     in_flight.clear();
     let mut waiters = TASK_WORKTREE_WAITING_CREATIONS.lock();
@@ -1068,7 +827,6 @@ pub fn reset_registry_for_tests() {
     lsp_suppression.clear();
     let mut notified = NOTIFIED_WAITERS.lock();
     notified.clear();
-    unregister_task_provider();
 }
 
 task_worktree_static!(
@@ -1123,7 +881,6 @@ pub fn notify_task_worktree_slot_available() {
     }
 }
 
-#[derive(Debug)]
 pub struct TaskWorktreeSlotGuard {
     pool_key: ProjectPoolKey,
     active: bool,
@@ -1201,141 +958,6 @@ impl Drop for NotifiedWaiterGuard {
     }
 }
 
-const MAX_REMOVAL_ATTEMPTS: usize = 5;
-const INITIAL_REMOVAL_BACKOFF: Duration = Duration::from_millis(50);
-const MAX_REMOVAL_BACKOFF: Duration = Duration::from_millis(800);
-const DEFAULT_SLOT_TIMEOUT: Duration = Duration::from_secs(45);
-
-fn is_sharing_violation(error: &anyhow::Error) -> bool {
-    for cause in error.chain() {
-        if let Some(io_error) = cause.downcast_ref::<std::io::Error>() {
-            if io_error.raw_os_error() == Some(32) {
-                return true;
-            }
-        }
-    }
-    let message = format!("{error:#}").to_lowercase();
-    message.contains("sharing violation")
-}
-
-fn removal_backoff_duration(attempt: usize) -> Duration {
-    let mut backoff = INITIAL_REMOVAL_BACKOFF;
-    for _ in 0..attempt {
-        backoff = (backoff * 2).min(MAX_REMOVAL_BACKOFF);
-    }
-    backoff
-}
-
-async fn remove_worktree_from_git_and_fs(
-    repository: &Entity<Repository>,
-    file_system: &Arc<dyn Fs>,
-    worktree_path: &Path,
-    anchor_path: &Path,
-    force: bool,
-    description: &str,
-    cx: &mut AsyncApp,
-) -> Result<()> {
-    let mut git_remove_result = Ok(());
-    for attempt in 0..MAX_REMOVAL_ATTEMPTS {
-        let remove_task = repository.update(cx, |repository, _| {
-            repository.remove_worktree(worktree_path.to_path_buf(), force)
-        });
-        let result = match remove_task.await {
-            Ok(inner_result) => inner_result,
-            Err(canceled) => Err(anyhow::anyhow!("remove_worktree task canceled: {canceled}")),
-        };
-
-        match result {
-            Ok(()) => {
-                git_remove_result = Ok(());
-                break;
-            }
-            Err(error) => {
-                let is_sharing = is_sharing_violation(&error);
-                git_remove_result = Err(error);
-                if attempt + 1 < MAX_REMOVAL_ATTEMPTS && is_sharing {
-                    let backoff = removal_backoff_duration(attempt);
-                    cx.background_executor().timer(backoff).await;
-                } else {
-                    break;
-                }
-            }
-        }
-    }
-
-    let directory_still_exists = file_system.is_dir(worktree_path).await;
-    if let Err(git_error) = git_remove_result {
-        log::warn!(
-            "git remove_worktree for {description} at {} failed: {git_error:#}; attempting fallback filesystem removal",
-            worktree_path.display()
-        );
-        if directory_still_exists {
-            for attempt in 0..MAX_REMOVAL_ATTEMPTS {
-                let remove_result = file_system
-                    .remove_dir(
-                        worktree_path,
-                        fs::RemoveOptions {
-                            recursive: true,
-                            ignore_if_not_exists: true,
-                        },
-                    )
-                    .await;
-                match remove_result {
-                    Ok(()) => break,
-                    Err(file_system_error) => {
-                        let is_sharing = is_sharing_violation(&file_system_error);
-                        if attempt + 1 < MAX_REMOVAL_ATTEMPTS && is_sharing {
-                            let backoff = removal_backoff_duration(attempt);
-                            cx.background_executor().timer(backoff).await;
-                        } else {
-                            return Err(file_system_error).with_context(|| {
-                                format!(
-                                    "failed to remove {description} directory at {}: git remove failed ({:#}) and filesystem removal failed",
-                                    worktree_path.display(),
-                                    git_error
-                                )
-                            });
-                        }
-                    }
-                }
-            }
-            prune_git_worktrees(anchor_path).await;
-        }
-    } else if directory_still_exists {
-        for attempt in 0..MAX_REMOVAL_ATTEMPTS {
-            let remove_result = file_system
-                .remove_dir(
-                    worktree_path,
-                    fs::RemoveOptions {
-                        recursive: true,
-                        ignore_if_not_exists: true,
-                    },
-                )
-                .await;
-            match remove_result {
-                Ok(()) => break,
-                Err(file_system_error) => {
-                    let is_sharing = is_sharing_violation(&file_system_error);
-                    if attempt + 1 < MAX_REMOVAL_ATTEMPTS && is_sharing {
-                        let backoff = removal_backoff_duration(attempt);
-                        cx.background_executor().timer(backoff).await;
-                    } else {
-                        return Err(file_system_error).with_context(|| {
-                            format!(
-                                "failed to remove {description} directory at {}",
-                                worktree_path.display()
-                            )
-                        });
-                    }
-                }
-            }
-        }
-        prune_git_worktrees(anchor_path).await;
-    }
-
-    Ok(())
-}
-
 async fn release_stale_task_worktree(
     project: &Entity<Project>,
     repository: &Entity<Repository>,
@@ -1344,15 +966,9 @@ async fn release_stale_task_worktree(
     stale_task_id: &AgentTaskId,
     stale_path: &Path,
     reason: &str,
-    already_marked_cleaning: bool,
     cx: &mut AsyncApp,
 ) -> Result<()> {
-    if !already_marked_cleaning {
-        if let Some(retention_reason) = task_worktree_retention_reason(stale_task_id) {
-            anyhow::bail!(
-                "cannot release worktree for task {stale_task_id} {reason}: worktree is retained ({retention_reason})"
-            );
-        }
+    {
         let mut reg = REGISTRY.write();
         if let Some(entry) = reg.entries.get_mut(stale_task_id) {
             if entry.is_cleaning {
@@ -1362,98 +978,112 @@ async fn release_stale_task_worktree(
         }
     }
 
-    let perform_release = async {
-        if !stale_path.as_os_str().is_empty() {
-            if file_system.is_dir(stale_path).await {
-                let dot_git = stale_path.join(".git");
-                let has_git =
-                    file_system.is_file(&dot_git).await || file_system.is_dir(&dot_git).await;
-                if has_git {
-                    let salvage_details = commit_task_worktree(
-                        file_system.clone(),
-                        stale_path.to_path_buf(),
-                        stale_task_id.to_string(),
-                        false,
-                        cx,
-                    )
-                    .await;
+    if !stale_path.as_os_str().is_empty() && file_system.is_dir(stale_path).await {
+        let dot_git = stale_path.join(".git");
+        let has_git = file_system.is_file(&dot_git).await || file_system.is_dir(&dot_git).await;
+        if has_git {
+            let salvage_details = commit_task_worktree(
+                file_system.clone(),
+                stale_path.to_path_buf(),
+                stale_task_id.to_string(),
+                false,
+                cx,
+            )
+            .await;
 
-                    match salvage_details {
-                        Ok(details) => {
-                            if let Some(err) = details.commit_error {
-                                anyhow::bail!(
-                                    "failed to salvage uncommitted changes from stale worktree for task {stale_task_id} {reason}: {err}; inspect or resolve that worktree manually"
-                                );
-                            }
-                        }
-                        Err(err) => {
-                            anyhow::bail!(
-                                "failed to salvage uncommitted changes from stale worktree for task {stale_task_id} {reason}: {err}; inspect or resolve that worktree manually"
-                            );
-                        }
+            match salvage_details {
+                Ok(details) => {
+                    if let Some(err) = details.commit_error {
+                        anyhow::bail!(
+                            "failed to salvage uncommitted changes from stale worktree for task {stale_task_id} {reason}: {err}; inspect or resolve that worktree manually"
+                        );
                     }
                 }
-            }
-
-            let stale_worktree_id = project.read_with(cx, |project, cx| {
-                project
-                    .worktrees(cx)
-                    .find(|w| {
-                        let w_abs = w.read(cx).abs_path();
-                        w_abs.as_ref() == stale_path
-                            || util::paths::normalize_lexically(w_abs.as_ref())
-                                .ok()
-                                .as_deref()
-                                == util::paths::normalize_lexically(stale_path).ok().as_deref()
-                    })
-                    .map(|w| w.read(cx).id())
-            });
-            {
-                let mut project_worktrees = PROJECT_TASK_WORKTREES.write();
-                for map in project_worktrees.values_mut() {
-                    map.remove(stale_task_id);
-                }
-            }
-            if let Some(id) = stale_worktree_id {
-                let wait = project.update(cx, |project, cx| {
-                    let wait = project.wait_for_worktree_release(id, cx);
-                    project.remove_worktree(id, cx);
-                    wait
-                });
-                wait.await.log_err();
-            }
-
-            if file_system.is_dir(stale_path).await {
-                remove_worktree_from_git_and_fs(
-                    repository,
-                    file_system,
-                    stale_path,
-                    anchor_path,
-                    true,
-                    "stale worktree",
-                    cx,
-                )
-                .await?;
-
-                if !file_system.is_fake() {
-                    prune_git_worktrees(anchor_path).await;
+                Err(err) => {
+                    anyhow::bail!(
+                        "failed to salvage uncommitted changes from stale worktree for task {stale_task_id} {reason}: {err}; inspect or resolve that worktree manually"
+                    );
                 }
             }
         }
 
-        unregister_task_worktree(stale_task_id);
-        log::info!("Released stale worktree of task {stale_task_id} {reason}");
-        Ok(())
-    };
+        let remove_task = repository.update(cx, |repository, _| {
+            repository.remove_worktree(stale_path.to_path_buf(), true)
+        });
+        let git_remove_result = match remove_task.await {
+            Ok(inner_result) => inner_result,
+            Err(canceled) => Err(anyhow::anyhow!("remove_worktree task canceled: {canceled}")),
+        };
 
-    let result = perform_release.await;
-    if result.is_err() {
-        let mut reg = REGISTRY.write();
-        if let Some(entry) = reg.entries.get_mut(stale_task_id) {
-            entry.is_cleaning = false;
+        let directory_still_exists = file_system.is_dir(stale_path).await;
+        if let Err(git_error) = git_remove_result {
+            log::warn!(
+                "git remove_worktree for stale worktree at {} failed: {git_error:#}; attempting fallback filesystem removal",
+                stale_path.display()
+            );
+            if directory_still_exists {
+                file_system
+                    .remove_dir(
+                        stale_path,
+                        fs::RemoveOptions {
+                            recursive: true,
+                            ignore_if_not_exists: true,
+                        },
+                    )
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "failed to remove stale worktree directory at {}: git remove failed ({:#}) and filesystem removal failed",
+                            stale_path.display(),
+                            git_error
+                        )
+                    })?;
+            }
+        } else if directory_still_exists {
+            file_system
+                .remove_dir(
+                    stale_path,
+                    fs::RemoveOptions {
+                        recursive: true,
+                        ignore_if_not_exists: true,
+                    },
+                )
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to remove stale worktree directory at {}",
+                        stale_path.display()
+                    )
+                })?;
+        }
+
+        if !file_system.is_fake() {
+            prune_git_worktrees(anchor_path).await;
+        }
+
+        let stale_worktree_id = project.read_with(cx, |project, cx| {
+            project
+                .worktrees(cx)
+                .find(|w| {
+                    let w_abs = w.read(cx).abs_path();
+                    w_abs.as_ref() == stale_path
+                        || util::paths::normalize_lexically(w_abs.as_ref())
+                            .ok()
+                            .as_deref()
+                            == util::paths::normalize_lexically(stale_path).ok().as_deref()
+                })
+                .map(|w| w.read(cx).id())
+        });
+        if let Some(id) = stale_worktree_id {
+            project.update(cx, |project, cx| {
+                project.remove_worktree(id, cx);
+            });
         }
     }
-    result
+
+    unregister_task_worktree(stale_task_id);
+    log::info!("Released stale worktree of task {stale_task_id} {reason}");
+    Ok(())
 }
 
 async fn acquire_task_worktree_slot(
@@ -1463,7 +1093,6 @@ async fn acquire_task_worktree_slot(
     anchor_path: &Path,
     base_dir: &Path,
     current_task_id: &AgentTaskId,
-    allow_overflow: bool,
     cx: &mut AsyncApp,
 ) -> Result<TaskWorktreeSlotGuard> {
     let pool_key = ProjectPoolKey::new(anchor_path, file_system);
@@ -1471,14 +1100,8 @@ async fn acquire_task_worktree_slot(
     let mut notified_guard: Option<NotifiedWaiterGuard> = None;
 
     loop {
-        let (limit, cleanup_enabled) = project.read_with(cx, |project, cx| {
-            let settings = agent_settings::AgentSettings::get_for_project(project, cx);
-            if REGISTRY.read().retention_timeout.is_none() {
-                set_task_worktree_retention_timeout(Some(
-                    settings.task_worktree_retention_timeout_seconds,
-                ));
-            }
-            (settings.task_worktree_limit, settings.cleanup)
+        let limit = project.read_with(cx, |project, cx| {
+            agent_settings::AgentSettings::get_for_project(project, cx).task_worktree_limit
         });
 
         let mut snapshotted_ids = collections::HashSet::default();
@@ -1498,8 +1121,8 @@ async fn acquire_task_worktree_slot(
                 })
                 .map(|(id, state)| {
                     snapshotted_ids.insert(id.clone());
-                    let active = reg.live_active_sessions_count(id);
-                    let safety = worktree_release_safety_for_state(id, state, active, &reg);
+                    let active = reg.active_sessions.get(id).copied().unwrap_or(0);
+                    let safety = worktree_release_safety_for_state(id, state, active);
                     (
                         id.clone(),
                         state.worktree_path.clone(),
@@ -1512,32 +1135,17 @@ async fn acquire_task_worktree_slot(
 
         let mut confirmed_existing_ids = collections::HashSet::default();
         let mut candidates = Vec::new();
-        for (id, path, safety, last_session_ended_at) in &entries {
-            if id == current_task_id {
+        for (id, path, safety, last_session_ended_at) in entries {
+            if id == *current_task_id {
                 continue;
             }
-            if !path.as_os_str().is_empty() && file_system.is_dir(path).await {
+            if !path.as_os_str().is_empty() && file_system.is_dir(&path).await {
                 confirmed_existing_ids.insert(id.clone());
-                if cleanup_enabled && safety.is_eviction_safe() {
-                    candidates.push((id.clone(), path.clone(), *last_session_ended_at));
+                if safety.is_eviction_safe() {
+                    candidates.push((id, path, last_session_ended_at));
                 }
             }
         }
-
-        let holder_info: Vec<(AgentTaskId, &'static str)> = entries
-            .iter()
-            .filter(|(id, _, _, _)| id != current_task_id && confirmed_existing_ids.contains(id))
-            .map(|(id, _, safety, _)| {
-                let reason = match safety {
-                    WorktreeReleaseSafety::ActiveSession => "active session",
-                    WorktreeReleaseSafety::CommitError => "commit error",
-                    WorktreeReleaseSafety::MergeConflict => "merge conflict",
-                    WorktreeReleaseSafety::Retained => "retained",
-                    WorktreeReleaseSafety::Safe => "other",
-                };
-                (id.clone(), reason)
-            })
-            .collect();
 
         // Re-validate existing worktrees and in-flight count under lock to prevent over-limit races.
         let slot_allocated = {
@@ -1551,9 +1159,7 @@ async fn acquire_task_worktree_slot(
                 .entries
                 .iter()
                 .filter(|(id, state)| {
-                    !snapshotted_ids.contains(id)
-                        && state.pool_key.as_ref() == Some(&pool_key)
-                        && !state.worktree_path.as_os_str().is_empty()
+                    !snapshotted_ids.contains(id) && state.pool_key.as_ref() == Some(&pool_key)
                 })
                 .count();
             let in_flight = in_flight_map.get(&pool_key).copied().unwrap_or(0);
@@ -1588,7 +1194,6 @@ async fn acquire_task_worktree_slot(
                 &candidate_id,
                 &candidate_path,
                 "due to LRU pool limit",
-                false,
                 cx,
             )
             .await;
@@ -1609,7 +1214,6 @@ async fn acquire_task_worktree_slot(
                             .filter(|(id, state)| {
                                 !snapshotted_ids.contains(id)
                                     && state.pool_key.as_ref() == Some(&pool_key)
-                                    && !state.worktree_path.as_os_str().is_empty()
                             })
                             .count();
                         let in_flight = in_flight_map.get(&pool_key).copied().unwrap_or(0);
@@ -1638,15 +1242,6 @@ async fn acquire_task_worktree_slot(
             return Ok(TaskWorktreeSlotGuard::new(pool_key));
         }
 
-        if allow_overflow {
-            drop(notified_guard);
-            {
-                let mut in_flight_map = IN_FLIGHT_CREATIONS.lock();
-                *in_flight_map.entry(pool_key.clone()).or_insert(0) += 1;
-            }
-            return Ok(TaskWorktreeSlotGuard::new(pool_key));
-        }
-
         drop(notified_guard.take());
 
         let (sender, receiver) = futures::channel::oneshot::channel();
@@ -1661,48 +1256,7 @@ async fn acquire_task_worktree_slot(
         }
         is_retry = true;
 
-        let mut receiver = receiver.fuse();
-        let mut timer = cx.background_executor().timer(DEFAULT_SLOT_TIMEOUT).fuse();
-
-        let slot_available = futures::select! {
-            _ = receiver => true,
-            _ = timer => false,
-        };
-
-        if !slot_available {
-            {
-                let mut all_waiters = TASK_WORKTREE_WAITING_CREATIONS.lock();
-                if let Some(waiters) = all_waiters.get_mut(&pool_key) {
-                    waiters.retain(|sender| !sender.is_canceled());
-                    if waiters.is_empty() {
-                        all_waiters.remove(&pool_key);
-                    }
-                }
-            }
-
-            unregister_subagent_session(current_task_id);
-            {
-                let mut reg = REGISTRY.write();
-                reg.active_guards.remove(current_task_id);
-                reg.entries.remove(current_task_id);
-            }
-
-            let mut holder_descriptions: Vec<String> = holder_info
-                .iter()
-                .map(|(id, reason)| format!("{id} ({reason})"))
-                .collect();
-            holder_descriptions.sort();
-            let holders_summary = if holder_descriptions.is_empty() {
-                "none".to_string()
-            } else {
-                holder_descriptions.join(", ")
-            };
-
-            anyhow::bail!(
-                "timed out waiting for task worktree slot after 45s (pool limit: {limit}, holders: [{holders_summary}]); consider increasing `task_worktree_limit` setting"
-            );
-        }
-
+        let _ = receiver.await;
         notified_guard = Some(NotifiedWaiterGuard::new(pool_key.clone()));
     }
 }
@@ -1720,7 +1274,6 @@ fn finish_slot_and_register_policy(
     base_sha: Option<String>,
     checkout_target: Option<String>,
     pool_key: Option<ProjectPoolKey>,
-    write_scopes: Option<Vec<String>>,
 ) {
     let mut reg = REGISTRY.write();
     let mut in_flight = IN_FLIGHT_CREATIONS.lock();
@@ -1735,13 +1288,12 @@ fn finish_slot_and_register_policy(
         }
     }
 
-    let has_active = reg.has_active_session(task_id);
+    let has_active = reg.active_sessions.get(task_id).copied().unwrap_or(0) > 0;
     let initial_ended_at = if has_active {
         None
     } else {
         Some(std::time::Instant::now())
     };
-    let session_from_map = reg.task_sessions.get(task_id).cloned();
     let entry = reg.entries.entry(task_id.clone()).or_default();
     let preserved_pool_key = pool_key.or_else(|| {
         if entry.worktree_path == worktree_path {
@@ -1750,24 +1302,11 @@ fn finish_slot_and_register_policy(
             None
         }
     });
-    let preserved_session_id = entry.session_id.clone().or(session_from_map);
-    let preserved_write_scopes = match write_scopes {
-        Some(scopes) if !scopes.is_empty() => scopes,
-        Some(scopes) => {
-            if entry.write_scopes.is_empty() {
-                scopes
-            } else {
-                entry.write_scopes.clone()
-            }
-        }
-        None => entry.write_scopes.clone(),
-    };
     *entry = TaskWorktreeState {
         worktree_path,
         commit_error: None,
         cleanup_error: None,
         is_terminal: false,
-        terminal_at: None,
         goal_branch,
         base_ref,
         base_sha,
@@ -1779,8 +1318,6 @@ fn finish_slot_and_register_policy(
         pool_key: preserved_pool_key,
         slot_notified: false,
         is_cleaning: false,
-        session_id: preserved_session_id,
-        write_scopes: preserved_write_scopes,
     };
 }
 
@@ -1792,26 +1329,6 @@ pub fn register_task_worktree_policy(
     base_sha: Option<String>,
     checkout_target: Option<String>,
 ) {
-    register_task_worktree_policy_with_scopes(
-        task_id,
-        worktree_path,
-        goal_branch,
-        base_ref,
-        base_sha,
-        checkout_target,
-        None,
-    );
-}
-
-pub fn register_task_worktree_policy_with_scopes(
-    task_id: &AgentTaskId,
-    worktree_path: PathBuf,
-    goal_branch: Option<String>,
-    base_ref: Option<String>,
-    base_sha: Option<String>,
-    checkout_target: Option<String>,
-    write_scopes: Option<Vec<String>>,
-) {
     finish_slot_and_register_policy(
         None,
         task_id,
@@ -1821,7 +1338,6 @@ pub fn register_task_worktree_policy_with_scopes(
         base_sha,
         checkout_target,
         None,
-        write_scopes,
     );
 }
 
@@ -1831,7 +1347,7 @@ pub fn claim_branch_or_error(
     checkout_target: Option<String>,
 ) -> Result<()> {
     let mut reg = REGISTRY.write();
-    let active_sessions = reg.live_active_sessions_count(task_id);
+    let active_sessions = reg.active_sessions.get(task_id).copied().unwrap_or(0);
     if active_sessions > 1 {
         anyhow::bail!(
             "task {task_id} already has an active session; wait for it to finish or resume via session_id later"
@@ -1841,20 +1357,12 @@ pub fn claim_branch_or_error(
         if other_task_id != task_id {
             let occupied = entry.checked_out_branch(other_task_id);
             if occupied == branch {
-                let active = reg.live_active_sessions_count(other_task_id);
-                let safety = worktree_release_safety_for_state(other_task_id, entry, active, &reg);
+                let active = reg.active_sessions.get(other_task_id).copied().unwrap_or(0);
+                let safety = worktree_release_safety_for_state(other_task_id, entry, active);
                 match safety {
                     WorktreeReleaseSafety::ActiveSession => {
                         anyhow::bail!(
                             "branch {branch} is checked out by task {other_task_id}; serialize or use on_branch after it completes"
-                        );
-                    }
-                    WorktreeReleaseSafety::Retained => {
-                        let reason = reg
-                            .retention_reason(other_task_id)
-                            .unwrap_or_else(|| "retained".to_string());
-                        anyhow::bail!(
-                            "cannot release worktree for task {other_task_id} holding branch {branch}: worktree is retained ({reason})"
                         );
                     }
                     WorktreeReleaseSafety::CommitError => {
@@ -1875,16 +1383,11 @@ pub fn claim_branch_or_error(
     } else {
         None
     };
-    let session_from_map = reg.task_sessions.get(task_id).cloned();
     let entry = reg.entries.entry(task_id.clone()).or_default();
-    let preserved_session_id = entry.session_id.clone().or(session_from_map);
-    let preserved_write_scopes = entry.write_scopes.clone();
     *entry = TaskWorktreeState {
         checkout_target,
         is_terminal: false,
         last_session_ended_at: initial_ended_at,
-        session_id: preserved_session_id,
-        write_scopes: preserved_write_scopes,
         ..Default::default()
     };
     Ok(())
@@ -1901,8 +1404,8 @@ fn stale_worktree_tasks_for_branch(
             *other_id != current_task_id && entry.checked_out_branch(other_id) == branch
         })
         .map(|(other_id, entry)| {
-            let active = reg.live_active_sessions_count(other_id);
-            let safety = worktree_release_safety_for_state(other_id, entry, active, &reg);
+            let active = reg.active_sessions.get(other_id).copied().unwrap_or(0);
+            let safety = worktree_release_safety_for_state(other_id, entry, active);
             (
                 other_id.clone(),
                 entry.worktree_path.clone(),
@@ -1951,67 +1454,15 @@ pub fn task_worktree_base_sha(task_id: &AgentTaskId) -> Option<String> {
 
 pub fn task_worktree_path_for_id(task_id: &AgentTaskId) -> Option<PathBuf> {
     let reg = REGISTRY.read();
-    reg.entries
-        .get(task_id)
-        .map(|e| e.worktree_path.clone())
-        .filter(|p| !p.as_os_str().is_empty())
-}
-
-pub fn task_worktree_anchor_path(task_worktree: &Path) -> Option<PathBuf> {
-    let reg = REGISTRY.read();
-    reg.entries.values().find_map(|state| {
-        if state.worktree_path == task_worktree {
-            state.pool_key.as_ref().map(|key| key.anchor_path.clone())
-        } else {
-            None
-        }
-    })
-}
-
-pub fn register_task_session(task_id: &AgentTaskId, session_id: String) {
-    let mut reg = REGISTRY.write();
-    reg.task_sessions
-        .insert(task_id.clone(), session_id.clone());
-    if let Some(entry) = reg.entries.get_mut(task_id) {
-        entry.session_id = Some(session_id);
-    } else {
-        reg.entries.insert(
-            task_id.clone(),
-            TaskWorktreeState {
-                session_id: Some(session_id),
-                ..Default::default()
-            },
-        );
-    }
-}
-
-pub fn task_session_id_for_id(task_id: &AgentTaskId) -> Option<String> {
-    let reg = REGISTRY.read();
-    reg.entries
-        .get(task_id)
-        .and_then(|e| e.session_id.clone())
-        .or_else(|| reg.task_sessions.get(task_id).cloned())
-}
-
-pub fn task_id_for_session_id(session_id: &str) -> Option<AgentTaskId> {
-    let reg = REGISTRY.read();
-    for (task_id, entry) in &reg.entries {
-        if entry.session_id.as_deref() == Some(session_id) {
-            return Some(task_id.clone());
-        }
-    }
-    for (task_id, sess) in &reg.task_sessions {
-        if sess == session_id {
-            return Some(task_id.clone());
-        }
-    }
-    None
+    reg.entries.get(task_id).map(|e| e.worktree_path.clone())
 }
 
 pub fn record_task_worktree_changed_files(task_id: &AgentTaskId, files: Vec<String>) {
     let mut reg = REGISTRY.write();
     if let Some(entry) = reg.entries.get_mut(task_id) {
-        entry.changed_files = files;
+        if !files.is_empty() || entry.changed_files.is_empty() {
+            entry.changed_files = files;
+        }
     }
 }
 
@@ -2021,21 +1472,6 @@ pub fn task_worktree_changed_files(task_id: &AgentTaskId) -> Vec<String> {
         .get(task_id)
         .map(|e| e.changed_files.clone())
         .unwrap_or_default()
-}
-
-pub fn task_worktree_write_scopes(task_id: &AgentTaskId) -> Vec<String> {
-    let reg = REGISTRY.read();
-    reg.entries
-        .get(task_id)
-        .map(|e| e.write_scopes.clone())
-        .unwrap_or_default()
-}
-
-pub fn record_task_worktree_write_scopes(task_id: &AgentTaskId, scopes: Vec<String>) {
-    let mut reg = REGISTRY.write();
-    if let Some(entry) = reg.entries.get_mut(task_id) {
-        entry.write_scopes = scopes;
-    }
 }
 
 pub fn record_task_worktree_merge_conflict(task_id: &AgentTaskId, conflict: Vec<String>) {
@@ -2176,17 +1612,12 @@ pub fn unregister_task_worktree(task_id: &AgentTaskId) {
     clear_task_lsp_suppressed(task_id);
     let mut reg = REGISTRY.write();
     let entry = reg.entries.remove(task_id);
-    reg.active_guards.remove(task_id);
     let mut project_worktrees = PROJECT_TASK_WORKTREES.write();
     for map in project_worktrees.values_mut() {
         map.remove(task_id);
     }
     drop(reg);
     drop(project_worktrees);
-    {
-        let mut contexts = TASK_WORKTREE_CONTEXTS.write();
-        contexts.retain(|path, _| !path.to_string_lossy().contains(task_id.as_str()));
-    }
     if let Some(pool_key) = entry.and_then(|e| e.pool_key) {
         let already_in_flight = {
             let notified = NOTIFIED_WAITERS.lock();
@@ -2201,10 +1632,6 @@ pub fn unregister_task_worktree(task_id: &AgentTaskId) {
 }
 
 pub fn record_task_worktree_commit_error(task_id: &AgentTaskId, error: String) {
-    if !is_non_empty_error(&error) {
-        clear_task_worktree_commit_error(task_id);
-        return;
-    }
     let mut reg = REGISTRY.write();
     if let Some(entry) = reg.entries.get_mut(task_id) {
         entry.commit_error = Some(error);
@@ -2231,7 +1658,6 @@ pub fn task_worktree_commit_error(task_id: &AgentTaskId) -> Option<String> {
     reg.entries
         .get(task_id)
         .and_then(|e| e.commit_error.clone())
-        .filter(|e| is_non_empty_error(e))
 }
 
 pub fn record_task_worktree_cleanup_error(task_id: &AgentTaskId, error: String) {
@@ -2265,29 +1691,16 @@ pub fn task_worktree_cleanup_error(task_id: &AgentTaskId) -> Option<String> {
 
 pub fn mark_task_terminal(task_id: &AgentTaskId) {
     let mut reg = REGISTRY.write();
-    let now = std::time::Instant::now();
     if let Some(entry) = reg.entries.get_mut(task_id) {
         entry.is_terminal = true;
-        if entry.terminal_at.is_none() {
-            entry.terminal_at = Some(now);
-        }
     } else {
         reg.entries.insert(
             task_id.clone(),
             TaskWorktreeState {
                 is_terminal: true,
-                terminal_at: Some(now),
                 ..Default::default()
             },
         );
-    }
-}
-
-#[cfg(any(test, feature = "test-support"))]
-pub fn set_task_terminal_at(task_id: &AgentTaskId, terminal_at: Option<std::time::Instant>) {
-    let mut reg = REGISTRY.write();
-    if let Some(entry) = reg.entries.get_mut(task_id) {
-        entry.terminal_at = terminal_at;
     }
 }
 
@@ -2296,270 +1709,28 @@ pub fn is_task_terminal(task_id: &AgentTaskId) -> bool {
     reg.entries.get(task_id).map_or(false, |e| e.is_terminal)
 }
 
-static NEXT_GUARD_ID: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
-
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-pub struct SubagentSessionGuardId(usize);
-
-#[derive(Clone, Debug)]
-pub struct SubagentSessionOwner {
-    pub thread_id: acp::SessionId,
-    pub tool_use_id: LanguageModelToolUseId,
-    pub thread: Option<WeakEntity<crate::Thread>>,
-    #[cfg(any(test, feature = "test-support"))]
-    pub is_test_live: bool,
-}
-
-pub fn is_owner_alive(owner: &SubagentSessionOwner) -> bool {
-    if let Some(ref thread) = owner.thread {
-        if thread.upgrade().is_none() {
-            return false;
-        }
-        crate::thread::is_thread_turn_running(&owner.thread_id)
-    } else {
-        #[cfg(any(test, feature = "test-support"))]
-        {
-            owner.is_test_live || crate::thread::is_thread_turn_running(&owner.thread_id)
-        }
-        #[cfg(not(any(test, feature = "test-support")))]
-        {
-            crate::thread::is_thread_turn_running(&owner.thread_id)
-        }
-    }
-}
-
-pub struct SubagentSessionGuard {
-    task_id: AgentTaskId,
-    guard_id: SubagentSessionGuardId,
-}
-
-impl SubagentSessionGuard {
-    pub fn new(task_id: AgentTaskId, owner: SubagentSessionOwner) -> Self {
-        register_subagent_session_guard(&task_id, owner)
-    }
-
-    pub fn task_id(&self) -> &AgentTaskId {
-        &self.task_id
-    }
-
-    pub fn id(&self) -> SubagentSessionGuardId {
-        self.guard_id
-    }
-
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn test_new(task_id: AgentTaskId) -> Self {
-        let owner = SubagentSessionOwner {
-            thread_id: acp::SessionId::new("test-thread"),
-            tool_use_id: LanguageModelToolUseId::from("test-tool-use"),
-            thread: None,
-            is_test_live: true,
-        };
-        register_subagent_session_guard(&task_id, owner)
-    }
-
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn test_new_stale(task_id: AgentTaskId) -> Self {
-        let owner = SubagentSessionOwner {
-            thread_id: acp::SessionId::new("test-stale-thread"),
-            tool_use_id: LanguageModelToolUseId::from("test-stale-tool-use"),
-            thread: None,
-            is_test_live: false,
-        };
-        register_subagent_session_guard(&task_id, owner)
-    }
-}
-
-impl Drop for SubagentSessionGuard {
-    fn drop(&mut self) {
-        unregister_subagent_session_guard(&self.task_id, self.guard_id);
-    }
-}
-
-pub fn register_subagent_session_guard(
-    task_id: &AgentTaskId,
-    owner: SubagentSessionOwner,
-) -> SubagentSessionGuard {
-    let guard_id =
-        SubagentSessionGuardId(NEXT_GUARD_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+pub fn register_subagent_session(task_id: &AgentTaskId) {
     let mut reg = REGISTRY.write();
-    let guards = reg.active_guards.entry(task_id.clone()).or_default();
-    guards.insert(guard_id, owner);
+    *reg.active_sessions.entry(task_id.clone()).or_insert(0) += 1;
     if let Some(entry) = reg.entries.get_mut(task_id) {
         entry.last_session_ended_at = None;
         entry.slot_notified = false;
     }
-    SubagentSessionGuard {
-        task_id: task_id.clone(),
-        guard_id,
-    }
-}
-
-pub fn unregister_subagent_session_guard(task_id: &AgentTaskId, guard_id: SubagentSessionGuardId) {
-    let mut reg = REGISTRY.write();
-    let mut session_ended = false;
-    let mut pool_key = None;
-    let (live_count, is_empty) = if let Some(guards) = reg.active_guards.get_mut(task_id) {
-        guards.remove(&guard_id);
-        (
-            guards.values().filter(|o| is_owner_alive(o)).count(),
-            guards.is_empty(),
-        )
-    } else {
-        (0, false)
-    };
-    if is_empty {
-        reg.active_guards.remove(task_id);
-    }
-    if live_count == 0 {
-        if let Some(entry) = reg.entries.get_mut(task_id) {
-            entry.last_session_ended_at = Some(std::time::Instant::now());
-            session_ended = true;
-            pool_key = entry.pool_key.clone();
-        }
-    }
-    drop(reg);
-
-    if session_ended {
-        if let Some(pool_key) = pool_key {
-            let already_in_flight = {
-                let notified = NOTIFIED_WAITERS.lock();
-                notified.get(&pool_key).copied().unwrap_or(0)
-            };
-            if already_in_flight == 0 {
-                notify_task_worktree_slot_available_for_pool(&pool_key);
-            }
-        } else {
-            notify_task_worktree_slot_available();
-        }
-    }
-}
-
-pub fn sweep_guards_for_thread(thread_id: &acp::SessionId) {
-    let mut reg = REGISTRY.write();
-    let mut ended_pools = Vec::new();
-    let mut tasks_to_clean = Vec::new();
-    let mut ended_tasks = Vec::new();
-
-    for (task_id, guards) in reg.active_guards.iter_mut() {
-        let before_live = guards.values().filter(|o| is_owner_alive(o)).count();
-        guards.retain(|_, owner| owner.thread_id != *thread_id);
-        let after_live = guards.values().filter(|o| is_owner_alive(o)).count();
-
-        if before_live > 0 && after_live == 0 {
-            ended_tasks.push(task_id.clone());
-        }
-        if guards.is_empty() {
-            tasks_to_clean.push(task_id.clone());
-        }
-    }
-
-    for task_id in tasks_to_clean {
-        reg.active_guards.remove(&task_id);
-    }
-
-    for task_id in ended_tasks {
-        if let Some(entry) = reg.entries.get_mut(&task_id) {
-            entry.last_session_ended_at = Some(std::time::Instant::now());
-            if let Some(ref pk) = entry.pool_key {
-                ended_pools.push(pk.clone());
-            }
-        }
-    }
-
-    drop(reg);
-
-    for pool_key in ended_pools {
-        let already_in_flight = {
-            let notified = NOTIFIED_WAITERS.lock();
-            notified.get(&pool_key).copied().unwrap_or(0)
-        };
-        if already_in_flight == 0 {
-            notify_task_worktree_slot_available_for_pool(&pool_key);
-        }
-    }
-}
-
-pub fn sweep_guards_for_tool_use(thread_id: &acp::SessionId, tool_use_id: &LanguageModelToolUseId) {
-    let mut reg = REGISTRY.write();
-    let mut ended_pools = Vec::new();
-    let mut tasks_to_clean = Vec::new();
-    let mut ended_tasks = Vec::new();
-
-    for (task_id, guards) in reg.active_guards.iter_mut() {
-        let before_live = guards.values().filter(|o| is_owner_alive(o)).count();
-        guards.retain(|_, owner| {
-            !(owner.thread_id == *thread_id && owner.tool_use_id == *tool_use_id)
-        });
-        let after_live = guards.values().filter(|o| is_owner_alive(o)).count();
-
-        if before_live > 0 && after_live == 0 {
-            ended_tasks.push(task_id.clone());
-        }
-        if guards.is_empty() {
-            tasks_to_clean.push(task_id.clone());
-        }
-    }
-
-    for task_id in tasks_to_clean {
-        reg.active_guards.remove(&task_id);
-    }
-
-    for task_id in ended_tasks {
-        if let Some(entry) = reg.entries.get_mut(&task_id) {
-            entry.last_session_ended_at = Some(std::time::Instant::now());
-            if let Some(ref pk) = entry.pool_key {
-                ended_pools.push(pk.clone());
-            }
-        }
-    }
-
-    drop(reg);
-
-    for pool_key in ended_pools {
-        let already_in_flight = {
-            let notified = NOTIFIED_WAITERS.lock();
-            notified.get(&pool_key).copied().unwrap_or(0)
-        };
-        if already_in_flight == 0 {
-            notify_task_worktree_slot_available_for_pool(&pool_key);
-        }
-    }
-}
-
-pub fn register_subagent_session(task_id: &AgentTaskId) {
-    let owner = SubagentSessionOwner {
-        thread_id: acp::SessionId::new("legacy-test-thread"),
-        tool_use_id: LanguageModelToolUseId::from("legacy-test-tool-use"),
-        thread: None,
-        #[cfg(any(test, feature = "test-support"))]
-        is_test_live: true,
-    };
-    register_subagent_session_guard(task_id, owner);
 }
 
 pub fn unregister_subagent_session(task_id: &AgentTaskId) {
     let mut reg = REGISTRY.write();
     let mut session_ended = false;
     let mut pool_key = None;
-    let (live_count, is_empty) = if let Some(guards) = reg.active_guards.get_mut(task_id) {
-        if let Some(&guard_id) = guards.keys().next() {
-            guards.remove(&guard_id);
-        }
-        (
-            guards.values().filter(|o| is_owner_alive(o)).count(),
-            guards.is_empty(),
-        )
-    } else {
-        (0, false)
-    };
-    if is_empty {
-        reg.active_guards.remove(task_id);
-    }
-    if live_count == 0 {
-        if let Some(entry) = reg.entries.get_mut(task_id) {
-            entry.last_session_ended_at = Some(std::time::Instant::now());
-            session_ended = true;
-            pool_key = entry.pool_key.clone();
+    if let Some(count) = reg.active_sessions.get_mut(task_id) {
+        *count = count.saturating_sub(1);
+        if *count == 0 {
+            reg.active_sessions.remove(task_id);
+            if let Some(entry) = reg.entries.get_mut(task_id) {
+                entry.last_session_ended_at = Some(std::time::Instant::now());
+                session_ended = true;
+                pool_key = entry.pool_key.clone();
+            }
         }
     }
     drop(reg);
@@ -2581,13 +1752,22 @@ pub fn unregister_subagent_session(task_id: &AgentTaskId) {
 
 pub fn has_active_subagent_session(task_id: &AgentTaskId) -> bool {
     let reg = REGISTRY.read();
-    reg.has_active_session(task_id)
+    reg.active_sessions.get(task_id).copied().unwrap_or(0) > 0
 }
 
-#[cfg(any(test, feature = "test-support"))]
-pub fn active_guards_count(task_id: &AgentTaskId) -> usize {
-    let reg = REGISTRY.read();
-    reg.active_guards.get(task_id).map_or(0, |m| m.len())
+pub struct SubagentSessionGuard(AgentTaskId);
+
+impl SubagentSessionGuard {
+    pub fn new(task_id: AgentTaskId) -> Self {
+        register_subagent_session(&task_id);
+        Self(task_id)
+    }
+}
+
+impl Drop for SubagentSessionGuard {
+    fn drop(&mut self) {
+        unregister_subagent_session(&self.0);
+    }
 }
 
 fn remove_task_worktree_internal(
@@ -2597,13 +1777,6 @@ fn remove_task_worktree_internal(
     cx: &mut App,
 ) -> Task<Result<()>> {
     let task_id = task_id.clone();
-    if !force {
-        if let Some(reason) = task_worktree_retention_reason(&task_id) {
-            return Task::ready(Err(anyhow::anyhow!(
-                "cannot remove worktree for task {task_id}: worktree is retained ({reason})"
-            )));
-        }
-    }
     cx.spawn(async move |cx| {
         let (repository, anchor_path, path_style, worktree_setting, file_system) = project
             .update(cx, |project, cx| {
@@ -2611,6 +1784,57 @@ fn remove_task_worktree_internal(
             })??;
         let worktree_path =
             task_worktree_path(&anchor_path, &worktree_setting, path_style, &task_id)?;
+
+        if file_system.is_dir(&worktree_path).await {
+            let remove_task = repository.update(cx, |repository, _| {
+                repository.remove_worktree(worktree_path.clone(), force)
+            });
+            let git_remove_result = match remove_task.await {
+                Ok(inner) => inner,
+                Err(canceled) => Err(anyhow::anyhow!("remove_worktree task canceled: {canceled}")),
+            };
+            let directory_still_exists = file_system.is_dir(&worktree_path).await;
+            if let Err(git_error) = git_remove_result {
+                log::warn!(
+                    "git remove_worktree for task worktree at {} failed: {git_error:#}; attempting fallback filesystem removal",
+                    worktree_path.display()
+                );
+                if directory_still_exists {
+                    file_system
+                        .remove_dir(
+                            &worktree_path,
+                            fs::RemoveOptions {
+                                recursive: true,
+                                ignore_if_not_exists: true,
+                            },
+                        )
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "failed to remove task worktree directory at {}: git remove failed ({:#}) and filesystem removal failed",
+                                worktree_path.display(),
+                                git_error
+                            )
+                        })?;
+                }
+            } else if directory_still_exists {
+                file_system
+                    .remove_dir(
+                        &worktree_path,
+                        fs::RemoveOptions {
+                            recursive: true,
+                            ignore_if_not_exists: true,
+                        },
+                    )
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "failed to remove task worktree directory at {}",
+                            worktree_path.display()
+                        )
+                    })?;
+            }
+        }
 
         let worktree_id = project.read_with(cx, |project, cx| {
             project
@@ -2627,32 +1851,10 @@ fn remove_task_worktree_internal(
                 })
                 .map(|w| w.read(cx).id())
         });
-        {
-            let mut project_worktrees = PROJECT_TASK_WORKTREES.write();
-            for map in project_worktrees.values_mut() {
-                map.remove(&task_id);
-            }
-        }
         if let Some(id) = worktree_id {
-            let wait = project.update(cx, |project, cx| {
-                let wait = project.wait_for_worktree_release(id, cx);
+            project.update(cx, |project, cx| {
                 project.remove_worktree(id, cx);
-                wait
             });
-            wait.await.log_err();
-        }
-
-        if file_system.is_dir(&worktree_path).await {
-            remove_worktree_from_git_and_fs(
-                &repository,
-                &file_system,
-                &worktree_path,
-                &anchor_path,
-                force,
-                "task worktree",
-                cx,
-            )
-            .await?;
         }
 
         Ok(())
@@ -2664,16 +1866,11 @@ pub fn remove_task_worktree(
     task_id: &AgentTaskId,
     cx: &mut App,
 ) -> Task<Result<()>> {
-    if let Some(reason) = task_worktree_retention_reason(task_id) {
-        return Task::ready(Err(anyhow::anyhow!(
-            "cannot remove worktree for task {task_id}: worktree is retained ({reason})"
-        )));
-    }
     clear_task_worktree_commit_error(task_id);
     clear_task_worktree_cleanup_error(task_id);
     clear_task_worktree_merge_conflict(task_id);
     let task_id_clone = task_id.clone();
-    let task = remove_task_worktree_internal(project, task_id, true, cx);
+    let task = remove_task_worktree_internal(project, task_id, false, cx);
     cx.spawn(async move |_cx| {
         task.await?;
         unregister_task_worktree(&task_id_clone);
@@ -2803,22 +2000,6 @@ pub fn auto_cleanup_task_worktree(
     task_id: &AgentTaskId,
     cx: &mut App,
 ) -> Task<Result<bool>> {
-    let cleanup_enabled = project.read_with(cx, |project, cx| {
-        let s = agent_settings::AgentSettings::get_for_project(project, cx);
-        s.task_lifecycle_mode != agent_settings::TaskLifecycleMode::Agent && s.cleanup
-    });
-    if !cleanup_enabled {
-        return Task::ready(Ok(false));
-    }
-
-    if REGISTRY.read().retention_timeout.is_none() {
-        let retention_timeout = project.read_with(cx, |project, cx| {
-            agent_settings::AgentSettings::get_for_project(project, cx)
-                .task_worktree_retention_timeout_seconds
-        });
-        set_task_worktree_retention_timeout(Some(retention_timeout));
-    }
-
     if task_worktree_path_for_id(task_id).is_none() {
         return Task::ready(Ok(false));
     }
@@ -2840,11 +2021,6 @@ pub fn auto_cleanup_task_worktree(
         return Task::ready(Ok(false));
     }
 
-    if let Some(reason) = task_worktree_retention_reason(task_id) {
-        log::info!("Safeguard: retaining worktree for {task_id} due to retention reason: {reason}");
-        return Task::ready(Ok(false));
-    }
-
     {
         let mut reg = REGISTRY.write();
         if let Some(entry) = reg.entries.get_mut(task_id) {
@@ -2856,30 +2032,14 @@ pub fn auto_cleanup_task_worktree(
     }
 
     let task_id_clone = task_id.clone();
-    cx.spawn(async move |cx| {
-        let (repository, anchor_path, _path_style, _worktree_setting, file_system) = project
-            .update(cx, |project, cx| {
-                anyhow::Ok(task_worktree_context(project, cx))
-            })??;
-        let worktree_path =
-            task_worktree_path_for_id(&task_id_clone).unwrap_or_else(|| PathBuf::new());
-        if let Err(e) = release_stale_task_worktree(
-            &project,
-            &repository,
-            &file_system,
-            &anchor_path,
-            &task_id_clone,
-            &worktree_path,
-            "auto-cleanup",
-            true,
-            cx,
-        )
-        .await
-        {
+    let remove_task = remove_task_worktree_internal(project, task_id, false, cx);
+    cx.spawn(async move |_cx| {
+        if let Err(e) = remove_task.await {
             let err_msg = e.to_string();
             record_task_worktree_cleanup_error(&task_id_clone, err_msg);
             return Err(e);
         }
+        unregister_task_worktree(&task_id_clone);
         log::info!("Auto-cleaned worktree for terminal task {task_id_clone}");
         Ok(true)
     })
@@ -2963,8 +2123,8 @@ pub fn startup_sweep(
                         .map_or(true, |pk| pk == &pool_key)
                 })
                 .map(|(id, state)| {
-                    let active = reg.live_active_sessions_count(id);
-                    let safety = worktree_release_safety_for_state(id, state, active, &reg);
+                    let active = reg.active_sessions.get(id).copied().unwrap_or(0);
+                    let safety = worktree_release_safety_for_state(id, state, active);
                     (
                         id.clone(),
                         state.worktree_path.clone(),
@@ -3037,7 +2197,6 @@ pub fn startup_sweep(
                     &candidate_id,
                     &candidate_path,
                     "startup sweep LRU eviction",
-                    false,
                     cx,
                 )
                 .await;
@@ -3154,87 +2313,6 @@ pub struct GoalBranchSummary {
     pub has_conflict: bool,
 }
 
-fn is_path_in_write_scopes(path: &RepoPath, scopes: &[String]) -> bool {
-    let valid_scopes: Vec<Arc<str>> = scopes
-        .iter()
-        .map(|scope| scope.trim())
-        .filter(|scope| !scope.is_empty())
-        .map(Arc::from)
-        .collect();
-
-    if valid_scopes.is_empty() {
-        return false;
-    }
-
-    let Ok(write_scopes) = agent_settings::WriteScopes::new(valid_scopes) else {
-        return false;
-    };
-
-    if write_scopes.is_match(path) {
-        return true;
-    }
-
-    for scope in scopes {
-        let trimmed_scope = scope.trim().trim_start_matches("./");
-        if let Some((_root_name, relative_pattern)) = trimmed_scope.split_once('/') {
-            let relative_pattern = relative_pattern.trim_matches('/');
-            if !relative_pattern.is_empty() {
-                if let Ok(sub_scopes) =
-                    agent_settings::WriteScopes::new(vec![Arc::from(relative_pattern)])
-                {
-                    if sub_scopes.is_match(path) {
-                        return true;
-                    }
-                }
-            }
-        }
-    }
-
-    false
-}
-
-pub const GIT_LOCK_RETRY_DELAY: Duration = Duration::from_millis(500);
-pub const GIT_LOCK_MAX_RETRIES: usize = 3;
-
-pub fn is_git_lock_contention(err: &str) -> bool {
-    let lower = err.to_ascii_lowercase();
-    lower.contains("index.lock")
-        || lower.contains(".lock")
-        || (lower.contains("unable to create") && lower.contains("lock"))
-        || lower.contains("file is locked")
-        || lower.contains("being used by another process")
-        || lower.contains("could not lock")
-        || lower.contains("cannot lock")
-        || lower.contains("failed to lock")
-        || lower.contains("resource temporarily unavailable")
-        || lower.contains("another git process seems to be running")
-}
-
-pub async fn retry_on_git_lock_contention<T, F, Fut>(
-    executor: &BackgroundExecutor,
-    mut op: F,
-) -> Result<T>
-where
-    F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = Result<T>>,
-{
-    let mut delay = GIT_LOCK_RETRY_DELAY;
-    let mut retries_left = GIT_LOCK_MAX_RETRIES;
-    loop {
-        match op().await {
-            Ok(val) => return Ok(val),
-            Err(err) => {
-                if retries_left == 0 || !is_git_lock_contention(&err.to_string()) {
-                    return Err(err);
-                }
-                retries_left -= 1;
-                executor.timer(delay).await;
-                delay = delay.saturating_mul(2);
-            }
-        }
-    }
-}
-
 pub async fn commit_task_worktree(
     fs: Arc<dyn Fs>,
     task_worktree: PathBuf,
@@ -3263,51 +2341,24 @@ pub async fn commit_task_worktree(
 
     let prefix = RepoPath::from_rel_path(&util::rel_path::RelPath::empty());
 
-    let status = match retry_on_git_lock_contention(cx.background_executor(), || {
-        git_repo.status(std::slice::from_ref(&prefix))
-    })
-    .await
-    {
+    let status = match git_repo.status(&[prefix]).await {
         Ok(status) => status,
         Err(e) => {
             let head_sha = git_repo.head_sha().await;
-            let err_str = e.to_string();
-            let commit_error = if is_git_lock_contention(&err_str) {
-                format!("git lock contention: {e}")
-            } else {
-                err_str
-            };
             return Ok(SubagentIsolationDetails {
                 mode: mode.to_string(),
                 branch,
                 base_branch,
                 head_sha,
                 changed_files: 0,
-                commit_error: Some(commit_error),
+                commit_error: Some(e.to_string()),
                 merged_into: None,
                 merge_conflict: None,
             });
         }
     };
 
-    let write_scopes = task_worktree_write_scopes(&task_id_typed);
-    let paths: Vec<RepoPath> = status
-        .entries
-        .iter()
-        .filter_map(|(path, _)| {
-            let unix_str = path.as_unix_str().replace('\\', "/");
-            let clean_path = unix_str.trim_start_matches("./").trim_start_matches('/');
-            let is_injected_settings = clean_path == ".zed/settings.json";
-            if is_injected_settings && !is_path_in_write_scopes(path, &write_scopes) {
-                None
-            } else {
-                Some(path.clone())
-            }
-        })
-        .collect();
-
-    if paths.is_empty() {
-        record_task_worktree_changed_files(&task_id_typed, Vec::new());
+    if status.entries.is_empty() {
         let head_sha = git_repo.head_sha().await;
         // Snapshot existing worktree files if any
         #[cfg(any(test, feature = "test-support"))]
@@ -3340,7 +2391,13 @@ pub async fn commit_task_worktree(
         });
     }
 
-    let changed_files = paths.len();
+    let changed_files = status.entries.len();
+    let paths: Vec<RepoPath> = status
+        .entries
+        .iter()
+        .map(|(path, _)| path.clone())
+        .collect();
+
     let file_strings: Vec<String> = paths.iter().map(|p| p.as_unix_str().to_string()).collect();
     record_task_worktree_changed_files(&task_id_typed, file_strings);
 
@@ -3362,25 +2419,18 @@ pub async fn commit_task_worktree(
         }
     }
 
-    let stage_res = retry_on_git_lock_contention(cx.background_executor(), || {
-        git_repo.stage_paths(paths.clone(), Arc::new(HashMap::default()))
-    })
-    .await;
-    if let Err(final_err) = stage_res {
+    if let Err(e) = git_repo
+        .stage_paths(paths, Arc::new(HashMap::default()))
+        .await
+    {
         let head_sha = git_repo.head_sha().await;
-        let err_trimmed = final_err.to_string();
-        let commit_error = if is_non_empty_error(&err_trimmed) {
-            Some(format!("staging failed: {final_err}"))
-        } else {
-            None
-        };
         return Ok(SubagentIsolationDetails {
             mode: mode.to_string(),
             branch,
             base_branch,
             head_sha,
             changed_files: 0,
-            commit_error,
+            commit_error: Some(format!("staging failed: {e}")),
             merged_into: None,
             merge_conflict: None,
         });
@@ -3389,52 +2439,30 @@ pub async fn commit_task_worktree(
     let commit_message = if is_error {
         format!("WIP: {branch} error checkpoint")
     } else {
-        let recorded_title = task_worktree_title(&task_id_typed);
-        if let Some(title) = recorded_title {
-            title
-        } else {
-            let mut fetched_title = None;
-            if let Some(provider) = task_provider() {
-                let task = cx.update(|cx| provider.get_task(&task_id_typed, cx));
-                if let Ok(detail) = task.await {
-                    let summary_title = detail.summary.title.trim().to_string();
-                    if !summary_title.is_empty() {
-                        record_task_title(&task_id_typed, &summary_title);
-                        fetched_title = task_worktree_title(&task_id_typed);
-                    }
-                }
-            }
-            fetched_title.unwrap_or_else(|| format!("{branch}: completed task work"))
-        }
+        task_worktree_title(&task_id_typed)
+            .unwrap_or_else(|| format!("{branch}: completed task work"))
     };
 
-    let executor = cx.background_executor().clone();
-    let commit_res = retry_on_git_lock_contention(&executor, || {
-        let askpass = AskPassDelegate::new(cx, |_, _, _| {});
-        git_repo.commit(
-            commit_message.clone().into(),
+    let askpass = AskPassDelegate::new(cx, |_, _, _| {});
+
+    if let Err(e) = git_repo
+        .commit(
+            commit_message.into(),
             None,
             CommitOptions::default(),
             askpass,
             Arc::new(HashMap::default()),
         )
-    })
-    .await;
-    if let Err(final_err) = commit_res {
+        .await
+    {
         let head_sha = git_repo.head_sha().await;
-        let err_trimmed = final_err.to_string();
-        let commit_error = if is_non_empty_error(&err_trimmed) {
-            Some(format!("commit failed: {final_err}"))
-        } else {
-            None
-        };
         return Ok(SubagentIsolationDetails {
             mode: mode.to_string(),
             branch,
             base_branch,
             head_sha,
             changed_files: 0,
-            commit_error,
+            commit_error: Some(format!("commit failed: {e}")),
             merged_into: None,
             merge_conflict: None,
         });
@@ -3502,6 +2530,39 @@ pub async fn commit_task_worktree(
         merged_into: None,
         merge_conflict: None,
     })
+}
+
+async fn detect_repo_author(
+    git_binary: Option<&std::path::Path>,
+    anchor_path: &std::path::Path,
+) -> Option<(SharedString, SharedString)> {
+    let git_binary = git_binary?;
+    let run_config = |key: &'static str| {
+        let mut command = util::command::new_command(git_binary);
+        command.args(["config", key]);
+        command.current_dir(anchor_path);
+        command
+    };
+
+    let name_output = run_config("user.name").output().await.ok()?;
+    if !name_output.status.success() {
+        return None;
+    }
+    let name = String::from_utf8_lossy(&name_output.stdout).trim().to_string();
+    if name.is_empty() {
+        return None;
+    }
+
+    let email_output = run_config("user.email").output().await.ok()?;
+    if !email_output.status.success() {
+        return None;
+    }
+    let email = String::from_utf8_lossy(&email_output.stdout).trim().to_string();
+    if email.is_empty() {
+        return None;
+    }
+
+    Some((name.into(), email.into()))
 }
 
 pub fn merge_task_branch_into_goal(
@@ -3657,11 +2718,15 @@ pub fn merge_task_branch_into_goal(
             }
             git::repository::MergeTreeResult::Clean { tree_sha } => {
                 let commit_message = format!("Merge task {} into goal {}", task_id, goal_id);
+                let author = detect_repo_author(git_binary.as_deref(), &anchor_path)
+                    .await
+                    .unwrap_or_else(|| ("Zed Agent".into(), "agent@zed.dev".into()));
                 git_repo
                     .commit_tree(
                         tree_sha,
                         vec![goal_sha.clone(), task_sha.clone()],
                         commit_message,
+                        Some(author),
                     )
                     .await?
             }
@@ -3904,62 +2969,33 @@ pub fn commit_and_merge_task_worktree(
                 details.merge_conflict = None;
                 clear_task_worktree_merge_conflict(&task_id);
             } else {
-                let executor = cx.background_executor().clone();
-                let merge_result = retry_on_git_lock_contention(&executor, || {
-                    let task =
-                        cx.update(|cx| merge_task_branch_into_goal(project.clone(), &task_id, cx));
-                    task
-                })
-                .await;
-                match merge_result {
-                    Ok(MergeOutcome::NoGoal) => {
+                let merge_task =
+                    cx.update(|cx| merge_task_branch_into_goal(project.clone(), &task_id, cx));
+                match merge_task.await? {
+                    MergeOutcome::NoGoal => {
                         details.merged_into = None;
                         details.merge_conflict = None;
                     }
-                    Ok(MergeOutcome::FastForward { target_ref, sha })
-                    | Ok(MergeOutcome::Merged { target_ref, sha }) => {
+                    MergeOutcome::FastForward { target_ref, sha }
+                    | MergeOutcome::Merged { target_ref, sha } => {
                         details.merged_into = Some(MergedInto { target_ref, sha });
                         details.merge_conflict = None;
                         clear_task_worktree_merge_conflict(&task_id);
                     }
-                    Ok(MergeOutcome::Conflict(conflict)) => {
+                    MergeOutcome::Conflict(conflict) => {
                         details.merged_into = None;
                         details.merge_conflict = Some(conflict.files.clone());
                         record_task_worktree_merge_conflict(&task_id, conflict.files);
-                    }
-                    Err(err) => {
-                        let err_str = format!("merge failed: {err:#}");
-                        let commit_error = if is_non_empty_error(&err.to_string()) {
-                            Some(err_str)
-                        } else {
-                            None
-                        };
-                        details.merged_into = None;
-                        details.merge_conflict = None;
-                        details.commit_error = commit_error.clone();
-                        if let Some(err_to_record) = commit_error {
-                            record_task_worktree_commit_error(&task_id, err_to_record);
-                        } else {
-                            clear_task_worktree_commit_error(&task_id);
-                        }
                     }
                 }
             }
         }
 
         record_task_worktree_isolation_details(&task_id, details.clone());
-        let should_publish = project.read_with(cx, |project, cx| {
-            let s = agent_settings::AgentSettings::get_for_project(project, cx);
-            s.task_lifecycle_mode != agent_settings::TaskLifecycleMode::Agent
-                && s.publish_ref_artifact
-        });
-        if should_publish {
-            let project_clone = project.clone();
-            let publish_task = cx.update(|cx| {
-                publish_task_ref_artifact_to_tgs(project_clone, &task_id, &details, cx)
-            });
-            publish_task.await.log_err();
-        }
+        let project_clone = project.clone();
+        let publish_task =
+            cx.update(|cx| publish_task_ref_artifact_to_tgs(project_clone, &task_id, &details, cx));
+        publish_task.await.log_err();
 
         Ok(details)
     })
@@ -4001,10 +3037,7 @@ pub fn assert_safe_graduation_ref(ref_or_branch: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn prepare_goal_graduation_summary(
-    goal_id: &str,
-    base_branch: &str,
-) -> Result<GoalGraduationSummary> {
+pub fn prepare_goal_graduation_summary(goal_id: &str) -> Result<GoalGraduationSummary> {
     let goal_id_str = goal_id.to_string();
     let goal_branch = format!("agent-goal/{goal_id_str}");
     assert_safe_graduation_ref(&goal_branch)?;
@@ -4040,10 +3073,10 @@ pub fn prepare_goal_graduation_summary(
     let title = format!("Graduate goal {goal_id_str}");
     let mut body = String::new();
     body.push_str(&format!(
-        "## Summary\n\nGoal `{goal_id_str}` graduation into `{base_branch}`.\n\n"
+        "## Summary\n\nGoal `{goal_id_str}` graduation into `main`.\n\n"
     ));
     body.push_str(&format!("- Source branch: `{goal_branch}`\n"));
-    body.push_str(&format!("- Target branch: `{base_branch}`\n"));
+    body.push_str("- Target branch: `main`\n");
     if let Some(sha) = &tip_sha {
         let short_sha: String = sha.chars().take(7).collect();
         body.push_str(&format!("- Tip SHA: `{short_sha}` ({sha})\n"));
@@ -4069,8 +3102,7 @@ pub fn prepare_goal_graduation_summary(
     body.push_str("\nRelease Notes:\n\n- N/A\n");
 
     let pr_cmd = format!(
-        "gh pr create --base {} --head {} --title \"{}\" --body \"{}\"",
-        base_branch,
+        "gh pr create --base main --head {} --title \"{}\" --body \"{}\"",
         goal_branch,
         title,
         body.replace('\"', "\\\"").replace('\n', "\\n")
@@ -4080,19 +3112,19 @@ pub fn prepare_goal_graduation_summary(
         title,
         body,
         source_branch: goal_branch.clone(),
-        target_branch: base_branch.to_string(),
+        target_branch: "main".to_string(),
         command: pr_cmd,
     };
 
     let summary = GoalGraduationSummary {
         goal_id: goal_id_str,
         goal_branch: goal_branch.clone(),
-        base_branch: base_branch.to_string(),
+        base_branch: "main".to_string(),
         refs: GoalRefs {
             goal_branch: goal_branch.clone(),
             goal_ref: format!("refs/heads/{goal_branch}"),
-            base_branch: base_branch.to_string(),
-            base_ref: format!("refs/heads/{base_branch}"),
+            base_branch: "main".to_string(),
+            base_ref: "refs/heads/main".to_string(),
         },
         tip_sha,
         commits_count,
@@ -4111,11 +3143,6 @@ pub fn prepare_goal_graduation(
     cx: &mut App,
 ) -> Task<Result<GoalGraduationSummary>> {
     let goal_id = goal_id.to_string();
-    let configured_base_branch = project.read_with(cx, |project, cx| {
-        agent_settings::AgentSettings::get_for_project(project, cx)
-            .goal_graduation_base_branch
-            .clone()
-    });
     cx.spawn(async move |cx| {
         let (_repository, anchor_path, _, _, file_system) = project
             .update(cx, |project, cx| {
@@ -4134,15 +3161,7 @@ pub fn prepare_goal_graduation(
             record_goal_tip_sha(&goal_id, sha);
         }
 
-        let base_branch = if let Some(base) = configured_base_branch {
-            base
-        } else if let Ok(Some(default_branch)) = git_repo.default_branch(false).await {
-            default_branch.to_string()
-        } else {
-            "main".to_string()
-        };
-
-        let summary = prepare_goal_graduation_summary(&goal_id, &base_branch)?;
+        let summary = prepare_goal_graduation_summary(&goal_id)?;
         {
             let mut reg = REGISTRY.write();
             reg.goal_graduations
@@ -4264,7 +3283,6 @@ pub struct GoalCleanupResult {
     pub goal_id: String,
     pub deleted_branches: Vec<String>,
     pub failed_branches: Vec<(String, String)>,
-    pub skipped_branches: Vec<String>,
     pub cleaned_tasks: Vec<AgentTaskId>,
 }
 
@@ -4287,13 +3305,6 @@ pub fn cleanup_graduated_goal(
     cx: &mut App,
 ) -> Task<Result<GoalCleanupResult>> {
     let goal_id = goal_id.to_string();
-    let (delete_goal_branch, delete_task_branches) = project.read_with(cx, |project, cx| {
-        let s = agent_settings::AgentSettings::get_for_project(project, cx);
-        (
-            s.delete_goal_branches_on_graduation,
-            s.delete_task_branches_on_graduation,
-        )
-    });
     cx.spawn(async move |cx| {
         let (repository, anchor_path, _, _, file_system) = project
             .update(cx, |project, cx| {
@@ -4308,13 +3319,7 @@ pub fn cleanup_graduated_goal(
         let goal_branch = format!("agent-goal/{}", goal_id);
         assert_safe_graduation_ref(&goal_branch)?;
 
-        let mut branches_to_delete = Vec::new();
-        let mut skipped_branches = Vec::new();
-        if delete_goal_branch {
-            branches_to_delete.push(goal_branch.clone());
-        } else {
-            skipped_branches.push(goal_branch.clone());
-        }
+        let mut branches_to_delete = vec![goal_branch.clone()];
         let mut tasks_to_cleanup = Vec::new();
 
         {
@@ -4348,17 +3353,11 @@ pub fn cleanup_graduated_goal(
         for task_id in &tasks_to_cleanup {
             let task_branch = format!("agent-task/{}", task_id);
             assert_safe_graduation_ref(&task_branch)?;
-            if delete_task_branches {
-                branches_to_delete.push(task_branch);
-            } else {
-                skipped_branches.push(task_branch);
-            }
+            branches_to_delete.push(task_branch);
         }
 
         branches_to_delete.sort();
         branches_to_delete.dedup();
-        skipped_branches.sort();
-        skipped_branches.dedup();
 
         let mut deleted_branches = Vec::new();
         let mut failed_branches = Vec::new();
@@ -4437,7 +3436,6 @@ pub fn cleanup_graduated_goal(
             goal_id,
             deleted_branches,
             failed_branches,
-            skipped_branches,
             cleaned_tasks: tasks_to_cleanup,
         })
     })
@@ -4512,7 +3510,7 @@ mod tests {
     use crate::AgentTaskStatus;
     use context_server::{ContextServer, ContextServerCommand, ContextServerId};
     use fs::FakeFs;
-    use futures::{StreamExt as _, channel::mpsc};
+    use futures::{FutureExt as _, StreamExt as _, channel::mpsc};
     use gpui::{BorrowAppContext, TestAppContext};
     use project::project_settings::ProjectSettings;
     use serde_json::json;
@@ -4529,6 +3527,44 @@ mod tests {
         });
     }
 
+    #[gpui::test]
+    async fn test_detect_repo_author(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        init_test(cx);
+        let temp_dir = tempfile::tempdir().unwrap();
+        assert_eq!(detect_repo_author(None, temp_dir.path()).await, None);
+
+        if let Some(git_binary) = system_git_binary() {
+            let mut init_cmd = util::command::new_command(&git_binary);
+            init_cmd.args(["init"]);
+            init_cmd.current_dir(temp_dir.path());
+            init_cmd.output().await.expect("git command failed");
+
+            let mut cmd = util::command::new_command(&git_binary);
+            cmd.args(["config", "user.name", "Test Name"]);
+            cmd.current_dir(temp_dir.path());
+            cmd.output().await.expect("git command failed");
+
+            let mut cmd = util::command::new_command(&git_binary);
+            cmd.args(["config", "user.email", "test@example.com"]);
+            cmd.current_dir(temp_dir.path());
+            cmd.output().await.expect("git command failed");
+
+            assert_eq!(
+                detect_repo_author(Some(&git_binary), temp_dir.path()).await,
+                Some(("Test Name".into(), "test@example.com".into()))
+            );
+
+            // Empty user.name -> returns None
+            let mut cmd = util::command::new_command(&git_binary);
+            cmd.args(["config", "user.name", ""]);
+            cmd.current_dir(temp_dir.path());
+            cmd.output().await.expect("git command failed");
+
+            assert_eq!(detect_repo_author(Some(&git_binary), temp_dir.path()).await, None);
+        }
+    }
+
     #[test]
     fn test_subagent_session_guard_drop_unregisters() {
         reset_registry_for_tests();
@@ -4536,7 +3572,7 @@ mod tests {
         assert!(!has_active_subagent_session(&task_id));
 
         {
-            let _guard = SubagentSessionGuard::test_new(task_id.clone());
+            let _guard = SubagentSessionGuard::new(task_id.clone());
             assert!(has_active_subagent_session(&task_id));
         }
 
@@ -4569,8 +3605,6 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
-            session_id: None,
-            metrics: None,
         };
 
         let path1 = cx
@@ -4616,8 +3650,6 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
-            session_id: None,
-            metrics: None,
         };
         let second_task = AgentTaskSummary {
             id: AgentTaskId::from("TASK-DIST-2"),
@@ -4631,8 +3663,6 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
-            session_id: None,
-            metrics: None,
         };
 
         let first_path = cx
@@ -4688,8 +3718,6 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
-            session_id: None,
-            metrics: None,
         };
 
         let initial_visible_count =
@@ -4869,8 +3897,6 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
-            session_id: None,
-            metrics: None,
         };
 
         // Case 1: task with goal_id forks from goal-tip
@@ -4910,8 +3936,6 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
-            session_id: None,
-            metrics: None,
         };
         let path2 = cx
             .update(|cx| {
@@ -4949,8 +3973,6 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
-            session_id: None,
-            metrics: None,
         };
         let path3 = cx
             .update(|cx| {
@@ -4984,8 +4006,6 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
-            session_id: None,
-            metrics: None,
         };
         let result4 = cx
             .update(|cx| {
@@ -5016,8 +4036,6 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
-            session_id: None,
-            metrics: None,
         };
         let path5 = cx
             .update(|cx| ensure_task_worktree(project.clone(), &task5, cx))
@@ -5068,8 +4086,6 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
-            session_id: None,
-            metrics: None,
         };
 
         let worktree_path = cx
@@ -5161,8 +4177,6 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
-            session_id: None,
-            metrics: None,
         };
         let task_b = AgentTaskSummary {
             id: AgentTaskId::from("TASK-NFF-B"),
@@ -5176,8 +4190,6 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
-            session_id: None,
-            metrics: None,
         };
 
         let path_a = cx
@@ -5294,8 +4306,6 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
-            session_id: None,
-            metrics: None,
         };
         let task_c2 = AgentTaskSummary {
             id: AgentTaskId::from("TASK-CONF-2"),
@@ -5309,8 +4319,6 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
-            session_id: None,
-            metrics: None,
         };
 
         let path_c1 = cx
@@ -5442,8 +4450,6 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
-            session_id: None,
-            metrics: None,
         };
 
         let worktree_path = cx
@@ -5487,7 +4493,6 @@ mod tests {
             .unwrap();
         assert_eq!(goal_sha, Some(merged_sha));
 
-        set_task_worktree_retention_timeout(Some(Duration::ZERO));
         mark_task_terminal(&task.id);
         assert!(is_task_terminal(&task.id));
         let cleaned = cx
@@ -5536,8 +4541,6 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
-            session_id: None,
-            metrics: None,
         };
 
         let path_a = cx
@@ -5568,7 +4571,6 @@ mod tests {
             .unwrap();
         assert!(details_a.merged_into.is_some());
 
-        set_task_worktree_retention_timeout(Some(Duration::ZERO));
         mark_task_terminal(&task_a.id);
         let cleaned_a = cx
             .update(|cx| auto_cleanup_task_worktree(project.clone(), &task_a.id, cx))
@@ -5589,8 +4591,6 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
-            session_id: None,
-            metrics: None,
         };
 
         let path_b = cx
@@ -5674,8 +4674,6 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
-            session_id: None,
-            metrics: None,
         };
 
         let path_a = cx
@@ -5706,7 +4704,6 @@ mod tests {
             .unwrap();
         assert!(details_a.merged_into.is_some());
 
-        set_task_worktree_retention_timeout(Some(Duration::ZERO));
         mark_task_terminal(&task_a.id);
         let cleaned_a = cx
             .update(|cx| auto_cleanup_task_worktree(project.clone(), &task_a.id, cx))
@@ -5728,8 +4725,6 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
-            session_id: None,
-            metrics: None,
         };
 
         let path_reviewer = cx
@@ -5810,8 +4805,6 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
-            session_id: None,
-            metrics: None,
         };
 
         let path_x = cx
@@ -5842,7 +4835,6 @@ mod tests {
             .unwrap();
         assert!(details_x.merged_into.is_some());
 
-        set_task_worktree_retention_timeout(Some(Duration::ZERO));
         mark_task_terminal(&task_x.id);
         let cleaned_x = cx
             .update(|cx| auto_cleanup_task_worktree(project.clone(), &task_x.id, cx))
@@ -5863,8 +4855,6 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
-            session_id: None,
-            metrics: None,
         };
 
         let path_insp = cx
@@ -5944,8 +4934,6 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
-            session_id: None,
-            metrics: None,
         };
         let task2 = AgentTaskSummary {
             id: AgentTaskId::from("TASK-EXC-2"),
@@ -5959,12 +4947,10 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
-            session_id: None,
-            metrics: None,
         };
 
         // Task 1 checks out shared-branch
-        let guard1 = SubagentSessionGuard::test_new(task1.id.clone());
+        let guard1 = SubagentSessionGuard::new(task1.id.clone());
         let path1 = cx
             .update(|cx| {
                 ensure_task_worktree_with_policy(
@@ -6003,7 +4989,6 @@ mod tests {
         drop(guard1);
 
         // Task 1 completes and cleans up
-        set_task_worktree_retention_timeout(Some(Duration::ZERO));
         mark_task_terminal(&task1.id);
         let cleaned1 = cx
             .update(|cx| auto_cleanup_task_worktree(project.clone(), &task1.id, cx))
@@ -6069,8 +5054,6 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
-            session_id: None,
-            metrics: None,
         };
 
         let task_a = AgentTaskSummary {
@@ -6085,8 +5068,6 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
-            session_id: None,
-            metrics: None,
         };
 
         let task_rec = AgentTaskSummary {
@@ -6101,8 +5082,6 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
-            session_id: None,
-            metrics: None,
         };
 
         // Both Task B and Task A create worktrees branched from the same initial goal state
@@ -6120,7 +5099,7 @@ mod tests {
             .await
             .unwrap();
 
-        let guard_a = SubagentSessionGuard::test_new(task_a.id.clone());
+        let guard_a = SubagentSessionGuard::new(task_a.id.clone());
         let path_a = cx
             .update(|cx| {
                 ensure_task_worktree_with_policy(
@@ -6236,8 +5215,6 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
-            session_id: None,
-            metrics: None,
         };
         let task2 = AgentTaskSummary {
             id: AgentTaskId::from("TASK-C-2"),
@@ -6251,12 +5228,10 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
-            session_id: None,
-            metrics: None,
         };
 
         // Task 1 checks out branch-c with an active session guard
-        let guard1 = SubagentSessionGuard::test_new(task1.id.clone());
+        let guard1 = SubagentSessionGuard::new(task1.id.clone());
         let path1 = cx
             .update(|cx| {
                 ensure_task_worktree_with_policy(
@@ -6355,8 +5330,6 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
-            session_id: None,
-            metrics: None,
         };
         let task2 = AgentTaskSummary {
             id: AgentTaskId::from("TASK-D-2"),
@@ -6370,8 +5343,6 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
-            session_id: None,
-            metrics: None,
         };
 
         let path1 = cx
@@ -6456,8 +5427,6 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
-            session_id: None,
-            metrics: None,
         };
 
         // 1. on_branch + base_branch mutually exclusive
@@ -6549,8 +5518,6 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
-            session_id: None,
-            metrics: None,
         };
 
         let path = cx
@@ -6706,8 +5673,6 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
-            session_id: None,
-            metrics: None,
         };
 
         let worktree_path = cx
@@ -7004,149 +5969,6 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_acceptance_cleanup_graduated_goal_skips_branches_per_settings(
-        cx: &mut TestAppContext,
-    ) {
-        init_test(cx);
-        let fs = FakeFs::new(cx.executor());
-        fs.insert_tree(
-            path!("/root"),
-            json!({
-                ".git": {
-                    "HEAD": "ref: refs/heads/main\n"
-                }
-            }),
-        )
-        .await;
-
-        let dot_git = std::path::Path::new(path!("/root/.git"));
-        fs.with_git_state(dot_git, true, |state| {
-            state.refs.insert(
-                "refs/heads/main".into(),
-                "main-sha-preserved-forever".into(),
-            );
-            state
-                .refs
-                .insert("HEAD".into(), "main-sha-preserved-forever".into());
-            state.branches.insert("main".into());
-
-            state.refs.insert(
-                "refs/heads/agent-goal/GOAL-SKIP-CLEANUP".into(),
-                "goal-sha-skip".into(),
-            );
-            state.branches.insert("agent-goal/GOAL-SKIP-CLEANUP".into());
-
-            state.refs.insert(
-                "refs/heads/agent-task/TASK-SKIP-1".into(),
-                "task-skip-1-sha".into(),
-            );
-            state.branches.insert("agent-task/TASK-SKIP-1".into());
-
-            state.refs.insert(
-                "refs/heads/agent-task/TASK-SKIP-2".into(),
-                "task-skip-2-sha".into(),
-            );
-            state.branches.insert("agent-task/TASK-SKIP-2".into());
-        })
-        .unwrap();
-
-        let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
-        let task1 = AgentTaskId::from("TASK-SKIP-1");
-        let task2 = AgentTaskId::from("TASK-SKIP-2");
-
-        register_task_worktree_policy(
-            &task1,
-            PathBuf::from("/fake/skip1"),
-            Some("agent-goal/GOAL-SKIP-CLEANUP".to_string()),
-            None,
-            None,
-            None,
-        );
-        register_task_worktree_policy(
-            &task2,
-            PathBuf::from("/fake/skip2"),
-            Some("agent-goal/GOAL-SKIP-CLEANUP".to_string()),
-            None,
-            None,
-            None,
-        );
-        record_goal_tip_sha("GOAL-SKIP-CLEANUP", "goal-sha-skip".to_string());
-        mark_task_terminal(&task1);
-        mark_task_terminal(&task2);
-
-        let _ = cx
-            .update(|cx| prepare_goal_graduation(project.clone(), "GOAL-SKIP-CLEANUP", cx))
-            .await
-            .unwrap();
-        assert!(get_goal_graduation_summary("GOAL-SKIP-CLEANUP").is_some());
-
-        // Configure both branch deletion settings to false
-        cx.update(|cx| {
-            cx.update_global::<SettingsStore, _>(|store, cx| {
-                store.update_user_settings(cx, |settings| {
-                    let agent = settings.agent.get_or_insert_default();
-                    agent.delete_goal_branches_on_graduation = Some(false);
-                    agent.delete_task_branches_on_graduation = Some(false);
-                });
-            });
-        });
-
-        let cleanup_result = cx
-            .update(|cx| cleanup_graduated_goal(project.clone(), "GOAL-SKIP-CLEANUP", cx))
-            .await
-            .unwrap();
-
-        // 1. Result reports skipped branches and no deleted branches
-        assert!(cleanup_result.deleted_branches.is_empty());
-        assert_eq!(
-            cleanup_result.skipped_branches,
-            vec![
-                "agent-goal/GOAL-SKIP-CLEANUP".to_string(),
-                "agent-task/TASK-SKIP-1".to_string(),
-                "agent-task/TASK-SKIP-2".to_string(),
-            ]
-        );
-
-        // 2. Branches survived in the fake repository
-        let (has_goal, has_t1, has_t2, main_sha, head_sha) = fs
-            .with_git_state(dot_git, false, |state| {
-                let g = state.branches.contains("agent-goal/GOAL-SKIP-CLEANUP")
-                    && state
-                        .refs
-                        .contains_key("refs/heads/agent-goal/GOAL-SKIP-CLEANUP");
-                let t1 = state.branches.contains("agent-task/TASK-SKIP-1")
-                    && state.refs.contains_key("refs/heads/agent-task/TASK-SKIP-1");
-                let t2 = state.branches.contains("agent-task/TASK-SKIP-2")
-                    && state.refs.contains_key("refs/heads/agent-task/TASK-SKIP-2");
-                let m = state.refs.get("refs/heads/main").cloned();
-                let h = state.refs.get("HEAD").cloned();
-                (g, t1, t2, m, h)
-            })
-            .unwrap();
-
-        assert!(
-            has_goal,
-            "goal branch must survive when deletion is disabled"
-        );
-        assert!(
-            has_t1,
-            "task 1 branch must survive when deletion is disabled"
-        );
-        assert!(
-            has_t2,
-            "task 2 branch must survive when deletion is disabled"
-        );
-        assert_eq!(main_sha, Some("main-sha-preserved-forever".to_string()));
-        assert_eq!(head_sha, Some("main-sha-preserved-forever".to_string()));
-
-        // 3. REGISTRY entries are still removed unconditionally
-        assert!(get_goal_graduation_summary("GOAL-SKIP-CLEANUP").is_none());
-        assert!(goal_tip_sha("GOAL-SKIP-CLEANUP").is_none());
-        assert!(goal_branch_summary_for_task(&task1).is_none());
-        assert!(goal_branch_summary_for_task(&task2).is_none());
-    }
-
-    #[gpui::test]
     async fn test_acceptance_cleanup_graduated_goal_blocked_by_active_sibling(
         cx: &mut TestAppContext,
     ) {
@@ -7234,7 +6056,7 @@ mod tests {
         assert!(assert_safe_graduation_ref("master").is_err());
         assert!(assert_safe_graduation_ref("refs/heads/master").is_err());
         // Graduation summary creation forbids targeting main
-        let bad_summary = prepare_goal_graduation_summary("../main", "main");
+        let bad_summary = prepare_goal_graduation_summary("../main");
         assert!(bad_summary.is_err());
     }
 
@@ -7285,8 +6107,6 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
-            session_id: None,
-            metrics: None,
         };
         let task2 = AgentTaskSummary {
             id: AgentTaskId::from("TASK-POOL-2"),
@@ -7300,8 +6120,6 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
-            session_id: None,
-            metrics: None,
         };
         let task3 = AgentTaskSummary {
             id: AgentTaskId::from("TASK-POOL-3"),
@@ -7315,8 +6133,6 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
-            session_id: None,
-            metrics: None,
         };
         let task4 = AgentTaskSummary {
             id: AgentTaskId::from("TASK-POOL-4"),
@@ -7330,19 +6146,17 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
-            session_id: None,
-            metrics: None,
         };
 
         // Task 1 and Task 2 active sessions
-        let guard1 = SubagentSessionGuard::test_new(task1.id.clone());
+        let guard1 = SubagentSessionGuard::new(task1.id.clone());
         let path1 = cx
             .update(|cx| ensure_task_worktree(project.clone(), &task1, cx))
             .await
             .unwrap();
         assert!(fs.is_dir(&path1).await);
 
-        let guard2 = SubagentSessionGuard::test_new(task2.id.clone());
+        let guard2 = SubagentSessionGuard::new(task2.id.clone());
         let path2 = cx
             .update(|cx| ensure_task_worktree(project.clone(), &task2, cx))
             .await
@@ -7385,7 +6199,6 @@ mod tests {
 
         // Now Task 1 drops session guard and cleans up (freeing a slot)
         drop(guard1);
-        set_task_worktree_retention_timeout(Some(Duration::ZERO));
         mark_task_terminal(&task1.id);
         let cleaned1 = cx
             .update(|cx| auto_cleanup_task_worktree(project.clone(), &task1.id, cx))
@@ -7410,7 +6223,6 @@ mod tests {
 
         // Now Task 2 finishes and cleans up
         drop(guard2);
-        set_task_worktree_retention_timeout(Some(Duration::ZERO));
         mark_task_terminal(&task2.id);
         let cleaned2 = cx
             .update(|cx| auto_cleanup_task_worktree(project.clone(), &task2.id, cx))
@@ -7474,8 +6286,6 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
-            session_id: None,
-            metrics: None,
         };
         let task2 = AgentTaskSummary {
             id: AgentTaskId::from("TASK-LRU-2"),
@@ -7489,8 +6299,6 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
-            session_id: None,
-            metrics: None,
         };
         let task3 = AgentTaskSummary {
             id: AgentTaskId::from("TASK-LRU-3"),
@@ -7504,12 +6312,10 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
-            session_id: None,
-            metrics: None,
         };
 
         // Create Task 1 with guard
-        let guard1 = SubagentSessionGuard::test_new(task1.id.clone());
+        let guard1 = SubagentSessionGuard::new(task1.id.clone());
         let path1 = cx
             .update(|cx| ensure_task_worktree(project.clone(), &task1, cx))
             .await
@@ -7529,7 +6335,7 @@ mod tests {
             .unwrap();
         assert!(commit_res1.head_sha.is_some());
 
-        let guard2 = SubagentSessionGuard::test_new(task2.id.clone());
+        let guard2 = SubagentSessionGuard::new(task2.id.clone());
         let path2 = cx
             .update(|cx| ensure_task_worktree(project.clone(), &task2, cx))
             .await
@@ -7625,8 +6431,6 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
-            session_id: None,
-            metrics: None,
         };
         let task_dirty = AgentTaskSummary {
             id: AgentTaskId::from("TASK-SAFE-DIRTY"),
@@ -7640,8 +6444,6 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
-            session_id: None,
-            metrics: None,
         };
         let task_new = AgentTaskSummary {
             id: AgentTaskId::from("TASK-SAFE-NEW"),
@@ -7655,12 +6457,10 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
-            session_id: None,
-            metrics: None,
         };
 
         // Task Err is created, guard dropped, but has commit_error
-        let guard_err = SubagentSessionGuard::test_new(task_err.id.clone());
+        let guard_err = SubagentSessionGuard::new(task_err.id.clone());
         let path_err = cx
             .update(|cx| ensure_task_worktree(project.clone(), &task_err, cx))
             .await
@@ -7669,7 +6469,7 @@ mod tests {
         record_task_worktree_commit_error(&task_err.id, "disk quota exceeded".to_string());
 
         // Task Dirty is created, guard dropped, has uncommitted dirty file
-        let guard_dirty = SubagentSessionGuard::test_new(task_dirty.id.clone());
+        let guard_dirty = SubagentSessionGuard::new(task_dirty.id.clone());
         let path_dirty = cx
             .update(|cx| ensure_task_worktree(project.clone(), &task_dirty, cx))
             .await
@@ -7782,8 +6582,6 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
-            session_id: None,
-            metrics: None,
         };
         let task2 = AgentTaskSummary {
             id: AgentTaskId::from("TASK-ACT-SAFE-2"),
@@ -7797,12 +6595,10 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
-            session_id: None,
-            metrics: None,
         };
 
         // Task 1 has active session guard
-        let guard1 = SubagentSessionGuard::test_new(task1.id.clone());
+        let guard1 = SubagentSessionGuard::new(task1.id.clone());
         let path1 = cx
             .update(|cx| ensure_task_worktree(project.clone(), &task1, cx))
             .await
@@ -7827,7 +6623,6 @@ mod tests {
         assert!(fs.is_dir(&path1).await, "active task1 must not be evicted");
 
         drop(guard1);
-        set_task_worktree_retention_timeout(Some(Duration::ZERO));
         mark_task_terminal(&task1.id);
         let cleaned1 = cx
             .update(|cx| auto_cleanup_task_worktree(project.clone(), &task1.id, cx))
@@ -7841,218 +6636,6 @@ mod tests {
             .expect("task2 must proceed after cleanup")
             .unwrap();
         assert!(fs.is_dir(&path2).await);
-    }
-
-    #[gpui::test]
-    async fn test_pool_allow_overflow_bypasses_slot_wait(cx: &mut TestAppContext) {
-        init_test(cx);
-        let fs = FakeFs::new(cx.executor());
-        fs.insert_tree(
-            path!("/root"),
-            json!({
-                ".git": {
-                    "HEAD": "ref: refs/heads/main\n"
-                }
-            }),
-        )
-        .await;
-
-        let dot_git = std::path::Path::new(path!("/root/.git"));
-        fs.with_git_state(dot_git, true, |state| {
-            state
-                .refs
-                .insert("refs/heads/main".into(), "main-sha-overflow".into());
-            state.refs.insert("HEAD".into(), "main-sha-overflow".into());
-            state.branches.insert("main".into());
-        })
-        .unwrap();
-
-        let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
-
-        cx.update(|cx| {
-            cx.update_global(|store: &mut settings::SettingsStore, cx| {
-                store
-                    .set_user_settings(r#"{ "agent": { "task_worktree_limit": 1 } }"#, cx)
-                    .unwrap();
-            });
-        });
-
-        let task1 = AgentTaskSummary {
-            id: AgentTaskId::from("TASK-OVERFLOW-1"),
-            parent_id: None,
-            goal_id: None,
-            title: "Task 1".to_string(),
-            status: AgentTaskStatus::Running,
-            attempt: 1,
-            assignee: None,
-            write_scopes: vec![],
-            created_at: None,
-            assigned_profile: None,
-            model: None,
-            session_id: None,
-            metrics: None,
-        };
-        let task2 = AgentTaskSummary {
-            id: AgentTaskId::from("TASK-OVERFLOW-2"),
-            parent_id: None,
-            goal_id: None,
-            title: "Task 2".to_string(),
-            status: AgentTaskStatus::Ready,
-            attempt: 1,
-            assignee: None,
-            write_scopes: vec![],
-            created_at: None,
-            assigned_profile: None,
-            model: None,
-            session_id: None,
-            metrics: None,
-        };
-        let task3 = AgentTaskSummary {
-            id: AgentTaskId::from("TASK-OVERFLOW-3"),
-            parent_id: None,
-            goal_id: None,
-            title: "Task 3".to_string(),
-            status: AgentTaskStatus::Ready,
-            attempt: 1,
-            assignee: None,
-            write_scopes: vec![],
-            created_at: None,
-            assigned_profile: None,
-            model: None,
-            session_id: None,
-            metrics: None,
-        };
-
-        let _guard1 = SubagentSessionGuard::test_new(task1.id.clone());
-        let path1 = cx
-            .update(|cx| ensure_task_worktree(project.clone(), &task1, cx))
-            .await
-            .unwrap();
-        assert!(fs.is_dir(&path1).await);
-
-        let path2 = cx
-            .update(|cx| {
-                ensure_task_worktree_with_options(
-                    project.clone(),
-                    &task2,
-                    None,
-                    None,
-                    None,
-                    true,
-                    cx,
-                )
-            })
-            .await
-            .unwrap();
-        assert!(fs.is_dir(&path2).await);
-        assert_ne!(path1, path2);
-        assert!(fs.is_dir(&path1).await);
-
-        let mut ensure_task3 = cx.spawn({
-            let project = project.clone();
-            let task3 = task3.clone();
-            |cx| async move {
-                cx.update(|cx| {
-                    ensure_task_worktree_with_options(project, &task3, None, None, None, false, cx)
-                })
-                .await
-            }
-        });
-        cx.run_until_parked();
-        assert!(
-            (&mut ensure_task3).now_or_never().is_none(),
-            "task3 with allow_overflow=false must block when pool is full"
-        );
-    }
-
-    #[gpui::test]
-    async fn test_ensure_task_worktree_restores_existing_task_branch(cx: &mut TestAppContext) {
-        init_test(cx);
-        let fs = FakeFs::new(cx.executor());
-        fs.insert_tree(
-            path!("/root"),
-            json!({
-                ".git": {
-                    "HEAD": "ref: refs/heads/main\n"
-                }
-            }),
-        )
-        .await;
-
-        let dot_git = std::path::Path::new(path!("/root/.git"));
-        fs.with_git_state(dot_git, true, |state| {
-            state
-                .refs
-                .insert("refs/heads/main".into(), "main-sha-restore".into());
-            state.refs.insert("HEAD".into(), "main-sha-restore".into());
-            state.branches.insert("main".into());
-        })
-        .unwrap();
-
-        let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
-
-        let task = AgentTaskSummary {
-            id: AgentTaskId::from("TASK-RESTORE-1"),
-            parent_id: None,
-            goal_id: None,
-            title: "Task Restore".to_string(),
-            status: AgentTaskStatus::Running,
-            attempt: 1,
-            assignee: None,
-            write_scopes: vec![],
-            created_at: None,
-            assigned_profile: None,
-            model: None,
-            session_id: None,
-            metrics: None,
-        };
-
-        let path1 = cx
-            .update(|cx| ensure_task_worktree(project.clone(), &task, cx))
-            .await
-            .unwrap();
-        assert!(fs.is_dir(&path1).await);
-
-        fs.save(
-            &path1.join("task_file.txt"),
-            &"task file content".into(),
-            text::LineEnding::Unix,
-        )
-        .await
-        .unwrap();
-
-        cx.spawn({
-            let fs = fs.clone();
-            let path1 = path1.clone();
-            let task_id = task.id.to_string();
-            |mut cx| async move { commit_task_worktree(fs, path1, task_id, false, &mut cx).await }
-        })
-        .await
-        .unwrap();
-
-        cx.update(|cx| remove_task_worktree(project.clone(), &task.id, cx))
-            .await
-            .unwrap();
-        assert!(!fs.is_dir(&path1).await);
-
-        let path2 = cx
-            .update(|cx| {
-                ensure_task_worktree_with_options(
-                    project.clone(),
-                    &task,
-                    None,
-                    None,
-                    None,
-                    false,
-                    cx,
-                )
-            })
-            .await
-            .unwrap();
-        assert!(fs.is_dir(&path2).await);
-
-        let content = fs.load(&path2.join("task_file.txt")).await.unwrap();
-        assert_eq!(content, "task file content");
     }
 
     #[gpui::test]
@@ -8105,8 +6688,6 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
-            session_id: None,
-            metrics: None,
         };
         let task2 = AgentTaskSummary {
             id: AgentTaskId::from("TASK-NONTERM-2"),
@@ -8120,8 +6701,6 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
-            session_id: None,
-            metrics: None,
         };
         let task3 = AgentTaskSummary {
             id: AgentTaskId::from("TASK-NONTERM-3"),
@@ -8135,19 +6714,17 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
-            session_id: None,
-            metrics: None,
         };
 
         // Tasks 1 and 2 occupy the entire pool (limit = 2) with active sessions.
-        let guard1 = SubagentSessionGuard::test_new(task1.id.clone());
+        let guard1 = SubagentSessionGuard::new(task1.id.clone());
         let path1 = cx
             .update(|cx| ensure_task_worktree(project.clone(), &task1, cx))
             .await
             .unwrap();
         assert!(fs.is_dir(&path1).await);
 
-        let guard2 = SubagentSessionGuard::test_new(task2.id.clone());
+        let guard2 = SubagentSessionGuard::new(task2.id.clone());
         let path2 = cx
             .update(|cx| ensure_task_worktree(project.clone(), &task2, cx))
             .await
@@ -8243,8 +6820,6 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
-            session_id: None,
-            metrics: None,
         };
         let task2 = AgentTaskSummary {
             id: AgentTaskId::from("TASK-SWP-2"),
@@ -8258,8 +6833,6 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
-            session_id: None,
-            metrics: None,
         };
         let task3 = AgentTaskSummary {
             id: AgentTaskId::from("TASK-SWP-3"),
@@ -8273,21 +6846,19 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
-            session_id: None,
-            metrics: None,
         };
 
-        let g1 = SubagentSessionGuard::test_new(task1.id.clone());
+        let g1 = SubagentSessionGuard::new(task1.id.clone());
         let path1 = cx
             .update(|cx| ensure_task_worktree(project.clone(), &task1, cx))
             .await
             .unwrap();
-        let g2 = SubagentSessionGuard::test_new(task2.id.clone());
+        let g2 = SubagentSessionGuard::new(task2.id.clone());
         let path2 = cx
             .update(|cx| ensure_task_worktree(project.clone(), &task2, cx))
             .await
             .unwrap();
-        let g3 = SubagentSessionGuard::test_new(task3.id.clone());
+        let g3 = SubagentSessionGuard::new(task3.id.clone());
         let path3 = cx
             .update(|cx| ensure_task_worktree(project.clone(), &task3, cx))
             .await
@@ -8397,8 +6968,6 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
-            session_id: None,
-            metrics: None,
         };
 
         let worktree_path = cx
@@ -8512,8 +7081,6 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
-            session_id: None,
-            metrics: None,
         };
 
         let worktree_path = cx
@@ -8600,8 +7167,6 @@ mod tests {
             created_at: None,
             assigned_profile: None,
             model: None,
-            session_id: None,
-            metrics: None,
         };
 
         assert_eq!(task_worktree_title(&task.id), None);
@@ -8618,634 +7183,63 @@ mod tests {
         );
     }
 
-    struct MockTgsProvider {
-        task_title: Option<String>,
-        should_fail: bool,
-    }
-
-    impl AgentTaskProvider for MockTgsProvider {
-        fn server_id(&self) -> context_server::ContextServerId {
-            context_server::ContextServerId("test_tgs".into())
-        }
-
-        fn fetch_graph(&self, _cx: &mut App) -> Task<Result<crate::agent_task::AgentTaskGraph>> {
-            Task::ready(Err(anyhow::anyhow!("not implemented")))
-        }
-
-        fn get_task(
-            &self,
-            id: &AgentTaskId,
-            _cx: &mut App,
-        ) -> Task<Result<crate::agent_task::AgentTaskDetail>> {
-            if self.should_fail {
-                return Task::ready(Err(anyhow::anyhow!("TGS service offline")));
-            }
-            let title = self.task_title.clone().unwrap_or_default();
-            Task::ready(Ok(crate::agent_task::AgentTaskDetail {
-                summary: AgentTaskSummary {
-                    id: id.clone(),
-                    parent_id: None,
-                    goal_id: None,
-                    title,
-                    status: AgentTaskStatus::Ready,
-                    attempt: 1,
-                    assignee: None,
-                    write_scopes: vec![],
-                    created_at: None,
-                    assigned_profile: None,
-                    model: None,
-                    session_id: None,
-                    metrics: None,
-                },
-                description: String::new(),
-                acceptance_criteria: Vec::new(),
-                events_tail: Vec::new(),
-            }))
-        }
-
-        fn complete_task(&self, _id: &AgentTaskId, _cx: &mut App) -> Task<Result<()>> {
-            Task::ready(Ok(()))
-        }
-
-        fn fail_task(&self, _id: &AgentTaskId, _reason: &str, _cx: &mut App) -> Task<Result<()>> {
-            Task::ready(Ok(()))
-        }
-
-        fn archive_task(&self, _id: &AgentTaskId, _cx: &mut App) -> Task<Result<()>> {
-            Task::ready(Ok(()))
-        }
-
-        fn unarchive_task(&self, _id: &AgentTaskId, _cx: &mut App) -> Task<Result<()>> {
-            Task::ready(Ok(()))
-        }
-
-        fn delete_task(&self, _id: &AgentTaskId, _cx: &mut App) -> Task<Result<()>> {
-            Task::ready(Ok(()))
-        }
-
-        fn list_artifacts(
-            &self,
-            _task_id: &AgentTaskId,
-            _cx: &mut App,
-        ) -> Task<Result<Vec<crate::agent_task::AgentTaskArtifact>>> {
-            Task::ready(Ok(Vec::new()))
-        }
-
-        fn get_artifact(
-            &self,
-            _artifact_id: &str,
-            _cx: &mut App,
-        ) -> Task<Result<crate::agent_task::AgentTaskArtifact>> {
-            Task::ready(Err(anyhow::anyhow!("not implemented")))
-        }
-    }
-
     #[gpui::test]
-    async fn test_commit_task_worktree_fallback_fetches_tgs_title_when_in_memory_empty(
-        cx: &mut TestAppContext,
-    ) {
+    async fn test_ensure_task_worktree_settings(cx: &mut TestAppContext) {
         init_test(cx);
         let fs = FakeFs::new(cx.executor());
-        fs.insert_tree(
-            path!("/root"),
-            json!({
-                ".git": {
-                    "HEAD": "ref: refs/heads/main\n"
-                }
-            }),
-        )
-        .await;
-
-        let dot_git = std::path::Path::new(path!("/root/.git"));
-        fs.with_git_state(dot_git, true, |state| {
-            state
-                .refs
-                .insert("refs/heads/main".into(), "main-sha-fallback-tgs".into());
-            state
-                .refs
-                .insert("HEAD".into(), "main-sha-fallback-tgs".into());
-            state.branches.insert("main".into());
-        })
-        .unwrap();
-
-        let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
-
-        let provider = Arc::new(MockTgsProvider {
-            task_title: Some("Persisted TGS Title".to_string()),
-            should_fail: false,
-        });
-        register_task_provider(provider);
-
-        let task = AgentTaskSummary {
-            id: AgentTaskId::from("TASK-TITLES-FALLBACK-TGS"),
-            parent_id: None,
-            goal_id: None,
-            title: "Temporary Title".to_string(),
-            status: AgentTaskStatus::Ready,
-            attempt: 1,
-            assignee: None,
-            write_scopes: vec![],
-            created_at: None,
-            assigned_profile: None,
-            model: None,
-            session_id: None,
-            metrics: None,
-        };
-
-        let worktree_path = cx
-            .update(|cx| ensure_task_worktree(project.clone(), &task, cx))
+        let worktree_path = Path::new("/worktree");
+        fs.create_dir(worktree_path)
             .await
-            .unwrap();
+            .expect("create_dir should succeed");
 
-        REGISTRY.write().task_titles.remove(&task.id);
-        assert_eq!(task_worktree_title(&task.id), None);
-
-        fs.save(
-            &worktree_path.join("file.txt"),
-            &"some edits".into(),
-            text::LineEnding::Unix,
-        )
-        .await
-        .unwrap();
-
-        let details = cx
-            .spawn({
-                let fs = fs.clone();
-                let worktree_path = worktree_path.clone();
-                let task_id = task.id.to_string();
-                |mut cx| async move {
-                    commit_task_worktree(fs, worktree_path, task_id, false, &mut cx).await
-                }
-            })
+        ensure_task_worktree_settings(&(fs.clone() as Arc<dyn Fs>), worktree_path)
             .await
-            .unwrap();
+            .expect("ensure_task_worktree_settings should succeed");
 
-        assert_eq!(details.commit_error, None);
-
-        let snapshot = fs
-            .with_git_state(&worktree_path.join(".git"), false, |state| {
-                state.commit_history.last().cloned()
-            })
-            .unwrap()
-            .expect("commit snapshot must exist in commit history");
-
-        assert_eq!(snapshot.message, "Persisted TGS Title");
+        let content = fs
+            .load(&worktree_path.join(".zed/settings.json"))
+            .await
+            .expect("load settings.json should succeed");
+        let json: serde_json::Value =
+            serde_json::from_str(&content).expect("settings.json should be valid JSON");
         assert_eq!(
-            task_worktree_title(&task.id),
-            Some("Persisted TGS Title".to_string())
+            json["file_scan_exclusions"],
+            serde_json::json!(["**/target", "**/target/**", "**/.git/**"])
         );
-    }
 
-    #[gpui::test]
-    async fn test_commit_task_worktree_fallback_placeholder_when_tgs_has_no_title(
-        cx: &mut TestAppContext,
-    ) {
-        init_test(cx);
-        let fs = FakeFs::new(cx.executor());
-        fs.insert_tree(
-            path!("/root"),
-            json!({
-                ".git": {
-                    "HEAD": "ref: refs/heads/main\n"
-                }
-            }),
-        )
-        .await;
-
-        let dot_git = std::path::Path::new(path!("/root/.git"));
-        fs.with_git_state(dot_git, true, |state| {
-            state
-                .refs
-                .insert("refs/heads/main".into(), "main-sha-fallback-empty".into());
-            state
-                .refs
-                .insert("HEAD".into(), "main-sha-fallback-empty".into());
-            state.branches.insert("main".into());
-        })
-        .unwrap();
-
-        let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
-
-        let provider = Arc::new(MockTgsProvider {
-            task_title: Some("   ".to_string()),
-            should_fail: false,
-        });
-        register_task_provider(provider);
-
-        let task = AgentTaskSummary {
-            id: AgentTaskId::from("TASK-TITLES-FALLBACK-NOTITLE"),
-            parent_id: None,
-            goal_id: None,
-            title: "Temporary Title".to_string(),
-            status: AgentTaskStatus::Ready,
-            attempt: 1,
-            assignee: None,
-            write_scopes: vec![],
-            created_at: None,
-            assigned_profile: None,
-            model: None,
-            session_id: None,
-            metrics: None,
-        };
-
-        let worktree_path = cx
-            .update(|cx| ensure_task_worktree(project.clone(), &task, cx))
-            .await
-            .unwrap();
-
-        REGISTRY.write().task_titles.remove(&task.id);
-        assert_eq!(task_worktree_title(&task.id), None);
-
-        fs.save(
-            &worktree_path.join("file.txt"),
-            &"some edits".into(),
-            text::LineEnding::Unix,
+        let existing = r#"{
+            // Custom comment
+            "tab_size": 4,
+            "file_scan_exclusions": [
+                "**/node_modules/**",
+            ],
+        }"#;
+        fs.atomic_write(
+            worktree_path.join(".zed/settings.json"),
+            existing.to_string(),
         )
         .await
-        .unwrap();
+        .expect("atomic_write should succeed");
 
-        let branch = format!("agent-task/{}", task.id);
-        let expected_message = format!("{branch}: completed task work");
-
-        let details = cx
-            .spawn({
-                let fs = fs.clone();
-                let worktree_path = worktree_path.clone();
-                let task_id = task.id.to_string();
-                |mut cx| async move {
-                    commit_task_worktree(fs, worktree_path, task_id, false, &mut cx).await
-                }
-            })
+        ensure_task_worktree_settings(&(fs.clone() as Arc<dyn Fs>), worktree_path)
             .await
-            .unwrap();
+            .expect("ensure_task_worktree_settings should succeed");
 
-        assert_eq!(details.commit_error, None);
-
-        let snapshot = fs
-            .with_git_state(&worktree_path.join(".git"), false, |state| {
-                state.commit_history.last().cloned()
-            })
-            .unwrap()
-            .expect("commit snapshot must exist in commit history");
-
-        assert_eq!(snapshot.message, expected_message);
-    }
-
-    #[gpui::test]
-    async fn test_fresh_task_worktree_has_zero_local_modifications(cx: &mut TestAppContext) {
-        init_test(cx);
-        let fs = FakeFs::new(cx.executor());
-        fs.insert_tree(
-            path!("/root"),
-            json!({
-                ".git": {
-                    "HEAD": "ref: refs/heads/main\n"
-                }
-            }),
-        )
-        .await;
-
-        let dot_git = std::path::Path::new(path!("/root/.git"));
-        fs.with_git_state(dot_git, true, |state| {
-            state
-                .refs
-                .insert("refs/heads/main".into(), "main-sha-fresh".into());
-            state.refs.insert("HEAD".into(), "main-sha-fresh".into());
-            state.branches.insert("main".into());
-        })
-        .unwrap();
-
-        let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
-        let task = AgentTaskSummary {
-            id: AgentTaskId::from("TASK-FRESH-1"),
-            parent_id: None,
-            goal_id: None,
-            title: "Fresh task worktree".to_string(),
-            status: AgentTaskStatus::Ready,
-            attempt: 1,
-            assignee: None,
-            write_scopes: vec![],
-            created_at: None,
-            assigned_profile: None,
-            model: None,
-            session_id: None,
-            metrics: None,
-        };
-
-        let worktree_path = cx
-            .update(|cx| ensure_task_worktree(project.clone(), &task, cx))
+        let content = fs
+            .load(&worktree_path.join(".zed/settings.json"))
             .await
-            .unwrap();
-
-        assert!(!fs.is_file(&worktree_path.join(".zed/settings.json")).await);
-        assert!(!fs.is_dir(&worktree_path.join(".zed")).await);
-
-        let git_repo = fs.open_repo(&worktree_path.join(".git"), None).unwrap();
-        let prefix = RepoPath::from_rel_path(&util::rel_path::RelPath::empty());
-        let status = git_repo
-            .status(std::slice::from_ref(&prefix))
-            .await
-            .unwrap();
-        assert!(
-            status.entries.is_empty(),
-            "expected zero local modifications right after creation, found: {:?}",
-            status.entries
-        );
-        assert!(task_worktree_changed_files(&task.id).is_empty());
-    }
-
-    #[gpui::test]
-    async fn test_commit_task_worktree_excludes_gitignored_file(cx: &mut TestAppContext) {
-        init_test(cx);
-        let fs = FakeFs::new(cx.executor());
-        fs.insert_tree(
-            path!("/root"),
-            json!({
-                ".git": {
-                    "HEAD": "ref: refs/heads/main\n"
-                },
-                ".gitignore": "*.log\n",
-            }),
-        )
-        .await;
-
-        let dot_git = std::path::Path::new(path!("/root/.git"));
-        fs.with_git_state(dot_git, true, |state| {
-            state
-                .refs
-                .insert("refs/heads/main".into(), "main-sha-ignore".into());
-            state.refs.insert("HEAD".into(), "main-sha-ignore".into());
-            state.branches.insert("main".into());
-        })
-        .unwrap();
-
-        let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
-        let task = AgentTaskSummary {
-            id: AgentTaskId::from("TASK-GITIGNORE-1"),
-            parent_id: None,
-            goal_id: None,
-            title: "Task with ignored files".to_string(),
-            status: AgentTaskStatus::Ready,
-            attempt: 1,
-            assignee: None,
-            write_scopes: vec![],
-            created_at: None,
-            assigned_profile: None,
-            model: None,
-            session_id: None,
-            metrics: None,
-        };
-
-        let worktree_path = cx
-            .update(|cx| ensure_task_worktree(project.clone(), &task, cx))
-            .await
-            .unwrap();
-
-        fs.save(
-            &worktree_path.join(".gitignore"),
-            &"*.log\n".into(),
-            text::LineEnding::Unix,
-        )
-        .await
-        .unwrap();
-
-        fs.save(
-            &worktree_path.join("src/lib.rs"),
-            &"pub fn run() {}".into(),
-            text::LineEnding::Unix,
-        )
-        .await
-        .unwrap();
-        fs.save(
-            &worktree_path.join("debug.log"),
-            &"debug logs that should be ignored".into(),
-            text::LineEnding::Unix,
-        )
-        .await
-        .unwrap();
-
-        let details = cx
-            .spawn({
-                let fs = fs.clone();
-                let worktree_path = worktree_path.clone();
-                let task_id = task.id.to_string();
-                |mut cx| async move {
-                    commit_task_worktree(fs, worktree_path, task_id, false, &mut cx).await
-                }
-            })
-            .await
-            .unwrap();
-
-        assert_eq!(details.commit_error, None);
-        let changed = task_worktree_changed_files(&task.id);
-        assert!(
-            !changed.contains(&"debug.log".to_string()),
-            "gitignored file debug.log must not be committed, changed: {changed:?}"
-        );
-        assert!(
-            changed.contains(&"src/lib.rs".to_string()),
-            "tracked file must be committed"
-        );
-    }
-
-    #[gpui::test]
-    async fn test_main_invariant_goalless_task_main_untouched_after_commit_and_merge(
-        cx: &mut TestAppContext,
-    ) {
-        init_test(cx);
-        let fs = FakeFs::new(cx.executor());
-        fs.insert_tree(
-            path!("/root"),
-            json!({
-                ".git": {
-                    "HEAD": "ref: refs/heads/main\n"
-                },
-                "initial.txt": "initial content",
-            }),
-        )
-        .await;
-
-        let dot_git = std::path::Path::new(path!("/root/.git"));
-        let initial_main_sha = "main-sha-invariant-init";
-        fs.with_git_state(dot_git, true, |state| {
-            state
-                .refs
-                .insert("refs/heads/main".into(), initial_main_sha.into());
-            state.refs.insert("HEAD".into(), initial_main_sha.into());
-            state.branches.insert("main".into());
-        })
-        .unwrap();
-
-        let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
-        let task = AgentTaskSummary {
-            id: AgentTaskId::from("TASK-GOALLESS-INVARIANT"),
-            parent_id: None,
-            goal_id: None,
-            title: "Goalless task invariant".to_string(),
-            status: AgentTaskStatus::Ready,
-            attempt: 1,
-            assignee: None,
-            write_scopes: vec![],
-            created_at: None,
-            assigned_profile: None,
-            model: None,
-            session_id: None,
-            metrics: None,
-        };
-
-        let worktree_path = cx
-            .update(|cx| ensure_task_worktree(project.clone(), &task, cx))
-            .await
-            .unwrap();
-
-        fs.save(
-            &worktree_path.join("task_only_file.txt"),
-            &"task only content".into(),
-            text::LineEnding::Unix,
-        )
-        .await
-        .unwrap();
-
-        let details = cx
-            .update(|cx| commit_and_merge_task_worktree(project.clone(), &task.id, false, cx))
-            .await
-            .unwrap();
-
-        assert_eq!(details.commit_error, None);
-        assert_eq!(details.merged_into, None);
-        assert_eq!(details.merge_conflict, None);
-
-        let main_ref = fs
-            .with_git_state(dot_git, false, |state| {
-                state.refs.get("refs/heads/main").cloned()
-            })
-            .unwrap();
+            .expect("load settings.json should succeed");
+        let json: serde_json::Value =
+            serde_json::from_str(&content).expect("settings.json should be valid JSON");
+        assert_eq!(json["tab_size"], 4);
         assert_eq!(
-            main_ref,
-            Some(initial_main_sha.to_string()),
-            "main ref must remain unchanged for goal-less task"
-        );
-
-        let task_branch_ref = fs
-            .with_git_state(dot_git, false, |state| {
-                state
-                    .refs
-                    .get(&format!("refs/heads/agent-task/{}", task.id))
-                    .cloned()
-            })
-            .unwrap();
-        assert!(task_branch_ref.is_some());
-        assert_ne!(
-            task_branch_ref,
-            Some(initial_main_sha.to_string()),
-            "changes must be committed on task branch"
-        );
-
-        assert!(
-            !fs.is_file(std::path::Path::new(path!("/root/task_only_file.txt")))
-                .await
-        );
-    }
-
-    #[gpui::test]
-    async fn test_main_invariant_goal_task_auto_merges_into_goal_branch_and_leaves_main_untouched(
-        cx: &mut TestAppContext,
-    ) {
-        init_test(cx);
-        let fs = FakeFs::new(cx.executor());
-        fs.insert_tree(
-            path!("/root"),
-            json!({
-                ".git": {
-                    "HEAD": "ref: refs/heads/main\n"
-                },
-                "initial.txt": "initial content",
-            }),
-        )
-        .await;
-
-        let dot_git = std::path::Path::new(path!("/root/.git"));
-        let initial_main_sha = "main-sha-goal-invariant-init";
-        fs.with_git_state(dot_git, true, |state| {
-            state
-                .refs
-                .insert("refs/heads/main".into(), initial_main_sha.into());
-            state.refs.insert("HEAD".into(), initial_main_sha.into());
-            state.branches.insert("main".into());
-        })
-        .unwrap();
-
-        let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
-        let goal_id = "GOAL-INVARIANT-TEST";
-        let task = AgentTaskSummary {
-            id: AgentTaskId::from("TASK-GOAL-INVARIANT"),
-            parent_id: None,
-            goal_id: Some(goal_id.to_string()),
-            title: "Goal task invariant".to_string(),
-            status: AgentTaskStatus::Ready,
-            attempt: 1,
-            assignee: None,
-            write_scopes: vec![],
-            created_at: None,
-            assigned_profile: None,
-            model: None,
-            session_id: None,
-            metrics: None,
-        };
-
-        let worktree_path = cx
-            .update(|cx| ensure_task_worktree(project.clone(), &task, cx))
-            .await
-            .unwrap();
-
-        fs.save(
-            &worktree_path.join("goal_merged_file.txt"),
-            &"goal merged content".into(),
-            text::LineEnding::Unix,
-        )
-        .await
-        .unwrap();
-
-        let details = cx
-            .update(|cx| commit_and_merge_task_worktree(project.clone(), &task.id, false, cx))
-            .await
-            .unwrap();
-
-        assert_eq!(details.commit_error, None);
-        assert_eq!(details.merge_conflict, None);
-        let merged_into = details
-            .merged_into
-            .expect("must be auto-merged into goal branch");
-        assert_eq!(
-            merged_into.target_ref,
-            format!("refs/heads/agent-goal/{goal_id}")
-        );
-        assert_ne!(merged_into.sha, initial_main_sha);
-
-        let main_ref = fs
-            .with_git_state(dot_git, false, |state| {
-                state.refs.get("refs/heads/main").cloned()
-            })
-            .unwrap();
-        assert_eq!(
-            main_ref,
-            Some(initial_main_sha.to_string()),
-            "main ref must remain unchanged for goal task"
-        );
-
-        let goal_branch_ref = fs
-            .with_git_state(dot_git, false, |state| {
-                state
-                    .refs
-                    .get(&format!("refs/heads/agent-goal/{goal_id}"))
-                    .cloned()
-            })
-            .unwrap();
-        assert_eq!(goal_branch_ref, Some(merged_into.sha));
-
-        assert!(
-            !fs.is_file(std::path::Path::new(path!("/root/goal_merged_file.txt")))
-                .await
+            json["file_scan_exclusions"],
+            serde_json::json!([
+                "**/node_modules/**",
+                "**/target",
+                "**/target/**",
+                "**/.git/**"
+            ])
         );
     }
 
@@ -9253,112 +7247,13 @@ mod tests {
     fn test_prepare_goal_graduation_summary_multibyte_utf8_sha() {
         reset_registry_for_tests();
         record_goal_tip_sha("GOAL-UTF8", "🦀🦀🦀abc".to_string());
-        let summary = prepare_goal_graduation_summary("GOAL-UTF8", "main")
+        let summary = prepare_goal_graduation_summary("GOAL-UTF8")
             .expect("prepare_goal_graduation_summary should succeed for multibyte UTF-8 SHA");
         assert!(
             summary
                 .pr_proposal
                 .body
                 .contains("- Tip SHA: `🦀🦀🦀abc` (🦀🦀🦀abc)")
-        );
-    }
-
-    #[gpui::test]
-    async fn test_prepare_goal_graduation_base_branch_resolution(cx: &mut TestAppContext) {
-        init_test(cx);
-        let fs = FakeFs::new(cx.executor());
-        fs.insert_tree(
-            path!("/root"),
-            json!({
-                ".git": {
-                    "HEAD": "ref: refs/heads/main\n"
-                }
-            }),
-        )
-        .await;
-
-        let dot_git = std::path::Path::new(path!("/root/.git"));
-        fs.with_git_state(dot_git, true, |state| {
-            state
-                .refs
-                .insert("refs/heads/main".into(), "main-sha-base".into());
-            state.refs.insert("HEAD".into(), "main-sha-base".into());
-            state.branches.insert("main".into());
-            state.refs.insert(
-                "refs/heads/agent-goal/GOAL-BASE-1".into(),
-                "goal-base-sha-1".into(),
-            );
-            state.branches.insert("agent-goal/GOAL-BASE-1".into());
-            state.refs.insert(
-                "refs/heads/agent-goal/GOAL-BASE-2".into(),
-                "goal-base-sha-2".into(),
-            );
-            state.branches.insert("agent-goal/GOAL-BASE-2".into());
-        })
-        .unwrap();
-
-        let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
-
-        // Absent setting falls back to git default branch / "main"
-        let summary_fallback = cx
-            .update(|cx| prepare_goal_graduation(project.clone(), "GOAL-BASE-1", cx))
-            .await
-            .unwrap();
-        assert_eq!(summary_fallback.base_branch, "main");
-        assert_eq!(summary_fallback.refs.base_branch, "main");
-        assert_eq!(summary_fallback.refs.base_ref, "refs/heads/main");
-        assert_eq!(summary_fallback.pr_proposal.target_branch, "main");
-        assert!(summary_fallback.pr_proposal.command.contains("--base main"));
-        assert!(
-            summary_fallback
-                .pr_proposal
-                .body
-                .contains("graduation into `main`")
-        );
-        assert!(
-            summary_fallback
-                .pr_proposal
-                .body
-                .contains("- Target branch: `main`")
-        );
-
-        // Explicit setting wins
-        cx.update(|cx| {
-            cx.update_global::<SettingsStore, _>(|store, cx| {
-                store.update_user_settings(cx, |settings| {
-                    settings
-                        .agent
-                        .get_or_insert_default()
-                        .goal_graduation_base_branch = Some("release/v2.0".to_string());
-                });
-            });
-        });
-
-        let summary_explicit = cx
-            .update(|cx| prepare_goal_graduation(project.clone(), "GOAL-BASE-2", cx))
-            .await
-            .unwrap();
-        assert_eq!(summary_explicit.base_branch, "release/v2.0");
-        assert_eq!(summary_explicit.refs.base_branch, "release/v2.0");
-        assert_eq!(summary_explicit.refs.base_ref, "refs/heads/release/v2.0");
-        assert_eq!(summary_explicit.pr_proposal.target_branch, "release/v2.0");
-        assert!(
-            summary_explicit
-                .pr_proposal
-                .command
-                .contains("--base release/v2.0")
-        );
-        assert!(
-            summary_explicit
-                .pr_proposal
-                .body
-                .contains("graduation into `release/v2.0`")
-        );
-        assert!(
-            summary_explicit
-                .pr_proposal
-                .body
-                .contains("- Target branch: `release/v2.0`")
         );
     }
 
@@ -9394,2624 +7289,5 @@ mod tests {
 
         reset_registry_for_tests();
         assert_eq!(task_worktree_path_for_id(&task_id), None);
-    }
-
-    #[gpui::test]
-    async fn test_release_stale_task_worktree_detaches_project_before_removal(
-        cx: &mut TestAppContext,
-    ) {
-        init_test(cx);
-        let fs = FakeFs::new(cx.executor());
-        fs.insert_tree(
-            "/root",
-            json!({
-                ".git": {}
-            }),
-        )
-        .await;
-
-        let project = Project::test(fs.clone(), ["/root".as_ref()], cx).await;
-        let task = AgentTaskSummary {
-            id: AgentTaskId::from("TASK-ORDER-1"),
-            parent_id: None,
-            goal_id: None,
-            title: "Order assertion task".to_string(),
-            status: AgentTaskStatus::Ready,
-            attempt: 1,
-            assignee: None,
-            write_scopes: vec!["src/".to_string()],
-            created_at: None,
-            assigned_profile: None,
-            model: None,
-            session_id: None,
-            metrics: None,
-        };
-
-        let path = cx
-            .update(|cx| ensure_task_worktree(project.clone(), &task, cx))
-            .await
-            .expect("ensure worktree should succeed");
-
-        let has_worktree_before = project.read_with(cx, |project, cx| {
-            project
-                .worktrees(cx)
-                .any(|worktree| worktree.read(cx).abs_path().as_ref() == path)
-        });
-        assert!(
-            has_worktree_before,
-            "worktree must be in project before release"
-        );
-
-        fs.set_remove_dir_error(&path, "permanent removal failure".to_string());
-
-        let (repository, anchor_path, _, _, _) = project
-            .update(cx, |project, cx| task_worktree_context(project, cx))
-            .unwrap();
-
-        let fs_trait: Arc<dyn Fs> = fs.clone();
-        let result = release_stale_task_worktree(
-            &project,
-            &repository,
-            &fs_trait,
-            &anchor_path,
-            &task.id,
-            &path,
-            "for order testing",
-            false,
-            &mut cx.to_async(),
-        )
-        .await;
-
-        assert!(result.is_err(), "removal should fail due to injected error");
-
-        let has_worktree_after = project.read_with(cx, |project, cx| {
-            project
-                .worktrees(cx)
-                .any(|worktree| worktree.read(cx).abs_path().as_ref() == path)
-        });
-        assert!(
-            !has_worktree_after,
-            "project worktree must be detached before git/fs removal"
-        );
-    }
-
-    #[gpui::test]
-    async fn test_remove_task_worktree_internal_detaches_project_before_removal(
-        cx: &mut TestAppContext,
-    ) {
-        init_test(cx);
-        let fs = FakeFs::new(cx.executor());
-        fs.insert_tree(
-            "/root",
-            json!({
-                ".git": {}
-            }),
-        )
-        .await;
-
-        let project = Project::test(fs.clone(), ["/root".as_ref()], cx).await;
-        let task = AgentTaskSummary {
-            id: AgentTaskId::from("TASK-ORDER-2"),
-            parent_id: None,
-            goal_id: None,
-            title: "Internal removal order assertion task".to_string(),
-            status: AgentTaskStatus::Ready,
-            attempt: 1,
-            assignee: None,
-            write_scopes: vec!["src/".to_string()],
-            created_at: None,
-            assigned_profile: None,
-            model: None,
-            session_id: None,
-            metrics: None,
-        };
-
-        let path = cx
-            .update(|cx| ensure_task_worktree(project.clone(), &task, cx))
-            .await
-            .expect("ensure worktree should succeed");
-
-        fs.set_remove_dir_error(&path, "fatal removal error".to_string());
-
-        let remove_task =
-            cx.update(|cx| remove_task_worktree_internal(project.clone(), &task.id, false, cx));
-        let result = remove_task.await;
-        assert!(result.is_err());
-
-        let has_worktree = project.read_with(cx, |project, cx| {
-            project
-                .worktrees(cx)
-                .any(|worktree| worktree.read(cx).abs_path().as_ref() == path)
-        });
-        assert!(
-            !has_worktree,
-            "worktree must be detached from project before removal failure"
-        );
-    }
-
-    #[test]
-    fn test_is_sharing_violation_helper() {
-        let os_sharing_error = anyhow::Error::new(std::io::Error::from_raw_os_error(32));
-        assert!(is_sharing_violation(&os_sharing_error));
-
-        let string_sharing_error =
-            anyhow::anyhow!("The process cannot access the file: sharing violation");
-        assert!(is_sharing_violation(&string_sharing_error));
-
-        let uppercase_sharing_error = anyhow::anyhow!("ERROR: SHARING VIOLATION DETECTED");
-        assert!(is_sharing_violation(&uppercase_sharing_error));
-
-        let unrelated_io_error = anyhow::Error::new(std::io::Error::from_raw_os_error(5));
-        assert!(!is_sharing_violation(&unrelated_io_error));
-
-        let unrelated_string_error = anyhow::anyhow!("file not found");
-        assert!(!is_sharing_violation(&unrelated_string_error));
-    }
-
-    #[test]
-    fn test_removal_backoff_schedule() {
-        assert_eq!(removal_backoff_duration(0), Duration::from_millis(50));
-        assert_eq!(removal_backoff_duration(1), Duration::from_millis(100));
-        assert_eq!(removal_backoff_duration(2), Duration::from_millis(200));
-        assert_eq!(removal_backoff_duration(3), Duration::from_millis(400));
-        assert_eq!(removal_backoff_duration(4), Duration::from_millis(800));
-        assert_eq!(removal_backoff_duration(5), Duration::from_millis(800));
-    }
-
-    #[gpui::test]
-    async fn test_removal_retry_fake_fs_sharing_violation_succeeds(cx: &mut TestAppContext) {
-        init_test(cx);
-        let fs = FakeFs::new(cx.executor());
-        fs.insert_tree(
-            "/root",
-            json!({
-                ".git": {}
-            }),
-        )
-        .await;
-
-        let project = Project::test(fs.clone(), ["/root".as_ref()], cx).await;
-        let task = AgentTaskSummary {
-            id: AgentTaskId::from("TASK-RETRY-SUCCESS"),
-            parent_id: None,
-            goal_id: None,
-            title: "Retry success task".to_string(),
-            status: AgentTaskStatus::Ready,
-            attempt: 1,
-            assignee: None,
-            write_scopes: vec!["src/".to_string()],
-            created_at: None,
-            assigned_profile: None,
-            model: None,
-            session_id: None,
-            metrics: None,
-        };
-
-        let path = cx
-            .update(|cx| ensure_task_worktree(project.clone(), &task, cx))
-            .await
-            .expect("ensure worktree should succeed");
-
-        fs.set_remove_dir_error(&path, "sharing violation: file locked".to_string());
-
-        let (repository, anchor_path, _, _, _) = project
-            .update(cx, |project, cx| task_worktree_context(project, cx))
-            .unwrap();
-
-        // Spawn background task to clear error after two failed attempts (50ms + 100ms backoff)
-        let fs_clone = fs.clone();
-        let path_clone = path.clone();
-        let background_executor = cx.background_executor.clone();
-        cx.background_executor
-            .spawn(async move {
-                background_executor.timer(Duration::from_millis(120)).await;
-                fs_clone.clear_remove_dir_error(&path_clone);
-            })
-            .detach();
-
-        let fs_trait: Arc<dyn Fs> = fs.clone();
-        let mut remove_task = cx.spawn({
-            let project = project.clone();
-            let task_id = task.id.clone();
-            let path = path.clone();
-            |mut cx| async move {
-                release_stale_task_worktree(
-                    &project,
-                    &repository,
-                    &fs_trait,
-                    &anchor_path,
-                    &task_id,
-                    &path,
-                    "testing retry",
-                    false,
-                    &mut cx,
-                )
-                .await
-            }
-        });
-
-        // Run until attempt 0 fails and waits 50ms
-        cx.run_until_parked();
-        // Advance 50ms: attempt 1 runs, fails, and waits 100ms
-        cx.executor().advance_clock(Duration::from_millis(50));
-        cx.run_until_parked();
-        // Advance 70ms (total 120ms): background task clears error
-        cx.executor().advance_clock(Duration::from_millis(70));
-        cx.run_until_parked();
-        // Advance 30ms (total 150ms): attempt 2 runs with error cleared, succeeds
-        cx.executor().advance_clock(Duration::from_millis(30));
-        cx.run_until_parked();
-
-        let result = (&mut remove_task)
-            .now_or_never()
-            .expect("removal should have completed after sharing violation cleared");
-        assert!(result.is_ok());
-        assert!(!fs.is_dir(&path).await);
-    }
-
-    #[gpui::test]
-    async fn test_removal_retry_exhaustion_records_cleanup_error(cx: &mut TestAppContext) {
-        init_test(cx);
-        let fs = FakeFs::new(cx.executor());
-        fs.insert_tree(
-            "/root",
-            json!({
-                ".git": {}
-            }),
-        )
-        .await;
-
-        let project = Project::test(fs.clone(), ["/root".as_ref()], cx).await;
-        let task = AgentTaskSummary {
-            id: AgentTaskId::from("TASK-RETRY-FAIL"),
-            parent_id: None,
-            goal_id: None,
-            title: "Retry exhaustion task".to_string(),
-            status: AgentTaskStatus::Ready,
-            attempt: 1,
-            assignee: None,
-            write_scopes: vec!["src/".to_string()],
-            created_at: None,
-            assigned_profile: None,
-            model: None,
-            session_id: None,
-            metrics: None,
-        };
-
-        let path = cx
-            .update(|cx| ensure_task_worktree(project.clone(), &task, cx))
-            .await
-            .expect("ensure worktree should succeed");
-
-        fs.set_remove_dir_error(&path, "sharing violation: locked file".to_string());
-
-        let mut cleanup_task = cx.spawn({
-            let project = project.clone();
-            let task_id = task.id.clone();
-            |cx| async move {
-                cx.update(|cx| auto_cleanup_task_worktree(project, &task_id, cx))
-                    .await
-            }
-        });
-
-        cx.run_until_parked();
-        // Advance past all backoffs (50 + 100 + 200 + 400 = 750ms for git, then again for fs fallback)
-        cx.executor().advance_clock(Duration::from_secs(5));
-        cx.run_until_parked();
-
-        let result = (&mut cleanup_task)
-            .now_or_never()
-            .expect("cleanup should complete after retries exhaust");
-        assert!(result.is_err());
-
-        let cleanup_error = task_worktree_cleanup_error(&task.id);
-        assert!(
-            cleanup_error.is_some(),
-            "cleanup error must be recorded after final failure"
-        );
-        let error_message = cleanup_error.unwrap().to_lowercase();
-        assert!(error_message.contains("sharing violation"));
-    }
-
-    #[gpui::test]
-    async fn test_acquire_slot_timeout_lists_holders(cx: &mut TestAppContext) {
-        init_test(cx);
-        let fs = FakeFs::new(cx.executor());
-        fs.insert_tree(
-            "/root",
-            json!({
-                ".git": {}
-            }),
-        )
-        .await;
-
-        let project = Project::test(fs.clone(), ["/root".as_ref()], cx).await;
-
-        cx.update(|cx| {
-            cx.update_global(|store: &mut settings::SettingsStore, cx| {
-                store
-                    .set_user_settings(r#"{ "agent": { "task_worktree_limit": 3 } }"#, cx)
-                    .unwrap();
-            });
-        });
-
-        for index in 1..=3 {
-            let task = AgentTaskSummary {
-                id: AgentTaskId::from(format!("TASK-HOLDER-{index}")),
-                parent_id: None,
-                goal_id: None,
-                title: format!("Holder task {index}"),
-                status: AgentTaskStatus::Ready,
-                attempt: 1,
-                assignee: None,
-                write_scopes: vec!["src/".to_string()],
-                created_at: None,
-                assigned_profile: None,
-                model: None,
-                session_id: None,
-                metrics: None,
-            };
-            cx.update(|cx| ensure_task_worktree(project.clone(), &task, cx))
-                .await
-                .expect("ensure holder worktree should succeed");
-            record_task_worktree_commit_error(&task.id, "uncommitted changes".to_string());
-        }
-
-        let task4 = AgentTaskSummary {
-            id: AgentTaskId::from("TASK-WAIT-4"),
-            parent_id: None,
-            goal_id: None,
-            title: "Waiting task 4".to_string(),
-            status: AgentTaskStatus::Ready,
-            attempt: 1,
-            assignee: None,
-            write_scopes: vec!["src/".to_string()],
-            created_at: None,
-            assigned_profile: None,
-            model: None,
-            session_id: None,
-            metrics: None,
-        };
-
-        let mut acquire_task = cx.spawn({
-            let project = project.clone();
-            |cx| async move {
-                cx.update(|cx| ensure_task_worktree(project, &task4, cx))
-                    .await
-            }
-        });
-
-        cx.run_until_parked();
-        assert!(
-            (&mut acquire_task).now_or_never().is_none(),
-            "slot acquisition must be waiting in queue"
-        );
-
-        cx.executor().advance_clock(Duration::from_secs(45));
-        cx.run_until_parked();
-
-        let result = (&mut acquire_task)
-            .now_or_never()
-            .expect("slot acquisition should fail with timeout");
-        assert!(
-            result.is_err(),
-            "acquisition must return an error on timeout"
-        );
-
-        let error_message = result.unwrap_err().to_string();
-        assert!(
-            error_message.contains("pool limit: 3"),
-            "error message must include pool limit, got: {error_message}"
-        );
-        assert!(
-            error_message.contains("task_worktree_limit"),
-            "error message must include task_worktree_limit setting name, got: {error_message}"
-        );
-        assert!(
-            error_message.contains("TASK-HOLDER-1")
-                && error_message.contains("TASK-HOLDER-2")
-                && error_message.contains("TASK-HOLDER-3"),
-            "error message must list holder task ids, got: {error_message}"
-        );
-        assert!(
-            error_message.contains("commit error"),
-            "error message must list hold reason 'commit error', got: {error_message}"
-        );
-    }
-
-    #[gpui::test]
-    async fn test_commit_task_worktree_excludes_settings_json_when_out_of_scope(
-        cx: &mut TestAppContext,
-    ) {
-        init_test(cx);
-        let fs = FakeFs::new(cx.executor());
-        fs.insert_tree(
-            path!("/root"),
-            json!({
-                ".git": {
-                    "HEAD": "ref: refs/heads/main\n"
-                }
-            }),
-        )
-        .await;
-
-        let dot_git = std::path::Path::new(path!("/root/.git"));
-        fs.with_git_state(dot_git, true, |state| {
-            state
-                .refs
-                .insert("refs/heads/main".into(), "main-sha-exclude".into());
-            state.refs.insert("HEAD".into(), "main-sha-exclude".into());
-            state.branches.insert("main".into());
-        })
-        .unwrap();
-
-        let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
-        let task = AgentTaskSummary {
-            id: AgentTaskId::from("TASK-OUT-OF-SCOPE-1"),
-            parent_id: None,
-            goal_id: None,
-            title: "Out of scope task".to_string(),
-            status: AgentTaskStatus::Ready,
-            attempt: 1,
-            assignee: None,
-            write_scopes: vec!["src/".to_string()],
-            created_at: None,
-            assigned_profile: None,
-            model: None,
-            session_id: None,
-            metrics: None,
-        };
-
-        let worktree_path = cx
-            .update(|cx| ensure_task_worktree(project.clone(), &task, cx))
-            .await
-            .unwrap();
-
-        let head_before = fs
-            .with_git_state(&worktree_path.join(".git"), false, |state| {
-                state.refs.get("HEAD").cloned()
-            })
-            .unwrap();
-
-        assert!(!fs.is_file(&worktree_path.join(".zed/settings.json")).await);
-        fs.save(
-            &worktree_path.join(".zed/settings.json"),
-            &r#"{"file_scan_exclusions":["**/target"]}"#.into(),
-            text::LineEnding::Unix,
-        )
-        .await
-        .unwrap();
-
-        let details = cx
-            .spawn({
-                let fs = fs.clone();
-                let worktree_path = worktree_path.clone();
-                let task_id = task.id.to_string();
-                |mut cx| async move {
-                    commit_task_worktree(fs, worktree_path, task_id, false, &mut cx).await
-                }
-            })
-            .await
-            .unwrap();
-
-        assert_eq!(details.changed_files, 0);
-        assert_eq!(details.commit_error, None);
-        assert_eq!(details.head_sha, head_before);
-
-        let head_after = fs
-            .with_git_state(&worktree_path.join(".git"), false, |state| {
-                state.refs.get("HEAD").cloned()
-            })
-            .unwrap();
-        assert_eq!(head_after, head_before);
-        assert!(task_worktree_changed_files(&task.id).is_empty());
-    }
-
-    #[gpui::test]
-    async fn test_commit_task_worktree_commits_settings_json_when_in_scope(
-        cx: &mut TestAppContext,
-    ) {
-        init_test(cx);
-        let fs = FakeFs::new(cx.executor());
-        fs.insert_tree(
-            path!("/root"),
-            json!({
-                ".git": {
-                    "HEAD": "ref: refs/heads/main\n"
-                }
-            }),
-        )
-        .await;
-
-        let dot_git = std::path::Path::new(path!("/root/.git"));
-        fs.with_git_state(dot_git, true, |state| {
-            state
-                .refs
-                .insert("refs/heads/main".into(), "main-sha-in-scope".into());
-            state.refs.insert("HEAD".into(), "main-sha-in-scope".into());
-            state.branches.insert("main".into());
-        })
-        .unwrap();
-
-        let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
-        let task = AgentTaskSummary {
-            id: AgentTaskId::from("TASK-IN-SCOPE-1"),
-            parent_id: None,
-            goal_id: None,
-            title: "In scope task".to_string(),
-            status: AgentTaskStatus::Ready,
-            attempt: 1,
-            assignee: None,
-            write_scopes: vec![".zed/".to_string()],
-            created_at: None,
-            assigned_profile: None,
-            model: None,
-            session_id: None,
-            metrics: None,
-        };
-
-        let worktree_path = cx
-            .update(|cx| ensure_task_worktree(project.clone(), &task, cx))
-            .await
-            .unwrap();
-
-        let head_before = fs
-            .with_git_state(&worktree_path.join(".git"), false, |state| {
-                state.refs.get("HEAD").cloned()
-            })
-            .unwrap();
-
-        assert!(!fs.is_file(&worktree_path.join(".zed/settings.json")).await);
-        fs.save(
-            &worktree_path.join(".zed/settings.json"),
-            &r#"{"file_scan_exclusions":["**/target"]}"#.into(),
-            text::LineEnding::Unix,
-        )
-        .await
-        .unwrap();
-
-        let details = cx
-            .spawn({
-                let fs = fs.clone();
-                let worktree_path = worktree_path.clone();
-                let task_id = task.id.to_string();
-                |mut cx| async move {
-                    commit_task_worktree(fs, worktree_path, task_id, false, &mut cx).await
-                }
-            })
-            .await
-            .unwrap();
-
-        assert_eq!(details.changed_files, 1);
-        assert_eq!(details.commit_error, None);
-        assert_ne!(details.head_sha, head_before);
-
-        let head_after = fs
-            .with_git_state(&worktree_path.join(".git"), false, |state| {
-                state.refs.get("HEAD").cloned()
-            })
-            .unwrap();
-        assert_ne!(head_after, head_before);
-        assert_eq!(
-            task_worktree_changed_files(&task.id),
-            vec![".zed/settings.json".to_string()]
-        );
-    }
-
-    #[gpui::test]
-    async fn test_commit_task_worktree_excludes_settings_json_when_scopes_empty(
-        cx: &mut TestAppContext,
-    ) {
-        init_test(cx);
-        let fs = FakeFs::new(cx.executor());
-        fs.insert_tree(
-            path!("/root"),
-            json!({
-                ".git": {
-                    "HEAD": "ref: refs/heads/main\n"
-                }
-            }),
-        )
-        .await;
-
-        let dot_git = std::path::Path::new(path!("/root/.git"));
-        fs.with_git_state(dot_git, true, |state| {
-            state
-                .refs
-                .insert("refs/heads/main".into(), "main-sha-empty".into());
-            state.refs.insert("HEAD".into(), "main-sha-empty".into());
-            state.branches.insert("main".into());
-        })
-        .unwrap();
-
-        let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
-        let task = AgentTaskSummary {
-            id: AgentTaskId::from("TASK-EMPTY-SCOPES-1"),
-            parent_id: None,
-            goal_id: None,
-            title: "Empty scopes task".to_string(),
-            status: AgentTaskStatus::Ready,
-            attempt: 1,
-            assignee: None,
-            write_scopes: vec![],
-            created_at: None,
-            assigned_profile: None,
-            model: None,
-            session_id: None,
-            metrics: None,
-        };
-
-        let worktree_path = cx
-            .update(|cx| ensure_task_worktree(project.clone(), &task, cx))
-            .await
-            .unwrap();
-
-        let head_before = fs
-            .with_git_state(&worktree_path.join(".git"), false, |state| {
-                state.refs.get("HEAD").cloned()
-            })
-            .unwrap();
-
-        assert!(!fs.is_file(&worktree_path.join(".zed/settings.json")).await);
-        fs.save(
-            &worktree_path.join(".zed/settings.json"),
-            &r#"{"file_scan_exclusions":["**/target"]}"#.into(),
-            text::LineEnding::Unix,
-        )
-        .await
-        .unwrap();
-
-        let details = cx
-            .spawn({
-                let fs = fs.clone();
-                let worktree_path = worktree_path.clone();
-                let task_id = task.id.to_string();
-                |mut cx| async move {
-                    commit_task_worktree(fs, worktree_path, task_id, false, &mut cx).await
-                }
-            })
-            .await
-            .unwrap();
-
-        assert_eq!(details.changed_files, 0);
-        assert_eq!(details.commit_error, None);
-        assert_eq!(details.head_sha, head_before);
-
-        let head_after = fs
-            .with_git_state(&worktree_path.join(".git"), false, |state| {
-                state.refs.get("HEAD").cloned()
-            })
-            .unwrap();
-        assert_eq!(head_after, head_before);
-        assert!(task_worktree_changed_files(&task.id).is_empty());
-    }
-
-    #[gpui::test]
-    async fn test_commit_task_worktree_excludes_settings_json_while_committing_in_scope_changes(
-        cx: &mut TestAppContext,
-    ) {
-        init_test(cx);
-        let fs = FakeFs::new(cx.executor());
-        fs.insert_tree(
-            path!("/root"),
-            json!({
-                ".git": {
-                    "HEAD": "ref: refs/heads/main\n"
-                }
-            }),
-        )
-        .await;
-
-        let dot_git = std::path::Path::new(path!("/root/.git"));
-        fs.with_git_state(dot_git, true, |state| {
-            state
-                .refs
-                .insert("refs/heads/main".into(), "main-sha-mixed".into());
-            state.refs.insert("HEAD".into(), "main-sha-mixed".into());
-            state.branches.insert("main".into());
-        })
-        .unwrap();
-
-        let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
-        let task = AgentTaskSummary {
-            id: AgentTaskId::from("TASK-MIXED-1"),
-            parent_id: None,
-            goal_id: None,
-            title: "Mixed changes task".to_string(),
-            status: AgentTaskStatus::Ready,
-            attempt: 1,
-            assignee: None,
-            write_scopes: vec!["src/".to_string()],
-            created_at: None,
-            assigned_profile: None,
-            model: None,
-            session_id: None,
-            metrics: None,
-        };
-
-        let worktree_path = cx
-            .update(|cx| ensure_task_worktree(project.clone(), &task, cx))
-            .await
-            .unwrap();
-
-        let head_before = fs
-            .with_git_state(&worktree_path.join(".git"), false, |state| {
-                state.refs.get("HEAD").cloned()
-            })
-            .unwrap();
-
-        assert!(!fs.is_file(&worktree_path.join(".zed/settings.json")).await);
-        fs.save(
-            &worktree_path.join(".zed/settings.json"),
-            &r#"{"file_scan_exclusions":["**/target"]}"#.into(),
-            text::LineEnding::Unix,
-        )
-        .await
-        .unwrap();
-
-        fs.save(
-            &worktree_path.join("src/lib.rs"),
-            &"pub fn hello() {}".into(),
-            text::LineEnding::Unix,
-        )
-        .await
-        .unwrap();
-
-        let details = cx
-            .spawn({
-                let fs = fs.clone();
-                let worktree_path = worktree_path.clone();
-                let task_id = task.id.to_string();
-                |mut cx| async move {
-                    commit_task_worktree(fs, worktree_path, task_id, false, &mut cx).await
-                }
-            })
-            .await
-            .unwrap();
-
-        assert_eq!(details.changed_files, 1);
-        assert_eq!(details.commit_error, None);
-        assert_ne!(details.head_sha, head_before);
-
-        assert_eq!(
-            task_worktree_changed_files(&task.id),
-            vec!["src/lib.rs".to_string()]
-        );
-
-        let snapshot = fs
-            .with_git_state(&worktree_path.join(".git"), false, |state| {
-                state.commit_history.last().cloned()
-            })
-            .unwrap()
-            .expect("commit snapshot must exist");
-
-        let committed_paths: Vec<String> = snapshot
-            .index_contents
-            .keys()
-            .map(|p| p.as_unix_str().to_string())
-            .collect();
-        assert!(committed_paths.contains(&"src/lib.rs".to_string()));
-        assert!(!committed_paths.contains(&".zed/settings.json".to_string()));
-    }
-
-    #[test]
-    fn test_task_worktree_write_scopes_preserved_across_reregistration() {
-        reset_registry_for_tests();
-        let task_id = AgentTaskId::from("TASK-SCOPES-PRESERVE-1");
-
-        register_task_worktree_policy_with_scopes(
-            &task_id,
-            PathBuf::from("/worktree/path"),
-            None,
-            None,
-            None,
-            None,
-            Some(vec!["src/".to_string(), "docs/".to_string()]),
-        );
-
-        assert_eq!(
-            task_worktree_write_scopes(&task_id),
-            vec!["src/".to_string(), "docs/".to_string()]
-        );
-
-        // Re-register without scopes preserves existing write_scopes
-        register_task_worktree_policy(
-            &task_id,
-            PathBuf::from("/worktree/path"),
-            None,
-            None,
-            None,
-            None,
-        );
-
-        assert_eq!(
-            task_worktree_write_scopes(&task_id),
-            vec!["src/".to_string(), "docs/".to_string()]
-        );
-
-        // Re-register with empty scopes preserves existing non-empty write_scopes
-        register_task_worktree_policy_with_scopes(
-            &task_id,
-            PathBuf::from("/worktree/path"),
-            None,
-            None,
-            None,
-            None,
-            Some(vec![]),
-        );
-
-        assert_eq!(
-            task_worktree_write_scopes(&task_id),
-            vec!["src/".to_string(), "docs/".to_string()]
-        );
-
-        // Re-register with new non-empty scopes updates them
-        register_task_worktree_policy_with_scopes(
-            &task_id,
-            PathBuf::from("/worktree/path"),
-            None,
-            None,
-            None,
-            None,
-            Some(vec!["crates/".to_string()]),
-        );
-
-        assert_eq!(
-            task_worktree_write_scopes(&task_id),
-            vec!["crates/".to_string()]
-        );
-    }
-
-    #[gpui::test]
-    async fn test_auto_cleanup_gated_by_settings(cx: &mut TestAppContext) {
-        init_test(cx);
-        let fs = FakeFs::new(cx.executor());
-        fs.insert_tree(
-            "/root",
-            json!({
-                ".git": {
-                    "HEAD": "ref: refs/heads/main\n"
-                }
-            }),
-        )
-        .await;
-
-        let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
-        let task = AgentTaskSummary {
-            id: AgentTaskId::from("TASK-CLEANUP-GATE"),
-            parent_id: None,
-            goal_id: None,
-            title: "Test".to_string(),
-            status: AgentTaskStatus::Completed,
-            attempt: 1,
-            assignee: None,
-            write_scopes: vec![],
-            created_at: None,
-            assigned_profile: None,
-            model: None,
-            session_id: None,
-            metrics: None,
-        };
-
-        let worktree_path = cx
-            .update(|cx| ensure_task_worktree(project.clone(), &task, cx))
-            .await
-            .unwrap();
-        assert!(fs.is_dir(&worktree_path).await);
-
-        cx.update(|cx| {
-            cx.update_global::<SettingsStore, _>(|store, cx| {
-                store.update_user_settings(cx, |settings| {
-                    settings.agent.get_or_insert_default().task_lifecycle_mode =
-                        Some(agent_settings::TaskLifecycleMode::Agent);
-                });
-            });
-        });
-
-        let cleaned = cx
-            .update(|cx| auto_cleanup_task_worktree(project.clone(), &task.id, cx))
-            .await
-            .unwrap();
-        assert!(!cleaned);
-        assert!(fs.is_dir(&worktree_path).await);
-
-        cx.update(|cx| {
-            cx.update_global::<SettingsStore, _>(|store, cx| {
-                store.update_user_settings(cx, |settings| {
-                    let agent = settings.agent.get_or_insert_default();
-                    agent.task_lifecycle_mode = Some(agent_settings::TaskLifecycleMode::Runtime);
-                    agent.cleanup = Some(false);
-                });
-            });
-        });
-
-        let cleaned = cx
-            .update(|cx| auto_cleanup_task_worktree(project.clone(), &task.id, cx))
-            .await
-            .unwrap();
-        assert!(!cleaned);
-        assert!(fs.is_dir(&worktree_path).await);
-
-        cx.update(|cx| {
-            cx.update_global::<SettingsStore, _>(|store, cx| {
-                store.update_user_settings(cx, |settings| {
-                    settings.agent.get_or_insert_default().cleanup = Some(true);
-                });
-            });
-        });
-        cx.update(|cx| {
-            cx.update_global::<SettingsStore, _>(|store, cx| {
-                store.update_user_settings(cx, |settings| {
-                    settings.agent.get_or_insert_default().cleanup = Some(true);
-                });
-            });
-        });
-
-        let cleaned = cx
-            .update(|cx| auto_cleanup_task_worktree(project.clone(), &task.id, cx))
-            .await
-            .unwrap();
-        assert!(cleaned);
-        assert!(!fs.is_dir(&worktree_path).await);
-    }
-
-    #[gpui::test]
-    async fn test_publish_ref_artifact_gated_by_settings(cx: &mut TestAppContext) {
-        init_test(cx);
-        let fs = FakeFs::new(cx.executor());
-        fs.insert_tree(
-            path!("/root"),
-            json!({
-                ".git": {
-                    "HEAD": "ref: refs/heads/main\n"
-                },
-                "initial.txt": "initial"
-            }),
-        )
-        .await;
-
-        let (tool_calls_tx, mut tool_calls_rx) = futures::channel::mpsc::unbounded();
-        let fake_transport = context_server::test::create_fake_transport("tgs", cx.executor())
-            .on_request::<context_server::types::requests::Initialize, _>(
-                move |_params| async move {
-                    context_server::types::InitializeResponse {
-                        protocol_version: context_server::types::ProtocolVersion(
-                            context_server::types::LATEST_PROTOCOL_VERSION.to_string(),
-                        ),
-                        server_info: context_server::types::Implementation {
-                            name: "tgs".into(),
-                            title: None,
-                            version: "1.0.0".to_string(),
-                            description: None,
-                        },
-                        capabilities: context_server::types::ServerCapabilities {
-                            tools: Some(context_server::types::ToolsCapabilities {
-                                list_changed: Some(true),
-                            }),
-                            ..Default::default()
-                        },
-                        meta: None,
-                    }
-                },
-            )
-            .on_request::<context_server::types::requests::CallTool, _>(move |params| {
-                let tool_calls_tx = tool_calls_tx.clone();
-                async move {
-                    tool_calls_tx.unbounded_send(params).unwrap();
-                    context_server::types::CallToolResponse {
-                        content: vec![context_server::types::ToolResponseContent::Text {
-                            text: "artifact published ok".into(),
-                        }],
-                        is_error: None,
-                        meta: None,
-                        structured_content: None,
-                    }
-                }
-            });
-
-        cx.update(|cx| {
-            cx.update_global::<SettingsStore, _>(|store, cx| {
-                store.update_user_settings(cx, |settings| {
-                    settings.project.context_servers.insert(
-                        "tgs".into(),
-                        project::project_settings::ContextServerSettings::Stdio {
-                            enabled: true,
-                            remote: false,
-                            command: context_server::ContextServerCommand {
-                                path: "somebinary".into(),
-                                args: Vec::new(),
-                                env: None,
-                                timeout: None,
-                                platforms: Default::default(),
-                            },
-                        }
-                        .into(),
-                    );
-                    settings.agent.get_or_insert_default().publish_ref_artifact = Some(false);
-                });
-            });
-        });
-
-        let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
-        let context_server_store = project.read_with(cx, |p, _| p.context_server_store());
-        context_server_store.update(cx, |store, cx| {
-            store.start_server(
-                Arc::new(context_server::ContextServer::new(
-                    context_server::ContextServerId("tgs".into()),
-                    Arc::new(fake_transport),
-                )),
-                cx,
-            );
-        });
-        cx.run_until_parked();
-
-        let task = AgentTaskSummary {
-            id: AgentTaskId::from("TASK-NO-REF-PUB"),
-            parent_id: None,
-            goal_id: None,
-            title: "Test".to_string(),
-            status: AgentTaskStatus::Ready,
-            attempt: 1,
-            assignee: None,
-            write_scopes: vec![],
-            created_at: None,
-            assigned_profile: None,
-            model: None,
-            session_id: None,
-            metrics: None,
-        };
-
-        let worktree_path = cx
-            .update(|cx| {
-                ensure_task_worktree_with_policy(
-                    project.clone(),
-                    &task,
-                    Some("GOAL-NO-REF-PUB".to_string()),
-                    None,
-                    None,
-                    cx,
-                )
-            })
-            .await
-            .unwrap();
-
-        fs.save(
-            &worktree_path.join("file.txt"),
-            &"change".into(),
-            text::LineEnding::Unix,
-        )
-        .await
-        .unwrap();
-
-        let details = cx
-            .update(|cx| commit_and_merge_task_worktree(project.clone(), &task.id, false, cx))
-            .await
-            .unwrap();
-        assert!(details.merged_into.is_some());
-
-        // With publish_ref_artifact = false, no TGS call should be received.
-        assert!(tool_calls_rx.try_recv().is_err());
-
-        // Now enable publish_ref_artifact and verify that publication occurs.
-        cx.update(|cx| {
-            cx.update_global::<SettingsStore, _>(|store, cx| {
-                store.update_user_settings(cx, |settings| {
-                    settings.agent.get_or_insert_default().publish_ref_artifact = Some(true);
-                });
-            });
-        });
-
-        let task2 = AgentTaskSummary {
-            id: AgentTaskId::from("TASK-WITH-REF-PUB"),
-            parent_id: None,
-            goal_id: None,
-            title: "Test 2".to_string(),
-            status: AgentTaskStatus::Ready,
-            attempt: 1,
-            assignee: None,
-            write_scopes: vec![],
-            created_at: None,
-            assigned_profile: None,
-            model: None,
-            session_id: None,
-            metrics: None,
-        };
-
-        let worktree_path2 = cx
-            .update(|cx| {
-                ensure_task_worktree_with_policy(
-                    project.clone(),
-                    &task2,
-                    Some("GOAL-NO-REF-PUB".to_string()),
-                    None,
-                    None,
-                    cx,
-                )
-            })
-            .await
-            .unwrap();
-
-        fs.save(
-            &worktree_path2.join("file2.txt"),
-            &"change 2".into(),
-            text::LineEnding::Unix,
-        )
-        .await
-        .unwrap();
-
-        let details2 = cx
-            .update(|cx| commit_and_merge_task_worktree(project.clone(), &task2.id, false, cx))
-            .await
-            .unwrap();
-        assert!(details2.merged_into.is_some());
-
-        let call = tool_calls_rx
-            .try_recv()
-            .expect("should receive artifact_publish call when enabled");
-        assert_eq!(call.name, "artifact_publish");
-    }
-
-    #[gpui::test]
-    async fn test_regression_waiters_do_not_reserve_slots_against_themselves(
-        cx: &mut TestAppContext,
-    ) {
-        init_test(cx);
-        let fs = FakeFs::new(cx.executor());
-        fs.insert_tree(
-            path!("/root"),
-            json!({
-                ".git": {
-                    "HEAD": "ref: refs/heads/main\n"
-                }
-            }),
-        )
-        .await;
-
-        let dot_git = std::path::Path::new(path!("/root/.git"));
-        fs.with_git_state(dot_git, true, |state| {
-            state
-                .refs
-                .insert("refs/heads/main".into(), "main-sha-waiters".into());
-            state.refs.insert("HEAD".into(), "main-sha-waiters".into());
-            state.branches.insert("main".into());
-        })
-        .unwrap();
-
-        let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
-
-        cx.update(|cx| {
-            cx.update_global(|store: &mut settings::SettingsStore, cx| {
-                store
-                    .set_user_settings(r#"{ "agent": { "task_worktree_limit": 2 } }"#, cx)
-                    .unwrap();
-            });
-        });
-
-        let task1 = AgentTaskSummary {
-            id: AgentTaskId::from("TASK-WAIT-REG-1"),
-            parent_id: None,
-            goal_id: None,
-            title: "Task 1".to_string(),
-            status: AgentTaskStatus::Running,
-            attempt: 1,
-            assignee: None,
-            write_scopes: vec![],
-            created_at: None,
-            assigned_profile: None,
-            model: None,
-            session_id: None,
-            metrics: None,
-        };
-        let task2 = AgentTaskSummary {
-            id: AgentTaskId::from("TASK-WAIT-REG-2"),
-            parent_id: None,
-            goal_id: None,
-            title: "Task 2".to_string(),
-            status: AgentTaskStatus::Running,
-            attempt: 1,
-            assignee: None,
-            write_scopes: vec![],
-            created_at: None,
-            assigned_profile: None,
-            model: None,
-            session_id: None,
-            metrics: None,
-        };
-        let task3 = AgentTaskSummary {
-            id: AgentTaskId::from("TASK-WAIT-REG-3"),
-            parent_id: None,
-            goal_id: None,
-            title: "Task 3".to_string(),
-            status: AgentTaskStatus::Ready,
-            attempt: 1,
-            assignee: None,
-            write_scopes: vec![],
-            created_at: None,
-            assigned_profile: None,
-            model: None,
-            session_id: None,
-            metrics: None,
-        };
-        let task4 = AgentTaskSummary {
-            id: AgentTaskId::from("TASK-WAIT-REG-4"),
-            parent_id: None,
-            goal_id: None,
-            title: "Task 4".to_string(),
-            status: AgentTaskStatus::Ready,
-            attempt: 1,
-            assignee: None,
-            write_scopes: vec![],
-            created_at: None,
-            assigned_profile: None,
-            model: None,
-            session_id: None,
-            metrics: None,
-        };
-
-        let guard1 = SubagentSessionGuard::test_new(task1.id.clone());
-        let path1 = cx
-            .update(|cx| ensure_task_worktree(project.clone(), &task1, cx))
-            .await
-            .unwrap();
-        assert!(fs.is_dir(&path1).await);
-
-        let guard2 = SubagentSessionGuard::test_new(task2.id.clone());
-        let path2 = cx
-            .update(|cx| ensure_task_worktree(project.clone(), &task2, cx))
-            .await
-            .unwrap();
-        assert!(fs.is_dir(&path2).await);
-
-        let mut ensure_task3 = cx.spawn({
-            let project = project.clone();
-            let task3 = task3.clone();
-            |cx| async move {
-                cx.update(|cx| ensure_task_worktree(project, &task3, cx))
-                    .await
-            }
-        });
-
-        cx.run_until_parked();
-        assert!((&mut ensure_task3).now_or_never().is_none());
-
-        let mut ensure_task4 = cx.spawn({
-            let project = project.clone();
-            let task4 = task4.clone();
-            |cx| async move {
-                cx.update(|cx| ensure_task_worktree(project, &task4, cx))
-                    .await
-            }
-        });
-
-        cx.run_until_parked();
-        assert!((&mut ensure_task4).now_or_never().is_none());
-
-        drop(guard1);
-        set_task_worktree_retention_timeout(Some(Duration::ZERO));
-        mark_task_terminal(&task1.id);
-        let cleaned1 = cx
-            .update(|cx| auto_cleanup_task_worktree(project.clone(), &task1.id, cx))
-            .await
-            .unwrap();
-        assert!(cleaned1);
-        assert!(!fs.is_dir(&path1).await);
-
-        cx.run_until_parked();
-        let path3 = (&mut ensure_task3)
-            .now_or_never()
-            .expect("task3 should succeed after slot 1 freed")
-            .unwrap();
-        assert!(fs.is_dir(&path3).await);
-
-        drop(guard2);
-        mark_task_terminal(&task2.id);
-        let cleaned2 = cx
-            .update(|cx| auto_cleanup_task_worktree(project.clone(), &task2.id, cx))
-            .await
-            .unwrap();
-        assert!(cleaned2);
-        assert!(!fs.is_dir(&path2).await);
-
-        cx.run_until_parked();
-        let path4 = (&mut ensure_task4)
-            .now_or_never()
-            .expect("task4 should succeed after slot 2 freed")
-            .unwrap();
-        assert!(fs.is_dir(&path4).await);
-    }
-
-    #[gpui::test]
-    async fn test_slot_wait_timeout_unregisters_holder_and_session_guard(cx: &mut TestAppContext) {
-        init_test(cx);
-        let fs = FakeFs::new(cx.executor());
-        fs.insert_tree(
-            path!("/root"),
-            json!({
-                ".git": {
-                    "HEAD": "ref: refs/heads/main\n"
-                }
-            }),
-        )
-        .await;
-
-        let dot_git = std::path::Path::new(path!("/root/.git"));
-        fs.with_git_state(dot_git, true, |state| {
-            state
-                .refs
-                .insert("refs/heads/main".into(), "main-sha-timeout".into());
-            state.refs.insert("HEAD".into(), "main-sha-timeout".into());
-            state.branches.insert("main".into());
-        })
-        .unwrap();
-
-        let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
-
-        cx.update(|cx| {
-            cx.update_global(|store: &mut settings::SettingsStore, cx| {
-                store
-                    .set_user_settings(r#"{ "agent": { "task_worktree_limit": 1 } }"#, cx)
-                    .unwrap();
-            });
-        });
-
-        let holder_task = AgentTaskSummary {
-            id: AgentTaskId::from("TASK-OCCUPIER-1"),
-            parent_id: None,
-            goal_id: None,
-            title: "Occupier Task 1".to_string(),
-            status: AgentTaskStatus::Ready,
-            attempt: 1,
-            assignee: None,
-            write_scopes: vec!["src/".to_string()],
-            created_at: None,
-            assigned_profile: None,
-            model: None,
-            session_id: None,
-            metrics: None,
-        };
-        cx.update(|cx| ensure_task_worktree(project.clone(), &holder_task, cx))
-            .await
-            .expect("ensure holder worktree should succeed");
-        record_task_worktree_commit_error(&holder_task.id, "real disk failure".to_string());
-
-        for i in 1..=3 {
-            let failed_task = AgentTaskSummary {
-                id: AgentTaskId::from(format!("TASK-FAILED-SPAWN-{i}")),
-                parent_id: None,
-                goal_id: None,
-                title: format!("Failed spawn task {i}"),
-                status: AgentTaskStatus::Ready,
-                attempt: 1,
-                assignee: None,
-                write_scopes: vec!["src/".to_string()],
-                created_at: None,
-                assigned_profile: None,
-                model: None,
-                session_id: None,
-                metrics: None,
-            };
-
-            let _guard = SubagentSessionGuard::test_new(failed_task.id.clone());
-            let mut spawn_task = cx.spawn({
-                let project = project.clone();
-                let failed_task = failed_task.clone();
-                |cx| async move {
-                    cx.update(|cx| ensure_task_worktree(project, &failed_task, cx))
-                        .await
-                }
-            });
-
-            cx.run_until_parked();
-            assert!((&mut spawn_task).now_or_never().is_none());
-
-            cx.executor().advance_clock(Duration::from_secs(45));
-            cx.run_until_parked();
-
-            let res = (&mut spawn_task)
-                .now_or_never()
-                .expect("spawn must finish with error on timeout");
-            assert!(res.is_err());
-
-            assert!(
-                !has_active_subagent_session(&failed_task.id),
-                "failed task session must be unregistered"
-            );
-            assert!(
-                !REGISTRY.read().entries.contains_key(&failed_task.id),
-                "failed task entry must be removed from registry"
-            );
-        }
-
-        let next_waiter = AgentTaskSummary {
-            id: AgentTaskId::from("TASK-NEXT-WAITER"),
-            parent_id: None,
-            goal_id: None,
-            title: "Next Waiter Task".to_string(),
-            status: AgentTaskStatus::Ready,
-            attempt: 1,
-            assignee: None,
-            write_scopes: vec!["src/".to_string()],
-            created_at: None,
-            assigned_profile: None,
-            model: None,
-            session_id: None,
-            metrics: None,
-        };
-
-        let mut next_spawn = cx.spawn({
-            let project = project.clone();
-            |cx| async move {
-                cx.update(|cx| ensure_task_worktree(project, &next_waiter, cx))
-                    .await
-            }
-        });
-
-        cx.run_until_parked();
-        cx.executor().advance_clock(Duration::from_secs(45));
-        cx.run_until_parked();
-
-        let err_msg = (&mut next_spawn)
-            .now_or_never()
-            .expect("must time out")
-            .unwrap_err()
-            .to_string();
-
-        assert!(
-            err_msg.contains("TASK-OCCUPIER-1"),
-            "holders list must contain actual occupier, got: {err_msg}"
-        );
-        assert!(
-            !err_msg.contains("TASK-FAILED-SPAWN-1")
-                && !err_msg.contains("TASK-FAILED-SPAWN-2")
-                && !err_msg.contains("TASK-FAILED-SPAWN-3"),
-            "holders list must not contain timed-out failed spawns, got: {err_msg}"
-        );
-    }
-
-    #[gpui::test]
-    async fn test_empty_commit_error_does_not_hold_worktree_and_allows_eviction_or_cleanup(
-        cx: &mut TestAppContext,
-    ) {
-        init_test(cx);
-        let fs = FakeFs::new(cx.executor());
-        fs.insert_tree(
-            path!("/root"),
-            json!({
-                ".git": {
-                    "HEAD": "ref: refs/heads/main\n"
-                }
-            }),
-        )
-        .await;
-
-        let dot_git = std::path::Path::new(path!("/root/.git"));
-        fs.with_git_state(dot_git, true, |state| {
-            state
-                .refs
-                .insert("refs/heads/main".into(), "main-sha-empty-err".into());
-            state
-                .refs
-                .insert("HEAD".into(), "main-sha-empty-err".into());
-            state.branches.insert("main".into());
-        })
-        .unwrap();
-
-        let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
-
-        let task = AgentTaskSummary {
-            id: AgentTaskId::from("TASK-EMPTY-ERR"),
-            parent_id: None,
-            goal_id: None,
-            title: "Task with empty error".to_string(),
-            status: AgentTaskStatus::Ready,
-            attempt: 1,
-            assignee: None,
-            write_scopes: vec![],
-            created_at: None,
-            assigned_profile: None,
-            model: None,
-            session_id: None,
-            metrics: None,
-        };
-
-        let worktree_path = cx
-            .update(|cx| ensure_task_worktree(project.clone(), &task, cx))
-            .await
-            .unwrap();
-
-        record_task_worktree_commit_error(&task.id, "".to_string());
-        assert_eq!(task_worktree_commit_error(&task.id), None);
-        assert_eq!(
-            worktree_release_safety(&task.id),
-            WorktreeReleaseSafety::Safe
-        );
-
-        record_task_worktree_commit_error(&task.id, "   ".to_string());
-        assert_eq!(task_worktree_commit_error(&task.id), None);
-        assert_eq!(
-            worktree_release_safety(&task.id),
-            WorktreeReleaseSafety::Safe
-        );
-
-        record_task_worktree_commit_error(&task.id, "commit failed: ".to_string());
-        assert_eq!(task_worktree_commit_error(&task.id), None);
-        assert_eq!(
-            worktree_release_safety(&task.id),
-            WorktreeReleaseSafety::Safe
-        );
-
-        record_task_worktree_commit_error(&task.id, "staging failed: ".to_string());
-        assert_eq!(task_worktree_commit_error(&task.id), None);
-        assert_eq!(
-            worktree_release_safety(&task.id),
-            WorktreeReleaseSafety::Safe
-        );
-
-        set_task_worktree_retention_timeout(Some(Duration::ZERO));
-        mark_task_terminal(&task.id);
-        let cleaned = cx
-            .update(|cx| auto_cleanup_task_worktree(project.clone(), &task.id, cx))
-            .await
-            .unwrap();
-        assert!(cleaned, "empty commit error must not block auto-cleanup");
-        assert!(!fs.is_dir(&worktree_path).await);
-    }
-
-    #[gpui::test]
-    async fn test_checkout_mode_commit_with_filtered_settings_returns_clean_details_no_commit_error(
-        cx: &mut TestAppContext,
-    ) {
-        init_test(cx);
-        let fs = FakeFs::new(cx.executor());
-        fs.insert_tree(
-            path!("/root"),
-            json!({
-                ".git": {
-                    "HEAD": "ref: refs/heads/main\n"
-                }
-            }),
-        )
-        .await;
-
-        let dot_git = std::path::Path::new(path!("/root/.git"));
-        fs.with_git_state(dot_git, true, |state| {
-            state
-                .refs
-                .insert("refs/heads/main".into(), "main-sha-checkout".into());
-            state.refs.insert("HEAD".into(), "main-sha-checkout".into());
-            state.branches.insert("main".into());
-        })
-        .unwrap();
-
-        let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
-
-        let task_setup = AgentTaskSummary {
-            id: AgentTaskId::from("TASK-SETUP-1"),
-            parent_id: None,
-            goal_id: None,
-            title: "Setup task".to_string(),
-            status: AgentTaskStatus::Ready,
-            attempt: 1,
-            assignee: None,
-            write_scopes: vec!["src/".to_string()],
-            created_at: None,
-            assigned_profile: None,
-            model: None,
-            session_id: None,
-            metrics: None,
-        };
-
-        let path_setup = cx
-            .update(|cx| {
-                ensure_task_worktree_with_policy(
-                    project.clone(),
-                    &task_setup,
-                    Some("GOAL-10".to_string()),
-                    None,
-                    None,
-                    cx,
-                )
-            })
-            .await
-            .unwrap();
-
-        fs.save(
-            &path_setup.join("src/lib.rs"),
-            &"pub fn hello() {}".into(),
-            text::LineEnding::Unix,
-        )
-        .await
-        .unwrap();
-
-        let details_setup = cx
-            .update(|cx| commit_and_merge_task_worktree(project.clone(), &task_setup.id, false, cx))
-            .await
-            .unwrap();
-        assert!(details_setup.merged_into.is_some());
-        mark_task_terminal(&task_setup.id);
-        cx.update(|cx| auto_cleanup_task_worktree(project.clone(), &task_setup.id, cx))
-            .await
-            .unwrap();
-
-        // TASK-178 scenario: checkout-mode reviewer session on agent-goal/GOAL-10, read-only
-        let reviewer_task = AgentTaskSummary {
-            id: AgentTaskId::from("TASK-178"),
-            parent_id: None,
-            goal_id: None,
-            title: "Reviewer TASK-178".to_string(),
-            status: AgentTaskStatus::Ready,
-            attempt: 1,
-            assignee: None,
-            write_scopes: vec![],
-            created_at: None,
-            assigned_profile: None,
-            model: None,
-            session_id: None,
-            metrics: None,
-        };
-
-        let path_reviewer = cx
-            .update(|cx| {
-                ensure_task_worktree_with_policy(
-                    project.clone(),
-                    &reviewer_task,
-                    Some("GOAL-10".to_string()),
-                    None,
-                    Some("agent-goal/GOAL-10".to_string()),
-                    cx,
-                )
-            })
-            .await
-            .unwrap();
-
-        fs.save(
-            &path_reviewer.join(".zed/settings.json"),
-            &r#"{"file_scan_exclusions":["**/target"]}"#.into(),
-            text::LineEnding::Unix,
-        )
-        .await
-        .unwrap();
-
-        let details = cx
-            .update(|cx| {
-                commit_and_merge_task_worktree(project.clone(), &reviewer_task.id, false, cx)
-            })
-            .await
-            .unwrap();
-
-        assert_eq!(details.mode, "checkout");
-        assert_eq!(details.branch, "agent-goal/GOAL-10");
-        assert_eq!(details.changed_files, 0);
-        assert_eq!(
-            details.commit_error, None,
-            "commit_error must be None for fully filtered changes"
-        );
-        assert_eq!(task_worktree_commit_error(&reviewer_task.id), None);
-        assert_eq!(
-            worktree_release_safety(&reviewer_task.id),
-            WorktreeReleaseSafety::Safe
-        );
-    }
-
-    #[gpui::test]
-    async fn test_failing_spawn_frees_slot_for_next_task(cx: &mut TestAppContext) {
-        init_test(cx);
-        let fs = FakeFs::new(cx.executor());
-        fs.insert_tree(
-            path!("/root"),
-            json!({
-                ".git": {
-                    "HEAD": "ref: refs/heads/main\n"
-                }
-            }),
-        )
-        .await;
-
-        let dot_git = std::path::Path::new(path!("/root/.git"));
-        fs.with_git_state(dot_git, true, |state| {
-            state
-                .refs
-                .insert("refs/heads/main".into(), "main-sha-fail-spawn".into());
-            state
-                .refs
-                .insert("HEAD".into(), "main-sha-fail-spawn".into());
-            state.branches.insert("main".into());
-        })
-        .unwrap();
-
-        let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
-
-        cx.update(|cx| {
-            cx.update_global(|store: &mut settings::SettingsStore, cx| {
-                store
-                    .set_user_settings(r#"{ "agent": { "task_worktree_limit": 1 } }"#, cx)
-                    .unwrap();
-            });
-        });
-
-        let failing_task = AgentTaskSummary {
-            id: AgentTaskId::from("TASK-FAIL-EARLY"),
-            parent_id: None,
-            goal_id: None,
-            title: "Failing Task".to_string(),
-            status: AgentTaskStatus::Ready,
-            attempt: 1,
-            assignee: None,
-            write_scopes: vec![],
-            created_at: None,
-            assigned_profile: None,
-            model: None,
-            session_id: None,
-            metrics: None,
-        };
-
-        let fail_res = cx
-            .update(|cx| {
-                ensure_task_worktree_with_policy(
-                    project.clone(),
-                    &failing_task,
-                    None,
-                    Some("main".to_string()),
-                    Some("main".to_string()),
-                    cx,
-                )
-            })
-            .await;
-        assert!(
-            fail_res.is_err(),
-            "mutually exclusive on_branch and base_branch must fail"
-        );
-        assert!(!has_active_subagent_session(&failing_task.id));
-        assert!(!REGISTRY.read().entries.contains_key(&failing_task.id));
-
-        let missing_branch_task = AgentTaskSummary {
-            id: AgentTaskId::from("TASK-FAIL-MISSING-BRANCH"),
-            parent_id: None,
-            goal_id: None,
-            title: "Missing branch task".to_string(),
-            status: AgentTaskStatus::Ready,
-            attempt: 1,
-            assignee: None,
-            write_scopes: vec![],
-            created_at: None,
-            assigned_profile: None,
-            model: None,
-            session_id: None,
-            metrics: None,
-        };
-
-        let fail_branch_res = cx
-            .update(|cx| {
-                ensure_task_worktree_with_policy(
-                    project.clone(),
-                    &missing_branch_task,
-                    None,
-                    None,
-                    Some("nonexistent-branch".to_string()),
-                    cx,
-                )
-            })
-            .await;
-        assert!(fail_branch_res.is_err(), "missing branch must fail");
-        assert!(!has_active_subagent_session(&missing_branch_task.id));
-        assert!(
-            !REGISTRY
-                .read()
-                .entries
-                .contains_key(&missing_branch_task.id)
-        );
-
-        let succeeding_task = AgentTaskSummary {
-            id: AgentTaskId::from("TASK-SUCCEED-AFTER-FAIL"),
-            parent_id: None,
-            goal_id: None,
-            title: "Succeeding Task".to_string(),
-            status: AgentTaskStatus::Ready,
-            attempt: 1,
-            assignee: None,
-            write_scopes: vec![],
-            created_at: None,
-            assigned_profile: None,
-            model: None,
-            session_id: None,
-            metrics: None,
-        };
-
-        let succeed_path = cx
-            .update(|cx| ensure_task_worktree(project.clone(), &succeeding_task, cx))
-            .await
-            .expect("slot must be free and available for next task");
-        assert!(fs.is_dir(&succeed_path).await);
-    }
-
-    #[gpui::test]
-    async fn test_pool_stale_guard_with_dead_owner_salvaged_and_evicted(cx: &mut TestAppContext) {
-        init_test(cx);
-        let fs = FakeFs::new(cx.executor());
-        fs.insert_tree(
-            path!("/root"),
-            json!({
-                ".git": {
-                    "HEAD": "ref: refs/heads/main\n"
-                }
-            }),
-        )
-        .await;
-
-        let dot_git = std::path::Path::new(path!("/root/.git"));
-        fs.with_git_state(dot_git, true, |state| {
-            state
-                .refs
-                .insert("refs/heads/main".into(), "main-sha-stale".into());
-            state.refs.insert("HEAD".into(), "main-sha-stale".into());
-            state.branches.insert("main".into());
-        })
-        .expect("git state setup");
-
-        let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
-
-        cx.update(|cx| {
-            cx.update_global(|store: &mut settings::SettingsStore, cx| {
-                store
-                    .set_user_settings(r#"{ "agent": { "task_worktree_limit": 1 } }"#, cx)
-                    .expect("settings update");
-            });
-        });
-
-        let task1 = AgentTaskSummary {
-            id: AgentTaskId::from("TASK-STALE-OWNER-1"),
-            parent_id: None,
-            goal_id: None,
-            title: "Task 1".to_string(),
-            status: AgentTaskStatus::Running,
-            attempt: 1,
-            assignee: None,
-            write_scopes: vec![],
-            created_at: None,
-            assigned_profile: None,
-            model: None,
-            session_id: None,
-            metrics: None,
-        };
-        let task2 = AgentTaskSummary {
-            id: AgentTaskId::from("TASK-STALE-OWNER-2"),
-            parent_id: None,
-            goal_id: None,
-            title: "Task 2".to_string(),
-            status: AgentTaskStatus::Ready,
-            attempt: 1,
-            assignee: None,
-            write_scopes: vec![],
-            created_at: None,
-            assigned_profile: None,
-            model: None,
-            session_id: None,
-            metrics: None,
-        };
-
-        // Task 1 gets created with a stale guard (owner is gone/dead)
-        let _guard1 = SubagentSessionGuard::test_new_stale(task1.id.clone());
-        let path1 = cx
-            .update(|cx| ensure_task_worktree(project.clone(), &task1, cx))
-            .await
-            .expect("ensure task 1");
-        assert!(fs.is_dir(&path1).await);
-
-        // Add dirty uncommitted file in task 1 worktree
-        fs.save(
-            &path1.join("salvage_file.txt"),
-            &"important dirty changes".into(),
-            text::LineEnding::Unix,
-        )
-        .await
-        .expect("save dirty file");
-
-        // Stale guard means no active session, and safety is Safe
-        assert!(!has_active_subagent_session(&task1.id));
-        assert_eq!(
-            worktree_release_safety(&task1.id),
-            WorktreeReleaseSafety::Safe
-        );
-
-        // Task 2 ensures worktree: pool limit is 1, Task 1 is evicted via salvage path
-        let path2 = cx
-            .update(|cx| ensure_task_worktree(project.clone(), &task2, cx))
-            .await
-            .expect("task 2 acquires slot by evicting stale task 1");
-
-        assert!(
-            !fs.is_dir(&path1).await,
-            "stale task 1 worktree must be removed"
-        );
-        assert!(fs.is_dir(&path2).await, "task 2 worktree must exist");
-
-        // Verify task 1 uncommitted changes were salvaged to branch
-        let branch_name = format!("agent-task/{}", task1.id);
-        fs.with_git_state(dot_git, true, |state| {
-            assert!(
-                state.branches.contains(&branch_name),
-                "salvaged branch must exist"
-            );
-        })
-        .expect("git state verification");
-    }
-
-    #[gpui::test]
-    async fn test_pool_live_resumed_session_not_evicted(cx: &mut TestAppContext) {
-        init_test(cx);
-        let fs = FakeFs::new(cx.executor());
-        fs.insert_tree(
-            path!("/root"),
-            json!({
-                ".git": {
-                    "HEAD": "ref: refs/heads/main\n"
-                }
-            }),
-        )
-        .await;
-
-        let dot_git = std::path::Path::new(path!("/root/.git"));
-        fs.with_git_state(dot_git, true, |state| {
-            state
-                .refs
-                .insert("refs/heads/main".into(), "main-sha-resume".into());
-            state.refs.insert("HEAD".into(), "main-sha-resume".into());
-            state.branches.insert("main".into());
-        })
-        .expect("git state setup");
-
-        let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
-
-        cx.update(|cx| {
-            cx.update_global(|store: &mut settings::SettingsStore, cx| {
-                store
-                    .set_user_settings(r#"{ "agent": { "task_worktree_limit": 1 } }"#, cx)
-                    .expect("settings update");
-            });
-        });
-
-        let task1 = AgentTaskSummary {
-            id: AgentTaskId::from("TASK-RESUME-1"),
-            parent_id: None,
-            goal_id: None,
-            title: "Task 1".to_string(),
-            status: AgentTaskStatus::Completed,
-            attempt: 1,
-            assignee: None,
-            write_scopes: vec![],
-            created_at: None,
-            assigned_profile: None,
-            model: None,
-            session_id: None,
-            metrics: None,
-        };
-        let task2 = AgentTaskSummary {
-            id: AgentTaskId::from("TASK-RESUME-2"),
-            parent_id: None,
-            goal_id: None,
-            title: "Task 2".to_string(),
-            status: AgentTaskStatus::Ready,
-            attempt: 1,
-            assignee: None,
-            write_scopes: vec![],
-            created_at: None,
-            assigned_profile: None,
-            model: None,
-            session_id: None,
-            metrics: None,
-        };
-
-        // Create Task 1 worktree initially
-        let path1 = cx
-            .update(|cx| ensure_task_worktree(project.clone(), &task1, cx))
-            .await
-            .expect("ensure task 1");
-        assert!(fs.is_dir(&path1).await);
-        mark_task_terminal(&task1.id);
-
-        // Resume session for completed Task 1 with live owner
-        let resumed_guard = SubagentSessionGuard::test_new(task1.id.clone());
-        assert!(has_active_subagent_session(&task1.id));
-        assert_eq!(
-            worktree_release_safety(&task1.id),
-            WorktreeReleaseSafety::ActiveSession
-        );
-
-        // Task 2 attempts to ensure: pool limit is 1, Task 1 is live resumed session -> must NOT evict -> Task 2 blocks!
-        let mut ensure_task2 = cx.spawn({
-            let project = project.clone();
-            let task2 = task2.clone();
-            |cx| async move {
-                cx.update(|cx| ensure_task_worktree(project, &task2, cx))
-                    .await
-            }
-        });
-
-        cx.run_until_parked();
-        assert!(
-            (&mut ensure_task2).now_or_never().is_none(),
-            "task 2 must block because resumed task 1 has live owner"
-        );
-        assert!(fs.is_dir(&path1).await, "task 1 must remain");
-
-        // End the resumed session
-        set_task_worktree_retention_timeout(Some(Duration::ZERO));
-        drop(resumed_guard);
-        assert!(!has_active_subagent_session(&task1.id));
-
-        // Now task 2 can proceed
-        cx.run_until_parked();
-        let path2 = (&mut ensure_task2)
-            .now_or_never()
-            .expect("task 2 must unblock")
-            .expect("task 2 worktree path");
-        assert!(fs.is_dir(&path2).await);
-    }
-
-    #[test]
-    fn test_timeout_path_leaves_zero_phantoms() {
-        reset_registry_for_tests();
-        let task_id = AgentTaskId::from("TASK-TIMEOUT-PHANTOM");
-
-        let guard = SubagentSessionGuard::test_new(task_id.clone());
-        assert_eq!(active_guards_count(&task_id), 1);
-        assert!(has_active_subagent_session(&task_id));
-
-        drop(guard);
-        assert_eq!(active_guards_count(&task_id), 0);
-        assert!(!has_active_subagent_session(&task_id));
-    }
-
-    #[test]
-    fn test_turn_end_sweep_releases_guards() {
-        reset_registry_for_tests();
-        let task_a = AgentTaskId::from("TASK-SWEEP-A");
-        let task_b = AgentTaskId::from("TASK-SWEEP-B");
-
-        let thread_1 = acp::SessionId::new("thread-turn-1");
-        let thread_2 = acp::SessionId::new("thread-turn-2");
-
-        let tool_use_1 = LanguageModelToolUseId::from("tool-call-1");
-        let tool_use_2 = LanguageModelToolUseId::from("tool-call-2");
-
-        let owner_1a = SubagentSessionOwner {
-            thread_id: thread_1.clone(),
-            tool_use_id: tool_use_1.clone(),
-            thread: None,
-            is_test_live: true,
-        };
-        let owner_1b = SubagentSessionOwner {
-            thread_id: thread_1.clone(),
-            tool_use_id: tool_use_2,
-            thread: None,
-            is_test_live: true,
-        };
-        let owner_2 = SubagentSessionOwner {
-            thread_id: thread_2,
-            tool_use_id: LanguageModelToolUseId::from("tool-call-other"),
-            thread: None,
-            is_test_live: true,
-        };
-
-        let _guard_1a = register_subagent_session_guard(&task_a, owner_1a);
-        let _guard_1b = register_subagent_session_guard(&task_a, owner_1b);
-        let _guard_2 = register_subagent_session_guard(&task_b, owner_2);
-
-        assert_eq!(active_guards_count(&task_a), 2);
-        assert_eq!(active_guards_count(&task_b), 1);
-
-        // Sweeping a single tool use removes only that tool's guard
-        sweep_guards_for_tool_use(&thread_1, &tool_use_1);
-        assert_eq!(active_guards_count(&task_a), 1);
-        assert!(has_active_subagent_session(&task_a));
-
-        // Sweeping thread_1 removes all remaining guards for thread_1
-        sweep_guards_for_thread(&thread_1);
-        assert_eq!(active_guards_count(&task_a), 0);
-        assert!(!has_active_subagent_session(&task_a));
-        assert_eq!(active_guards_count(&task_b), 1);
-        assert!(has_active_subagent_session(&task_b));
-    }
-
-    #[gpui::test]
-    async fn test_lru_eviction_skipped_when_cleanup_disabled(cx: &mut TestAppContext) {
-        init_test(cx);
-        let fs = FakeFs::new(cx.executor());
-        fs.insert_tree(
-            path!("/root"),
-            json!({
-                ".git": {
-                    "HEAD": "ref: refs/heads/main\n"
-                }
-            }),
-        )
-        .await;
-
-        let dot_git = std::path::Path::new(path!("/root/.git"));
-        fs.with_git_state(dot_git, true, |state| {
-            state
-                .refs
-                .insert("refs/heads/main".into(), "main-sha-nocleanup".into());
-            state
-                .refs
-                .insert("HEAD".into(), "main-sha-nocleanup".into());
-            state.branches.insert("main".into());
-        })
-        .expect("git state setup");
-
-        let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
-
-        // Set limit = 1 and cleanup = false
-        cx.update(|cx| {
-            cx.update_global(|store: &mut settings::SettingsStore, cx| {
-                store
-                    .set_user_settings(
-                        r#"{ "agent": { "task_worktree_limit": 1, "cleanup": false } }"#,
-                        cx,
-                    )
-                    .expect("settings update");
-            });
-        });
-
-        let task1 = AgentTaskSummary {
-            id: AgentTaskId::from("TASK-NOCLEANUP-1"),
-            parent_id: None,
-            goal_id: None,
-            title: "Task 1".to_string(),
-            status: AgentTaskStatus::Completed,
-            attempt: 1,
-            assignee: None,
-            write_scopes: vec![],
-            created_at: None,
-            assigned_profile: None,
-            model: None,
-            session_id: None,
-            metrics: None,
-        };
-        let task2 = AgentTaskSummary {
-            id: AgentTaskId::from("TASK-NOCLEANUP-2"),
-            parent_id: None,
-            goal_id: None,
-            title: "Task 2".to_string(),
-            status: AgentTaskStatus::Ready,
-            attempt: 1,
-            assignee: None,
-            write_scopes: vec![],
-            created_at: None,
-            assigned_profile: None,
-            model: None,
-            session_id: None,
-            metrics: None,
-        };
-
-        // Create Task 1 worktree and commit it so it is Safe for eviction
-        let path1 = cx
-            .update(|cx| ensure_task_worktree(project.clone(), &task1, cx))
-            .await
-            .expect("ensure task 1");
-        assert!(fs.is_dir(&path1).await);
-        let commit_res = commit_task_worktree(
-            fs.clone(),
-            path1.clone(),
-            task1.id.to_string(),
-            false,
-            &mut cx.to_async(),
-        )
-        .await
-        .expect("commit task 1");
-        assert!(commit_res.head_sha.is_some());
-        assert_eq!(
-            worktree_release_safety(&task1.id),
-            WorktreeReleaseSafety::Safe
-        );
-
-        // Task 2 attempts to acquire a slot: because cleanup is disabled, Task 1 must NOT be evicted!
-        let mut ensure_task2 = cx.spawn({
-            let project = project.clone();
-            let task2 = task2.clone();
-            |cx| async move {
-                cx.update(|cx| ensure_task_worktree(project, &task2, cx))
-                    .await
-            }
-        });
-
-        cx.run_until_parked();
-        assert!(
-            (&mut ensure_task2).now_or_never().is_none(),
-            "task 2 must block because cleanup is disabled and eviction is skipped"
-        );
-        assert!(fs.is_dir(&path1).await, "task 1 must remain intact");
-    }
-
-    #[gpui::test]
-    async fn retry_on_git_lock_contention_retries_then_succeeds(cx: &mut TestAppContext) {
-        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let attempts_clone = attempts.clone();
-
-        let result = retry_on_git_lock_contention(&cx.background_executor, || {
-            let attempts = attempts_clone.clone();
-            async move {
-                let count = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                if count < 2 {
-                    anyhow::bail!("fatal: Unable to create '.git/index.lock': File exists");
-                } else {
-                    Ok("success")
-                }
-            }
-        })
-        .await;
-
-        let Ok(val) = result else {
-            panic!("expected Ok, got Err");
-        };
-        assert_eq!(val, "success");
-        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 3);
-    }
-
-    #[gpui::test]
-    async fn retry_on_git_lock_contention_fails_fast_on_non_contention(cx: &mut TestAppContext) {
-        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let attempts_clone = attempts.clone();
-
-        let result: Result<()> = retry_on_git_lock_contention(&cx.background_executor, || {
-            let attempts = attempts_clone.clone();
-            async move {
-                attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                anyhow::bail!("fatal: branch 'feature' not found");
-            }
-        })
-        .await;
-
-        let Err(err) = result else {
-            panic!("expected Err, got Ok");
-        };
-        assert_eq!(err.to_string(), "fatal: branch 'feature' not found");
-        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
-    }
-
-    #[gpui::test]
-    async fn retry_on_git_lock_contention_fails_after_max_retries(cx: &mut TestAppContext) {
-        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let attempts_clone = attempts.clone();
-
-        let result: Result<()> = retry_on_git_lock_contention(&cx.background_executor, || {
-            let attempts = attempts_clone.clone();
-            async move {
-                attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                anyhow::bail!("fatal: Unable to create '.git/index.lock': File exists");
-            }
-        })
-        .await;
-
-        let Err(err) = result else {
-            panic!("expected Err, got Ok");
-        };
-        assert!(is_git_lock_contention(&err.to_string()));
-        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 4);
-    }
-
-    #[gpui::test]
-    async fn test_dependent_task_retains_worktree(cx: &mut TestAppContext) {
-        init_test(cx);
-        let fs = FakeFs::new(cx.executor());
-        fs.insert_tree(
-            path!("/root"),
-            json!({
-                ".git": {
-                    "HEAD": "ref: refs/heads/main\n"
-                }
-            }),
-        )
-        .await;
-
-        let dot_git = std::path::Path::new(path!("/root/.git"));
-        fs.with_git_state(dot_git, true, |state| {
-            state
-                .refs
-                .insert("refs/heads/main".into(), "main-sha-dep".into());
-            state.refs.insert("HEAD".into(), "main-sha-dep".into());
-            state.branches.insert("main".into());
-        })
-        .unwrap();
-
-        let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
-
-        let host_task = AgentTaskSummary {
-            id: AgentTaskId::from("TASK-HOST-1"),
-            parent_id: None,
-            goal_id: None,
-            title: "Host Task".to_string(),
-            status: AgentTaskStatus::Running,
-            attempt: 1,
-            assignee: None,
-            write_scopes: vec![],
-            created_at: None,
-            assigned_profile: None,
-            model: None,
-            session_id: None,
-            metrics: None,
-        };
-
-        let path = cx
-            .update(|cx| ensure_task_worktree(project.clone(), &host_task, cx))
-            .await
-            .unwrap();
-        assert!(fs.is_dir(&path).await);
-
-        register_task_dependency("TASK-DEP-1", "TASK-HOST-1", AgentTaskStatus::Ready);
-        mark_task_terminal(&host_task.id);
-        set_task_worktree_retention_timeout(Some(Duration::ZERO));
-        assert_eq!(task_worktree_retention_reason(&host_task.id), None);
-
-        let provider = Arc::new(MockTgsProvider {
-            task_title: None,
-            should_fail: false,
-        });
-        register_task_provider(provider);
-
-        assert_eq!(
-            task_worktree_retention_reason(&host_task.id),
-            Some("dependent:TASK-DEP-1".to_string())
-        );
-        assert_eq!(
-            worktree_release_safety(&host_task.id),
-            WorktreeReleaseSafety::Retained
-        );
-
-        let cleaned = cx
-            .update(|cx| auto_cleanup_task_worktree(project.clone(), &host_task.id, cx))
-            .await
-            .unwrap();
-        assert!(!cleaned);
-        assert!(fs.is_dir(&path).await);
-
-        set_dependent_task_status(&AgentTaskId::from("TASK-DEP-1"), AgentTaskStatus::Completed);
-        assert_eq!(task_worktree_retention_reason(&host_task.id), None);
-        assert_eq!(
-            worktree_release_safety(&host_task.id),
-            WorktreeReleaseSafety::Safe
-        );
-
-        let cleaned = cx
-            .update(|cx| auto_cleanup_task_worktree(project.clone(), &host_task.id, cx))
-            .await
-            .unwrap();
-        assert!(cleaned);
-        assert!(!fs.is_dir(&path).await);
-    }
-
-    #[gpui::test]
-    async fn test_timeout_expiry_allows_cleanup(cx: &mut TestAppContext) {
-        init_test(cx);
-        let fs = FakeFs::new(cx.executor());
-        fs.insert_tree(
-            path!("/root"),
-            json!({
-                ".git": {
-                    "HEAD": "ref: refs/heads/main\n"
-                }
-            }),
-        )
-        .await;
-
-        let dot_git = std::path::Path::new(path!("/root/.git"));
-        fs.with_git_state(dot_git, true, |state| {
-            state
-                .refs
-                .insert("refs/heads/main".into(), "main-sha-time".into());
-            state.refs.insert("HEAD".into(), "main-sha-time".into());
-            state.branches.insert("main".into());
-        })
-        .unwrap();
-
-        let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
-
-        let task = AgentTaskSummary {
-            id: AgentTaskId::from("TASK-TIME-1"),
-            parent_id: None,
-            goal_id: None,
-            title: "Timing Task".to_string(),
-            status: AgentTaskStatus::Running,
-            attempt: 1,
-            assignee: None,
-            write_scopes: vec![],
-            created_at: None,
-            assigned_profile: None,
-            model: None,
-            session_id: None,
-            metrics: None,
-        };
-
-        let path = cx
-            .update(|cx| ensure_task_worktree(project.clone(), &task, cx))
-            .await
-            .unwrap();
-        assert!(fs.is_dir(&path).await);
-
-        set_task_worktree_retention_timeout(Some(Duration::from_secs(1800)));
-        mark_task_terminal(&task.id);
-
-        assert_eq!(
-            task_worktree_retention_reason(&task.id),
-            Some("retention-window".to_string())
-        );
-        assert_eq!(
-            worktree_release_safety(&task.id),
-            WorktreeReleaseSafety::Retained
-        );
-
-        let cleaned = cx
-            .update(|cx| auto_cleanup_task_worktree(project.clone(), &task.id, cx))
-            .await
-            .unwrap();
-        assert!(!cleaned);
-        assert!(fs.is_dir(&path).await);
-
-        set_task_terminal_at(
-            &task.id,
-            Some(std::time::Instant::now() - Duration::from_secs(1801)),
-        );
-        assert_eq!(task_worktree_retention_reason(&task.id), None);
-        assert_eq!(
-            worktree_release_safety(&task.id),
-            WorktreeReleaseSafety::Safe
-        );
-
-        let cleaned = cx
-            .update(|cx| auto_cleanup_task_worktree(project.clone(), &task.id, cx))
-            .await
-            .unwrap();
-        assert!(cleaned);
-        assert!(!fs.is_dir(&path).await);
-    }
-
-    #[gpui::test]
-    async fn test_active_holder_blocks_eviction_and_cleanup(cx: &mut TestAppContext) {
-        init_test(cx);
-        let fs = FakeFs::new(cx.executor());
-        fs.insert_tree(
-            path!("/root"),
-            json!({
-                ".git": {
-                    "HEAD": "ref: refs/heads/main\n"
-                }
-            }),
-        )
-        .await;
-
-        let dot_git = std::path::Path::new(path!("/root/.git"));
-        fs.with_git_state(dot_git, true, |state| {
-            state
-                .refs
-                .insert("refs/heads/main".into(), "main-sha-holder".into());
-            state.refs.insert("HEAD".into(), "main-sha-holder".into());
-            state.branches.insert("main".into());
-        })
-        .unwrap();
-
-        let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
-
-        let host_id = AgentTaskId::from("TASK-HOST-HOLDER");
-        let host_task = AgentTaskSummary {
-            id: host_id.clone(),
-            parent_id: None,
-            goal_id: None,
-            title: "Host Holder Task".to_string(),
-            status: AgentTaskStatus::Completed,
-            attempt: 1,
-            assignee: None,
-            write_scopes: vec![],
-            created_at: None,
-            assigned_profile: None,
-            model: None,
-            session_id: None,
-            metrics: None,
-        };
-
-        let path = cx
-            .update(|cx| ensure_task_worktree(project.clone(), &host_task, cx))
-            .await
-            .unwrap();
-        assert!(fs.is_dir(&path).await);
-
-        set_task_worktree_retention_timeout(Some(Duration::ZERO));
-        mark_task_terminal(&host_id);
-
-        register_worktree_holder(&host_id, "session-guest-99");
-        assert_eq!(
-            worktree_holders(&host_id),
-            vec!["session-guest-99".to_string()]
-        );
-        assert_eq!(
-            task_worktree_retention_reason(&host_id),
-            Some("holder:session-guest-99".to_string())
-        );
-        assert_eq!(
-            worktree_release_safety(&host_id),
-            WorktreeReleaseSafety::Retained
-        );
-
-        let cleaned = cx
-            .update(|cx| auto_cleanup_task_worktree(project.clone(), &host_id, cx))
-            .await
-            .unwrap();
-        assert!(!cleaned);
-        assert!(fs.is_dir(&path).await);
-
-        let remove_res = cx
-            .update(|cx| remove_task_worktree(project.clone(), &host_id, cx))
-            .await;
-        assert!(remove_res.is_err());
-        assert!(
-            remove_res
-                .unwrap_err()
-                .to_string()
-                .contains("worktree is retained (holder:session-guest-99)")
-        );
-
-        unregister_worktree_holder(&host_id, "session-guest-99");
-        assert!(worktree_holders(&host_id).is_empty());
-        assert_eq!(task_worktree_retention_reason(&host_id), None);
-        assert_eq!(
-            worktree_release_safety(&host_id),
-            WorktreeReleaseSafety::Safe
-        );
-
-        let cleaned = cx
-            .update(|cx| auto_cleanup_task_worktree(project.clone(), &host_id, cx))
-            .await
-            .unwrap();
-        assert!(cleaned);
-        assert!(!fs.is_dir(&path).await);
-    }
-
-    #[gpui::test]
-    async fn test_retention_reason_exposed_and_prioritized(cx: &mut TestAppContext) {
-        init_test(cx);
-        let task_id = AgentTaskId::from("TASK-REASONS");
-
-        assert_eq!(task_worktree_retention_reason(&task_id), None);
-
-        set_task_worktree_retention_timeout(Some(Duration::from_secs(1800)));
-        mark_task_terminal(&task_id);
-        assert_eq!(
-            task_worktree_retention_reason(&task_id),
-            Some("retention-window".to_string())
-        );
-
-        let provider = Arc::new(MockTgsProvider {
-            task_title: None,
-            should_fail: false,
-        });
-        register_task_provider(provider);
-        register_task_dependency("TASK-DEPENDENT-A", "TASK-REASONS", AgentTaskStatus::Ready);
-        assert_eq!(
-            task_worktree_retention_reason(&task_id),
-            Some("dependent:TASK-DEPENDENT-A".to_string())
-        );
-
-        register_worktree_holder(&task_id, "session-alpha");
-        assert_eq!(
-            task_worktree_retention_reason(&task_id),
-            Some("holder:session-alpha".to_string())
-        );
-
-        unregister_worktree_holder(&task_id, "session-alpha");
-        assert_eq!(
-            task_worktree_retention_reason(&task_id),
-            Some("dependent:TASK-DEPENDENT-A".to_string())
-        );
-
-        clear_dependent_tasks();
-        assert_eq!(
-            task_worktree_retention_reason(&task_id),
-            Some("retention-window".to_string())
-        );
-
-        set_task_terminal_at(
-            &task_id,
-            Some(std::time::Instant::now() - Duration::from_secs(1801)),
-        );
-        assert_eq!(task_worktree_retention_reason(&task_id), None);
     }
 }

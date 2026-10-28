@@ -1150,6 +1150,7 @@ pub trait GitRepository: Send + Sync {
         tree_sha: String,
         parents: Vec<String>,
         message: String,
+        author: Option<(SharedString, SharedString)>,
     ) -> BoxFuture<'_, Result<String>>;
 
     fn set_trusted(&self, trusted: bool);
@@ -2902,6 +2903,7 @@ impl GitRepository for RealGitRepository {
         tree_sha: String,
         parents: Vec<String>,
         message: String,
+        author: Option<(SharedString, SharedString)>,
     ) -> BoxFuture<'_, Result<String>> {
         let git = self.git_binary();
         self.executor
@@ -2915,10 +2917,12 @@ impl GitRepository for RealGitRepository {
                 args.push(message);
 
                 let mut command = git.build_command(&args);
-                command.env("GIT_AUTHOR_NAME", "Zed Agent");
-                command.env("GIT_AUTHOR_EMAIL", "agent@zed.dev");
-                command.env("GIT_COMMITTER_NAME", "Zed Agent");
-                command.env("GIT_COMMITTER_EMAIL", "agent@zed.dev");
+                if let Some((name, email)) = author {
+                    command.env("GIT_AUTHOR_NAME", name.as_ref());
+                    command.env("GIT_AUTHOR_EMAIL", email.as_ref());
+                    command.env("GIT_COMMITTER_NAME", name.as_ref());
+                    command.env("GIT_COMMITTER_EMAIL", email.as_ref());
+                }
 
                 let output = command.output().await?;
                 anyhow::ensure!(
@@ -7217,13 +7221,43 @@ mod tests {
 
         let commit_msg = "Merge branch-2 into branch-1".to_string();
         let merge_sha = repo
-            .commit_tree(tree_sha, vec![sha_1.clone(), sha_2.clone()], commit_msg)
+            .commit_tree(
+                tree_sha.clone(),
+                vec![sha_1.clone(), sha_2.clone()],
+                commit_msg.clone(),
+                Some(("Custom Author".into(), "author@example.com".into())),
+            )
             .await
             .unwrap();
 
         assert!(!merge_sha.is_empty());
         assert_ne!(merge_sha, sha_1);
         assert_ne!(merge_sha, sha_2);
+
+        let details = repo.show(merge_sha.clone()).await.unwrap();
+        assert_eq!(details.author_name, "Custom Author");
+        assert_eq!(details.author_email, "author@example.com");
+
+        git_command(repo_dir.path(), ["config", "user.name", "Configured User"]);
+        git_command(repo_dir.path(), ["config", "user.email", "configured@example.com"]);
+
+        let merge_sha_configured = repo
+            .commit_tree(
+                tree_sha,
+                vec![sha_1.clone(), sha_2.clone()],
+                commit_msg,
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert!(!merge_sha_configured.is_empty());
+        assert_ne!(merge_sha_configured, sha_1);
+        assert_ne!(merge_sha_configured, sha_2);
+
+        let details_configured = repo.show(merge_sha_configured.clone()).await.unwrap();
+        assert_eq!(details_configured.author_name, "Configured User");
+        assert_eq!(details_configured.author_email, "configured@example.com");
 
         // Update branch-1 ref to merge commit
         repo.update_ref("refs/heads/branch-1".into(), merge_sha.clone())
