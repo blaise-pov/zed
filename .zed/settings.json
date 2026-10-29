@@ -259,7 +259,9 @@
   },
   "agent": {
     "task_graph_server_id": "taskgraph",
-    "task_worktree_limit": 18,
+    "task_worktree_limit": 6,
+    "task_worktree_retention_timeout_seconds": 0,
+    "task_worktree_language_servers": false,
     "commit_message_instructions": "Include tracking lines when available (Goal: <goal_id>, Task: <task_id>) before the Release Notes section.",
     "spawn_step_timeout_seconds": {
       "task_graph": 120,
@@ -537,6 +539,7 @@
           "list_directory": true,
           "edit_file": true,
           "write_file": true,
+          "terminal": true,
           "spawn_agent": true
         },
         "skills": [],
@@ -613,6 +616,14 @@
             },
             "spawn_agent": {
               "default": "allow"
+            },
+            "terminal": {
+              "default": "deny",
+              "always_allow": [
+                {
+                  "pattern": "^([A-Z_]+=\\S+\\s+)*git\\s+(-C\\s+\\S+\\s+)?(--no-pager\\s+|--no-optional-locks\\s+)*(status|diff|log|rev-parse|branch)\\b.*"
+                }
+              ]
             },
             "mcp:agent-bus:send_feedback": {
               "default": "allow"
