@@ -16,7 +16,7 @@ use agent::{
     SandboxStatusKey, SandboxStatusRefresh, SkillLoadingIssue, SkillLoadingIssueKind,
     SkillLoadingIssuesUpdated, ThreadSandbox, VerifiedSandboxStatus,
 };
-use agent_settings::UserAgentsMd;
+use agent_settings::{AgentProfileId, AgentProfileSettings, AgentSettings, UserAgentsMd};
 use agent_skills::MAX_SKILL_DESCRIPTION_LEN;
 use cloud_api_types::{SubmitAgentThreadFeedbackBody, SubmitAgentThreadFeedbackCommentsBody};
 use editor::actions::OpenExcerpts;
@@ -8844,10 +8844,7 @@ impl ThreadView {
                         active_session_id,
                         entry_ix,
                         tool_call,
-                        tool_call
-                            .subagent_session_info
-                            .as_ref()
-                            .map(|i| i.session_id.clone()),
+                        Self::subagent_session_id_for_tool_call(tool_call),
                         focus_handle,
                         window,
                         cx,
@@ -11361,6 +11358,65 @@ impl ThreadView {
             .into_any_element()
     }
 
+    pub(crate) fn subagent_session_id_for_tool_call(
+        tool_call: &ToolCall,
+    ) -> Option<acp_v1::SessionId> {
+        Self::subagent_session_id_from_raw(
+            tool_call.subagent_session_info.as_ref(),
+            tool_call.raw_input.as_ref(),
+        )
+    }
+
+    pub(crate) fn subagent_session_id_from_raw(
+        subagent_session_info: Option<&acp_thread::SubagentSessionInfo>,
+        raw_input: Option<&serde_json::Value>,
+    ) -> Option<acp_v1::SessionId> {
+        subagent_session_info
+            .map(|i| i.session_id.clone())
+            .or_else(|| {
+                raw_input
+                    .and_then(|input| input.get("session_id"))
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(acp_v1::SessionId::new)
+            })
+    }
+
+    pub(crate) fn resolve_subagent_profile_label(
+        tool_call: &ToolCall,
+        native_thread_profile: Option<&AgentProfileId>,
+        profiles: &collections::IndexMap<AgentProfileId, AgentProfileSettings>,
+    ) -> String {
+        Self::resolve_subagent_profile_label_from_raw(
+            tool_call
+                .raw_input
+                .as_ref()
+                .and_then(|input| input.get("profile")),
+            native_thread_profile,
+            profiles,
+        )
+    }
+
+    pub(crate) fn resolve_subagent_profile_label_from_raw(
+        raw_profile: Option<&serde_json::Value>,
+        native_thread_profile: Option<&AgentProfileId>,
+        profiles: &collections::IndexMap<AgentProfileId, AgentProfileSettings>,
+    ) -> String {
+        let profile_id = raw_profile
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(|s| AgentProfileId(s.into()))
+            .or_else(|| native_thread_profile.cloned());
+
+        match profile_id {
+            Some(profile_id) => profiles
+                .get(&profile_id)
+                .map(|profile| profile.name.to_string())
+                .unwrap_or_else(|| profile_id.0.to_string()),
+            None => "no profile".to_string(),
+        }
+    }
+
     fn render_subagent_tool_call(
         &self,
         active_session_id: &acp_v1::SessionId,
@@ -11371,6 +11427,10 @@ impl ThreadView {
         window: &Window,
         cx: &Context<Self>,
     ) -> Div {
+        let subagent_session_id = subagent_session_id.or_else(|| {
+            Self::subagent_session_id_for_tool_call(tool_call)
+        });
+
         let subagent_thread_view = subagent_session_id.and_then(|session_id| {
             self.server_view
                 .upgrade()
@@ -11476,24 +11536,12 @@ impl ThreadView {
         };
 
         let profile_label = {
-            let raw_profile = tool_call
-                .raw_input
-                .as_ref()
-                .and_then(|input| input.get("profile"))
-                .and_then(|v| v.as_str())
-                .filter(|s| !s.is_empty());
-
-            match raw_profile {
-                Some(id_str) => {
-                    let profile_id = AgentProfileId(id_str.into());
-                    AgentSettings::get_global(cx)
-                        .profiles
-                        .get(&profile_id)
-                        .map(|profile| profile.name.to_string())
-                        .unwrap_or_else(|| id_str.to_string())
-                }
-                None => "no profile".to_string(),
-            }
+            let native_profile = native_thread.as_ref().map(|t| t.read(cx).profile().clone());
+            Self::resolve_subagent_profile_label(
+                tool_call,
+                native_profile.as_ref(),
+                &AgentSettings::get_global(cx).profiles,
+            )
         };
 
         let goal_id = tool_call
@@ -14018,6 +14066,178 @@ mod tests {
     use std::sync::Once;
     use util::path;
     use workspace::MultiWorkspace;
+
+    #[test]
+    fn test_subagent_session_id_fallback() {
+        let info = acp_thread::SubagentSessionInfo {
+            session_id: acp_v1::SessionId::new("session-from-info"),
+            message_start_index: 0,
+            message_end_index: None,
+        };
+
+        let raw_with_id = json!({"session_id": "session-from-raw"});
+        assert_eq!(
+            ThreadView::subagent_session_id_from_raw(Some(&info), Some(&raw_with_id)),
+            Some(acp_v1::SessionId::new("session-from-info"))
+        );
+
+        assert_eq!(
+            ThreadView::subagent_session_id_from_raw(None, Some(&raw_with_id)),
+            Some(acp_v1::SessionId::new("session-from-raw"))
+        );
+
+        let raw_empty_id = json!({"session_id": ""});
+        assert_eq!(
+            ThreadView::subagent_session_id_from_raw(None, Some(&raw_empty_id)),
+            None
+        );
+
+        let raw_no_id = json!({"other_key": "val"});
+        assert_eq!(
+            ThreadView::subagent_session_id_from_raw(None, Some(&raw_no_id)),
+            None
+        );
+
+        assert_eq!(ThreadView::subagent_session_id_from_raw(None, None), None);
+    }
+
+    #[test]
+    fn test_subagent_profile_fallback() {
+        let mut profiles = collections::IndexMap::default();
+        let content: settings::AgentProfileContent =
+            serde_json::from_str(r#"{"name": "Known Engineer"}"#).unwrap();
+        profiles.insert(
+            AgentProfileId("engineer".into()),
+            AgentProfileSettings::from(content),
+        );
+
+        let native_profile_known = AgentProfileId("engineer".into());
+        let native_profile_unknown = AgentProfileId("unknown_role".into());
+
+        let raw_known = json!("engineer");
+        assert_eq!(
+            ThreadView::resolve_subagent_profile_label_from_raw(
+                Some(&raw_known),
+                None,
+                &profiles
+            ),
+            "Known Engineer"
+        );
+
+        let raw_unknown = json!("unknown_role");
+        assert_eq!(
+            ThreadView::resolve_subagent_profile_label_from_raw(
+                Some(&raw_unknown),
+                None,
+                &profiles
+            ),
+            "unknown_role"
+        );
+
+        assert_eq!(
+            ThreadView::resolve_subagent_profile_label_from_raw(
+                None,
+                Some(&native_profile_known),
+                &profiles
+            ),
+            "Known Engineer"
+        );
+
+        assert_eq!(
+            ThreadView::resolve_subagent_profile_label_from_raw(
+                None,
+                Some(&native_profile_unknown),
+                &profiles
+            ),
+            "unknown_role"
+        );
+
+        let raw_empty = json!("");
+        assert_eq!(
+            ThreadView::resolve_subagent_profile_label_from_raw(
+                Some(&raw_empty),
+                Some(&native_profile_known),
+                &profiles
+            ),
+            "Known Engineer"
+        );
+
+        assert_eq!(
+            ThreadView::resolve_subagent_profile_label_from_raw(None, None, &profiles),
+            "no profile"
+        );
+
+        assert_eq!(
+            ThreadView::resolve_subagent_profile_label_from_raw(
+                Some(&raw_unknown),
+                Some(&native_profile_known),
+                &profiles
+            ),
+            "unknown_role"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_subagent_session_and_profile_with_tool_call(cx: &mut gpui::TestAppContext) {
+        crate::test_support::init_test(cx);
+
+        let connection = std::rc::Rc::new(acp_thread::StubAgentConnection::new());
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let action_log = cx.new(|_| action_log::ActionLog::new(project.clone()));
+        let thread = cx.new(|cx| {
+            AcpThread::new(
+                None,
+                None,
+                None,
+                connection,
+                project,
+                action_log,
+                acp_v1::SessionId::new("root-session"),
+                watch::Receiver::constant(acp_v2::PromptCapabilities::new()),
+                cx,
+            )
+        });
+
+        let mut profiles = collections::IndexMap::default();
+        let content: settings::AgentProfileContent =
+            serde_json::from_str(r#"{"name": "Subagent Specialist"}"#).unwrap();
+        profiles.insert(
+            AgentProfileId("specialist".into()),
+            AgentProfileSettings::from(content),
+        );
+
+        thread.update(cx, |thread, cx| {
+            let tc = acp_v1::ToolCall::new("resume-call", "Spawn agent")
+                .name("spawn_agent")
+                .raw_input(json!({
+                    "session_id": "resumed-session-99"
+                }));
+            thread.upsert_tool_call(tc, cx).unwrap();
+        });
+
+        thread.read_with(cx, |thread, _| {
+            let AgentThreadEntry::ToolCall(call) = &thread.entries()[0] else {
+                panic!("expected ToolCall entry");
+            };
+
+            assert_eq!(
+                ThreadView::subagent_session_id_for_tool_call(call),
+                Some(acp_v1::SessionId::new("resumed-session-99"))
+            );
+
+            let native_profile = AgentProfileId("specialist".into());
+            assert_eq!(
+                ThreadView::resolve_subagent_profile_label(call, Some(&native_profile), &profiles),
+                "Subagent Specialist"
+            );
+
+            assert_eq!(
+                ThreadView::resolve_subagent_profile_label(call, None, &profiles),
+                "no profile"
+            );
+        });
+    }
 
     #[test]
     fn test_reported_activity_completion_status() {
