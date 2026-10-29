@@ -595,6 +595,12 @@ pub struct AgentSettingsContent {
     ///
     /// Default: 3
     pub task_worktree_limit: Option<usize>,
+    /// Timeout window in seconds after host task completion before task worktree can be cleaned up or evicted.
+    ///
+    /// 0 disables the retention window, values 1 to 59 clamp to 60, omitted means default 0.
+    ///
+    /// Default: 0
+    pub task_worktree_retention_timeout_seconds: Option<u64>,
     /// Timeouts in seconds for spawn sub-steps (task_graph, commit, cleanup, diff).
     pub spawn_step_timeout_seconds: Option<SpawnStepTimeoutSettingsContent>,
     /// Timeout in seconds for sending messages to a sub-agent before watchdog kills the turn.
@@ -2079,6 +2085,31 @@ mod tests {
         );
         assert_eq!(base_agent.send_watchdog_seconds, Some(45));
         assert_eq!(base_agent.turn_watchdog_seconds, Some(240));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_task_worktree_retention_timeout_seconds_content_parsing() -> anyhow::Result<()> {
+        let omitted: AgentSettingsContent = serde_json::from_str("{}")?;
+        assert_eq!(omitted.task_worktree_retention_timeout_seconds, None);
+
+        let configured: AgentSettingsContent = serde_json::from_str(
+            r#"{
+                "task_worktree_retention_timeout_seconds": 120
+            }"#,
+        )?;
+        assert_eq!(
+            configured.task_worktree_retention_timeout_seconds,
+            Some(120)
+        );
+
+        let zero: AgentSettingsContent = serde_json::from_str(
+            r#"{
+                "task_worktree_retention_timeout_seconds": 0
+            }"#,
+        )?;
+        assert_eq!(zero.task_worktree_retention_timeout_seconds, Some(0));
 
         Ok(())
     }

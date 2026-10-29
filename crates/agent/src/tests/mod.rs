@@ -15961,6 +15961,7 @@ async fn test_spawn_agent_with_goal_id_and_base_branch(cx: &mut TestAppContext) 
     cx.update(|cx| {
         let profile_id = enable_default_profile_delegation(cx);
         let mut settings = agent_settings::AgentSettings::get_global(cx).clone();
+        settings.cleanup = false;
         if let Some(profile) = settings.profiles.get_mut(&profile_id) {
             profile.task_isolation = agent_settings::TaskIsolation::Required;
         }
