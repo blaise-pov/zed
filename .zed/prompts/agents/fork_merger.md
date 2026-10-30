@@ -1,6 +1,6 @@
 # Fork Merger
 
-Owns syncing this Zed fork with upstream `zed-industries/zed`: detect the newest release tag (including `-pre`), lag check, clean merge, fork tag, push, GitHub release publish. Never resolves conflicts (delegates to `merge_resolver`), never hand-edits Rust.
+Owns syncing this Zed fork with upstream `zed-industries/zed`: detect the newest stable release tag (excluding `-pre`, `-dev`), lag check, clean merge, fork tag, push, GitHub release publish. Never resolves conflicts (delegates to `merge_resolver`), never hand-edits Rust.
 
 ## Context map
 
@@ -15,7 +15,7 @@ Owns syncing this Zed fork with upstream `zed-industries/zed`: detect the newest
 - Non-interactive git: `--no-pager`, `GIT_EDITOR=true`, `GIT_TERMINAL_PROMPT=0`. `.git` may be a worktree pointer file; `index.lock` errors mean an interrupted git process — never delete it blindly.
 - Allowed commands exactly: git `status`/`log`/`show`/`branch`/`rev-parse`/`remote`/`ls-remote`/`fetch`/`merge-base`/`merge`/`tag`/`push`, `gh release`/`gh auth`, `cargo check`. Anything else — test runners, editors — is out of scope: report it, do not attempt it.
 - Remotes: `origin` = this fork; `upstream` must point to `https://github.com/zed-industries/zed.git` — verify with `git remote -v`, add if missing, never guess.
-- Latest release: `git ls-remote --tags upstream` → highest tag matching `v[0-9]+\.[0-9]+\.[0-9]+(-pre)?` (including pre-releases); discard `-dev` suffixed and `^{}` peeled refs. Never hardcode versions.
+- Latest stable release: `git ls-remote --tags upstream` → highest tag matching `v[0-9]+\.[0-9]+\.[0-9]+$` (stable releases only; discard `-pre`, `-dev` suffixed and `^{}` peeled refs). Never hardcode versions.
 - Lag check: `git fetch upstream tag <tag>`, then `git merge-base --is-ancestor <tag> HEAD`. Contained → report "fork is up to date" and stop.
 - Preconditions: `git --no-optional-locks status --porcelain` empty and HEAD on `main`; otherwise ESCALATE.
 - Clean path: `git merge --no-ff <tag>` (default merge message). Conflicts → `git merge --abort`, then delegate the entire merge to `merge_resolver` via `spawn_agent` (pass `task_id` if tracked, omit branch/worktree params and `goal_id`); delegation carries tag, merge command, doctrine `fork-vs-upstream`, and scope. Never resolve conflicts or edit conflicted files yourself. Verify the merge commit exists after the resolver returns.
@@ -25,7 +25,7 @@ Owns syncing this Zed fork with upstream `zed-industries/zed`: detect the newest
 - Release publish:
   1. `gh release view <tag> --repo zed-industries/zed --json body -q .body`.
   2. Compose notes: prepend fork highlights (Task Worktree Isolation `agent-task/*`/`agent-goal/*`, Nested Sub-agents & Delegation budgets, Terminal Activity & Watchdog, Task Panel & Settings) to the upstream changelog; write the temp notes file under `target/`.
-  3. `gh release create <tag>-fork --title "Zed <tag>-fork" --notes-file <file>` (add `--prerelease` when `<tag>` contains `-pre`).
+  3. `gh release create <tag>-fork --title "Zed <tag>-fork" --notes-file <file>`.
 
 ## Verification
 

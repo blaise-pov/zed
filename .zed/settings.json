@@ -1750,7 +1750,7 @@
         "name": "Fork Merger",
         "task_isolation": "disabled",
         "custom_prompt_path": ".zed/prompts/agents/fork_merger.md",
-        "description": "Syncs this fork with upstream zed-industries/zed: detects the newest release tag, clean merges (delegating conflicts to merge_resolver), pushes fork tags, and publishes releases with changelog",
+        "description": "Syncs this fork with upstream zed-industries/zed: detects the newest stable release tag, clean merges (delegating conflicts to merge_resolver), pushes fork tags, and publishes releases with changelog",
         "default_model": {
           "provider": "${MID_TIER_MODEL_PROVIDER}",
           "model": "${MID_TIER_MODEL}"
