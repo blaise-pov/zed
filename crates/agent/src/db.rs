@@ -89,6 +89,8 @@ pub struct DbThread {
     pub sandbox_grants: DbSandboxGrants,
     #[serde(default)]
     pub task_id: Option<String>,
+    #[serde(default)]
+    pub goal_id: Option<String>,
 }
 
 /// Serialized form of the sandbox permissions the user granted "for the rest of
@@ -173,6 +175,7 @@ impl SharedThread {
             sandboxed_terminal_temp_dir: None,
             sandbox_grants: DbSandboxGrants::default(),
             task_id: None,
+            goal_id: None,
         }
     }
 
@@ -361,6 +364,7 @@ impl DbThread {
             sandboxed_terminal_temp_dir: None,
             sandbox_grants: DbSandboxGrants::default(),
             task_id: None,
+            goal_id: None,
         })
     }
 }
@@ -904,6 +908,7 @@ mod tests {
             sandboxed_terminal_temp_dir: None,
             sandbox_grants: DbSandboxGrants::default(),
             task_id: None,
+            goal_id: None,
         }
     }
 
@@ -1446,5 +1451,49 @@ mod tests {
 
         let thread: DbThread = serde_json::from_str(json).unwrap();
         assert_eq!(thread.task_id, None);
+    }
+
+    #[gpui::test]
+    async fn test_goal_id_roundtrips_through_save_load(cx: &mut TestAppContext) {
+        let database = ThreadsDatabase::new(cx.executor()).unwrap();
+
+        let thread_id = session_id("goal-thread");
+        let mut thread = make_thread(
+            "Goal Associated Thread",
+            Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap(),
+        );
+        thread.goal_id = Some("GOAL-11".to_string());
+
+        database
+            .save_thread(thread_id.clone(), thread, PathList::default())
+            .await
+            .unwrap();
+
+        let loaded = database
+            .load_thread(thread_id.clone())
+            .await
+            .unwrap()
+            .expect("thread should exist");
+
+        assert_eq!(loaded.goal_id.as_deref(), Some("GOAL-11"));
+
+        // Also test synchronous loading via load_thread_sync
+        let loaded_sync = database
+            .load_thread_sync(&thread_id)
+            .unwrap()
+            .expect("thread should exist sync");
+        assert_eq!(loaded_sync.goal_id.as_deref(), Some("GOAL-11"));
+    }
+
+    #[test]
+    fn test_goal_id_defaults_to_none_when_deserializing_legacy_json() {
+        let json = r#"{
+            "title": "Legacy Thread",
+            "messages": [],
+            "updated_at": "2024-01-01T00:00:00Z"
+        }"#;
+
+        let thread: DbThread = serde_json::from_str(json).unwrap();
+        assert_eq!(thread.goal_id, None);
     }
 }

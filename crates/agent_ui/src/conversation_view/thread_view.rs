@@ -11417,6 +11417,125 @@ impl ThreadView {
         }
     }
 
+    pub(crate) fn resolve_subagent_task_id(
+        tool_call: &ToolCall,
+        native_thread_task_id: Option<&str>,
+    ) -> Option<String> {
+        Self::resolve_subagent_task_id_from_raw(
+            tool_call.raw_input.as_ref(),
+            native_thread_task_id,
+        )
+    }
+
+    pub(crate) fn resolve_subagent_task_id_from_raw(
+        raw_input: Option<&serde_json::Value>,
+        native_thread_task_id: Option<&str>,
+    ) -> Option<String> {
+        let raw_task_id = raw_input
+            .and_then(|input| input.get("task_id"))
+            .and_then(|v| {
+                v.as_str()
+                    .map(|s| s.to_string())
+                    .or_else(|| v.as_i64().map(|n| n.to_string()))
+            })
+            .filter(|s| !s.is_empty());
+
+        let fallback_task_id = native_thread_task_id
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
+
+        let id = raw_task_id.or(fallback_task_id)?;
+        Some(if id.starts_with("TASK-") {
+            id
+        } else {
+            format!("TASK-{id}")
+        })
+    }
+
+    pub(crate) fn resolve_subagent_goal_id(
+        tool_call: &ToolCall,
+        native_thread_goal_id: Option<&str>,
+        effective_task_id: Option<&str>,
+    ) -> Option<String> {
+        Self::resolve_subagent_goal_id_from_raw(
+            tool_call.raw_input.as_ref(),
+            native_thread_goal_id,
+            effective_task_id,
+        )
+    }
+
+    pub(crate) fn resolve_subagent_goal_id_from_raw(
+        raw_input: Option<&serde_json::Value>,
+        native_thread_goal_id: Option<&str>,
+        effective_task_id: Option<&str>,
+    ) -> Option<String> {
+        let raw_goal_id = raw_input
+            .and_then(|input| input.get("goal_id"))
+            .and_then(|v| {
+                v.as_str()
+                    .map(|s| s.to_string())
+                    .or_else(|| v.as_i64().map(|n| n.to_string()))
+            })
+            .filter(|s| !s.is_empty());
+
+        let fallback_goal_id = native_thread_goal_id
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
+
+        let task_id_for_worktree = effective_task_id
+            .map(|s| s.to_string())
+            .or_else(|| {
+                raw_input
+                    .and_then(|input| input.get("task_id"))
+                    .and_then(|v| {
+                        v.as_str()
+                            .map(|s| s.to_string())
+                            .or_else(|| v.as_i64().map(|n| n.to_string()))
+                    })
+                    .filter(|s| !s.is_empty())
+            });
+
+        let worktree_goal_id = task_id_for_worktree
+            .filter(|s| !s.is_empty())
+            .and_then(|tid| {
+                let mut candidates = vec![tid.clone()];
+                if let Some(stripped) = tid.strip_prefix("TASK-") {
+                    candidates.push(stripped.to_string());
+                } else {
+                    candidates.push(format!("TASK-{tid}"));
+                }
+                for candidate in candidates {
+                    let task_id_typed = agent::AgentTaskId::from(candidate);
+                    if let Some(summary) =
+                        agent::task_worktree::goal_branch_summary_for_task(&task_id_typed)
+                    {
+                        return Some(summary.goal_id);
+                    }
+                    if let Some(branch) =
+                        agent::task_worktree::task_worktree_goal_branch(&task_id_typed)
+                    {
+                        return Some(
+                            branch
+                                .strip_prefix("agent-goal/")
+                                .unwrap_or(&branch)
+                                .to_string(),
+                        );
+                    }
+                }
+                None
+            });
+
+        let id = raw_goal_id
+            .or(fallback_goal_id)
+            .or(worktree_goal_id)?;
+
+        Some(if id.starts_with("GOAL-") {
+            id
+        } else {
+            format!("GOAL-{id}")
+        })
+    }
+
     fn render_subagent_tool_call(
         &self,
         active_session_id: &acp_v1::SessionId,
@@ -11544,33 +11663,23 @@ impl ThreadView {
             )
         };
 
-        let goal_id = tool_call
-            .raw_input
-            .as_ref()
-            .and_then(|input| input.get("goal_id"))
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty())
-            .map(|id| {
-                if id.starts_with("GOAL-") {
-                    id.to_string()
-                } else {
-                    format!("GOAL-{id}")
-                }
-            });
+        let task_id = {
+            let native_task_id = native_thread
+                .as_ref()
+                .and_then(|t| t.read(cx).task_id().map(|s| s.to_string()));
+            Self::resolve_subagent_task_id(tool_call, native_task_id.as_deref())
+        };
 
-        let task_id = tool_call
-            .raw_input
-            .as_ref()
-            .and_then(|input| input.get("task_id"))
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty())
-            .map(|id| {
-                if id.starts_with("TASK-") {
-                    id.to_string()
-                } else {
-                    format!("TASK-{id}")
-                }
-            });
+        let goal_id = {
+            let native_goal_id = native_thread
+                .as_ref()
+                .and_then(|t| t.read(cx).goal_id().map(|s| s.to_string()));
+            Self::resolve_subagent_goal_id(
+                tool_call,
+                native_goal_id.as_deref(),
+                task_id.as_deref(),
+            )
+        };
 
         let card_header_id = format!("subagent-header-{}", entry_ix);
         let status_icon = format!("status-icon-{}", entry_ix);
@@ -14236,7 +14345,156 @@ mod tests {
                 ThreadView::resolve_subagent_profile_label(call, None, &profiles),
                 "no profile"
             );
+
+            assert_eq!(
+                ThreadView::resolve_subagent_task_id(call, Some("TASK-100")),
+                Some("TASK-100".to_string())
+            );
+            assert_eq!(
+                ThreadView::resolve_subagent_task_id(call, None),
+                None
+            );
+
+            assert_eq!(
+                ThreadView::resolve_subagent_goal_id(call, Some("GOAL-200"), Some("TASK-100")),
+                Some("GOAL-200".to_string())
+            );
+            assert_eq!(
+                ThreadView::resolve_subagent_goal_id(call, None, None),
+                None
+            );
         });
+    }
+
+    #[test]
+    fn test_subagent_task_id_fallback() {
+        let raw_with_task = json!({"task_id": "123"});
+        assert_eq!(
+            ThreadView::resolve_subagent_task_id_from_raw(Some(&raw_with_task), None),
+            Some("TASK-123".to_string())
+        );
+
+        let raw_with_prefixed_task = json!({"task_id": "TASK-123"});
+        assert_eq!(
+            ThreadView::resolve_subagent_task_id_from_raw(Some(&raw_with_prefixed_task), None),
+            Some("TASK-123".to_string())
+        );
+
+        // raw_input takes precedence over native_thread
+        assert_eq!(
+            ThreadView::resolve_subagent_task_id_from_raw(
+                Some(&raw_with_task),
+                Some("999")
+            ),
+            Some("TASK-123".to_string())
+        );
+
+        // Fallback to native_thread when raw_input task_id is absent
+        let raw_empty_task = json!({"task_id": ""});
+        assert_eq!(
+            ThreadView::resolve_subagent_task_id_from_raw(Some(&raw_empty_task), Some("456")),
+            Some("TASK-456".to_string())
+        );
+        assert_eq!(
+            ThreadView::resolve_subagent_task_id_from_raw(None, Some("TASK-456")),
+            Some("TASK-456".to_string())
+        );
+
+        // Both absent returns None
+        assert_eq!(
+            ThreadView::resolve_subagent_task_id_from_raw(None, None),
+            None
+        );
+        assert_eq!(
+            ThreadView::resolve_subagent_task_id_from_raw(Some(&raw_empty_task), None),
+            None
+        );
+    }
+
+    #[test]
+    fn test_subagent_goal_id_fallback() {
+        let raw_with_goal = json!({"goal_id": "42"});
+        assert_eq!(
+            ThreadView::resolve_subagent_goal_id_from_raw(Some(&raw_with_goal), None, None),
+            Some("GOAL-42".to_string())
+        );
+
+        let raw_with_prefixed_goal = json!({"goal_id": "GOAL-42"});
+        assert_eq!(
+            ThreadView::resolve_subagent_goal_id_from_raw(Some(&raw_with_prefixed_goal), None, None),
+            Some("GOAL-42".to_string())
+        );
+
+        // raw_input takes precedence over native_thread and worktree
+        assert_eq!(
+            ThreadView::resolve_subagent_goal_id_from_raw(
+                Some(&raw_with_goal),
+                Some("GOAL-99"),
+                Some("TASK-1")
+            ),
+            Some("GOAL-42".to_string())
+        );
+
+        // Fallback to native_thread when raw_input goal_id is absent
+        let raw_empty_goal = json!({"goal_id": ""});
+        assert_eq!(
+            ThreadView::resolve_subagent_goal_id_from_raw(Some(&raw_empty_goal), Some("88"), None),
+            Some("GOAL-88".to_string())
+        );
+        assert_eq!(
+            ThreadView::resolve_subagent_goal_id_from_raw(None, Some("GOAL-88"), None),
+            Some("GOAL-88".to_string())
+        );
+
+        // Fallback to task_worktree when both raw_input and native_thread goal_id are absent
+        agent::task_worktree::reset_registry_for_tests();
+        let task_id = agent::AgentTaskId::from("TASK-WORKTREE-1");
+        agent::task_worktree::register_task_worktree_policy(
+            &task_id,
+            std::path::PathBuf::from("/worktree/test"),
+            Some("agent-goal/GOAL-WT-1".to_string()),
+            None,
+            None,
+            None,
+        );
+
+        assert_eq!(
+            ThreadView::resolve_subagent_goal_id_from_raw(
+                None,
+                None,
+                Some("TASK-WORKTREE-1")
+            ),
+            Some("GOAL-WT-1".to_string())
+        );
+        assert_eq!(
+            ThreadView::resolve_subagent_goal_id_from_raw(
+                None,
+                None,
+                Some("WORKTREE-1")
+            ),
+            Some("GOAL-WT-1".to_string())
+        );
+
+        // Also checks raw_input task_id against task_worktree if effective_task_id is None
+        let raw_with_only_task = json!({"task_id": "TASK-WORKTREE-1"});
+        assert_eq!(
+            ThreadView::resolve_subagent_goal_id_from_raw(
+                Some(&raw_with_only_task),
+                None,
+                None
+            ),
+            Some("GOAL-WT-1".to_string())
+        );
+
+        // All absent returns None
+        assert_eq!(
+            ThreadView::resolve_subagent_goal_id_from_raw(None, None, None),
+            None
+        );
+        assert_eq!(
+            ThreadView::resolve_subagent_goal_id_from_raw(None, None, Some("TASK-NONEXISTENT")),
+            None
+        );
     }
 
     #[test]

@@ -940,6 +940,9 @@ impl AgentTool for SpawnAgentTool {
                     message_start_index: subagent.num_entries(cx),
                     message_end_index: None,
                 };
+                if is_initial_turn {
+                    subagent.set_goal_id(input.goal_id.clone(), cx);
+                }
                 if let Some(ref task_id) = task_id {
                     subagent.set_task_id(Some(task_id.clone()), cx);
                     let task_id_typed = crate::AgentTaskId::from(task_id.clone());

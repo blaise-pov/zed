@@ -1908,6 +1908,7 @@ mod tests {
             sandboxed_terminal_temp_dir: None,
             sandbox_grants: Default::default(),
             task_id: None,
+            goal_id: None,
         }
     }
 

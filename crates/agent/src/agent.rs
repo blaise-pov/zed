@@ -3663,21 +3663,65 @@ impl NativeThreadEnvironment {
             });
         }
 
+        let found_task_id = subagent_thread
+            .read(cx)
+            .task_id()
+            .map(|tid| crate::AgentTaskId::from(tid.to_string()))
+            .or_else(|| crate::task_worktree::task_id_for_session_id(&session_id.to_string()))
+            .or_else(|| {
+                task_worktree.as_ref().and_then(|p| {
+                    p.file_name()
+                        .and_then(|n| n.to_str())
+                        .and_then(|s| s.strip_prefix("agent-task-"))
+                        .map(|s| crate::AgentTaskId::from(s.to_string()))
+                })
+            });
+        if let Some(ref tid) = found_task_id {
+            if subagent_thread.read(cx).task_id().is_none() {
+                subagent_thread.update(cx, |t, _| t.set_task_id(Some(tid.to_string())));
+            }
+        }
+
         let effective_task_worktree = task_worktree
             .or_else(|| subagent_thread.read(cx).task_worktree().map(|p| p.to_path_buf()))
             .or_else(|| {
-                let found_task_id = subagent_thread
-                    .read(cx)
-                    .task_id()
-                    .map(|tid| crate::AgentTaskId::from(tid.to_string()))
-                    .or_else(|| crate::task_worktree::task_id_for_session_id(&session_id.to_string()));
-                if let Some(ref tid) = found_task_id {
-                    if subagent_thread.read(cx).task_id().is_none() {
-                        subagent_thread.update(cx, |t, _| t.set_task_id(Some(tid.to_string())));
-                    }
-                }
-                found_task_id.and_then(|tid| crate::task_worktree::task_worktree_path_for_id(&tid))
+                found_task_id
+                    .as_ref()
+                    .and_then(|tid| crate::task_worktree::task_worktree_path_for_id(tid))
             });
+
+        if subagent_thread.read(cx).goal_id().is_none() {
+            let task_id_from_worktree = effective_task_worktree.as_ref().and_then(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .and_then(|s| s.strip_prefix("agent-task-"))
+                    .map(|s| crate::AgentTaskId::from(s.to_string()))
+            });
+            let task_id_for_goal = found_task_id.as_ref().or(task_id_from_worktree.as_ref());
+
+            let restored_goal_id = task_id_for_goal
+                .and_then(|tid| {
+                    crate::task_worktree::goal_branch_summary_for_task(tid)
+                        .map(|summary| summary.goal_id)
+                        .or_else(|| {
+                            crate::task_worktree::task_worktree_goal_branch(tid)
+                                .as_deref()
+                                .and_then(|b| b.strip_prefix("agent-goal/"))
+                                .map(|g| g.to_string())
+                        })
+                })
+                .or_else(|| {
+                    effective_task_worktree.as_ref().and_then(|p| {
+                        let name = p.file_name()?.to_str()?;
+                        name.strip_prefix("agent-goal-")
+                            .or_else(|| name.strip_prefix("goal-"))
+                            .map(|s| s.to_string())
+                    })
+                });
+            if let Some(goal_id) = restored_goal_id {
+                subagent_thread.update(cx, |t, _| t.set_goal_id(Some(goal_id)));
+            }
+        }
         if let Some(task_worktree) = effective_task_worktree {
             subagent_thread.update(cx, |thread, _cx| {
                 thread.set_task_worktree(Some(task_worktree.clone()));
@@ -4728,6 +4772,12 @@ impl SubagentHandle for NativeSubagentHandle {
     fn set_task_id(&self, task_id: Option<String>, cx: &mut App) {
         self.subagent_thread.update(cx, |thread, _cx| {
             thread.set_task_id(task_id);
+        });
+    }
+
+    fn set_goal_id(&self, goal_id: Option<String>, cx: &mut App) {
+        self.subagent_thread.update(cx, |thread, _cx| {
+            thread.set_goal_id(goal_id);
         });
     }
 }
@@ -9217,6 +9267,7 @@ mod internal_tests {
         subagent_thread.update(cx, |t, cx| {
             t.set_model(model.clone(), cx);
             t.set_task_id(Some("TASK-42".to_string()));
+            t.set_goal_id(Some("GOAL-42".to_string()));
             t.send(ClientUserMessageId::new(), ["subagent task"], cx)
                 .unwrap();
         });
@@ -9269,6 +9320,7 @@ mod internal_tests {
             let session = &agent.sessions[&subagent_session_id];
             assert!(session.acp_thread.upgrade().is_some());
             assert_eq!(session.thread.read(cx).task_id(), Some("TASK-42"));
+            assert_eq!(session.thread.read(cx).goal_id(), Some("GOAL-42"));
         });
 
         // 5. Test resume_subagent_thread with restored in-memory session
@@ -9308,7 +9360,136 @@ mod internal_tests {
                     .task_id(),
                 Some("TASK-42")
             );
+            assert_eq!(
+                agent.sessions[&subagent_session_id]
+                    .thread
+                    .read(cx)
+                    .goal_id(),
+                Some("GOAL-42")
+            );
         });
+    }
+
+    #[gpui::test]
+    async fn test_subagent_resume_restores_goal_id_from_task_and_worktree(cx: &mut TestAppContext) {
+        let _fake = init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            "/",
+            json!({
+                "a": {
+                    "file.txt": "hello"
+                }
+            }),
+        )
+        .await;
+        let project = Project::test(fs.clone(), [path!("/a").as_ref()], cx).await;
+        let thread_store = cx.new(|cx| ThreadStore::new(cx));
+        let agent = cx
+            .update(|cx| NativeAgent::new(thread_store.clone(), Templates::new(), fs.clone(), cx));
+        let connection = Rc::new(NativeAgentConnection(agent.clone()));
+
+        let acp_thread = cx
+            .update(|cx| {
+                connection
+                    .clone()
+                    .new_session(project.clone(), PathList::new(&[Path::new("")]), cx)
+            })
+            .await
+            .unwrap();
+        let parent_session_id = acp_thread.read_with(cx, |t, _| t.session_id().clone());
+        let parent_thread =
+            cx.update(|cx| native_thread_for_session(&agent, &parent_session_id, cx));
+        let environment = NativeThreadEnvironment {
+            agent: agent.downgrade(),
+            thread: parent_thread.downgrade(),
+            acp_thread: acp_thread.downgrade(),
+        };
+
+        crate::task_worktree::reset_registry_for_tests();
+
+        // 1. Register a policy with goal branch for TASK-RESTORE-1
+        let task_id = crate::AgentTaskId::from("TASK-RESTORE-1");
+        crate::task_worktree::register_task_worktree_policy(
+            &task_id,
+            std::path::PathBuf::from("/worktrees/agent-task-TASK-RESTORE-1"),
+            Some("agent-goal/GOAL-RESTORE-1".to_string()),
+            None,
+            None,
+            None,
+        );
+
+        let subagent_handle = cx
+            .update(|cx| {
+                environment.create_subagent_thread("worker".to_string(), None, None, None, cx)
+            })
+            .unwrap();
+        let subagent_session_id = subagent_handle.id();
+        let subagent_thread = agent.read_with(cx, |agent, _| {
+            agent
+                .sessions
+                .get(&subagent_session_id)
+                .unwrap()
+                .thread
+                .clone()
+        });
+
+        // Set task_id but NOT goal_id
+        subagent_thread.update(cx, |t, _cx| {
+            t.set_task_id(Some("TASK-RESTORE-1".to_string()));
+        });
+        assert_eq!(
+            cx.update(|cx| subagent_thread.read(cx).goal_id().map(ToString::to_string)),
+            None
+        );
+
+        // Resume subagent thread - should restore goal_id from task's goal branch
+        let _resumed = cx
+            .update(|cx| {
+                environment.resume_subagent_thread(subagent_session_id.clone(), None, None, cx)
+            })
+            .unwrap();
+
+        assert_eq!(
+            cx.update(|cx| subagent_thread.read(cx).goal_id().map(ToString::to_string)),
+            Some("GOAL-RESTORE-1".to_string())
+        );
+
+        // 2. Also test restoring from worktree path with agent-goal prefix
+        let subagent_handle2 = cx
+            .update(|cx| {
+                environment.create_subagent_thread("worker2".to_string(), None, None, None, cx)
+            })
+            .unwrap();
+        let subagent_session_id2 = subagent_handle2.id();
+        let subagent_thread2 = agent.read_with(cx, |agent, _| {
+            agent
+                .sessions
+                .get(&subagent_session_id2)
+                .unwrap()
+                .thread
+                .clone()
+        });
+        assert_eq!(
+            cx.update(|cx| subagent_thread2.read(cx).goal_id().map(ToString::to_string)),
+            None
+        );
+
+        let _resumed2 = cx
+            .update(|cx| {
+                environment.resume_subagent_thread(
+                    subagent_session_id2.clone(),
+                    None,
+                    Some(std::path::PathBuf::from("/worktrees/agent-goal-GOAL-WORKTREE-2")),
+                    cx,
+                )
+            })
+            .unwrap();
+
+        assert_eq!(
+            cx.update(|cx| subagent_thread2.read(cx).goal_id().map(ToString::to_string)),
+            Some("GOAL-WORKTREE-2".to_string())
+        );
     }
 
     #[gpui::test]

@@ -11984,6 +11984,7 @@ mod tests {
             sandboxed_terminal_temp_dir: None,
             sandbox_grants: Default::default(),
             task_id: None,
+            goal_id: None,
         };
 
         let thread_store = cx.update(|cx| ThreadStore::global(cx));
@@ -15105,6 +15106,7 @@ mod tests {
                 sandboxed_terminal_temp_dir: None,
                 sandbox_grants: Default::default(),
                 task_id: None,
+                goal_id: None,
             },
             PathList::default(),
         )
@@ -15137,6 +15139,7 @@ mod tests {
                 sandboxed_terminal_temp_dir: None,
                 sandbox_grants: Default::default(),
                 task_id: None,
+                goal_id: None,
             },
             PathList::default(),
         )
