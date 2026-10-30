@@ -902,6 +902,8 @@ pub trait SubagentHandle {
 
     fn set_task_id(&self, _task_id: Option<String>, _cx: &mut App) {}
 
+    fn set_goal_id(&self, _goal_id: Option<String>, _cx: &mut App) {}
+
     fn model_id(&self, _cx: &App) -> Option<String> {
         None
     }
@@ -1549,6 +1551,7 @@ pub(crate) struct StreamingSaveKey {
     sandboxed_terminal_temp_dir: Option<PathBuf>,
     sandbox_grants: crate::db::DbSandboxGrants,
     task_id: Option<String>,
+    goal_id: Option<String>,
 }
 
 pub struct Thread {
@@ -1618,6 +1621,7 @@ pub struct Thread {
     delegation_budget: u8,
     task_worktree: Option<PathBuf>,
     task_id: Option<String>,
+    goal_id: Option<String>,
     is_canceling: bool,
     was_canceled: bool,
     pub(crate) watchdog_timeout: Duration,
@@ -1659,6 +1663,10 @@ impl Thread {
         self.task_id.as_deref()
     }
 
+    pub fn goal_id(&self) -> Option<&str> {
+        self.goal_id.as_deref()
+    }
+
     pub fn watchdog_timeout(&self) -> Duration {
         self.watchdog_timeout
     }
@@ -1686,6 +1694,10 @@ impl Thread {
 
     pub fn set_task_id(&mut self, task_id: Option<String>) {
         self.task_id = task_id;
+    }
+
+    pub fn set_goal_id(&mut self, goal_id: Option<String>) {
+        self.goal_id = goal_id;
     }
 
     pub fn is_canceling(&self) -> bool {
@@ -1929,6 +1941,7 @@ impl Thread {
             delegation_budget,
             task_worktree: None,
             task_id: None,
+            goal_id: None,
             is_canceling: false,
             was_canceled: false,
             watchdog_timeout: turn_watchdog_seconds,
@@ -2451,6 +2464,7 @@ impl Thread {
             delegation_budget,
             task_worktree: None,
             task_id: db_thread.task_id,
+            goal_id: db_thread.goal_id,
             is_canceling: false,
             was_canceled: false,
             watchdog_timeout: AgentSettings::get(settings_location, cx).turn_watchdog_seconds,
@@ -2556,6 +2570,7 @@ impl Thread {
             sandboxed_terminal_temp_dir: self.sandboxed_terminal_temp_dir.clone(),
             sandbox_grants: self.sandbox_grants.borrow().to_db(),
             task_id: self.task_id.clone(),
+            goal_id: self.goal_id.clone(),
         };
 
         cx.background_spawn(async move {
@@ -2582,6 +2597,7 @@ impl Thread {
             sandboxed_terminal_temp_dir: self.sandboxed_terminal_temp_dir.clone(),
             sandbox_grants: self.sandbox_grants.borrow().to_db(),
             task_id: self.task_id.clone(),
+            goal_id: self.goal_id.clone(),
         }
     }
 
@@ -9538,6 +9554,7 @@ mod tests {
             sandboxed_terminal_temp_dir: None,
             sandbox_grants: Default::default(),
             task_id: Some("TASK-11".to_string()),
+            goal_id: None,
         };
 
         let session_id = acp::SessionId::new(Arc::<str>::from("session-test-from-db"));

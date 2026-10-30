@@ -202,6 +202,7 @@ pub(crate) struct FakeSubagentHandle {
     send_task: Shared<Task<String>>,
     send_error: Option<String>,
     task_id: Arc<parking_lot::Mutex<Option<String>>>,
+    goal_id: Arc<parking_lot::Mutex<Option<String>>>,
     sent_messages: Arc<parking_lot::Mutex<Vec<String>>>,
     token_usage: Arc<parking_lot::Mutex<Option<language_model::TokenUsage>>>,
     send_tokens: Option<language_model::TokenUsage>,
@@ -219,6 +220,7 @@ impl FakeSubagentHandle {
             send_task,
             send_error,
             task_id: Arc::new(parking_lot::Mutex::new(None)),
+            goal_id: Arc::new(parking_lot::Mutex::new(None)),
             sent_messages: Arc::new(parking_lot::Mutex::new(Vec::new())),
             token_usage: Arc::new(parking_lot::Mutex::new(None)),
             send_tokens: None,
@@ -236,6 +238,10 @@ impl FakeSubagentHandle {
 
     pub(crate) fn task_id(&self) -> Option<String> {
         self.task_id.lock().clone()
+    }
+
+    pub(crate) fn goal_id(&self) -> Option<String> {
+        self.goal_id.lock().clone()
     }
 
     pub(crate) fn sent_messages(&self) -> Vec<String> {
@@ -274,6 +280,10 @@ impl SubagentHandle for FakeSubagentHandle {
 
     fn set_task_id(&self, task_id: Option<String>, _cx: &mut App) {
         *self.task_id.lock() = task_id;
+    }
+
+    fn set_goal_id(&self, goal_id: Option<String>, _cx: &mut App) {
+        *self.goal_id.lock() = goal_id;
     }
 
     fn cumulative_token_usage(&self, _cx: &App) -> Option<language_model::TokenUsage> {
@@ -9437,6 +9447,60 @@ async fn test_spawn_agent_disabled_isolation_preserves_task_linkage_without_work
                 crate::AgentTaskStatus::Completed
             ),
         ]
+    );
+}
+
+#[gpui::test]
+async fn test_spawn_agent_propagates_goal_id_to_subagent_handle(cx: &mut TestAppContext) {
+    init_test(cx);
+    crate::task_worktree::reset_registry_for_tests();
+
+    cx.update(|cx| {
+        insert_profile_with_isolation(cx, "isolated_prof", agent_settings::TaskIsolation::Required);
+    });
+
+    let environment = Rc::new(
+        FakeThreadEnvironment::default()
+            .with_task_id("TASK-GOAL-PROP")
+            .with_subagent(FakeSubagentHandle::new(
+                acp::SessionId::new("subagent-goal-prop"),
+                Task::ready("worker findings".to_string()).shared(),
+                None,
+            )),
+    );
+    #[allow(clippy::arc_with_non_send_sync)]
+    let tool = Arc::new(SpawnAgentTool::new(environment.clone()));
+    let (event_stream, _rx) = ToolCallEventStream::test();
+
+    let result = cx
+        .update(|cx| {
+            tool.run(
+                ToolInput::resolved(SpawnAgentToolInput {
+                    label: "goal task".to_string(),
+                    message: "execute goal task".to_string(),
+                    profile: Some(AgentProfileId("isolated_prof".into())),
+                    task_id: Some("TASK-GOAL-PROP".to_string()),
+                    goal_id: Some("GOAL-PROP-42".to_string()),
+                    ..Default::default()
+                }),
+                event_stream,
+                cx,
+            )
+        })
+        .await;
+
+    assert!(matches!(result, Ok(SpawnAgentToolOutput::Success { .. })));
+
+    let subagent_handle = environment.subagent_handle().unwrap();
+    assert_eq!(
+        subagent_handle.goal_id(),
+        Some("GOAL-PROP-42".to_string()),
+        "subagent should have its goal_id set during creation"
+    );
+    assert_eq!(
+        subagent_handle.task_id(),
+        Some("TASK-GOAL-PROP".to_string()),
+        "subagent should have its task_id set during creation"
     );
 }
 
