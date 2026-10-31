@@ -415,6 +415,25 @@ impl FakeThreadEnvironment {
         self
     }
 
+    pub(crate) fn with_task_status(self, task_id: &str, status: crate::AgentTaskStatus) -> Self {
+        let detail = crate::AgentTaskDetail {
+            summary: crate::AgentTaskSummary {
+                id: crate::AgentTaskId::from(task_id),
+                title: task_id.to_string(),
+                status,
+                attempt: 1,
+                ..Default::default()
+            },
+            description: String::new(),
+            acceptance_criteria: Vec::new(),
+            events_tail: Vec::new(),
+        };
+        self.task_details
+            .borrow_mut()
+            .insert(task_id.to_string(), detail);
+        self
+    }
+
     pub(crate) fn register_fake_task(&self, task_id: &str) {
         let detail = crate::AgentTaskDetail {
             summary: crate::AgentTaskSummary {
@@ -8236,6 +8255,372 @@ async fn test_spawn_agent_one_session_per_task(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+async fn test_spawn_agent_status_validation_new_sessions(cx: &mut TestAppContext) {
+    init_test(cx);
+
+    let cases = vec![
+        (crate::AgentTaskStatus::Blocked, "blocked"),
+        (crate::AgentTaskStatus::Running, "running"),
+        (crate::AgentTaskStatus::Completed, "completed"),
+        (crate::AgentTaskStatus::Failed, "failed"),
+        (crate::AgentTaskStatus::Review, "review"),
+        (crate::AgentTaskStatus::Cancelled, "cancelled"),
+        (crate::AgentTaskStatus::Archived, "archived"),
+        (crate::AgentTaskStatus::Stale, "stale"),
+        (
+            crate::AgentTaskStatus::Other(gpui::SharedString::from("custom_status")),
+            "custom_status",
+        ),
+    ];
+
+    for (status, status_str) in cases {
+        let task_id = format!("TASK-NEW-{status_str}");
+        let task_id_typed = crate::AgentTaskId::from(task_id.clone());
+        let environment = Rc::new(
+            FakeThreadEnvironment::default()
+                .with_task_status(&task_id, status)
+                .with_subagent(FakeSubagentHandle::new(
+                    acp::SessionId::new("subagent-new"),
+                    Task::ready("done".to_string()).shared(),
+                    None,
+                )),
+        );
+        #[allow(clippy::arc_with_non_send_sync)]
+        let tool = Arc::new(SpawnAgentTool::new(environment.clone()));
+        let (event_stream, _rx) = ToolCallEventStream::test();
+
+        let result = cx
+            .update(|cx| {
+                tool.run(
+                    ToolInput::resolved(SpawnAgentToolInput {
+                        label: "task".to_string(),
+                        message: "prompt".to_string(),
+                        task_id: Some(task_id.clone()),
+                        base_branch: Some("main".to_string()),
+                        ..Default::default()
+                    }),
+                    event_stream,
+                    cx,
+                )
+            })
+            .await;
+
+        let Err(SpawnAgentToolOutput::Error { error, .. }) = result else {
+            panic!("expected status validation error for status {status_str}");
+        };
+        let expected_error = format!(
+            "Cannot spawn agent for task '{task_id}': status is '{status_str}', expected 'ready'. Resolve dependencies first or update status via task_update."
+        );
+        assert_eq!(error, expected_error);
+        assert!(
+            !crate::task_worktree::has_active_subagent_session(&task_id_typed),
+            "no session guard should be allocated on validation failure"
+        );
+        assert!(
+            environment.ensure_worktree_calls().is_empty(),
+            "no worktree should be created on validation failure"
+        );
+    }
+
+    // Ready status is allowed
+    let task_id = "TASK-NEW-READY".to_string();
+    let environment = Rc::new(
+        FakeThreadEnvironment::default()
+            .with_task_status(&task_id, crate::AgentTaskStatus::Ready)
+            .with_subagent(FakeSubagentHandle::new(
+                acp::SessionId::new("subagent-ready"),
+                Task::ready("done".to_string()).shared(),
+                None,
+            )),
+    );
+    #[allow(clippy::arc_with_non_send_sync)]
+    let tool = Arc::new(SpawnAgentTool::new(environment.clone()));
+    let (event_stream, _rx) = ToolCallEventStream::test();
+
+    let result = cx
+        .update(|cx| {
+            tool.run(
+                ToolInput::resolved(SpawnAgentToolInput {
+                    label: "task".to_string(),
+                    message: "prompt".to_string(),
+                    task_id: Some(task_id.clone()),
+                    ..Default::default()
+                }),
+                event_stream,
+                cx,
+            )
+        })
+        .await;
+
+    assert!(matches!(result, Ok(SpawnAgentToolOutput::Success { .. })));
+}
+
+#[gpui::test]
+async fn test_spawn_agent_status_validation_resumed_sessions(cx: &mut TestAppContext) {
+    init_test(cx);
+
+    let allowed = vec![
+        crate::AgentTaskStatus::Ready,
+        crate::AgentTaskStatus::Running,
+        crate::AgentTaskStatus::Completed,
+        crate::AgentTaskStatus::Failed,
+        crate::AgentTaskStatus::Review,
+    ];
+
+    for status in allowed {
+        let task_id = format!("TASK-RESUME-OK-{}", status.as_str());
+        let session_id = acp::SessionId::new(format!("sess-{}", status.as_str()));
+        let environment = Rc::new(
+            FakeThreadEnvironment::default()
+                .with_task_status(&task_id, status)
+                .with_subagent_task_id(session_id.clone(), task_id.clone())
+                .with_subagent(FakeSubagentHandle::new(
+                    session_id.clone(),
+                    Task::ready("done".to_string()).shared(),
+                    None,
+                )),
+        );
+        #[allow(clippy::arc_with_non_send_sync)]
+        let tool = Arc::new(SpawnAgentTool::new(environment));
+        let (event_stream, _rx) = ToolCallEventStream::test();
+
+        let result = cx
+            .update(|cx| {
+                tool.run(
+                    ToolInput::resolved(SpawnAgentToolInput {
+                        label: "task".to_string(),
+                        message: "follow up".to_string(),
+                        session_id: Some(session_id.clone()),
+                        task_id: Some(task_id),
+                        ..Default::default()
+                    }),
+                    event_stream,
+                    cx,
+                )
+            })
+            .await;
+
+        assert!(matches!(result, Ok(SpawnAgentToolOutput::Success { .. })));
+    }
+
+    let rejected = vec![
+        (crate::AgentTaskStatus::Blocked, "blocked"),
+        (crate::AgentTaskStatus::Cancelled, "cancelled"),
+        (crate::AgentTaskStatus::Archived, "archived"),
+        (crate::AgentTaskStatus::Stale, "stale"),
+        (
+            crate::AgentTaskStatus::Other(gpui::SharedString::from("custom_status")),
+            "custom_status",
+        ),
+    ];
+
+    for (status, status_str) in rejected {
+        let task_id = format!("TASK-RESUME-REJECT-{status_str}");
+        let session_id = acp::SessionId::new(format!("sess-rej-{status_str}"));
+        let task_id_typed = crate::AgentTaskId::from(task_id.clone());
+        let environment = Rc::new(
+            FakeThreadEnvironment::default()
+                .with_task_status(&task_id, status)
+                .with_subagent_task_id(session_id.clone(), task_id.clone())
+                .with_subagent(FakeSubagentHandle::new(
+                    session_id.clone(),
+                    Task::ready("done".to_string()).shared(),
+                    None,
+                )),
+        );
+        #[allow(clippy::arc_with_non_send_sync)]
+        let tool = Arc::new(SpawnAgentTool::new(environment.clone()));
+        let (event_stream, _rx) = ToolCallEventStream::test();
+
+        let result = cx
+            .update(|cx| {
+                tool.run(
+                    ToolInput::resolved(SpawnAgentToolInput {
+                        label: "task".to_string(),
+                        message: "follow up".to_string(),
+                        session_id: Some(session_id.clone()),
+                        task_id: Some(task_id.clone()),
+                        ..Default::default()
+                    }),
+                    event_stream,
+                    cx,
+                )
+            })
+            .await;
+
+        let Err(SpawnAgentToolOutput::Error { error, .. }) = result else {
+            panic!("expected status validation error for resumed session with status {status_str}");
+        };
+        let expected_error = format!(
+            "Cannot resume agent for task '{task_id}': status is '{status_str}'. Expected one of: ready, running, completed, failed, review."
+        );
+        assert_eq!(error, expected_error);
+        assert!(
+            !crate::task_worktree::has_active_subagent_session(&task_id_typed),
+            "no session guard should be allocated on validation failure"
+        );
+    }
+}
+
+#[gpui::test]
+async fn test_spawn_agent_status_validation_skips_and_guest_mode(cx: &mut TestAppContext) {
+    init_test(cx);
+
+    // 1. Skip when task_lifecycle_mode is Agent
+    cx.update(|cx| {
+        let mut settings = agent_settings::AgentSettings::get_global(cx).clone();
+        settings.task_lifecycle_mode = agent_settings::TaskLifecycleMode::Agent;
+        agent_settings::AgentSettings::override_global(settings, cx);
+    });
+
+    let task_id = "TASK-AGENT-MODE-BLOCKED".to_string();
+    let environment = Rc::new(
+        FakeThreadEnvironment::default()
+            .with_task_status(&task_id, crate::AgentTaskStatus::Blocked)
+            .with_subagent(FakeSubagentHandle::new(
+                acp::SessionId::new("subagent-agent-mode"),
+                Task::ready("done".to_string()).shared(),
+                None,
+            )),
+    );
+    #[allow(clippy::arc_with_non_send_sync)]
+    let tool = Arc::new(SpawnAgentTool::new(environment));
+    let (event_stream, _rx) = ToolCallEventStream::test();
+
+    let result = cx
+        .update(|cx| {
+            tool.run(
+                ToolInput::resolved(SpawnAgentToolInput {
+                    label: "task".to_string(),
+                    message: "prompt".to_string(),
+                    task_id: Some(task_id),
+                    ..Default::default()
+                }),
+                event_stream,
+                cx,
+            )
+        })
+        .await;
+
+    assert!(matches!(result, Ok(SpawnAgentToolOutput::Success { .. })));
+
+    // Reset settings to Runtime mode
+    cx.update(|cx| {
+        let mut settings = agent_settings::AgentSettings::get_global(cx).clone();
+        settings.task_lifecycle_mode = agent_settings::TaskLifecycleMode::Runtime;
+        agent_settings::AgentSettings::override_global(settings, cx);
+    });
+
+    // 2. Skip when task_id is None
+    let environment = Rc::new(
+        FakeThreadEnvironment::default().with_subagent(FakeSubagentHandle::new(
+            acp::SessionId::new("subagent-no-task"),
+            Task::ready("done".to_string()).shared(),
+            None,
+        )),
+    );
+    #[allow(clippy::arc_with_non_send_sync)]
+    let tool = Arc::new(SpawnAgentTool::new(environment));
+    let (event_stream, _rx) = ToolCallEventStream::test();
+
+    let result = cx
+        .update(|cx| {
+            tool.run(
+                ToolInput::resolved(SpawnAgentToolInput {
+                    label: "task".to_string(),
+                    message: "prompt".to_string(),
+                    task_id: None,
+                    ..Default::default()
+                }),
+                event_stream,
+                cx,
+            )
+        })
+        .await;
+
+    assert!(matches!(result, Ok(SpawnAgentToolOutput::Success { .. })));
+
+    // 3. Guest mode validates target task_id status only
+    let host_task_id = "TASK-HOST".to_string();
+    let guest_task_id_blocked = "TASK-GUEST-BLOCKED".to_string();
+    let environment = Rc::new(
+        FakeThreadEnvironment::default()
+            .with_task_status(&host_task_id, crate::AgentTaskStatus::Running)
+            .with_task_status(&guest_task_id_blocked, crate::AgentTaskStatus::Blocked)
+            .with_worktree_path(std::path::PathBuf::from("/mock/worktree"))
+            .with_subagent(FakeSubagentHandle::new(
+                acp::SessionId::new("subagent-guest"),
+                Task::ready("done".to_string()).shared(),
+                None,
+            )),
+    );
+    #[allow(clippy::arc_with_non_send_sync)]
+    let tool = Arc::new(SpawnAgentTool::new(environment));
+    let (event_stream, _rx) = ToolCallEventStream::test();
+
+    let result = cx
+        .update(|cx| {
+            tool.run(
+                ToolInput::resolved(SpawnAgentToolInput {
+                    label: "guest task".to_string(),
+                    message: "prompt".to_string(),
+                    task_id: Some(guest_task_id_blocked.clone()),
+                    worktree_of: Some(host_task_id.clone()),
+                    ..Default::default()
+                }),
+                event_stream,
+                cx,
+            )
+        })
+        .await;
+
+    let Err(SpawnAgentToolOutput::Error { error, .. }) = result else {
+        panic!("expected validation error for blocked target task in guest mode");
+    };
+    assert_eq!(
+        error,
+        format!(
+            "Cannot spawn agent for task '{guest_task_id_blocked}': status is 'blocked', expected 'ready'. Resolve dependencies first or update status via task_update."
+        )
+    );
+
+    // Target task Ready in guest mode succeeds
+    let guest_task_id_ready = "TASK-GUEST-READY".to_string();
+    let environment = Rc::new(
+        FakeThreadEnvironment::default()
+            .with_task_status(&host_task_id, crate::AgentTaskStatus::Running)
+            .with_task_status(&guest_task_id_ready, crate::AgentTaskStatus::Ready)
+            .with_worktree_path(std::path::PathBuf::from("/mock/worktree"))
+            .with_subagent(FakeSubagentHandle::new(
+                acp::SessionId::new("subagent-guest-2"),
+                Task::ready("done".to_string()).shared(),
+                None,
+            )),
+    );
+    #[allow(clippy::arc_with_non_send_sync)]
+    let tool = Arc::new(SpawnAgentTool::new(environment));
+    let (event_stream, _rx) = ToolCallEventStream::test();
+
+    let result = cx
+        .update(|cx| {
+            tool.run(
+                ToolInput::resolved(SpawnAgentToolInput {
+                    label: "guest task".to_string(),
+                    message: "prompt".to_string(),
+                    task_id: Some(guest_task_id_ready),
+                    worktree_of: Some(host_task_id),
+                    ..Default::default()
+                }),
+                event_stream,
+                cx,
+            )
+        })
+        .await;
+
+    assert!(matches!(result, Ok(SpawnAgentToolOutput::Success { .. })));
+}
+
+#[gpui::test]
 async fn test_spawn_agent_session_end_cleanup_flow(cx: &mut TestAppContext) {
     init_test(cx);
     crate::task_worktree::reset_registry_for_tests();
@@ -15060,7 +15445,7 @@ async fn test_spawn_agent_two_tasks_isolated_worktrees(cx: &mut TestAppContext) 
     cx.run_until_parked();
 
     // === First subagent with TASK-1 ===
-    let send1 = acp_thread.update(cx, |thread, cx| thread.send_raw("Start task 1", cx));
+    let send1 = acp_thread.update(cx, |thread, cx| thread.send(vec!["Start task 1".into()], cx));
     cx.run_until_parked();
     fake.send_last_text(&model, "spawning subagent 1");
     let subagent1_input = SpawnAgentToolInput {
@@ -15172,7 +15557,7 @@ async fn test_spawn_agent_two_tasks_isolated_worktrees(cx: &mut TestAppContext) 
     send1.await.unwrap();
 
     // === Second subagent with TASK-2 ===
-    let send2 = acp_thread.update(cx, |thread, cx| thread.send_raw("Start task 2", cx));
+    let send2 = acp_thread.update(cx, |thread, cx| thread.send(vec!["Start task 2".into()], cx));
     cx.run_until_parked();
     fake.send_last_text(&model, "spawning subagent 2");
     let subagent2_input = SpawnAgentToolInput {
@@ -15385,7 +15770,7 @@ async fn test_spawn_agent_non_git_degrades_isolation(cx: &mut TestAppContext) {
     });
     cx.run_until_parked();
 
-    let send = acp_thread.update(cx, |thread, cx| thread.send_raw("Start task", cx));
+    let send = acp_thread.update(cx, |thread, cx| thread.send(vec!["Start task".into()], cx));
     cx.run_until_parked();
     fake.send_last_text(&model, "spawning subagent");
     let subagent_input = SpawnAgentToolInput {
@@ -15519,7 +15904,7 @@ async fn test_spawn_agent_error_creates_wip_commit(cx: &mut TestAppContext) {
     });
     cx.run_until_parked();
 
-    let send = acp_thread.update(cx, |thread, cx| thread.send_raw("Start failing task", cx));
+    let send = acp_thread.update(cx, |thread, cx| thread.send(vec!["Start failing task".into()], cx));
     cx.run_until_parked();
     fake.send_last_text(&model, "spawning subagent");
     let subagent_input = SpawnAgentToolInput {
@@ -16131,7 +16516,7 @@ async fn test_spawn_agent_with_goal_id_and_base_branch(cx: &mut TestAppContext) 
     cx.run_until_parked();
 
     // 1. Unknown base_branch -> model-readable error before subagent starts
-    let send1 = acp_thread.update(cx, |thread, cx| thread.send_raw("Start invalid branch", cx));
+    let send1 = acp_thread.update(cx, |thread, cx| thread.send(vec!["Start invalid branch".into()], cx));
     cx.run_until_parked();
     fake.send_last_text(&model, "spawning subagent invalid");
     let invalid_input = SpawnAgentToolInput {
@@ -16187,7 +16572,7 @@ async fn test_spawn_agent_with_goal_id_and_base_branch(cx: &mut TestAppContext) 
     send1.await.unwrap();
 
     // 2. Goal branch lazy creation and task fork from goal-tip
-    let send2 = acp_thread.update(cx, |thread, cx| thread.send_raw("Start goal task", cx));
+    let send2 = acp_thread.update(cx, |thread, cx| thread.send(vec!["Start goal task".into()], cx));
     cx.run_until_parked();
     fake.send_last_text(&model, "spawning goal subagent");
     let goal_input = SpawnAgentToolInput {
@@ -16372,7 +16757,7 @@ async fn test_spawn_agent_with_on_branch_goal_and_exclusivity(cx: &mut TestAppCo
 
     // 1. Validation error: on_branch and base_branch mutually exclusive
     let send1 = acp_thread.update(cx, |thread, cx| {
-        thread.send_raw("Start mutual exclusivity", cx)
+        thread.send(vec!["Start mutual exclusivity".into()], cx)
     });
     cx.run_until_parked();
     fake.send_last_text(&model, "spawning subagent mutual exclusivity");
@@ -16427,7 +16812,7 @@ async fn test_spawn_agent_with_on_branch_goal_and_exclusivity(cx: &mut TestAppCo
 
     // 2. Validation error: on_branch requires task_id
     let send2 = acp_thread.update(cx, |thread, cx| {
-        thread.send_raw("Start on_branch without task_id", cx)
+        thread.send(vec!["Start on_branch without task_id".into()], cx)
     });
     cx.run_until_parked();
     fake.send_last_text(&model, "spawning subagent on_branch without task_id");
@@ -16487,7 +16872,7 @@ async fn test_spawn_agent_with_on_branch_goal_and_exclusivity(cx: &mut TestAppCo
     ensure_goal.await.unwrap();
 
     // 3. Subagent 1 spawns on explicit on_branch
-    let send3 = acp_thread.update(cx, |thread, cx| thread.send_raw("Start subagent 1", cx));
+    let send3 = acp_thread.update(cx, |thread, cx| thread.send(vec!["Start subagent 1".into()], cx));
     cx.run_until_parked();
     fake.send_last_text(&model, "spawning subagent 1");
     let subagent1_input = SpawnAgentToolInput {
@@ -16562,7 +16947,7 @@ async fn test_spawn_agent_with_on_branch_goal_and_exclusivity(cx: &mut TestAppCo
     cx.run_until_parked();
 
     let send4 = acp_thread2.update(cx, |thread, cx| {
-        thread.send_raw("Start concurrent subagent 2", cx)
+        thread.send(vec!["Start concurrent subagent 2".into()], cx)
     });
     cx.run_until_parked();
     fake.send_last_text(&model, "spawning subagent 2 on same goal");

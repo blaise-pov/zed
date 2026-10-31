@@ -66,25 +66,25 @@ pub struct SpawnAgentToolInput {
     pub task_id: Option<String>,
     /// Optional profile ID to use for this subagent. If not specified, the subagent will use the default profile.
     /// The profile controls which tools are available, default model, and whether task isolation (dedicated git worktree) is required, optional, or disabled.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<agent_settings::AgentProfileId>,
     /// Goal identifier for goal-scoped task coordination (§8.2).
     /// Requires task isolation (dedicated worktree or guest mode). In dedicated worktree mode, forks from the goal's integration branch
     /// `agent-goal/{goal_id}` (created lazily from HEAD of main if absent). In guest mode (`worktree_of`), serves as task graph linkage without forking.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub goal_id: Option<String>,
     /// Base branch or ref to fork the task worktree from (§8.2).
     /// Requires task_id. Mutually exclusive with on_branch and worktree_of.
     /// Overrides goal-tip as the fork base when both are specified. If the ref
     /// matches `agent-goal/*`, it is auto-created lazily if absent; otherwise,
     /// it must exist in the repository.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_branch: Option<String>,
     /// Existing branch to check out into the subagent's task worktree (§8.2).
     /// Requires task_id. Used for review, CI, inspection, or conflict resolution without creating a new branch.
     /// The subagent gets its own worktree on this existing branch, and writes are restricted
     /// to this worktree. Mutually exclusive with base_branch and worktree_of. Branch names must be explicit (e.g. `agent-goal/GOAL-21`).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on_branch: Option<String>,
     /// Host task ID whose git worktree this subagent will share in guest mode (§8.2).
     /// Requires task_id. Mutually exclusive with base_branch and on_branch.
@@ -687,6 +687,50 @@ impl AgentTool for SpawnAgentTool {
                 tool_use_id,
                 task_status_str
             );
+
+            if !is_agent_mode {
+                if let (Some(task_id), Some(task_detail)) = (task_id.as_ref(), task_detail.as_ref()) {
+                    let status = &task_detail.summary.status;
+                    if input.session_id.is_none() {
+                        if *status != crate::AgentTaskStatus::Ready {
+                            return Err(SpawnAgentToolOutput::Error {
+                                session_id: input.session_id.clone(),
+                                error: format!(
+                                    "Cannot spawn agent for task '{task_id}': status is '{}', expected 'ready'. Resolve dependencies first or update status via task_update.",
+                                    status.as_str()
+                                ),
+                                session_info: None,
+                                isolation: None,
+                                isolation_details: None,
+                            });
+                        }
+                    } else {
+                        match status {
+                            crate::AgentTaskStatus::Ready
+                            | crate::AgentTaskStatus::Running
+                            | crate::AgentTaskStatus::Completed
+                            | crate::AgentTaskStatus::Failed
+                            | crate::AgentTaskStatus::Review => {}
+                            crate::AgentTaskStatus::Blocked
+                            | crate::AgentTaskStatus::Cancelled
+                            | crate::AgentTaskStatus::Archived
+                            | crate::AgentTaskStatus::Stale
+                            | crate::AgentTaskStatus::Other(_) => {
+                                return Err(SpawnAgentToolOutput::Error {
+                                    session_id: input.session_id.clone(),
+                                    error: format!(
+                                        "Cannot resume agent for task '{task_id}': status is '{}'. Expected one of: ready, running, completed, failed, review.",
+                                        status.as_str()
+                                    ),
+                                    session_info: None,
+                                    isolation: None,
+                                    isolation_details: None,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
 
             let session_guard = if let Some(ref host_task_id_str) = input.worktree_of {
                 let host_task_id = crate::AgentTaskId::from(host_task_id_str.clone());
