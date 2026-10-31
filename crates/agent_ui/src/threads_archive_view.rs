@@ -9,7 +9,7 @@ use crate::thread_metadata_store::{
 use crate::{Agent, ArchiveSelectedThread, DEFAULT_THREAD_TITLE, RemoveSelectedThread};
 
 use agent::ThreadStore;
-use agent_client_protocol::schema::v1 as acp;
+use agent_client_protocol::schema::v2 as acp;
 use agent_settings::AgentSettings;
 use chrono::{DateTime, Datelike as _, Local, NaiveDate, TimeDelta, Utc};
 use collections::HashMap;
@@ -611,6 +611,7 @@ impl ThreadsArchiveView {
                 let archived_color = Color::Custom(cx.theme().colors().icon_muted.opacity(0.6));
 
                 let base = ThreadItem::new(id, thread.display_title())
+                    .base_bg(cx.theme().colors().panel_background)
                     .icon(icon)
                     .when(is_archived, |this| {
                         this.archived(true)

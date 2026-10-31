@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::sync::LazyLock;
 use std::time::Duration;
 
-use agent_client_protocol::schema::v1 as acp;
+use agent_client_protocol::schema::v2 as acp;
 use anyhow::{Context as _, Result};
 use fs::Fs;
 use futures::FutureExt as _;
@@ -871,12 +871,17 @@ pub fn task_worktree_entity_for_path(
 ) -> Option<Entity<project::Worktree>> {
     let map = PROJECT_TASK_WORKTREES.read();
     let tasks = map.get(&project_id)?;
-    tasks.values().find(|wt| {
-        let abs = wt.read(cx).abs_path();
-        abs.as_ref() == path
-            || util::paths::normalize_lexically(abs.as_ref()).ok().as_deref()
-                == util::paths::normalize_lexically(path).ok().as_deref()
-    }).cloned()
+    tasks
+        .values()
+        .find(|wt| {
+            let abs = wt.read(cx).abs_path();
+            abs.as_ref() == path
+                || util::paths::normalize_lexically(abs.as_ref())
+                    .ok()
+                    .as_deref()
+                    == util::paths::normalize_lexically(path).ok().as_deref()
+        })
+        .cloned()
 }
 
 task_worktree_static!(
@@ -3520,7 +3525,9 @@ async fn detect_repo_author(
     if !name_output.status.success() {
         return None;
     }
-    let name = String::from_utf8_lossy(&name_output.stdout).trim().to_string();
+    let name = String::from_utf8_lossy(&name_output.stdout)
+        .trim()
+        .to_string();
     if name.is_empty() {
         return None;
     }
@@ -3529,7 +3536,9 @@ async fn detect_repo_author(
     if !email_output.status.success() {
         return None;
     }
-    let email = String::from_utf8_lossy(&email_output.stdout).trim().to_string();
+    let email = String::from_utf8_lossy(&email_output.stdout)
+        .trim()
+        .to_string();
     if email.is_empty() {
         return None;
     }

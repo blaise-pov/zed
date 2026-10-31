@@ -842,7 +842,7 @@ impl AgentTaskPanel {
                                 workspace.update(cx, |workspace, cx| {
                                     if let Some(panel) = workspace.panel::<crate::AgentPanel>(cx) {
                                         let session_id =
-                                            agent_client_protocol::schema::v1::SessionId::new(
+                                            agent_client_protocol::schema::v2::SessionId::new(
                                                 session_id_for_open_thread.clone(),
                                             );
                                         let title = goal_title_for_open_thread.clone();
@@ -867,7 +867,7 @@ impl AgentTaskPanel {
                                 workspace.update(cx, |workspace, cx| {
                                     if let Some(panel) = workspace.panel::<crate::AgentPanel>(cx) {
                                         let session_id =
-                                            agent_client_protocol::schema::v1::SessionId::new(
+                                            agent_client_protocol::schema::v2::SessionId::new(
                                                 session_id_for_view_thread.clone(),
                                             );
                                         let title = goal_title_for_view_thread.clone();
@@ -887,7 +887,7 @@ impl AgentTaskPanel {
                         let session_id_for_transcript = session_id;
                         menu = menu.entry("View Thread as Markdown", None, move |window, cx| {
                             let db_task = agent::ThreadsDatabase::connect(cx);
-                            let session_id_acp = agent_client_protocol::schema::v1::SessionId::new(
+                            let session_id_acp = agent_client_protocol::schema::v2::SessionId::new(
                                 session_id_for_transcript.clone(),
                             );
                             let workspace = workspace_for_transcript.clone();
@@ -1204,7 +1204,7 @@ impl AgentTaskPanel {
                         let session_id_for_transcript = session_id.clone();
                         menu = menu.entry("View Thread as Markdown", None, move |window, cx| {
                             let db_task = agent::ThreadsDatabase::connect(cx);
-                            let session_id_acp = agent_client_protocol::schema::v1::SessionId::new(
+                            let session_id_acp = agent_client_protocol::schema::v2::SessionId::new(
                                 session_id_for_transcript.clone(),
                             );
                             let workspace = workspace_for_transcript.clone();
@@ -1250,7 +1250,7 @@ impl AgentTaskPanel {
                                 workspace.update(cx, |workspace, cx| {
                                     if let Some(panel) = workspace.panel::<crate::AgentPanel>(cx) {
                                         let session_id =
-                                            agent_client_protocol::schema::v1::SessionId::new(
+                                            agent_client_protocol::schema::v2::SessionId::new(
                                                 session_id_for_view.clone(),
                                             );
                                         let title = task_title.clone();
@@ -1280,7 +1280,7 @@ impl AgentTaskPanel {
                         let view_for_open_thread = view.clone();
 
                         menu = menu.entry("Open Thread", None, move |window, cx| {
-                            let session_id = agent_client_protocol::schema::v1::SessionId::new(
+                            let session_id = agent_client_protocol::schema::v2::SessionId::new(
                                 session_id_for_open_thread.clone(),
                             );
                             let title = task_title_for_open_thread.clone();
@@ -3045,9 +3045,13 @@ pub fn render_metrics_elements(
 
     if let Some(diff) = &metrics.diff {
         elements.push(
-            DiffStat::new(id.clone(), diff.insertions as usize, diff.deletions as usize)
-                .tooltip(format!("{} files changed", diff.files_changed))
-                .into_any_element(),
+            DiffStat::new(
+                id.clone(),
+                diff.insertions as usize,
+                diff.deletions as usize,
+            )
+            .tooltip(format!("{} files changed", diff.files_changed))
+            .into_any_element(),
         );
     }
 
@@ -5457,10 +5461,7 @@ mod tests {
             "GOAL-1 · 0 / 1 · P1"
         );
 
-        assert_eq!(
-            format_task_meta_line(&task_full),
-            "TASK-1 · agent_engineer"
-        );
+        assert_eq!(format_task_meta_line(&task_full), "TASK-1 · agent_engineer");
         assert_eq!(
             format_goal_meta_line("GOAL-1", &AgentGoalStatus::Completed, 1, 2, 2, None),
             "GOAL-1 · 2 / 2 · P1"
@@ -5494,10 +5495,7 @@ mod tests {
             3,
             Some(&sample_metrics),
         );
-        assert_eq!(
-            goal_meta_no_diff,
-            "GOAL-10 · 3 / 3 · P1 · 14s · 1 · $0.04"
-        );
+        assert_eq!(goal_meta_no_diff, "GOAL-10 · 3 / 3 · P1 · 14s · 1 · $0.04");
         assert!(!goal_meta_no_diff.contains(" ·  · "));
 
         let mut metrics_with_diff = sample_metrics.clone();
@@ -5546,10 +5544,7 @@ mod tests {
             3,
             Some(&metrics_no_cost),
         );
-        assert_eq!(
-            goal_meta_no_cost,
-            "GOAL-10 · 3 / 3 · P1 · 14s · 1 · $0.00"
-        );
+        assert_eq!(goal_meta_no_cost, "GOAL-10 · 3 / 3 · P1 · 14s · 1 · $0.00");
         assert!(!goal_meta_no_cost.contains(" ·  · "));
     }
 

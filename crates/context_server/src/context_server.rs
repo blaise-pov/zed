@@ -15,7 +15,7 @@ use std::time::Duration;
 use std::{fmt::Display, path::PathBuf};
 
 use anyhow::{Context as _, Result};
-use client::Client;
+use client::{Client, StdinPrefix};
 use gpui::AsyncApp;
 use parking_lot::RwLock;
 pub use settings::ContextServerCommand;
@@ -34,7 +34,7 @@ impl Display for ContextServerId {
 }
 
 enum ContextServerTransport {
-    Stdio(ContextServerCommand, Option<PathBuf>),
+    Stdio(ContextServerCommand, Option<PathBuf>, Option<StdinPrefix>),
     Custom(Arc<dyn crate::transport::Transport>),
 }
 
@@ -85,6 +85,7 @@ impl ContextServer {
         id: ContextServerId,
         command: ContextServerCommand,
         working_directory: Option<Arc<Path>>,
+        stdin_prefix: Option<StdinPrefix>,
     ) -> Self {
         Self {
             id,
@@ -92,6 +93,7 @@ impl ContextServer {
             configuration: ContextServerTransport::Stdio(
                 command,
                 working_directory.map(|directory| directory.to_path_buf()),
+                stdin_prefix,
             ),
             request_timeout: None,
         }
@@ -158,7 +160,7 @@ impl ContextServer {
 
     fn new_client(&self, cx: &AsyncApp) -> Result<Client> {
         Ok(match &self.configuration {
-            ContextServerTransport::Stdio(command, working_directory) => {
+            ContextServerTransport::Stdio(command, working_directory, stdin_prefix) => {
                 let command = command.resolve()?;
                 let args = expand_env_vars_in_args(&command.args)?;
                 let env = match &command.env {
@@ -172,6 +174,7 @@ impl ContextServer {
                         args,
                         env,
                         timeout: command.timeout,
+                        stdin_prefix: stdin_prefix.clone(),
                     },
                     working_directory,
                     cx.clone(),

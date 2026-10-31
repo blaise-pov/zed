@@ -1,5 +1,5 @@
 use acp_thread::{SUBAGENT_SESSION_INFO_META_KEY, SubagentSessionInfo};
-use agent_client_protocol::schema::v1 as acp;
+use agent_client_protocol::schema::v2 as acp_v2;
 use anyhow::Result;
 use futures::FutureExt;
 use gpui::{App, SharedString, Task};
@@ -58,7 +58,7 @@ pub struct SpawnAgentToolInput {
     /// Session ID of an existing agent session to continue instead of creating a new one. Omit to create a new agent.
     /// Resumed sessions inherit isolation and fork base from session creation; branch params, worktree_of, and goal_id are forbidden on resume.
     #[serde(default, deserialize_with = "deserialize_session_id")]
-    pub session_id: Option<acp::SessionId>,
+    pub session_id: Option<acp_v2::SessionId>,
     /// Optional reference to a task managed in the Task Graph Service (e.g. `TASK-42`).
     /// Required when task isolation is required by profile, or when base_branch, on_branch, or worktree_of is specified.
     /// If passed alone with an optional-isolation profile and no branch params, the agent runs in shared mode (isolation: shared:task-linked).
@@ -100,7 +100,7 @@ pub struct SpawnAgentToolInput {
     pub model: Option<String>,
 }
 
-fn deserialize_session_id<'de, D>(deserializer: D) -> Result<Option<acp::SessionId>, D::Error>
+fn deserialize_session_id<'de, D>(deserializer: D) -> Result<Option<acp_v2::SessionId>, D::Error>
 where
     D: Deserializer<'de>,
 {
@@ -151,7 +151,7 @@ fn validate_profile(
 #[serde(rename_all = "snake_case")]
 pub enum SpawnAgentToolOutput {
     Success {
-        session_id: acp::SessionId,
+        session_id: acp_v2::SessionId,
         output: String,
         session_info: SubagentSessionInfo,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -162,7 +162,7 @@ pub enum SpawnAgentToolOutput {
     Error {
         #[serde(skip_serializing_if = "Option::is_none")]
         #[serde(default)]
-        session_id: Option<acp::SessionId>,
+        session_id: Option<acp_v2::SessionId>,
         error: String,
         session_info: Option<SubagentSessionInfo>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -288,7 +288,7 @@ where
 /// Tool that spawns an agent thread to work on a task.
 fn cancelled_error(
     stage: &'static str,
-    session_id: Option<acp::SessionId>,
+    session_id: Option<acp_v2::SessionId>,
     session_info: Option<SubagentSessionInfo>,
     isolation: Option<String>,
     isolation_details: Option<SubagentIsolationDetails>,
@@ -345,8 +345,8 @@ impl AgentTool for SpawnAgentTool {
 
     const NAME: &'static str = "spawn_agent";
 
-    fn kind() -> acp::ToolKind {
-        acp::ToolKind::Other
+    fn kind() -> acp_v2::ToolKind {
+        acp_v2::ToolKind::Other
     }
 
     fn initial_title(
@@ -705,7 +705,7 @@ impl AgentTool for SpawnAgentTool {
                     let thread_weak = event_stream.thread().cloned();
                     let thread_id = event_stream
                         .session_id(cx)
-                        .unwrap_or_else(|| acp::SessionId::new("standalone"));
+                        .unwrap_or_else(|| acp_v2::SessionId::new("standalone"));
                     let tool_use_id = event_stream.tool_use_id().clone();
                     let _is_test = thread_weak.is_none();
                     crate::task_worktree::SubagentSessionOwner {
@@ -737,7 +737,7 @@ impl AgentTool for SpawnAgentTool {
                     let thread_weak = event_stream.thread().cloned();
                     let thread_id = event_stream
                         .session_id(cx)
-                        .unwrap_or_else(|| acp::SessionId::new("standalone"));
+                        .unwrap_or_else(|| acp_v2::SessionId::new("standalone"));
                     let tool_use_id = event_stream.tool_use_id().clone();
                     let _is_test = thread_weak.is_none();
                     crate::task_worktree::SubagentSessionOwner {
@@ -962,14 +962,12 @@ impl AgentTool for SpawnAgentTool {
                     );
                 }
 
-                event_stream.subagent_spawned(subagent.id());
-                event_stream.update_fields_with_meta(
-                    acp::ToolCallUpdateFields::new(),
-                    Some(acp::Meta::from_iter([(
+                event_stream.update_fields(|update| {
+                    update.meta(acp_v2::Meta::from_iter([(
                         SUBAGENT_SESSION_INFO_META_KEY.into(),
                         serde_json::json!(&session_info),
-                    )])),
-                );
+                    )]))
+                });
 
                 Ok((subagent, session_info, resolved_model))
             })?;
@@ -1243,14 +1241,14 @@ impl AgentTool for SpawnAgentTool {
 
                 drop(session_guard);
 
-                let meta = Some(acp::Meta::from_iter([(
-                    SUBAGENT_SESSION_INFO_META_KEY.into(),
-                    serde_json::json!(&session_info),
-                )]));
-                event_stream.update_fields_with_meta(
-                    acp::ToolCallUpdateFields::new().content(vec![error_message.clone().into()]),
-                    meta,
-                );
+                event_stream.update_fields(|update| {
+                    update
+                        .content(vec![error_message.clone().into()])
+                        .meta(acp_v2::Meta::from_iter([(
+                            SUBAGENT_SESSION_INFO_META_KEY.into(),
+                            serde_json::json!(&session_info),
+                        )]))
+                });
 
                 return Err(SpawnAgentToolOutput::Error {
                     session_id: Some(session_info.session_id.clone()),
@@ -1650,7 +1648,7 @@ impl AgentTool for SpawnAgentTool {
                     isolation_details,
                 ));
             }
-            let meta = Some(acp::Meta::from_iter([(
+            let meta = Some(acp_v2::Meta::from_iter([(
                 SUBAGENT_SESSION_INFO_META_KEY.into(),
                 serde_json::json!(&session_info),
             )]));
@@ -1680,10 +1678,13 @@ impl AgentTool for SpawnAgentTool {
                     )
                 }
             };
-            event_stream.update_fields_with_meta(
-                acp::ToolCallUpdateFields::new().content(vec![output.into()]),
-                meta,
-            );
+            event_stream.update_fields(|update| {
+                let update = update.content(vec![output.into()]);
+                match meta {
+                    Some(meta) => update.meta(meta),
+                    None => update,
+                }
+            });
             result
         })
     }
@@ -1709,15 +1710,18 @@ impl AgentTool for SpawnAgentTool {
         };
 
         let meta = session_info.map(|session_info| {
-            acp::Meta::from_iter([(
+            acp_v2::Meta::from_iter([(
                 SUBAGENT_SESSION_INFO_META_KEY.into(),
                 serde_json::json!(&session_info),
             )])
         });
-        event_stream.update_fields_with_meta(
-            acp::ToolCallUpdateFields::new().content(vec![content]),
-            meta,
-        );
+        event_stream.update_fields(|update| {
+            let update = update.content(vec![content]);
+            match meta {
+                Some(meta) => update.meta(meta),
+                None => update,
+            }
+        });
 
         Ok(())
     }
@@ -1911,6 +1915,31 @@ async fn compute_turn_diff(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn session_ids_preserve_legacy_tool_json() -> Result<(), serde_json::Error> {
+        let session_id = "  session/雪:\"quoted\"\\opaque  ";
+        let input_json = json!({
+            "label": "label",
+            "message": "message",
+            "session_id": session_id,
+        });
+        let input: SpawnAgentToolInput = serde_json::from_value(input_json.clone())?;
+        assert_eq!(
+            input.session_id.as_ref().map(|id| id.0.as_ref()),
+            Some(session_id)
+        );
+        assert_eq!(serde_json::to_value(input)?, input_json);
+
+        let output_json = json!({
+            "session_id": session_id,
+            "error": "failed after session creation",
+            "session_info": null,
+        });
+        let output: SpawnAgentToolOutput = serde_json::from_value(output_json.clone())?;
+        assert_eq!(serde_json::to_value(output)?, output_json);
+        Ok(())
+    }
 
     #[test]
     fn deserializes_blank_session_id_as_absent() {
@@ -2200,12 +2229,12 @@ Strict Constraints:
     }
 
     struct TestSubagentHandle {
-        session_id: acp::SessionId,
+        session_id: acp_v2::SessionId,
         send_started_tx: Arc<parking_lot::Mutex<Option<futures::channel::oneshot::Sender<()>>>>,
     }
 
     impl crate::thread::SubagentHandle for TestSubagentHandle {
-        fn id(&self) -> acp::SessionId {
+        fn id(&self) -> acp_v2::SessionId {
             self.session_id.clone()
         }
 
@@ -2236,7 +2265,7 @@ Strict Constraints:
         fn create_terminal(
             &self,
             _command: String,
-            _extra_env: Vec<acp::EnvVariable>,
+            _extra_env: Vec<(String, String)>,
             _cwd: Option<std::path::PathBuf>,
             _output_byte_limit: Option<u64>,
             _sandbox_wrap: Option<acp_thread::SandboxWrap>,
@@ -2254,7 +2283,7 @@ Strict Constraints:
             _cx: &mut App,
         ) -> Result<Rc<dyn crate::thread::SubagentHandle>> {
             Ok(Rc::new(TestSubagentHandle {
-                session_id: acp::SessionId::new("mock-subagent-session"),
+                session_id: acp_v2::SessionId::new("mock-subagent-session"),
                 send_started_tx: self.send_started_tx.clone(),
             }))
         }

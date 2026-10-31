@@ -2,7 +2,7 @@ use std::fmt::Write;
 use std::path::Path;
 use std::sync::Arc;
 
-use agent_client_protocol::schema::v1 as acp;
+use agent_client_protocol::schema::v2 as acp;
 use agent_settings::{AgentPermissionMode, AgentProfileSettings};
 use gpui::{App, Entity, SharedString, Task};
 use project::Project;

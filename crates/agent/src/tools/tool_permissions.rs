@@ -2,7 +2,7 @@ use crate::{
     Thread, ToolCallEventStream, ToolPermissionContext, ToolPermissionDecision,
     decide_permission_for_path_with_profile,
 };
-use agent_client_protocol::schema::v1 as acp;
+use agent_client_protocol::schema::v2 as acp;
 use agent_settings::{AgentPermissionMode, AgentProfileSettings};
 use agent_skills::is_agents_skills_path;
 use anyhow::{Result, anyhow, bail};
@@ -12,7 +12,7 @@ use project::{Project, ProjectPath};
 use settings::Settings;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
-use util::{normalize_path, paths::component_matches_ignore_ascii_case, rel_path::RelPath};
+use util::{paths::component_matches_ignore_ascii_case, paths::normalize_path, rel_path::RelPath};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SensitiveSettingsKind {
@@ -574,8 +574,7 @@ pub fn resolve_project_path(
 
 /// Returns true if `path` is inside `task_worktree` (or equal to it).
 pub fn is_inside_task_worktree(path: &Path, task_worktree: &Path) -> bool {
-    let norm_path = util::paths::normalize_lexically(path)
-        .unwrap_or_else(|_| normalize_path(path));
+    let norm_path = util::paths::normalize_lexically(path).unwrap_or_else(|_| normalize_path(path));
     let norm_task = util::paths::normalize_lexically(task_worktree)
         .unwrap_or_else(|_| normalize_path(task_worktree));
 
@@ -2450,7 +2449,10 @@ mod tests {
         });
 
         let auth = rx.expect_authorization().await;
-        let title = auth.tool_call.fields.title.unwrap_or_default();
+        let title = match &auth.tool_call.title {
+            agent_client_protocol::schema::MaybeUndefined::Value(title) => title.as_str(),
+            _ => "",
+        };
         assert!(
             title.contains("(hidden / configuration file)"),
             "expected prompt title to contain '(hidden / configuration file)', got: {title}"

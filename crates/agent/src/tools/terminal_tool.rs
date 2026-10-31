@@ -1,4 +1,5 @@
-use agent_client_protocol::schema::v1 as acp;
+use acp_thread::ProcessOutput;
+use agent_client_protocol::schema::v2 as acp_v2;
 use agent_settings::{AgentPermissionMode, AgentProfileSettings};
 use anyhow::Result;
 use brush_parser::ast;
@@ -653,8 +654,8 @@ impl AgentTool for TerminalTool {
 
     const NAME: &'static str = "terminal";
 
-    fn kind() -> acp::ToolKind {
-        acp::ToolKind::Execute
+    fn kind() -> acp_v2::ToolKind {
+        acp_v2::ToolKind::Execute
     }
 
     fn allow_in_restricted_mode() -> bool {
@@ -705,8 +706,8 @@ impl AgentTool for SandboxedTerminalTool {
 
     const NAME: &'static str = "sandboxed_terminal";
 
-    fn kind() -> acp::ToolKind {
-        acp::ToolKind::Execute
+    fn kind() -> acp_v2::ToolKind {
+        acp_v2::ToolKind::Execute
     }
 
     fn allow_in_restricted_mode() -> bool {
@@ -1008,12 +1009,10 @@ pub fn validate_terminal_dot_paths(
         if !in_scope {
             let display_path = target.display_path();
             return match mode {
-                AgentPermissionMode::Autonomous => TerminalDotPathValidation::Denied {
-                    path: display_path,
-                },
-                _ => TerminalDotPathValidation::NeedsPrompt {
-                    path: display_path,
-                },
+                AgentPermissionMode::Autonomous => {
+                    TerminalDotPathValidation::Denied { path: display_path }
+                }
+                _ => TerminalDotPathValidation::NeedsPrompt { path: display_path },
             };
         }
     }
@@ -1246,27 +1245,28 @@ fn extract_targets_from_simple_command(
         .and_then(|f| f.to_str())
         .unwrap_or(raw_cmd);
 
-    let (effective_exec, cmd_args) = if (exec_name == "sudo" || exec_name == "env") && words.len() > 1 {
-        let mut next_cmd_idx = None;
-        for (i, word) in words.iter().enumerate().skip(1) {
-            if !word.starts_with('-') && !word.contains('=') {
-                next_cmd_idx = Some(i);
-                break;
+    let (effective_exec, cmd_args) =
+        if (exec_name == "sudo" || exec_name == "env") && words.len() > 1 {
+            let mut next_cmd_idx = None;
+            for (i, word) in words.iter().enumerate().skip(1) {
+                if !word.starts_with('-') && !word.contains('=') {
+                    next_cmd_idx = Some(i);
+                    break;
+                }
             }
-        }
-        if let Some(idx) = next_cmd_idx {
-            let raw = &words[idx];
-            let name = Path::new(raw)
-                .file_name()
-                .and_then(|f| f.to_str())
-                .unwrap_or(raw);
-            (name, &words[idx + 1..])
+            if let Some(idx) = next_cmd_idx {
+                let raw = &words[idx];
+                let name = Path::new(raw)
+                    .file_name()
+                    .and_then(|f| f.to_str())
+                    .unwrap_or(raw);
+                (name, &words[idx + 1..])
+            } else {
+                (exec_name, &words[1..])
+            }
         } else {
             (exec_name, &words[1..])
-        }
-    } else {
-        (exec_name, &words[1..])
-    };
+        };
 
     match effective_exec {
         "cd" => {
@@ -1934,12 +1934,8 @@ fn normalize_word_piece_into(
 }
 
 fn word_to_string(word: &ast::Word) -> String {
-    normalize_word(word).unwrap_or_else(|| {
-        word.value
-            .trim_matches('\'')
-            .trim_matches('"')
-            .to_string()
-    })
+    normalize_word(word)
+        .unwrap_or_else(|| word.value.trim_matches('\'').trim_matches('"').to_string())
 }
 
 fn is_known_safe_redirect_target(normalized_target: &str) -> bool {
@@ -2586,27 +2582,29 @@ async fn run_terminal_tool(
     });
 
     let terminal_id = terminal.id(cx).map_err(|e| e.to_string())?;
-    let fields = acp::ToolCallUpdateFields::new().content(vec![acp::ToolCallContent::Terminal(
-        acp::Terminal::new(terminal_id),
-    )]);
-    let mut meta_entries = Vec::new();
-    if let Some(reason) = &sandbox_not_applied {
-        meta_entries.push((
-            acp_thread::SANDBOX_NOT_APPLIED_META_KEY.into(),
-            serde_json::to_value(reason).unwrap_or_default(),
-        ));
-    }
-    if let Some(warning) = &wrapper_warning {
-        meta_entries.push((
-            acp_thread::TERMINAL_WRAPPER_WARNING_META_KEY.into(),
-            serde_json::to_value(warning).unwrap_or_default(),
-        ));
-    }
-    if !meta_entries.is_empty() {
-        event_stream.update_fields_with_meta(fields, Some(acp::Meta::from_iter(meta_entries)));
-    } else {
-        event_stream.update_fields(fields);
-    }
+    event_stream.update_fields(|update| {
+        let update = update.content(vec![acp_v2::ToolCallContent::Terminal(
+            acp_v2::Terminal::new(terminal_id),
+        )]);
+        let mut meta_entries = Vec::new();
+        if let Some(reason) = &sandbox_not_applied {
+            meta_entries.push((
+                acp_thread::SANDBOX_NOT_APPLIED_META_KEY.into(),
+                serde_json::to_value(reason).unwrap_or_default(),
+            ));
+        }
+        if let Some(warning) = &wrapper_warning {
+            meta_entries.push((
+                acp_thread::TERMINAL_WRAPPER_WARNING_META_KEY.into(),
+                serde_json::to_value(warning).unwrap_or_default(),
+            ));
+        }
+        if meta_entries.is_empty() {
+            update
+        } else {
+            update.meta(acp_v2::Meta::from_iter(meta_entries))
+        }
+    });
 
     let timeout = input.timeout_ms.map(Duration::from_millis);
 
@@ -2949,7 +2947,7 @@ fn format_watchdog_cap_duration(cap_milliseconds: u64) -> String {
 }
 
 fn process_content(
-    output: acp::TerminalOutputResponse,
+    output: ProcessOutput,
     command: &str,
     timed_out: bool,
     user_stopped: bool,
@@ -3166,27 +3164,27 @@ fn resolve_cd_in_task_worktree(
         return Ok(normalized_task_worktree);
     }
 
-    let cd_norm = path_style.normalize(cd);
-    if cd_norm.is_empty() || cd_norm == "." {
+    let cd_norm = path_style.normalize_lexically(cd);
+    if cd_norm.is_empty() || cd_norm == Path::new(".") {
         return Ok(normalized_task_worktree);
     }
 
     let cd_path = Path::new(&cd_norm);
-    let is_absolute = path_style.is_absolute(&cd_norm);
+    let is_absolute = path_style.is_absolute(cd_path);
 
     let task_worktree_subpath = if is_absolute {
         task_worktree
             .to_str()
             .and_then(|str_path| {
-                let prefix = path_style.normalize(str_path);
-                let subpath = path_style.strip_prefix(cd_path, Path::new(&prefix))?;
-                Some(subpath.display(path_style).to_string())
+                let prefix = path_style.normalize_lexically(str_path);
+                let subpath = path_style.strip_prefix(cd_path, prefix).ok()?;
+                Some(subpath.display().to_string())
             })
             .or_else(|| {
                 normalized_task_worktree.to_str().and_then(|str_path| {
-                    let prefix = path_style.normalize(str_path);
-                    let subpath = path_style.strip_prefix(cd_path, Path::new(&prefix))?;
-                    Some(subpath.display(path_style).to_string())
+                    let prefix = path_style.normalize_lexically(str_path);
+                    let subpath = path_style.strip_prefix(cd_path, prefix).ok()?;
+                    Some(subpath.display().to_string())
                 })
             })
     } else {
@@ -3195,8 +3193,8 @@ fn resolve_cd_in_task_worktree(
             .and_then(|name| name.to_str())
             .filter(|name| !name.is_empty())
             .and_then(|name| {
-                let subpath = path_style.strip_prefix(cd_path, Path::new(name))?;
-                Some(subpath.display(path_style).to_string())
+                let subpath = path_style.strip_prefix(cd_path, name).ok()?;
+                Some(subpath.display().to_string())
             })
     };
 
@@ -3205,19 +3203,19 @@ fn resolve_cd_in_task_worktree(
             abs_path
                 .to_str()
                 .and_then(|str_path| {
-                    let prefix = path_style.normalize(str_path);
-                    let subpath = path_style.strip_prefix(cd_path, Path::new(&prefix))?;
-                    Some(subpath.display(path_style).to_string())
+                    let prefix = path_style.normalize_lexically(str_path);
+                    let subpath = path_style.strip_prefix(cd_path, prefix).ok()?;
+                    Some(subpath.display().to_string())
                 })
                 .or_else(|| {
                     let normalized = util::paths::normalize_lexically(abs_path).ok()?;
-                    let prefix = path_style.normalize(normalized.to_str()?);
-                    let subpath = path_style.strip_prefix(cd_path, Path::new(&prefix))?;
-                    Some(subpath.display(path_style).to_string())
+                    let prefix = path_style.normalize_lexically(normalized.to_str()?);
+                    let subpath = path_style.strip_prefix(cd_path, prefix).ok()?;
+                    Some(subpath.display().to_string())
                 })
         } else {
-            let subpath = path_style.strip_prefix(cd_path, Path::new(root_name))?;
-            Some(subpath.display(path_style).to_string())
+            let subpath = path_style.strip_prefix(cd_path, root_name).ok()?;
+            Some(subpath.display().to_string())
         }
     });
 
@@ -3266,23 +3264,27 @@ fn resolve_cd_in_worktrees(
     path_style: util::paths::PathStyle,
     worktree_roots: &[(&str, PathBuf)],
 ) -> Option<PathBuf> {
-    let cd = path_style.normalize(cd);
-    let cd_path = Path::new(&cd);
-    let is_absolute = path_style.is_absolute(&cd);
+    let cd_path = path_style.normalize_lexically(cd);
+    let is_absolute = path_style.is_absolute(&cd_path);
 
     worktree_roots.iter().find_map(|(root_name, abs_path)| {
-        let prefix = if is_absolute {
-            path_style.normalize(abs_path.to_str()?)
+        let abs_path = path_style.normalize_lexically(abs_path);
+        let prefix: &Path = if is_absolute {
+            &abs_path
         } else {
-            (*root_name).to_string()
+            Path::new(*root_name)
         };
-        let subpath = path_style.strip_prefix(cd_path, Path::new(&prefix))?;
-        if subpath.is_empty() {
-            Some(abs_path.clone())
+        let subpath = path_style.strip_prefix(&cd_path, prefix).ok()?;
+        let resolved_path = if subpath.is_empty() {
+            abs_path.clone()
         } else {
-            path_style
-                .join_path(abs_path, &*subpath.display(path_style))
-                .ok()
+            path_style.join_path(&abs_path, subpath).ok()?
+        };
+
+        if path_style.starts_with(&resolved_path, &abs_path) {
+            Some(resolved_path)
+        } else {
+            None
         }
     })
 }
@@ -3309,7 +3311,10 @@ mod tests {
         assert!(targets[0].is_dot_path());
 
         let targets = extract_terminal_mutation_targets("cmd > /dev/null 2> /dev/null", ".");
-        assert!(targets.is_empty(), "/dev/null redirect should not be extracted as mutation target");
+        assert!(
+            targets.is_empty(),
+            "/dev/null redirect should not be extracted as mutation target"
+        );
     }
 
     #[test]
@@ -3341,10 +3346,18 @@ mod tests {
         // mv
         let targets = extract_terminal_mutation_targets("mv src.txt .dest.txt", ".");
         assert_eq!(targets.len(), 2);
-        assert!(targets.iter().any(|t| t.raw_path == ".dest.txt" && t.is_dot_path()));
+        assert!(
+            targets
+                .iter()
+                .any(|t| t.raw_path == ".dest.txt" && t.is_dot_path())
+        );
 
         let targets = extract_terminal_mutation_targets("mv -t .backup file.txt", ".");
-        assert!(targets.iter().any(|t| t.raw_path == ".backup" && t.is_dot_path()));
+        assert!(
+            targets
+                .iter()
+                .any(|t| t.raw_path == ".backup" && t.is_dot_path())
+        );
 
         // cp (destination only)
         let targets = extract_terminal_mutation_targets("cp src.txt .dest.txt", ".");
@@ -3353,7 +3366,11 @@ mod tests {
         assert!(targets[0].is_dot_path());
 
         let targets = extract_terminal_mutation_targets("cp -t .backup file.txt", ".");
-        assert!(targets.iter().any(|t| t.raw_path == ".backup" && t.is_dot_path()));
+        assert!(
+            targets
+                .iter()
+                .any(|t| t.raw_path == ".backup" && t.is_dot_path())
+        );
 
         // touch
         let targets = extract_terminal_mutation_targets("touch .env", ".");
@@ -3442,13 +3459,19 @@ mod tests {
         assert!(targets[0].is_dot_path());
 
         let targets = extract_terminal_mutation_targets("git checkout main", ".");
-        assert!(targets.is_empty(), "branch checkout is not a dot-path mutation target");
+        assert!(
+            targets.is_empty(),
+            "branch checkout is not a dot-path mutation target"
+        );
 
         // git -C
         let targets = extract_terminal_mutation_targets("git -C .github add ci.yml", ".");
         assert_eq!(targets.len(), 1);
         assert_eq!(targets[0].raw_path, "ci.yml");
-        assert!(targets[0].is_dot_path(), "git -C .github should make target a dot-path");
+        assert!(
+            targets[0].is_dot_path(),
+            "git -C .github should make target a dot-path"
+        );
     }
 
     #[test]
@@ -3808,7 +3831,11 @@ mod tests {
         });
 
         let result = task.await;
-        assert!(result.is_err(), "expected PolicyDenied error, got: {:?}", result);
+        assert!(
+            result.is_err(),
+            "expected PolicyDenied error, got: {:?}",
+            result
+        );
         let err = result.unwrap_err();
         assert!(
             err.contains("PolicyDenied: Terminal command mutates/stages hidden path '.env' without explicit write_scope"),
@@ -3881,18 +3908,22 @@ mod tests {
         });
 
         let auth = rx.expect_authorization().await;
-        let title = auth.tool_call.fields.title.unwrap_or_default();
+        let title = match &auth.tool_call.title {
+            agent_client_protocol::schema::MaybeUndefined::Value(title) => title.clone(),
+            _ => String::new(),
+        };
         assert!(
             title.contains("(hidden / configuration file)"),
             "expected prompt title to contain '(hidden / configuration file)', got: {title}"
         );
-        assert!(auth
-            .response
-            .send(acp_thread::SelectedPermissionOutcome::new(
-                acp::PermissionOptionId::new("allow"),
-                acp::PermissionOptionKind::AllowOnce,
-            ))
-            .is_ok());
+        assert!(
+            auth.response
+                .send(acp_thread::SelectedPermissionOutcome::new(
+                    acp_v2::PermissionOptionId::new("allow"),
+                    acp_v2::PermissionOptionKind::AllowOnce,
+                ))
+                .is_ok()
+        );
 
         task.await.unwrap();
     }
@@ -3909,6 +3940,8 @@ mod tests {
         // Worktree roots are stored with backslash separators on Windows, but
         // models frequently write paths with forward slashes; both must match.
         let windows_roots = vec![("worktree", PathBuf::from("C:\\work\\worktree"))];
+
+        let windows_verbatim_roots = vec![("worktree", PathBuf::from(r"\\?\C:\work\worktree"))];
 
         // absolute paths
         assert_eq!(
@@ -4015,6 +4048,17 @@ mod tests {
             None,
             "a Windows-absolute path that escapes its worktree via `..` is rejected"
         );
+
+        // Windows verbatim path
+        assert_eq!(
+            resolve_cd_in_worktrees(
+                r"\\?\C:\work\worktree\../another",
+                Windows,
+                &windows_verbatim_roots
+            ),
+            None,
+            "The Windows verbatim path should not return a path that escapes its worktree"
+        );
     }
 
     #[test]
@@ -4045,48 +4089,86 @@ mod tests {
                 PathBuf::from("/worktrees/zed/agent-task-1")
             );
             assert_eq!(
-                resolve_cd_in_task_worktree("zed/crates/agent", Unix, &task_worktree, &unix_roots).unwrap(),
+                resolve_cd_in_task_worktree("zed/crates/agent", Unix, &task_worktree, &unix_roots)
+                    .unwrap(),
                 PathBuf::from("/worktrees/zed/agent-task-1/crates/agent")
             );
             assert_eq!(
-                resolve_cd_in_task_worktree("crates/agent", Unix, &task_worktree, &unix_roots).unwrap(),
+                resolve_cd_in_task_worktree("crates/agent", Unix, &task_worktree, &unix_roots)
+                    .unwrap(),
                 PathBuf::from("/worktrees/zed/agent-task-1/crates/agent")
             );
             assert_eq!(
-                resolve_cd_in_task_worktree("./crates/agent", Unix, &task_worktree, &unix_roots).unwrap(),
+                resolve_cd_in_task_worktree("./crates/agent", Unix, &task_worktree, &unix_roots)
+                    .unwrap(),
                 PathBuf::from("/worktrees/zed/agent-task-1/crates/agent")
             );
             assert_eq!(
-                resolve_cd_in_task_worktree("/projects/zed", Unix, &task_worktree, &unix_roots).unwrap(),
+                resolve_cd_in_task_worktree("/projects/zed", Unix, &task_worktree, &unix_roots)
+                    .unwrap(),
                 PathBuf::from("/worktrees/zed/agent-task-1")
             );
             assert_eq!(
-                resolve_cd_in_task_worktree("/projects/zed/crates/agent", Unix, &task_worktree, &unix_roots).unwrap(),
+                resolve_cd_in_task_worktree(
+                    "/projects/zed/crates/agent",
+                    Unix,
+                    &task_worktree,
+                    &unix_roots
+                )
+                .unwrap(),
                 PathBuf::from("/worktrees/zed/agent-task-1/crates/agent")
             );
             assert_eq!(
-                resolve_cd_in_task_worktree("agent-task-1", Unix, &task_worktree, &unix_roots).unwrap(),
+                resolve_cd_in_task_worktree("agent-task-1", Unix, &task_worktree, &unix_roots)
+                    .unwrap(),
                 PathBuf::from("/worktrees/zed/agent-task-1")
             );
             assert_eq!(
-                resolve_cd_in_task_worktree("agent-task-1/crates/agent", Unix, &task_worktree, &unix_roots).unwrap(),
+                resolve_cd_in_task_worktree(
+                    "agent-task-1/crates/agent",
+                    Unix,
+                    &task_worktree,
+                    &unix_roots
+                )
+                .unwrap(),
                 PathBuf::from("/worktrees/zed/agent-task-1/crates/agent")
             );
             assert_eq!(
-                resolve_cd_in_task_worktree("/worktrees/zed/agent-task-1", Unix, &task_worktree, &unix_roots).unwrap(),
+                resolve_cd_in_task_worktree(
+                    "/worktrees/zed/agent-task-1",
+                    Unix,
+                    &task_worktree,
+                    &unix_roots
+                )
+                .unwrap(),
                 PathBuf::from("/worktrees/zed/agent-task-1")
             );
             assert_eq!(
-                resolve_cd_in_task_worktree("/worktrees/zed/agent-task-1/crates/agent", Unix, &task_worktree, &unix_roots).unwrap(),
+                resolve_cd_in_task_worktree(
+                    "/worktrees/zed/agent-task-1/crates/agent",
+                    Unix,
+                    &task_worktree,
+                    &unix_roots
+                )
+                .unwrap(),
                 PathBuf::from("/worktrees/zed/agent-task-1/crates/agent")
             );
             assert_eq!(
                 resolve_cd_in_task_worktree("zedextra", Unix, &task_worktree, &unix_roots).unwrap(),
                 PathBuf::from("/worktrees/zed/agent-task-1/zedextra")
             );
-            assert!(resolve_cd_in_task_worktree("../escape", Unix, &task_worktree, &unix_roots).is_err());
-            assert!(resolve_cd_in_task_worktree("zed/../../escape", Unix, &task_worktree, &unix_roots).is_err());
-            assert!(resolve_cd_in_task_worktree("/other/dir", Unix, &task_worktree, &unix_roots).is_err());
+            assert!(
+                resolve_cd_in_task_worktree("../escape", Unix, &task_worktree, &unix_roots)
+                    .is_err()
+            );
+            assert!(
+                resolve_cd_in_task_worktree("zed/../../escape", Unix, &task_worktree, &unix_roots)
+                    .is_err()
+            );
+            assert!(
+                resolve_cd_in_task_worktree("/other/dir", Unix, &task_worktree, &unix_roots)
+                    .is_err()
+            );
         }
 
         #[cfg(target_os = "windows")]
@@ -4112,77 +4194,186 @@ mod tests {
                 PathBuf::from("C:\\worktrees\\zed\\agent-task-1")
             );
             assert_eq!(
-                resolve_cd_in_task_worktree("zed", Windows, &task_worktree, &windows_roots).unwrap(),
+                resolve_cd_in_task_worktree("zed", Windows, &task_worktree, &windows_roots)
+                    .unwrap(),
                 PathBuf::from("C:\\worktrees\\zed\\agent-task-1")
             );
             assert_eq!(
-                resolve_cd_in_task_worktree("zed/crates/agent", Windows, &task_worktree, &windows_roots).unwrap(),
+                resolve_cd_in_task_worktree(
+                    "zed/crates/agent",
+                    Windows,
+                    &task_worktree,
+                    &windows_roots
+                )
+                .unwrap(),
                 PathBuf::from("C:\\worktrees\\zed\\agent-task-1\\crates\\agent")
             );
             assert_eq!(
-                resolve_cd_in_task_worktree("zed\\crates\\agent", Windows, &task_worktree, &windows_roots).unwrap(),
+                resolve_cd_in_task_worktree(
+                    "zed\\crates\\agent",
+                    Windows,
+                    &task_worktree,
+                    &windows_roots
+                )
+                .unwrap(),
                 PathBuf::from("C:\\worktrees\\zed\\agent-task-1\\crates\\agent")
             );
             assert_eq!(
-                resolve_cd_in_task_worktree("crates/agent", Windows, &task_worktree, &windows_roots).unwrap(),
+                resolve_cd_in_task_worktree(
+                    "crates/agent",
+                    Windows,
+                    &task_worktree,
+                    &windows_roots
+                )
+                .unwrap(),
                 PathBuf::from("C:\\worktrees\\zed\\agent-task-1\\crates\\agent")
             );
             assert_eq!(
-                resolve_cd_in_task_worktree("crates\\agent", Windows, &task_worktree, &windows_roots).unwrap(),
+                resolve_cd_in_task_worktree(
+                    "crates\\agent",
+                    Windows,
+                    &task_worktree,
+                    &windows_roots
+                )
+                .unwrap(),
                 PathBuf::from("C:\\worktrees\\zed\\agent-task-1\\crates\\agent")
             );
             assert_eq!(
-                resolve_cd_in_task_worktree("./crates/agent", Windows, &task_worktree, &windows_roots).unwrap(),
+                resolve_cd_in_task_worktree(
+                    "./crates/agent",
+                    Windows,
+                    &task_worktree,
+                    &windows_roots
+                )
+                .unwrap(),
                 PathBuf::from("C:\\worktrees\\zed\\agent-task-1\\crates\\agent")
             );
             assert_eq!(
-                resolve_cd_in_task_worktree(".\\crates\\agent", Windows, &task_worktree, &windows_roots).unwrap(),
+                resolve_cd_in_task_worktree(
+                    ".\\crates\\agent",
+                    Windows,
+                    &task_worktree,
+                    &windows_roots
+                )
+                .unwrap(),
                 PathBuf::from("C:\\worktrees\\zed\\agent-task-1\\crates\\agent")
             );
             assert_eq!(
-                resolve_cd_in_task_worktree("C:/projects/zed", Windows, &task_worktree, &windows_roots).unwrap(),
+                resolve_cd_in_task_worktree(
+                    "C:/projects/zed",
+                    Windows,
+                    &task_worktree,
+                    &windows_roots
+                )
+                .unwrap(),
                 PathBuf::from("C:\\worktrees\\zed\\agent-task-1")
             );
             assert_eq!(
-                resolve_cd_in_task_worktree("C:\\projects\\zed", Windows, &task_worktree, &windows_roots).unwrap(),
+                resolve_cd_in_task_worktree(
+                    "C:\\projects\\zed",
+                    Windows,
+                    &task_worktree,
+                    &windows_roots
+                )
+                .unwrap(),
                 PathBuf::from("C:\\worktrees\\zed\\agent-task-1")
             );
             assert_eq!(
-                resolve_cd_in_task_worktree("C:/projects/zed/crates/agent", Windows, &task_worktree, &windows_roots).unwrap(),
+                resolve_cd_in_task_worktree(
+                    "C:/projects/zed/crates/agent",
+                    Windows,
+                    &task_worktree,
+                    &windows_roots
+                )
+                .unwrap(),
                 PathBuf::from("C:\\worktrees\\zed\\agent-task-1\\crates\\agent")
             );
             assert_eq!(
-                resolve_cd_in_task_worktree("c:\\projects\\zed\\crates\\agent", Windows, &task_worktree, &windows_roots).unwrap(),
+                resolve_cd_in_task_worktree(
+                    "c:\\projects\\zed\\crates\\agent",
+                    Windows,
+                    &task_worktree,
+                    &windows_roots
+                )
+                .unwrap(),
                 PathBuf::from("C:\\worktrees\\zed\\agent-task-1\\crates\\agent")
             );
             assert_eq!(
-                resolve_cd_in_task_worktree("agent-task-1", Windows, &task_worktree, &windows_roots).unwrap(),
+                resolve_cd_in_task_worktree(
+                    "agent-task-1",
+                    Windows,
+                    &task_worktree,
+                    &windows_roots
+                )
+                .unwrap(),
                 PathBuf::from("C:\\worktrees\\zed\\agent-task-1")
             );
             assert_eq!(
-                resolve_cd_in_task_worktree("agent-task-1\\crates\\agent", Windows, &task_worktree, &windows_roots).unwrap(),
+                resolve_cd_in_task_worktree(
+                    "agent-task-1\\crates\\agent",
+                    Windows,
+                    &task_worktree,
+                    &windows_roots
+                )
+                .unwrap(),
                 PathBuf::from("C:\\worktrees\\zed\\agent-task-1\\crates\\agent")
             );
             assert_eq!(
-                resolve_cd_in_task_worktree("agent-task-1/crates/agent", Windows, &task_worktree, &windows_roots).unwrap(),
+                resolve_cd_in_task_worktree(
+                    "agent-task-1/crates/agent",
+                    Windows,
+                    &task_worktree,
+                    &windows_roots
+                )
+                .unwrap(),
                 PathBuf::from("C:\\worktrees\\zed\\agent-task-1\\crates\\agent")
             );
             assert_eq!(
-                resolve_cd_in_task_worktree("C:\\worktrees\\zed\\agent-task-1", Windows, &task_worktree, &windows_roots).unwrap(),
+                resolve_cd_in_task_worktree(
+                    "C:\\worktrees\\zed\\agent-task-1",
+                    Windows,
+                    &task_worktree,
+                    &windows_roots
+                )
+                .unwrap(),
                 PathBuf::from("C:\\worktrees\\zed\\agent-task-1")
             );
             assert_eq!(
-                resolve_cd_in_task_worktree("C:\\worktrees\\zed\\agent-task-1\\crates\\agent", Windows, &task_worktree, &windows_roots).unwrap(),
+                resolve_cd_in_task_worktree(
+                    "C:\\worktrees\\zed\\agent-task-1\\crates\\agent",
+                    Windows,
+                    &task_worktree,
+                    &windows_roots
+                )
+                .unwrap(),
                 PathBuf::from("C:\\worktrees\\zed\\agent-task-1\\crates\\agent")
             );
             assert_eq!(
-                resolve_cd_in_task_worktree("zedextra", Windows, &task_worktree, &windows_roots).unwrap(),
+                resolve_cd_in_task_worktree("zedextra", Windows, &task_worktree, &windows_roots)
+                    .unwrap(),
                 PathBuf::from("C:\\worktrees\\zed\\agent-task-1\\zedextra")
             );
-            assert!(resolve_cd_in_task_worktree("..\\escape", Windows, &task_worktree, &windows_roots).is_err());
-            assert!(resolve_cd_in_task_worktree("../escape", Windows, &task_worktree, &windows_roots).is_err());
-            assert!(resolve_cd_in_task_worktree("zed/../../escape", Windows, &task_worktree, &windows_roots).is_err());
-            assert!(resolve_cd_in_task_worktree("D:\\other", Windows, &task_worktree, &windows_roots).is_err());
+            assert!(
+                resolve_cd_in_task_worktree("..\\escape", Windows, &task_worktree, &windows_roots)
+                    .is_err()
+            );
+            assert!(
+                resolve_cd_in_task_worktree("../escape", Windows, &task_worktree, &windows_roots)
+                    .is_err()
+            );
+            assert!(
+                resolve_cd_in_task_worktree(
+                    "zed/../../escape",
+                    Windows,
+                    &task_worktree,
+                    &windows_roots
+                )
+                .is_err()
+            );
+            assert!(
+                resolve_cd_in_task_worktree("D:\\other", Windows, &task_worktree, &windows_roots)
+                    .is_err()
+            );
         }
     }
 
@@ -4267,7 +4458,7 @@ mod tests {
 
     #[test]
     fn test_process_content_user_stopped() {
-        let output = acp::TerminalOutputResponse::new("partial output".to_string(), false);
+        let output = ProcessOutput::new("partial output".to_string(), false);
 
         let result = process_content(
             output,
@@ -4504,8 +4695,8 @@ mod tests {
 
     #[test]
     fn test_process_content_filters_success_output_for_model() {
-        let output = acp::TerminalOutputResponse::new("one\ntwo\nthree\nfour".to_string(), false)
-            .exit_status(acp::TerminalExitStatus::new().exit_code(0));
+        let output = ProcessOutput::new("one\ntwo\nthree\nfour".to_string(), false)
+            .exit_status(acp_v2::TerminalExitStatus::new().exit_code(0));
 
         let result = process_content(
             output,
@@ -4524,8 +4715,8 @@ mod tests {
 
     #[test]
     fn test_process_content_filters_failure_output_for_model() {
-        let output = acp::TerminalOutputResponse::new("one\ntwo\nthree".to_string(), false)
-            .exit_status(acp::TerminalExitStatus::new().exit_code(1));
+        let output = ProcessOutput::new("one\ntwo\nthree".to_string(), false)
+            .exit_status(acp_v2::TerminalExitStatus::new().exit_code(1));
 
         let result = process_content(
             output,
@@ -4547,7 +4738,7 @@ mod tests {
 
     #[test]
     fn test_process_content_filters_timeout_output_for_model() {
-        let output = acp::TerminalOutputResponse::new("one\ntwo\nthree".to_string(), false);
+        let output = ProcessOutput::new("one\ntwo\nthree".to_string(), false);
 
         let result = process_content(
             output,
@@ -4569,7 +4760,7 @@ mod tests {
 
     #[test]
     fn test_process_content_filters_watchdog_output_for_model() {
-        let output = acp::TerminalOutputResponse::new(
+        let output = ProcessOutput::new(
             "alpha
 beta
 gamma"
@@ -4597,7 +4788,7 @@ gamma"
 
     #[test]
     fn test_process_content_filters_user_stopped_output_for_model() {
-        let output = acp::TerminalOutputResponse::new("one\ntwo\nthree".to_string(), false);
+        let output = ProcessOutput::new("one\ntwo\nthree".to_string(), false);
 
         let result = process_content(
             output,
@@ -4620,8 +4811,8 @@ gamma"
 
     #[test]
     fn test_process_content_selected_output_has_no_explanatory_note() {
-        let output = acp::TerminalOutputResponse::new("one\ntwo\nthree".to_string(), false)
-            .exit_status(acp::TerminalExitStatus::new().exit_code(0));
+        let output = ProcessOutput::new("one\ntwo\nthree".to_string(), false)
+            .exit_status(acp_v2::TerminalExitStatus::new().exit_code(0));
 
         let result = process_content(
             output,
@@ -4642,7 +4833,7 @@ gamma"
 
     #[test]
     fn test_process_content_user_stopped_empty_output() {
-        let output = acp::TerminalOutputResponse::new("".to_string(), false);
+        let output = ProcessOutput::new("".to_string(), false);
 
         let result = process_content(
             output,
@@ -4667,7 +4858,7 @@ gamma"
 
     #[test]
     fn test_process_content_timed_out() {
-        let output = acp::TerminalOutputResponse::new("build output here".to_string(), false);
+        let output = ProcessOutput::new("build output here".to_string(), false);
 
         let result = process_content(
             output,
@@ -4692,7 +4883,7 @@ gamma"
 
     #[test]
     fn test_process_content_timed_out_with_empty_output() {
-        let output = acp::TerminalOutputResponse::new("".to_string(), false);
+        let output = ProcessOutput::new("".to_string(), false);
 
         let result = process_content(
             output,
@@ -4717,7 +4908,7 @@ gamma"
 
     #[test]
     fn test_process_content_watchdog_idle() {
-        let output = acp::TerminalOutputResponse::new("hanging output here".to_string(), false);
+        let output = ProcessOutput::new("hanging output here".to_string(), false);
 
         let result = process_content(
             output,
@@ -4757,7 +4948,7 @@ gamma"
 
     #[test]
     fn test_process_content_watchdog_idle_with_empty_output() {
-        let output = acp::TerminalOutputResponse::new("".to_string(), false);
+        let output = ProcessOutput::new("".to_string(), false);
 
         let result = process_content(
             output,
@@ -4797,7 +4988,7 @@ gamma"
 
     #[test]
     fn test_process_content_watchdog_hard_cap() {
-        let output = acp::TerminalOutputResponse::new("busy loop output".to_string(), false);
+        let output = ProcessOutput::new("busy loop output".to_string(), false);
 
         let result = process_content(
             output,
@@ -4832,7 +5023,7 @@ gamma"
 
     #[test]
     fn test_process_content_watchdog_hard_cap_with_empty_output() {
-        let output = acp::TerminalOutputResponse::new("".to_string(), false);
+        let output = ProcessOutput::new("".to_string(), false);
 
         let result = process_content(
             output,
@@ -4879,7 +5070,7 @@ gamma"
 
     #[test]
     fn test_process_content_user_stopped_takes_precedence_over_watchdog() {
-        let output = acp::TerminalOutputResponse::new("output".to_string(), false);
+        let output = ProcessOutput::new("output".to_string(), false);
 
         let result = process_content(
             output,
@@ -4896,8 +5087,8 @@ gamma"
 
     #[test]
     fn test_process_content_with_success() {
-        let output = acp::TerminalOutputResponse::new("success output".to_string(), false)
-            .exit_status(acp::TerminalExitStatus::new().exit_code(0));
+        let output = ProcessOutput::new("success output".to_string(), false)
+            .exit_status(acp_v2::TerminalExitStatus::new().exit_code(0));
 
         let result = process_content(
             output,
@@ -4922,8 +5113,8 @@ gamma"
 
     #[test]
     fn test_process_content_with_success_empty_output() {
-        let output = acp::TerminalOutputResponse::new("".to_string(), false)
-            .exit_status(acp::TerminalExitStatus::new().exit_code(0));
+        let output = ProcessOutput::new("".to_string(), false)
+            .exit_status(acp_v2::TerminalExitStatus::new().exit_code(0));
 
         let result = process_content(
             output,
@@ -4943,8 +5134,8 @@ gamma"
 
     #[test]
     fn test_process_content_with_error_exit() {
-        let output = acp::TerminalOutputResponse::new("error output".to_string(), false)
-            .exit_status(acp::TerminalExitStatus::new().exit_code(1));
+        let output = ProcessOutput::new("error output".to_string(), false)
+            .exit_status(acp_v2::TerminalExitStatus::new().exit_code(1));
 
         let result = process_content(
             output,
@@ -4969,8 +5160,8 @@ gamma"
 
     #[test]
     fn test_process_content_with_error_exit_empty_output() {
-        let output = acp::TerminalOutputResponse::new("".to_string(), false)
-            .exit_status(acp::TerminalExitStatus::new().exit_code(1));
+        let output = ProcessOutput::new("".to_string(), false)
+            .exit_status(acp_v2::TerminalExitStatus::new().exit_code(1));
 
         let result = process_content(
             output,
@@ -4990,7 +5181,7 @@ gamma"
 
     #[test]
     fn test_process_content_unexpected_termination() {
-        let output = acp::TerminalOutputResponse::new("some output".to_string(), false);
+        let output = ProcessOutput::new("some output".to_string(), false);
 
         let result = process_content(
             output,
@@ -5015,7 +5206,7 @@ gamma"
 
     #[test]
     fn test_process_content_unexpected_termination_empty_output() {
-        let output = acp::TerminalOutputResponse::new("".to_string(), false);
+        let output = ProcessOutput::new("".to_string(), false);
 
         let result = process_content(
             output,
@@ -5098,7 +5289,7 @@ gamma"
             !matches!(
                 rx.try_recv(),
                 Ok(Ok(crate::ThreadEvent::ToolCallUpdate(
-                    acp_thread::ToolCallUpdate::UpdateFields(_)
+                    acp_thread::ToolCallUpdate::V2(_)
                 )))
             ),
             "invalid command should not emit a terminal card update"
@@ -5115,11 +5306,17 @@ gamma"
         fs.insert_tree("/root", serde_json::json!({})).await;
         let project = project::Project::test(fs, ["/root".as_ref()], cx).await;
 
-        let environment = std::rc::Rc::new(cx.update(|cx| {
-            crate::tests::FakeThreadEnvironment::default().with_terminal(
-                crate::tests::FakeTerminalHandle::new_with_immediate_exit(cx, 0),
+        let (environment, process_terminal_id) = cx.update(|cx| {
+            let terminal = crate::tests::FakeTerminalHandle::new_with_immediate_exit(cx, 0);
+            let terminal_id = crate::TerminalHandle::id(&terminal, &cx.to_async())
+                .expect("expected process terminal ID");
+            (
+                std::rc::Rc::new(
+                    crate::tests::FakeThreadEnvironment::default().with_terminal(terminal),
+                ),
+                terminal_id,
             )
-        }));
+        });
 
         cx.update(|cx| {
             let mut settings = agent_settings::AgentSettings::get_global(cx).clone();
@@ -5146,13 +5343,19 @@ gamma"
         });
 
         let update = rx.expect_update_fields().await;
+        let terminal_reference = update
+            .content
+            .value()
+            .and_then(|content| {
+                content.iter().find_map(|content| match content {
+                    acp_v2::ToolCallContent::Terminal(terminal) => Some(terminal),
+                    _ => None,
+                })
+            })
+            .expect("expected terminal content update in unconditional allow-all mode");
         assert!(
-            update.content.iter().any(|blocks| {
-                blocks
-                    .iter()
-                    .any(|content| matches!(content, acp::ToolCallContent::Terminal(_)))
-            }),
-            "expected terminal content update in unconditional allow-all mode"
+            Arc::ptr_eq(&terminal_reference.terminal_id.0, &process_terminal_id.0),
+            "native terminal references must reuse the process terminal ID"
         );
 
         let result = task
@@ -5280,10 +5483,10 @@ gamma"
 
         let update = rx.expect_update_fields().await;
         assert!(
-            update.content.iter().any(|blocks| {
+            update.content.value().is_some_and(|blocks| {
                 blocks
                     .iter()
-                    .any(|content| matches!(content, acp::ToolCallContent::Terminal(_)))
+                    .any(|content| matches!(content, acp_v2::ToolCallContent::Terminal(_)))
             }),
             "expected terminal content update for matching env-prefixed allow rule"
         );
@@ -5311,9 +5514,8 @@ gamma"
         fs.insert_tree("/root", serde_json::json!({})).await;
         let project = project::Project::test(fs, ["/root".as_ref()], cx).await;
 
-        let output =
-            acp::TerminalOutputResponse::new("one\ntwo\nthree\nfour\nfive".to_string(), false)
-                .exit_status(acp::TerminalExitStatus::new().exit_code(0));
+        let output = ProcessOutput::new("one\ntwo\nthree\nfour\nfive".to_string(), false)
+            .exit_status(acp_v2::TerminalExitStatus::new().exit_code(0));
         let environment = std::rc::Rc::new(cx.update(|cx| {
             crate::tests::FakeThreadEnvironment::default().with_terminal(
                 crate::tests::FakeTerminalHandle::new_with_immediate_exit(cx, 0)
@@ -5348,10 +5550,10 @@ gamma"
 
         let update = rx.expect_update_fields().await;
         assert!(
-            update.content.iter().any(|blocks| {
+            update.content.value().is_some_and(|blocks| {
                 blocks
                     .iter()
-                    .any(|content| matches!(content, acp::ToolCallContent::Terminal(_)))
+                    .any(|content| matches!(content, acp_v2::ToolCallContent::Terminal(_)))
             }),
             "expected terminal content update"
         );
@@ -5371,8 +5573,8 @@ gamma"
         fs.insert_tree("/root", serde_json::json!({})).await;
         let project = project::Project::test(fs, ["/root".as_ref()], cx).await;
 
-        let output = acp::TerminalOutputResponse::new("command output".to_string(), false)
-            .exit_status(acp::TerminalExitStatus::new().exit_code(0));
+        let output = ProcessOutput::new("command output".to_string(), false)
+            .exit_status(acp_v2::TerminalExitStatus::new().exit_code(0));
         let environment = std::rc::Rc::new(cx.update(|cx| {
             crate::tests::FakeThreadEnvironment::default().with_terminal(
                 crate::tests::FakeTerminalHandle::new_with_immediate_exit(cx, 0)
@@ -5764,10 +5966,10 @@ gamma"
 
         let update = rx.expect_update_fields().await;
         assert!(
-            update.content.iter().any(|blocks| {
+            update.content.value().is_some_and(|blocks| {
                 blocks
                     .iter()
-                    .any(|content| matches!(content, acp::ToolCallContent::Terminal(_)))
+                    .any(|content| matches!(content, acp_v2::ToolCallContent::Terminal(_)))
             }),
             "terminal-specific allow-all should bypass substitution rejection"
         );
@@ -5906,10 +6108,10 @@ gamma"
 
         let update = rx.expect_update_fields().await;
         assert!(
-            update.content.iter().any(|blocks| {
+            update.content.value().is_some_and(|blocks| {
                 blocks
                     .iter()
-                    .any(|content| matches!(content, acp::ToolCallContent::Terminal(_)))
+                    .any(|content| matches!(content, acp_v2::ToolCallContent::Terminal(_)))
             }),
             "multi-assignment pattern should match and produce terminal content"
         );
@@ -5985,10 +6187,10 @@ gamma"
 
         let update = rx.expect_update_fields().await;
         assert!(
-            update.content.iter().any(|blocks| {
+            update.content.value().is_some_and(|blocks| {
                 blocks
                     .iter()
-                    .any(|content| matches!(content, acp::ToolCallContent::Terminal(_)))
+                    .any(|content| matches!(content, acp_v2::ToolCallContent::Terminal(_)))
             }),
             "quoted whitespace value should match pattern with quoted form"
         );
@@ -6217,9 +6419,10 @@ gamma"
         let task = cx.update(|cx| tool.run(crate::ToolInput::resolved(input), event_stream, cx));
 
         let authorization = receiver.expect_authorization().await;
-        let details =
-            acp_thread::sandbox_authorization_details_from_meta(&authorization.tool_call.meta)
-                .expect("legacy allow_fs_write should request sandbox authorization details");
+        let details = acp_thread::sandbox_authorization_details_from_meta(
+            &authorization.tool_call.meta.clone().take(),
+        )
+        .expect("legacy allow_fs_write should request sandbox authorization details");
         assert!(details.network_hosts.is_empty());
         assert!(!details.network_all_hosts);
         assert!(details.allow_fs_write_all);
@@ -6235,33 +6438,37 @@ gamma"
                 (
                     option.option_id.0.as_ref(),
                     option.name.as_ref(),
-                    option.kind,
+                    option.kind.clone(),
                 )
             })
             .collect::<Vec<_>>();
         assert_eq!(
             options,
             vec![
-                ("allow", "Allow once", acp::PermissionOptionKind::AllowOnce),
+                (
+                    "allow",
+                    "Allow once",
+                    acp_v2::PermissionOptionKind::AllowOnce
+                ),
                 (
                     "allow_thread",
                     "Allow for this thread",
-                    acp::PermissionOptionKind::AllowAlways,
+                    acp_v2::PermissionOptionKind::AllowAlways,
                 ),
                 (
                     "allow_always",
                     "Allow always",
-                    acp::PermissionOptionKind::AllowAlways,
+                    acp_v2::PermissionOptionKind::AllowAlways,
                 ),
-                ("deny", "Deny", acp::PermissionOptionKind::RejectOnce),
+                ("deny", "Deny", acp_v2::PermissionOptionKind::RejectOnce),
             ]
         );
 
         authorization
             .response
             .send(acp_thread::SelectedPermissionOutcome::new(
-                acp::PermissionOptionId::new("deny"),
-                acp::PermissionOptionKind::RejectOnce,
+                acp_v2::PermissionOptionId::new("deny"),
+                acp_v2::PermissionOptionKind::RejectOnce,
             ))
             .expect("authorization response should send");
 
@@ -6313,10 +6520,11 @@ gamma"
         let authorization = receiver.expect_authorization().await;
         // The sandbox approval deliberately leaves the tool-call title untouched
         // so the card keeps showing the command being approved.
-        assert_eq!(authorization.tool_call.fields.title, None);
-        let details =
-            acp_thread::sandbox_authorization_details_from_meta(&authorization.tool_call.meta)
-                .expect("unsandboxed should request sandbox authorization details");
+        assert!(authorization.tool_call.title.is_undefined());
+        let details = acp_thread::sandbox_authorization_details_from_meta(
+            &authorization.tool_call.meta.clone().take(),
+        )
+        .expect("unsandboxed should request sandbox authorization details");
         assert!(details.network_hosts.is_empty());
         assert!(!details.network_all_hosts);
         assert!(!details.allow_fs_write_all);
@@ -6332,33 +6540,37 @@ gamma"
                 (
                     option.option_id.0.as_ref(),
                     option.name.as_ref(),
-                    option.kind,
+                    option.kind.clone(),
                 )
             })
             .collect::<Vec<_>>();
         assert_eq!(
             options,
             vec![
-                ("allow", "Allow once", acp::PermissionOptionKind::AllowOnce),
+                (
+                    "allow",
+                    "Allow once",
+                    acp_v2::PermissionOptionKind::AllowOnce
+                ),
                 (
                     "allow_thread",
                     "Allow for this thread",
-                    acp::PermissionOptionKind::AllowAlways,
+                    acp_v2::PermissionOptionKind::AllowAlways,
                 ),
                 (
                     "allow_always",
                     "Allow always",
-                    acp::PermissionOptionKind::AllowAlways,
+                    acp_v2::PermissionOptionKind::AllowAlways,
                 ),
-                ("deny", "Deny", acp::PermissionOptionKind::RejectOnce),
+                ("deny", "Deny", acp_v2::PermissionOptionKind::RejectOnce),
             ]
         );
 
         authorization
             .response
             .send(acp_thread::SelectedPermissionOutcome::new(
-                acp::PermissionOptionId::new("deny"),
-                acp::PermissionOptionKind::RejectOnce,
+                acp_v2::PermissionOptionId::new("deny"),
+                acp_v2::PermissionOptionKind::RejectOnce,
             ))
             .expect("authorization response should send");
 
@@ -6430,8 +6642,8 @@ gamma"
         authorization
             .response
             .send(acp_thread::SelectedPermissionOutcome::new(
-                acp::PermissionOptionId::new("allow_always"),
-                acp::PermissionOptionKind::AllowAlways,
+                acp_v2::PermissionOptionId::new("allow_always"),
+                acp_v2::PermissionOptionKind::AllowAlways,
             ))
             .expect("authorization response should send");
         task.await.expect("granted command should run");
@@ -6468,9 +6680,10 @@ gamma"
             cx.update(|cx| tool2.run(crate::ToolInput::resolved(resolved2), event_stream2, cx));
 
         let authorization2 = receiver2.expect_authorization().await;
-        let details =
-            acp_thread::sandbox_authorization_details_from_meta(&authorization2.tool_call.meta)
-                .expect("the identical request should prompt for sandbox authorization again");
+        let details = acp_thread::sandbox_authorization_details_from_meta(
+            &authorization2.tool_call.meta.clone().take(),
+        )
+        .expect("the identical request should prompt for sandbox authorization again");
         assert!(
             details
                 .write_paths
@@ -6483,8 +6696,8 @@ gamma"
         authorization2
             .response
             .send(acp_thread::SelectedPermissionOutcome::new(
-                acp::PermissionOptionId::new("deny"),
-                acp::PermissionOptionKind::RejectOnce,
+                acp_v2::PermissionOptionId::new("deny"),
+                acp_v2::PermissionOptionKind::RejectOnce,
             ))
             .expect("authorization response should send");
         let result = task2
@@ -6850,15 +7063,19 @@ gamma"
         });
 
         let auth = rx.expect_authorization().await;
+        let title = match &auth.tool_call.title {
+            agent_client_protocol::schema::MaybeUndefined::Value(title) => Some(title.as_str()),
+            _ => None,
+        };
         assert_eq!(
-            auth.tool_call.fields.title.as_deref(),
+            title,
             Some("cargo test"),
             "authorization should show the original command in title"
         );
         auth.response
             .send(acp_thread::SelectedPermissionOutcome::new(
-                acp::PermissionOptionId::new("allow"),
-                acp::PermissionOptionKind::AllowOnce,
+                acp_v2::PermissionOptionId::new("allow"),
+                acp_v2::PermissionOptionKind::AllowOnce,
             ))
             .expect("authorization response should send");
 
@@ -7300,15 +7517,16 @@ gamma"
         // Assert warning was attached to tool call meta
         let mut found_warning = false;
         while let Ok(event) = rx.try_recv() {
-            if let Ok(crate::thread::ThreadEvent::ToolCallUpdate(
-                acp_thread::ToolCallUpdate::UpdateFields(update),
-            )) = event
+            if let Ok(crate::thread::ThreadEvent::ToolCallUpdate(acp_thread::ToolCallUpdate::V2(
+                update,
+            ))) = event
             {
-                if let Some(warning) = acp_thread::terminal_wrapper_warning_from_meta(&update.meta)
-                {
-                    assert!(warning.contains("Invalid `terminal_wrapper_command`"));
-                    found_warning = true;
-                    break;
+                if let agent_client_protocol::schema::MaybeUndefined::Value(meta) = &update.meta {
+                    if let Some(warning) = acp_thread::terminal_wrapper_warning_from_meta(meta) {
+                        assert!(warning.contains("Invalid `terminal_wrapper_command`"));
+                        found_warning = true;
+                        break;
+                    }
                 }
             }
         }
@@ -7776,13 +7994,15 @@ gamma"
 
         let mut run1_warning = false;
         while let Ok(event) = rx.try_recv() {
-            if let Ok(crate::thread::ThreadEvent::ToolCallUpdate(
-                acp_thread::ToolCallUpdate::UpdateFields(update),
-            )) = event
+            if let Ok(crate::thread::ThreadEvent::ToolCallUpdate(acp_thread::ToolCallUpdate::V2(
+                update,
+            ))) = event
             {
-                if acp_thread::terminal_wrapper_warning_from_meta(&update.meta).is_some() {
-                    run1_warning = true;
-                    break;
+                if let agent_client_protocol::schema::MaybeUndefined::Value(meta) = &update.meta {
+                    if acp_thread::terminal_wrapper_warning_from_meta(meta).is_some() {
+                        run1_warning = true;
+                        break;
+                    }
                 }
             }
         }
@@ -7806,13 +8026,15 @@ gamma"
 
         let mut run2_warning = false;
         while let Ok(event) = rx.try_recv() {
-            if let Ok(crate::thread::ThreadEvent::ToolCallUpdate(
-                acp_thread::ToolCallUpdate::UpdateFields(update),
-            )) = event
+            if let Ok(crate::thread::ThreadEvent::ToolCallUpdate(acp_thread::ToolCallUpdate::V2(
+                update,
+            ))) = event
             {
-                if acp_thread::terminal_wrapper_warning_from_meta(&update.meta).is_some() {
-                    run2_warning = true;
-                    break;
+                if let agent_client_protocol::schema::MaybeUndefined::Value(meta) = &update.meta {
+                    if acp_thread::terminal_wrapper_warning_from_meta(meta).is_some() {
+                        run2_warning = true;
+                        break;
+                    }
                 }
             }
         }

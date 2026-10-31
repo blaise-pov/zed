@@ -2,7 +2,7 @@ use crate::tools::tool_permissions::{
     ResolvedProjectPath, canonicalize_worktree_roots, is_inside_task_worktree, resolve_tool_path,
 };
 use crate::{AgentTool, ToolCallEventStream, ToolInput};
-use agent_client_protocol::schema::v1 as acp;
+use agent_client_protocol::schema::v2 as acp;
 use futures::{Future, FutureExt as _};
 use gpui::{App, AsyncApp, Entity, Task};
 use language::{DiagnosticSeverity, OffsetRangeExt};
