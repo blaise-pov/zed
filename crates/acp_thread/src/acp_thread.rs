@@ -11643,7 +11643,6 @@ mod tests {
         assert!(stopped_events.borrow().is_empty());
 
         let cancellation = thread.update(cx, |thread, cx| thread.cancel(cx));
-        cancellation.await.unwrap();
 
         assert_eq!(
             *stopped_events.borrow(),
@@ -11653,6 +11652,7 @@ mod tests {
         complete
             .send(Ok(acp_v1::PromptResponse::new(acp_v1::StopReason::EndTurn)))
             .ok();
+        cancellation.await.unwrap();
         cx.run_until_parked();
 
         assert_eq!(
