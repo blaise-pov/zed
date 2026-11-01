@@ -480,12 +480,15 @@ impl RenderOnce for ThreadItem {
         let mut metadata_segments: Vec<AnyElement> = Vec::new();
 
         if let Some(agent_name) = self.agent_name.filter(|s| !s.is_empty()) {
-            let mut agent_container = div()
+            let mut agent_container = h_flex()
+                .min_w_0()
+                .flex_shrink(1.0)
                 .id((self.id.clone(), "thread-item-agent"))
                 .child(
                     Label::new(agent_name)
                         .size(LabelSize::Small)
-                        .color(Color::Muted),
+                        .color(Color::Muted)
+                        .truncate(),
                 );
 
             if let Some(model_name) = self.model_name.as_ref().filter(|s| !s.is_empty()) {
@@ -520,7 +523,10 @@ impl RenderOnce for ThreadItem {
                 .gap_1p5()
                 .when_some(self.project_name, |this, name| {
                     this.child(
-                        Label::new(name).size(LabelSize::Small).color(Color::Muted),
+                        Label::new(name)
+                            .size(LabelSize::Small)
+                            .color(Color::Muted)
+                            .truncate(),
                     )
                 })
                 .when(
@@ -531,7 +537,8 @@ impl RenderOnce for ThreadItem {
                     this.child(
                         Label::new(paths)
                             .size(LabelSize::Small)
-                            .color(Color::Muted),
+                            .color(Color::Muted)
+                            .truncate(),
                     )
                 })
                 .when(has_project_paths && has_worktree, |this| {
@@ -607,6 +614,7 @@ impl RenderOnce for ThreadItem {
         if has_diff_section {
             let diff_section = h_flex()
                 .min_w_0()
+                .flex_shrink_0()
                 .gap_1p5()
                 .when(has_files_changed, |this| {
                     let label = if files_changed_count == 1 {
