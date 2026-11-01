@@ -6994,7 +6994,7 @@ impl AcpThread {
                     return Ok(None);
                 };
 
-                if this.turn_id != turn_id {
+                if !is_same_turn || this.turn_id != turn_id {
                     return response.map(Some);
                 }
 
@@ -7144,10 +7144,18 @@ impl AcpThread {
         self.shrink_message_source_capacity(turn.first_entry_index);
         self.mark_pending_entries_as_canceled(permission_outcome, cx);
         self.set_foreground_state(
-            acp_v2::StateUpdate::Idle(acp_v2::IdleStateUpdate::new()),
+            acp_v2::StateUpdate::Idle(
+                acp_v2::IdleStateUpdate::new()
+                    .stop_reason(Some(acp_v2::StopReason::Cancelled)),
+            ),
             cx,
         );
         cx.emit(AcpThreadEvent::StatusChanged);
+        cx.emit(AcpThreadEvent::Stopped {
+            activity_generation: self.activity.generation(),
+            activity_duration: self.activity.duration(),
+            stop_reason: Some(acp_v2::StopReason::Cancelled),
+        });
 
         // Wait for the send task to complete
         Ok(cx.background_spawn(async move {
@@ -11598,6 +11606,59 @@ mod tests {
             .send(Ok(acp_v1::PromptResponse::new(acp_v1::StopReason::EndTurn)))
             .expect("original request remains live");
         running.await.expect("original turn completes");
+    }
+
+    #[gpui::test]
+    async fn test_local_cancellation_emits_stopped_with_cancelled_reason_and_no_duplicate(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let connection = Rc::new(StubAgentConnection::new());
+        let thread = cx
+            .update(|cx| {
+                connection.clone().new_session(
+                    project,
+                    PathList::new(&[Path::new(path!("/test"))]),
+                    cx,
+                )
+            })
+            .await
+            .expect("legacy session");
+
+        let stopped_events = Rc::new(RefCell::new(Vec::new()));
+        let stopped_clone = stopped_events.clone();
+        let _subscription = cx.update(|cx| {
+            cx.subscribe(&thread, move |_, event, _| {
+                if let AcpThreadEvent::Stopped { stop_reason, .. } = event {
+                    stopped_clone.borrow_mut().push(stop_reason.clone());
+                }
+            })
+        });
+
+        let complete = connection.defer_next_prompt_response();
+        let _running = thread.update(cx, |thread, cx| thread.send(vec!["original".into()], cx));
+        cx.run_until_parked();
+
+        assert!(stopped_events.borrow().is_empty());
+
+        let cancellation = thread.update(cx, |thread, cx| thread.cancel(cx));
+
+        assert_eq!(
+            *stopped_events.borrow(),
+            vec![Some(acp_v2::StopReason::Cancelled)]
+        );
+
+        complete
+            .send(Ok(acp_v1::PromptResponse::new(acp_v1::StopReason::EndTurn)))
+            .ok();
+        cancellation.await.unwrap();
+        cx.run_until_parked();
+
+        assert_eq!(
+            *stopped_events.borrow(),
+            vec![Some(acp_v2::StopReason::Cancelled)]
+        );
     }
 
     #[gpui::test]

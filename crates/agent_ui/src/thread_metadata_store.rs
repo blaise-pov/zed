@@ -3,8 +3,9 @@ use std::{
     sync::Arc,
 };
 
-use agent::{ThreadStore, ZED_AGENT_ID};
+use agent::{ThreadStore, ThreadsDatabase, ZED_AGENT_ID};
 use agent_client_protocol::schema::v2 as acp;
+use agent_settings::AgentSettings;
 use anyhow::Context as _;
 use chrono::{DateTime, Utc};
 use collections::{HashMap, HashSet};
@@ -24,6 +25,7 @@ use gpui::{AppContext as _, Entity, Global, Subscription, Task, TaskExt};
 pub use project::WorktreePaths;
 use project::{AgentId, linked_worktree_short_name};
 use remote::{RemoteConnectionOptions, same_remote_connection_identity};
+use settings::Settings as _;
 use ui::{App, Context, SharedString, ThreadItemWorktreeInfo, WorktreeKind};
 use util::{ResultExt as _, paths::PathStyle};
 use workspace::{PathList, SerializedWorkspaceLocation, WorkspaceDb};
@@ -59,6 +61,7 @@ impl Column for ThreadId {
 
 const THREAD_REMOTE_CONNECTION_MIGRATION_KEY: &str = "thread-metadata-remote-connection-backfill";
 const THREAD_ID_MIGRATION_KEY: &str = "thread-metadata-thread-id-backfill";
+const THREAD_MODEL_AND_LABEL_MIGRATION_KEY: &str = "thread-metadata-model-and-label-backfill";
 
 /// List all sidebar thread metadata from an arbitrary SQLite connection.
 ///
@@ -90,6 +93,7 @@ pub fn init(cx: &mut App) {
     let migration_task = migrate_thread_metadata(cx);
     migrate_thread_remote_connections(cx, migration_task);
     migrate_thread_ids(cx);
+    migrate_thread_models_and_labels(cx).detach_and_log_err(cx);
 }
 
 /// Migrate existing thread metadata from native agent thread store to the new metadata storage.
@@ -301,6 +305,84 @@ fn migrate_thread_ids(cx: &mut App) {
         Ok(())
     })
     .detach_and_log_err(cx);
+}
+
+pub fn migrate_thread_models_and_labels(cx: &mut App) -> Task<anyhow::Result<()>> {
+    let store = ThreadMetadataStore::global(cx);
+    let db = store.read(cx).db.clone();
+    let kvp = KeyValueStore::global(cx);
+    let threads_db = ThreadsDatabase::connect(cx);
+
+    cx.spawn(async move |cx| -> anyhow::Result<()> {
+        if kvp
+            .read_kvp(THREAD_MODEL_AND_LABEL_MIGRATION_KEY)?
+            .is_some()
+        {
+            return Ok(());
+        }
+
+        let threads_db = threads_db.await.map_err(|err| anyhow::anyhow!("{err}"))?;
+        let default_profile_id = cx.update(|cx| {
+            AgentSettings::try_get(cx)
+                .map(|settings| settings.default_profile.clone())
+                .unwrap_or_default()
+        });
+
+        let to_backfill: Vec<ThreadMetadata> = db
+            .list()?
+            .into_iter()
+            .filter(|metadata| {
+                metadata.agent_id.as_ref() == agent::ZED_AGENT_ID.as_ref()
+                    && metadata.session_id.is_some()
+                    && metadata.model.is_none()
+                    && metadata.agent_label.is_none()
+            })
+            .collect();
+
+        let mut reloaded = false;
+        for mut metadata in to_backfill {
+            let Some(session_id) = metadata.session_id.clone() else {
+                continue;
+            };
+
+            let Some(db_thread) = threads_db.load_thread(session_id).await? else {
+                continue;
+            };
+
+            let profile = db_thread
+                .profile
+                .unwrap_or_else(|| default_profile_id.clone());
+            let agent_label = if profile == default_profile_id || profile.0.is_empty() {
+                None
+            } else {
+                Some(SharedString::from(profile.0))
+            };
+            let model = db_thread
+                .model
+                .filter(|m| !m.model.is_empty())
+                .map(|m| SharedString::from(m.model));
+
+            if metadata.model != model || metadata.agent_label != agent_label {
+                metadata.model = model;
+                metadata.agent_label = agent_label;
+                db.save(metadata).await?;
+                reloaded = true;
+            }
+        }
+
+        let reloaded_task = reloaded
+            .then_some(store.update(cx, |store, cx| store.reload(cx)))
+            .unwrap_or(Task::ready(()).shared());
+
+        kvp.write_kvp(
+            THREAD_MODEL_AND_LABEL_MIGRATION_KEY.to_string(),
+            "1".to_string(),
+        )
+        .await?;
+        reloaded_task.await;
+
+        Ok(())
+    })
 }
 
 struct GlobalThreadMetadataStore(Entity<ThreadMetadataStore>);
@@ -1267,7 +1349,7 @@ impl ThreadMetadataStore {
     fn handle_conversation_event(
         &mut self,
         conversation_view: Entity<crate::ConversationView>,
-        _event: &crate::conversation_view::RootThreadUpdated,
+        event: &crate::conversation_view::RootThreadUpdated,
         cx: &mut Context<Self>,
     ) {
         let view = conversation_view.read(cx);
@@ -1293,7 +1375,10 @@ impl ThreadMetadataStore {
         let title = thread_ref.title();
         let title_override = existing_thread.and_then(|t| t.title_override.clone());
 
-        let updated_at = Utc::now();
+        let updated_at = match existing_thread {
+            Some(existing) if !event.content_changed => existing.updated_at,
+            _ => Utc::now(),
+        };
 
         let created_at = existing_thread
             .and_then(|t| t.created_at)
@@ -1878,8 +1963,9 @@ mod tests {
     use super::*;
     use acp_thread::StubAgentConnection;
     use action_log::ActionLog;
-    use agent::DbThread;
+    use agent::{DbLanguageModel, DbThread, ThreadsDatabase};
     use agent_client_protocol::schema::{v1 as acp_v1, v2 as acp};
+    use agent_settings::AgentProfileId;
     use gpui::{TestAppContext, VisualTestContext};
     use project::FakeFs;
     use project::Project;
@@ -1945,6 +2031,7 @@ mod tests {
         cx.update(|cx| {
             let settings_store = settings::SettingsStore::test(cx);
             cx.set_global(settings_store);
+            agent_settings::AgentSettings::register(cx);
             theme_settings::init(theme::LoadThemes::JustBase, cx);
             editor::init(cx);
             release_channel::init("0.0.0".parse().unwrap(), cx);
@@ -1976,6 +2063,12 @@ mod tests {
     fn clear_thread_metadata_remote_connection_backfill(cx: &mut TestAppContext) {
         let kvp = cx.update(|cx| KeyValueStore::global(cx));
         gpui::block_on(kvp.delete_kvp("thread-metadata-remote-connection-backfill".to_string()))
+            .unwrap();
+    }
+
+    fn clear_thread_metadata_model_and_label_backfill(cx: &mut TestAppContext) {
+        let kvp = cx.update(|cx| KeyValueStore::global(cx));
+        gpui::block_on(kvp.delete_kvp(THREAD_MODEL_AND_LABEL_MIGRATION_KEY.to_string()))
             .unwrap();
     }
 
@@ -2753,6 +2846,181 @@ mod tests {
                 user: Some("anth".to_string()),
             }))
         );
+    }
+
+    #[gpui::test]
+    async fn test_migrate_thread_models_and_labels(cx: &mut TestAppContext) {
+        init_test(cx);
+        clear_thread_metadata_model_and_label_backfill(cx);
+
+        let threads_db = cx.update(|cx| ThreadsDatabase::connect(cx)).await.unwrap();
+        let now = Utc::now();
+        let project_paths = PathList::new(&[Path::new("/test-project")]);
+
+        // 1. Thread with custom profile and model
+        let mut thread_1 = make_db_thread("Thread 1", now);
+        thread_1.profile = Some(AgentProfileId("custom_agent".into()));
+        thread_1.model = Some(DbLanguageModel {
+            provider: "anthropic".to_string(),
+            model: "claude-3-5".to_string(),
+        });
+        threads_db
+            .save_thread(
+                acp::SessionId::new("session-1"),
+                thread_1,
+                project_paths.clone(),
+            )
+            .await
+            .unwrap();
+
+        // 2. Thread with default profile ("write") and model
+        let mut thread_2 = make_db_thread("Thread 2", now);
+        thread_2.profile = Some(AgentProfileId("write".into()));
+        thread_2.model = Some(DbLanguageModel {
+            provider: "openai".to_string(),
+            model: "gpt-4".to_string(),
+        });
+        threads_db
+            .save_thread(
+                acp::SessionId::new("session-2"),
+                thread_2,
+                project_paths.clone(),
+            )
+            .await
+            .unwrap();
+
+        // 3. Thread with default profile and no model (trap for infinite loops)
+        let mut thread_3 = make_db_thread("Thread 3", now);
+        thread_3.profile = Some(AgentProfileId("write".into()));
+        thread_3.model = None;
+        threads_db
+            .save_thread(
+                acp::SessionId::new("session-3"),
+                thread_3,
+                project_paths.clone(),
+            )
+            .await
+            .unwrap();
+
+        // 4. Thread with custom profile and no model
+        let mut thread_4 = make_db_thread("Thread 4", now);
+        thread_4.profile = Some(AgentProfileId("reviewer".into()));
+        thread_4.model = None;
+        threads_db
+            .save_thread(
+                acp::SessionId::new("session-4"),
+                thread_4,
+                project_paths.clone(),
+            )
+            .await
+            .unwrap();
+
+        // 5. Thread that already has model and label in sidebar_threads
+        let mut thread_5 = make_db_thread("Thread 5", now);
+        thread_5.profile = Some(AgentProfileId("db_profile".into()));
+        thread_5.model = Some(DbLanguageModel {
+            provider: "anthropic".to_string(),
+            model: "db_model".to_string(),
+        });
+        threads_db
+            .save_thread(
+                acp::SessionId::new("session-5"),
+                thread_5,
+                project_paths.clone(),
+            )
+            .await
+            .unwrap();
+
+        // Seed sidebar_threads
+        let meta_1 = make_metadata("session-1", "Thread 1", now, project_paths.clone());
+        let meta_2 = make_metadata("session-2", "Thread 2", now, project_paths.clone());
+        let meta_3 = make_metadata("session-3", "Thread 3", now, project_paths.clone());
+        let meta_4 = make_metadata("session-4", "Thread 4", now, project_paths.clone());
+        let mut meta_5 = make_metadata("session-5", "Thread 5", now, project_paths.clone());
+        meta_5.model = Some("existing_model".into());
+        meta_5.agent_label = Some("existing_label".into());
+
+        let t1_id = meta_1.thread_id;
+        let t2_id = meta_2.thread_id;
+        let t3_id = meta_3.thread_id;
+        let t4_id = meta_4.thread_id;
+        let t5_id = meta_5.thread_id;
+
+        cx.update(|cx| {
+            let store = ThreadMetadataStore::global(cx);
+            store.update(cx, |store, cx| {
+                store.save(meta_1, cx);
+                store.save(meta_2, cx);
+                store.save(meta_3, cx);
+                store.save(meta_4, cx);
+                store.save(meta_5, cx);
+            });
+        });
+        cx.run_until_parked();
+
+        // Run the migration: backfills model and agent_label
+        let migration_task = cx.update(|cx| migrate_thread_models_and_labels(cx));
+        migration_task.await.unwrap();
+
+        // Verify in-memory store cache is updated
+        cx.update(|cx| {
+            let store = ThreadMetadataStore::global(cx);
+            let store = store.read(cx);
+
+            let e1 = store.entry(t1_id).unwrap();
+            assert_eq!(e1.agent_label.as_deref(), Some("custom_agent"));
+            assert_eq!(e1.model.as_deref(), Some("claude-3-5"));
+
+            let e2 = store.entry(t2_id).unwrap();
+            assert_eq!(e2.agent_label, None); // default profile -> None
+            assert_eq!(e2.model.as_deref(), Some("gpt-4"));
+
+            let e3 = store.entry(t3_id).unwrap();
+            assert_eq!(e3.agent_label, None);
+            assert_eq!(e3.model, None);
+
+            let e4 = store.entry(t4_id).unwrap();
+            assert_eq!(e4.agent_label.as_deref(), Some("reviewer"));
+            assert_eq!(e4.model, None);
+
+            let e5 = store.entry(t5_id).unwrap();
+            assert_eq!(e5.agent_label.as_deref(), Some("existing_label"));
+            assert_eq!(e5.model.as_deref(), Some("existing_model"));
+        });
+
+        // Also check database directly
+        let store = cx.update(|cx| ThreadMetadataStore::global(cx));
+        let db = store.read_with(cx, |store, _| store.db.clone());
+        let list = db.list().unwrap();
+
+        let row1 = list.iter().find(|r| r.thread_id == t1_id).unwrap();
+        assert_eq!(row1.agent_label.as_deref(), Some("custom_agent"));
+        assert_eq!(row1.model.as_deref(), Some("claude-3-5"));
+
+        let row2 = list.iter().find(|r| r.thread_id == t2_id).unwrap();
+        assert_eq!(row2.agent_label, None);
+        assert_eq!(row2.model.as_deref(), Some("gpt-4"));
+
+        let row3 = list.iter().find(|r| r.thread_id == t3_id).unwrap();
+        assert_eq!(row3.agent_label, None);
+        assert_eq!(row3.model, None);
+
+        let row4 = list.iter().find(|r| r.thread_id == t4_id).unwrap();
+        assert_eq!(row4.agent_label.as_deref(), Some("reviewer"));
+        assert_eq!(row4.model, None);
+
+        let row5 = list.iter().find(|r| r.thread_id == t5_id).unwrap();
+        assert_eq!(row5.agent_label.as_deref(), Some("existing_label"));
+        assert_eq!(row5.model.as_deref(), Some("existing_model"));
+
+        // Second run: KVP key is set, returns immediately without re-processing
+        let migration_task_2 = cx.update(|cx| migrate_thread_models_and_labels(cx));
+        migration_task_2.await.unwrap();
+
+        // Third run: Even if KVP key is cleared, it does not loop infinitely on default profile / no model threads
+        clear_thread_metadata_model_and_label_backfill(cx);
+        let migration_task_3 = cx.update(|cx| migrate_thread_models_and_labels(cx));
+        migration_task_3.await.unwrap();
     }
 
     #[gpui::test]
@@ -4531,5 +4799,72 @@ mod tests {
                 "retained thread A's stored path must not be updated while the project is via collab"
             );
         });
+    }
+
+    #[gpui::test]
+    async fn test_root_thread_updated_preserves_updated_at_when_content_not_changed(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [Path::new("/project-a")], cx).await;
+        let (panel, mut vcx) = setup_panel_with_project(project, cx);
+
+        crate::test_support::open_thread_with_connection(
+            &panel,
+            StubAgentConnection::new(),
+            &mut vcx,
+        );
+        let thread_id = crate::test_support::active_thread_id(&panel, &vcx);
+        let conversation_view = panel.read_with(&vcx, |panel, _| {
+            panel.active_conversation_view().cloned().unwrap()
+        });
+
+        // Set updated_at to a known past timestamp.
+        let past = Utc::now() - chrono::Duration::seconds(60);
+        cx.update(|cx| {
+            let store = ThreadMetadataStore::global(cx);
+            store.update(cx, |store, cx| {
+                let mut meta = store.entry(thread_id).unwrap().clone();
+                meta.updated_at = past;
+                store.save(meta, cx);
+            });
+        });
+        cx.run_until_parked();
+
+        // Emitting RootThreadUpdated { content_changed: false } preserves existing updated_at.
+        conversation_view.update_in(&mut vcx, |_view, _window, cx| {
+            cx.emit(crate::conversation_view::RootThreadUpdated {
+                content_changed: false,
+            });
+        });
+        vcx.run_until_parked();
+
+        let preserved_updated_at = cx.read(|cx| {
+            let store = ThreadMetadataStore::global(cx);
+            store.read(cx).entry(thread_id).unwrap().updated_at
+        });
+        assert_eq!(
+            preserved_updated_at, past,
+            "updated_at should be preserved when content_changed is false"
+        );
+
+        // Emitting RootThreadUpdated { content_changed: true } updates updated_at.
+        conversation_view.update_in(&mut vcx, |_view, _window, cx| {
+            cx.emit(crate::conversation_view::RootThreadUpdated {
+                content_changed: true,
+            });
+        });
+        vcx.run_until_parked();
+
+        let updated_at = cx.read(|cx| {
+            let store = ThreadMetadataStore::global(cx);
+            store.read(cx).entry(thread_id).unwrap().updated_at
+        });
+        assert!(
+            updated_at > past,
+            "updated_at should be updated when content_changed is true"
+        );
     }
 }

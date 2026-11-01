@@ -694,7 +694,10 @@ impl Conversation {
     }
 }
 
-pub(crate) struct RootThreadUpdated;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RootThreadUpdated {
+    pub content_changed: bool,
+}
 
 impl EventEmitter<RootThreadUpdated> for ConversationView {}
 
@@ -1256,7 +1259,9 @@ impl ConversationView {
         cx.emit(StateChange);
         cx.emit(AcpServerViewEvent::ActiveThreadChanged);
         if matches!(&self.server_state, ServerState::Connected(_)) {
-            cx.emit(RootThreadUpdated);
+            cx.emit(RootThreadUpdated {
+                content_changed: false,
+            });
         }
         cx.notify();
     }
@@ -1966,6 +1971,9 @@ impl ConversationView {
                 active.cancel_generation(cx);
             });
         }
+        cx.emit(RootThreadUpdated {
+            content_changed: true,
+        });
     }
 
     pub fn parent_id(&self) -> ThreadId {
@@ -2015,7 +2023,9 @@ impl ConversationView {
         };
         let is_subagent = thread.read(cx).parent_session_id().is_some();
         if !is_subagent && affects_thread_metadata(event) {
-            cx.emit(RootThreadUpdated);
+            cx.emit(RootThreadUpdated {
+                content_changed: true,
+            });
         }
         match event {
             AcpThreadEvent::ActivityConfirmedIdle => {
@@ -6193,6 +6203,136 @@ pub(crate) mod tests {
                 );
             });
         }
+    }
+
+    #[gpui::test]
+    async fn test_cancel_generation_persists_diff_stats_to_db(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.update(language_model::init);
+
+        let connection = StubAgentConnection::new();
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        add_to_workspace(conversation_view.clone(), cx);
+
+        let thread_view = active_thread(&conversation_view, cx);
+        let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
+        let thread_id = conversation_view.read_with(cx, |view, _| view.thread_id);
+
+        let project = thread.read_with(cx, |thread, _| thread.project().clone());
+        let action_log = thread.read_with(cx, |thread, _| thread.action_log().clone());
+
+        let buffer = project
+            .update(cx, |project, cx| project.create_buffer(None, false, cx))
+            .await
+            .unwrap();
+
+        cx.update(|_, cx| {
+            action_log.update(cx, |log, cx| log.buffer_read(buffer.clone(), cx));
+            buffer.update(cx, |buffer, cx| {
+                buffer.set_text("test line 1\ntest line 2\n", cx);
+            });
+            action_log.update(cx, |log, cx| log.buffer_edited(buffer.clone(), cx));
+        });
+        cx.run_until_parked();
+
+        let initial_diff_stats = action_log.read_with(cx, |log, cx| log.diff_stats(cx));
+        assert!(initial_diff_stats.lines_added > 0);
+
+        conversation_view.update(cx, |view, cx| {
+            view.cancel_generation(cx);
+        });
+        cx.run_until_parked();
+
+        let stored_diff_stats = cx.read(|cx| {
+            ThreadMetadataStore::global(cx)
+                .read(cx)
+                .entry(thread_id)
+                .and_then(|metadata| metadata.diff_stats)
+        });
+
+        assert_eq!(stored_diff_stats, Some(initial_diff_stats));
+    }
+
+    #[gpui::test]
+    async fn test_local_turn_cancellation_emits_stopped_and_persists_diff_stats(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        cx.update(language_model::init);
+
+        let connection = StubAgentConnection::new();
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        add_to_workspace(conversation_view.clone(), cx);
+
+        let thread_view = active_thread(&conversation_view, cx);
+        let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
+        let thread_id = conversation_view.read_with(cx, |view, _| view.thread_id);
+
+        let stopped_events = Rc::new(RefCell::new(Vec::new()));
+        let stopped_clone = stopped_events.clone();
+        let _subscription = cx.update(|_window, cx| {
+            cx.subscribe(&thread, move |_, event, _| {
+                if let AcpThreadEvent::Stopped { stop_reason, .. } = event {
+                    stopped_clone.borrow_mut().push(stop_reason.clone());
+                }
+            })
+        });
+
+        let project = thread.read_with(cx, |thread, _| thread.project().clone());
+        let action_log = thread.read_with(cx, |thread, _| thread.action_log().clone());
+
+        let buffer = project
+            .update(cx, |project, cx| project.create_buffer(None, false, cx))
+            .await
+            .unwrap();
+
+        cx.update(|_, cx| {
+            action_log.update(cx, |log, cx| log.buffer_read(buffer.clone(), cx));
+            buffer.update(cx, |buffer, cx| {
+                buffer.set_text("hello world\n", cx);
+            });
+            action_log.update(cx, |log, cx| log.buffer_edited(buffer.clone(), cx));
+        });
+
+        let complete = connection.defer_next_prompt_response();
+        let _running = thread.update(cx, |thread, cx| thread.send(vec!["hello".into()], cx));
+        cx.run_until_parked();
+
+        assert!(stopped_events.borrow().is_empty());
+
+        thread_view.update(cx, |view, cx| {
+            view.cancel_generation(cx);
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            *stopped_events.borrow(),
+            vec![Some(acp_v2::StopReason::Cancelled)]
+        );
+
+        complete
+            .send(Ok(acp_v1::PromptResponse::new(acp_v1::StopReason::EndTurn)))
+            .ok();
+        cx.run_until_parked();
+
+        assert_eq!(
+            *stopped_events.borrow(),
+            vec![Some(acp_v2::StopReason::Cancelled)]
+        );
+
+        let stored_diff_stats = cx.read(|cx| {
+            ThreadMetadataStore::global(cx)
+                .read(cx)
+                .entry(thread_id)
+                .and_then(|metadata| metadata.diff_stats)
+        });
+        assert!(stored_diff_stats.is_some());
+        assert_eq!(
+            stored_diff_stats.unwrap().lines_added,
+            1
+        );
     }
 
     #[gpui::test]
