@@ -11199,6 +11199,23 @@ mod internal_tests {
         });
 
         let model = fake.model("fake");
+        parent_thread.update(cx, |t, cx| {
+            t.set_model(model.clone(), cx);
+            t.send(ClientUserMessageId::new(), ["parent task"], cx)
+                .unwrap();
+        });
+        cx.run_until_parked();
+
+        let completion = fake.pending_completions().pop().unwrap();
+        fake.send_text(&model, &completion, "parent completed work");
+        fake.end_stream(&model, &completion);
+        cx.run_until_parked();
+
+        agent.update(cx, |agent, cx| {
+            agent.save_thread(parent_thread.clone(), cx);
+        });
+        cx.run_until_parked();
+
         subagent_thread.update(cx, |t, cx| {
             t.set_model(model.clone(), cx);
             t.set_task_id(Some("TASK-42".to_string()));
@@ -11226,14 +11243,26 @@ mod internal_tests {
 
         // 2. Simulate restart / thread release by evicting subagent session from memory
         drop(subagent_handle);
-        cx.update(|cx| {
-            agent.update(cx, |agent, _cx| {
-                agent.sessions.remove(&subagent_session_id);
-            });
-        });
-        assert!(!agent.read_with(cx, |agent, _| {
-            agent.sessions.contains_key(&subagent_session_id)
-        }));
+        drop(subagent_thread);
+        drop(parent_thread);
+        drop(acp_thread);
+        drop(environment);
+        release_dropped_entities(cx);
+        assert!(agent.read_with(cx, |agent, _| agent.sessions.is_empty()));
+
+        let acp_thread = agent
+            .update(cx, |agent, cx| {
+                agent.open_thread(parent_session_id.clone(), project.clone(), cx)
+            })
+            .await
+            .unwrap();
+        let parent_thread =
+            cx.update(|cx| native_thread_for_session(&agent, &parent_session_id, cx));
+        let environment = NativeThreadEnvironment {
+            agent: agent.downgrade(),
+            thread: parent_thread.downgrade(),
+            acp_thread: acp_thread.downgrade(),
+        };
 
         // 3. Verify subagent_task_id falls back to SQLite
         assert_eq!(
@@ -11265,14 +11294,25 @@ mod internal_tests {
 
         // 6. Test resume_subagent_thread fallback to SQLite when missing from memory
         drop(resumed);
-        cx.update(|cx| {
-            agent.update(cx, |agent, _cx| {
-                agent.sessions.remove(&subagent_session_id);
-            });
-        });
-        assert!(!agent.read_with(cx, |agent, _| {
-            agent.sessions.contains_key(&subagent_session_id)
-        }));
+        drop(parent_thread);
+        drop(acp_thread);
+        drop(environment);
+        release_dropped_entities(cx);
+        assert!(agent.read_with(cx, |agent, _| agent.sessions.is_empty()));
+
+        let acp_thread = agent
+            .update(cx, |agent, cx| {
+                agent.open_thread(parent_session_id.clone(), project.clone(), cx)
+            })
+            .await
+            .unwrap();
+        let parent_thread =
+            cx.update(|cx| native_thread_for_session(&agent, &parent_session_id, cx));
+        let environment = NativeThreadEnvironment {
+            agent: agent.downgrade(),
+            thread: parent_thread.downgrade(),
+            acp_thread: acp_thread.downgrade(),
+        };
 
         let direct_resumed = cx
             .update(|cx| {

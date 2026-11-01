@@ -11262,7 +11262,7 @@ async fn test_subagent_tool_resume_session_after_restart(cx: &mut TestAppContext
     cx.run_until_parked();
 
     // === First turn: spawn subagent ===
-    let send = acp_thread.update(cx, |thread, cx| thread.send_raw("Start", cx));
+    let send = acp_thread.update(cx, |thread, cx| thread.send(vec!["Start".into()], cx));
     cx.run_until_parked();
     let request = fake.pending_completions_for(&model).pop().unwrap();
     fake.send_text(&model, &request, "spawning subagent");
@@ -11351,7 +11351,7 @@ async fn test_subagent_tool_resume_session_after_restart(cx: &mut TestAppContext
     }));
 
     // === Second turn: resume subagent with session_id after restart ===
-    let send2 = acp_thread.update(cx, |thread, cx| thread.send_raw("Follow up", cx));
+    let send2 = acp_thread.update(cx, |thread, cx| thread.send(vec!["Follow up".into()], cx));
     cx.run_until_parked();
     let request = fake.pending_completions_for(&model).pop().unwrap();
     fake.send_text(&model, &request, "resuming subagent");
@@ -16363,7 +16363,7 @@ async fn test_subagent_lsp_rename_denied_outside_task_worktree(cx: &mut TestAppC
     cx.run_until_parked();
 
     // Spawn subagent with TASK-LSP
-    let _send = acp_thread.update(cx, |thread, cx| thread.send_raw("Start subagent", cx));
+    let _send = acp_thread.update(cx, |thread, cx| thread.send(vec!["Start subagent".into()], cx));
     cx.run_until_parked();
     fake.send_last_text(&model, "spawning subagent");
     let subagent_input = SpawnAgentToolInput {
@@ -16645,7 +16645,7 @@ async fn test_spawn_agent_with_goal_id_and_base_branch(cx: &mut TestAppContext) 
     send2.await.unwrap();
 
     setup_mock_tgs(&project.read_with(cx, |p, _| p.context_server_store()), cx);
-    let _send3 = acp_thread.update(cx, |thread, cx| thread.send_raw("Start standard task", cx));
+    let _send3 = acp_thread.update(cx, |thread, cx| thread.send(vec!["Start standard task".into()], cx));
     cx.run_until_parked();
     fake.send_last_text(&model, "spawning standard subagent");
     let standard_input = SpawnAgentToolInput {

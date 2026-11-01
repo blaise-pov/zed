@@ -154,7 +154,7 @@ pub struct SubagentContext {
     /// `spawn_agent`. While set, the subagent keeps this profile even when the
     /// parent thread switches profiles, because the profile gates the tools,
     /// context servers and model available to the subagent.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub explicit_profile: Option<AgentProfileId>,
 }
 
