@@ -1267,7 +1267,7 @@ impl ThreadMetadataStore {
     fn handle_conversation_event(
         &mut self,
         conversation_view: Entity<crate::ConversationView>,
-        _event: &crate::conversation_view::RootThreadUpdated,
+        event: &crate::conversation_view::RootThreadUpdated,
         cx: &mut Context<Self>,
     ) {
         let view = conversation_view.read(cx);
@@ -1293,7 +1293,10 @@ impl ThreadMetadataStore {
         let title = thread_ref.title();
         let title_override = existing_thread.and_then(|t| t.title_override.clone());
 
-        let updated_at = Utc::now();
+        let updated_at = match existing_thread {
+            Some(existing) if !event.content_changed => existing.updated_at,
+            _ => Utc::now(),
+        };
 
         let created_at = existing_thread
             .and_then(|t| t.created_at)
@@ -4531,5 +4534,72 @@ mod tests {
                 "retained thread A's stored path must not be updated while the project is via collab"
             );
         });
+    }
+
+    #[gpui::test]
+    async fn test_root_thread_updated_preserves_updated_at_when_content_not_changed(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [Path::new("/project-a")], cx).await;
+        let (panel, mut vcx) = setup_panel_with_project(project, cx);
+
+        crate::test_support::open_thread_with_connection(
+            &panel,
+            StubAgentConnection::new(),
+            &mut vcx,
+        );
+        let thread_id = crate::test_support::active_thread_id(&panel, &vcx);
+        let conversation_view = panel.read_with(&vcx, |panel, _| {
+            panel.active_conversation_view().cloned().unwrap()
+        });
+
+        // Set updated_at to a known past timestamp.
+        let past = Utc::now() - chrono::Duration::seconds(60);
+        cx.update(|cx| {
+            let store = ThreadMetadataStore::global(cx);
+            store.update(cx, |store, cx| {
+                let mut meta = store.entry(thread_id).unwrap().clone();
+                meta.updated_at = past;
+                store.save(meta, cx);
+            });
+        });
+        cx.run_until_parked();
+
+        // Emitting RootThreadUpdated { content_changed: false } preserves existing updated_at.
+        conversation_view.update_in(&mut vcx, |_view, _window, cx| {
+            cx.emit(crate::conversation_view::RootThreadUpdated {
+                content_changed: false,
+            });
+        });
+        vcx.run_until_parked();
+
+        let preserved_updated_at = cx.read(|cx| {
+            let store = ThreadMetadataStore::global(cx);
+            store.read(cx).entry(thread_id).unwrap().updated_at
+        });
+        assert_eq!(
+            preserved_updated_at, past,
+            "updated_at should be preserved when content_changed is false"
+        );
+
+        // Emitting RootThreadUpdated { content_changed: true } updates updated_at.
+        conversation_view.update_in(&mut vcx, |_view, _window, cx| {
+            cx.emit(crate::conversation_view::RootThreadUpdated {
+                content_changed: true,
+            });
+        });
+        vcx.run_until_parked();
+
+        let updated_at = cx.read(|cx| {
+            let store = ThreadMetadataStore::global(cx);
+            store.read(cx).entry(thread_id).unwrap().updated_at
+        });
+        assert!(
+            updated_at > past,
+            "updated_at should be updated when content_changed is true"
+        );
     }
 }

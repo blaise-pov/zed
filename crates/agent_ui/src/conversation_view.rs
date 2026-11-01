@@ -694,7 +694,10 @@ impl Conversation {
     }
 }
 
-pub(crate) struct RootThreadUpdated;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RootThreadUpdated {
+    pub content_changed: bool,
+}
 
 impl EventEmitter<RootThreadUpdated> for ConversationView {}
 
@@ -1256,7 +1259,9 @@ impl ConversationView {
         cx.emit(StateChange);
         cx.emit(AcpServerViewEvent::ActiveThreadChanged);
         if matches!(&self.server_state, ServerState::Connected(_)) {
-            cx.emit(RootThreadUpdated);
+            cx.emit(RootThreadUpdated {
+                content_changed: false,
+            });
         }
         cx.notify();
     }
@@ -2015,7 +2020,9 @@ impl ConversationView {
         };
         let is_subagent = thread.read(cx).parent_session_id().is_some();
         if !is_subagent && affects_thread_metadata(event) {
-            cx.emit(RootThreadUpdated);
+            cx.emit(RootThreadUpdated {
+                content_changed: true,
+            });
         }
         match event {
             AcpThreadEvent::ActivityConfirmedIdle => {
