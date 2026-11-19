@@ -1621,6 +1621,13 @@ pub struct Thread {
     /// Remaining delegation depth budget for spawning subagents.
     delegation_budget: u8,
     task_worktree: Option<PathBuf>,
+    /// Repository anchor used when creating task worktrees for this thread.
+    /// Resolved once when the thread is created and never recomputed.
+    effective_repo: Option<PathBuf>,
+    /// Directory used as the terminal cwd and prompt context for shared-mode
+    /// subagents. Resolved once when the thread is created and never
+    /// recomputed.
+    working_dir: Option<PathBuf>,
     task_id: Option<String>,
     goal_id: Option<String>,
     is_canceling: bool,
@@ -1658,6 +1665,22 @@ impl Thread {
 
     pub fn set_task_worktree(&mut self, task_worktree: Option<PathBuf>) {
         self.task_worktree = task_worktree;
+    }
+
+    pub fn effective_repo(&self) -> Option<&Path> {
+        self.effective_repo.as_deref()
+    }
+
+    pub fn set_effective_repo(&mut self, effective_repo: Option<PathBuf>) {
+        self.effective_repo = effective_repo;
+    }
+
+    pub fn working_dir(&self) -> Option<&Path> {
+        self.working_dir.as_deref()
+    }
+
+    pub fn set_working_dir(&mut self, working_dir: Option<PathBuf>) {
+        self.working_dir = working_dir;
     }
 
     pub fn task_id(&self) -> Option<&str> {
@@ -1713,6 +1736,9 @@ impl Thread {
         if let Some(task_worktree) = &self.task_worktree {
             return Some(Arc::from(task_worktree.as_path()));
         }
+        if let Some(working_dir) = &self.working_dir {
+            return Some(Arc::from(working_dir.as_path()));
+        }
         let project = self.project.read(cx);
         project
             .visible_worktrees(cx)
@@ -1733,6 +1759,8 @@ impl Thread {
         profile: Option<AgentProfileId>,
         model_selection: Option<&LanguageModelSelection>,
         task_worktree: Option<PathBuf>,
+        working_dir: Option<PathBuf>,
+        effective_repo: Option<PathBuf>,
         cx: &mut Context<Self>,
     ) -> Self {
         let project = parent_thread.read(cx).project.clone();
@@ -1745,6 +1773,16 @@ impl Thread {
                 .to_vec();
             let (worktree_context, _) =
                 crate::initial_task_worktree_context(&project, None, worktree_path, cx);
+            cx.new(|_| ProjectContext::new(vec![worktree_context]).with_skills(parent_skills))
+        } else if let Some(ref working_dir) = working_dir {
+            let parent_skills = parent_thread
+                .read(cx)
+                .project_context
+                .read(cx)
+                .skills()
+                .to_vec();
+            let (worktree_context, _) =
+                crate::initial_task_worktree_context(&project, None, working_dir, cx);
             cx.new(|_| ProjectContext::new(vec![worktree_context]).with_skills(parent_skills))
         } else {
             parent_thread.read(cx).project_context.clone()
@@ -1771,6 +1809,8 @@ impl Thread {
             explicit_profile: profile,
         });
         thread.task_worktree = task_worktree;
+        thread.working_dir = working_dir;
+        thread.effective_repo = effective_repo;
         thread.subagent_slot_pool = parent_thread.read(cx).subagent_slot_pool.clone();
         thread.inherit_parent_settings(parent_thread, cx);
         let model_selection = model_selection.cloned().or_else(|| {
@@ -1936,6 +1976,8 @@ impl Thread {
             sandbox_grants: Rc::new(RefCell::new(ThreadSandboxGrants::default())),
             delegation_budget,
             task_worktree: None,
+            effective_repo: None,
+            working_dir: None,
             task_id: None,
             goal_id: None,
             is_canceling: false,
@@ -2465,6 +2507,8 @@ impl Thread {
             ))),
             delegation_budget,
             task_worktree: None,
+            effective_repo: db_thread.effective_repo,
+            working_dir: db_thread.working_dir,
             task_id: db_thread.task_id,
             goal_id: db_thread.goal_id,
             is_canceling: false,
@@ -2573,6 +2617,8 @@ impl Thread {
             sandbox_grants: self.sandbox_grants.borrow().to_db(),
             task_id: self.task_id.clone(),
             goal_id: self.goal_id.clone(),
+            working_dir: self.working_dir.clone(),
+            effective_repo: self.effective_repo.clone(),
         };
 
         cx.background_spawn(async move {
@@ -9951,6 +9997,8 @@ mod tests {
             sandbox_grants: Default::default(),
             task_id: Some("TASK-11".to_string()),
             goal_id: None,
+            working_dir: None,
+            effective_repo: None,
         };
 
         let session_id = acp::SessionId::new(Arc::<str>::from("session-test-from-db"));
@@ -9998,6 +10046,30 @@ mod tests {
                 _ => false,
             }));
         });
+    }
+
+    #[gpui::test]
+    async fn test_worktree_root_path_prefers_working_dir_without_task_worktree(
+        cx: &mut TestAppContext,
+    ) {
+        let (thread, _, _) = setup_thread_for_test(cx).await;
+        let working_dir = PathBuf::from("/repo/sub-project");
+
+        thread.update(cx, |thread, _cx| {
+            thread.set_task_worktree(None);
+            thread.set_working_dir(Some(working_dir.clone()));
+        });
+
+        let root_path = thread.read_with(cx, |thread, cx| thread.worktree_root_path(cx));
+        assert_eq!(root_path.as_deref(), Some(working_dir.as_path()));
+
+        // A task worktree still takes precedence over the working dir.
+        let task_worktree = PathBuf::from("/repo/worktrees/agent-task-TASK-1");
+        thread.update(cx, |thread, _cx| {
+            thread.set_task_worktree(Some(task_worktree.clone()));
+        });
+        let root_path = thread.read_with(cx, |thread, cx| thread.worktree_root_path(cx));
+        assert_eq!(root_path.as_deref(), Some(task_worktree.as_path()));
     }
 
     #[test]
@@ -12589,7 +12661,8 @@ mod tests {
         cx.update(|cx| {
             let mut subagents = Vec::new();
             for _ in 0..count {
-                let subagent = cx.new(|cx| Thread::new_subagent(parent, None, None, None, cx));
+                let subagent =
+                    cx.new(|cx| Thread::new_subagent(parent, None, None, None, None, None, cx));
                 parent.update(cx, |thread, _cx| {
                     thread.register_running_subagent(subagent.downgrade());
                 });
@@ -12641,8 +12714,9 @@ mod tests {
                     cx,
                 )
             });
-            let child = cx.new(|cx| Thread::new_subagent(&root, None, None, None, cx));
-            let grandchild = cx.new(|cx| Thread::new_subagent(&child, None, None, None, cx));
+            let child = cx.new(|cx| Thread::new_subagent(&root, None, None, None, None, None, cx));
+            let grandchild =
+                cx.new(|cx| Thread::new_subagent(&child, None, None, None, None, None, cx));
             root.update(cx, |thread, _| {
                 thread.register_running_subagent(child.downgrade())
             });

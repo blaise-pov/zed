@@ -3876,6 +3876,8 @@ impl NativeThreadEnvironment {
                 profile,
                 model.as_ref(),
                 task_worktree.clone(),
+                None,
+                None,
                 cx,
             );
             let title = if depth > 1 {
@@ -9116,8 +9118,9 @@ mod internal_tests {
 
         // Build the subagent thread the same way
         // `NativeThreadEnvironment::create_subagent_thread` does.
-        let subagent_thread =
-            cx.update(|cx| cx.new(|cx| Thread::new_subagent(&parent_thread, None, None, None, cx)));
+        let subagent_thread = cx.update(|cx| {
+            cx.new(|cx| Thread::new_subagent(&parent_thread, None, None, None, None, None, cx))
+        });
 
         // Run the subagent through the production registration path.
         // This is what installs the `SkillTool` on the thread.

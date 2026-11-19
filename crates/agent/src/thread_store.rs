@@ -173,6 +173,8 @@ mod tests {
             sandbox_grants: Default::default(),
             task_id: None,
             goal_id: None,
+            effective_repo: None,
+            working_dir: None,
         }
     }
 
