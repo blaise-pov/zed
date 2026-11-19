@@ -16868,7 +16868,7 @@ async fn test_spawn_agent_with_on_branch_goal_and_exclusivity(cx: &mut TestAppCo
 
     // Ensure the goal branch exists before checking it out
     let ensure_goal =
-        cx.update(|cx| task_worktree::ensure_goal_branch(project.clone(), "GOAL-EXC", cx));
+        cx.update(|cx| task_worktree::ensure_goal_branch(project.clone(), "GOAL-EXC", None, cx));
     ensure_goal.await.unwrap();
 
     // 3. Subagent 1 spawns on explicit on_branch
