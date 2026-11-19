@@ -231,6 +231,8 @@ mod tests {
             terminal_wrapper_command: None,
             task_isolation: crate::TaskIsolation::default(),
             task_worktree_language_servers: None,
+            task_worktree_repo: None,
+            working_dir: None,
         }
     }
 
