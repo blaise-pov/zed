@@ -11984,6 +11984,8 @@ mod tests {
             sandbox_grants: Default::default(),
             task_id: None,
             goal_id: None,
+            effective_repo: None,
+            working_dir: None,
         };
 
         let thread_store = cx.update(|cx| ThreadStore::global(cx));
@@ -15153,6 +15155,8 @@ mod tests {
                 sandbox_grants: Default::default(),
                 task_id: None,
                 goal_id: None,
+                effective_repo: None,
+                working_dir: None,
             },
             PathList::default(),
         )
@@ -15186,6 +15190,8 @@ mod tests {
                 sandbox_grants: Default::default(),
                 task_id: None,
                 goal_id: None,
+                effective_repo: None,
+                working_dir: None,
             },
             PathList::default(),
         )
