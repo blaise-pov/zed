@@ -10583,6 +10583,8 @@ async fn test_subagent_tool_call_end_to_end(cx: &mut TestAppContext) {
         on_branch: None,
         worktree_of: None,
         model: None,
+        repo: None,
+        working_dir: None,
     };
     let subagent_tool_use = LanguageModelToolUse {
         id: "subagent_1".into(),
@@ -10739,6 +10741,8 @@ async fn test_subagent_tool_output_does_not_include_thinking(cx: &mut TestAppCon
         on_branch: None,
         worktree_of: None,
         model: None,
+        repo: None,
+        working_dir: None,
     };
     let subagent_tool_use = LanguageModelToolUse {
         id: "subagent_1".into(),
@@ -10905,6 +10909,8 @@ async fn test_subagent_tool_call_cancellation_during_task_prompt(cx: &mut TestAp
         on_branch: None,
         worktree_of: None,
         model: None,
+        repo: None,
+        working_dir: None,
     };
     let subagent_tool_use = LanguageModelToolUse {
         id: "subagent_1".into(),
@@ -11050,6 +11056,8 @@ async fn test_subagent_tool_resume_session(cx: &mut TestAppContext) {
         on_branch: None,
         worktree_of: None,
         model: None,
+        repo: None,
+        working_dir: None,
     };
     let subagent_tool_use = LanguageModelToolUse {
         id: "subagent_1".into(),
@@ -11128,6 +11136,8 @@ async fn test_subagent_tool_resume_session(cx: &mut TestAppContext) {
         on_branch: None,
         worktree_of: None,
         model: None,
+        repo: None,
+        working_dir: None,
     };
     let resume_tool_use = LanguageModelToolUse {
         id: "subagent_2".into(),
@@ -11278,6 +11288,8 @@ async fn test_subagent_tool_resume_session_after_restart(cx: &mut TestAppContext
         on_branch: None,
         worktree_of: None,
         model: None,
+        repo: None,
+        working_dir: None,
     };
     let subagent_tool_use = LanguageModelToolUse {
         id: "subagent_1".into(),
@@ -11366,6 +11378,8 @@ async fn test_subagent_tool_resume_session_after_restart(cx: &mut TestAppContext
         on_branch: None,
         worktree_of: None,
         model: None,
+        repo: None,
+        working_dir: None,
     };
     let resume_tool_use = LanguageModelToolUse {
         id: "subagent_2".into(),
@@ -12875,6 +12889,8 @@ async fn test_subagent_error_propagation(cx: &mut TestAppContext) {
         on_branch: None,
         worktree_of: None,
         model: None,
+        repo: None,
+        working_dir: None,
     };
     let subagent_tool_use = LanguageModelToolUse {
         id: "subagent_1".into(),
@@ -14897,6 +14913,8 @@ async fn test_subagent_task_id_prompt_formatting(cx: &mut TestAppContext) {
         on_branch: None,
         worktree_of: None,
         model: None,
+        repo: None,
+        working_dir: None,
     };
 
     let tool_use = LanguageModelToolUse {
@@ -15459,6 +15477,8 @@ async fn test_spawn_agent_two_tasks_isolated_worktrees(cx: &mut TestAppContext) 
         on_branch: None,
         worktree_of: None,
         model: None,
+        repo: None,
+        working_dir: None,
     };
     let tool_use_1 = LanguageModelToolUse {
         id: "subagent_1".into(),
@@ -15571,6 +15591,8 @@ async fn test_spawn_agent_two_tasks_isolated_worktrees(cx: &mut TestAppContext) 
         on_branch: None,
         worktree_of: None,
         model: None,
+        repo: None,
+        working_dir: None,
     };
     let tool_use_2 = LanguageModelToolUse {
         id: "subagent_2".into(),
@@ -15784,6 +15806,8 @@ async fn test_spawn_agent_non_git_degrades_isolation(cx: &mut TestAppContext) {
         on_branch: None,
         worktree_of: None,
         model: None,
+        repo: None,
+        working_dir: None,
     };
     let tool_use = LanguageModelToolUse {
         id: "subagent_1".into(),
@@ -15918,6 +15942,8 @@ async fn test_spawn_agent_error_creates_wip_commit(cx: &mut TestAppContext) {
         on_branch: None,
         worktree_of: None,
         model: None,
+        repo: None,
+        working_dir: None,
     };
     let tool_use = LanguageModelToolUse {
         id: "subagent_1".into(),
@@ -16377,6 +16403,8 @@ async fn test_subagent_lsp_rename_denied_outside_task_worktree(cx: &mut TestAppC
         on_branch: None,
         worktree_of: None,
         model: None,
+        repo: None,
+        working_dir: None,
     };
     let tool_use = LanguageModelToolUse {
         id: "subagent_1".into(),
@@ -16530,6 +16558,8 @@ async fn test_spawn_agent_with_goal_id_and_base_branch(cx: &mut TestAppContext) 
         on_branch: None,
         worktree_of: None,
         model: None,
+        repo: None,
+        working_dir: None,
     };
     let tool_use_invalid = LanguageModelToolUse {
         id: "subagent_invalid".into(),
@@ -16586,6 +16616,8 @@ async fn test_spawn_agent_with_goal_id_and_base_branch(cx: &mut TestAppContext) 
         on_branch: None,
         worktree_of: None,
         model: None,
+        repo: None,
+        working_dir: None,
     };
     let tool_use_goal = LanguageModelToolUse {
         id: "subagent_goal".into(),
@@ -16659,6 +16691,8 @@ async fn test_spawn_agent_with_goal_id_and_base_branch(cx: &mut TestAppContext) 
         on_branch: None,
         worktree_of: None,
         model: None,
+        repo: None,
+        working_dir: None,
     };
     let tool_use_standard = LanguageModelToolUse {
         id: "subagent_standard".into(),
@@ -16772,6 +16806,8 @@ async fn test_spawn_agent_with_on_branch_goal_and_exclusivity(cx: &mut TestAppCo
         on_branch: Some("agent-goal/GOAL-EXC".to_string()),
         worktree_of: None,
         model: None,
+        repo: None,
+        working_dir: None,
     };
     let tool_use1 = LanguageModelToolUse {
         id: "subagent_invalid_1".into(),
@@ -16827,6 +16863,8 @@ async fn test_spawn_agent_with_on_branch_goal_and_exclusivity(cx: &mut TestAppCo
         on_branch: Some("agent-goal/GOAL-EXC".to_string()),
         worktree_of: None,
         model: None,
+        repo: None,
+        working_dir: None,
     };
     let tool_use2 = LanguageModelToolUse {
         id: "subagent_invalid_2".into(),
@@ -16886,6 +16924,8 @@ async fn test_spawn_agent_with_on_branch_goal_and_exclusivity(cx: &mut TestAppCo
         on_branch: Some("agent-goal/GOAL-EXC".to_string()),
         worktree_of: None,
         model: None,
+        repo: None,
+        working_dir: None,
     };
     let tool_use3 = LanguageModelToolUse {
         id: "subagent_1".into(),
@@ -16962,6 +17002,8 @@ async fn test_spawn_agent_with_on_branch_goal_and_exclusivity(cx: &mut TestAppCo
         on_branch: Some("agent-goal/GOAL-EXC".to_string()),
         worktree_of: None,
         model: None,
+        repo: None,
+        working_dir: None,
     };
     let tool_use4 = LanguageModelToolUse {
         id: "subagent_2".into(),
