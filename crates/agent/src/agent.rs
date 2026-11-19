@@ -4504,6 +4504,7 @@ impl ThreadEnvironment for NativeThreadEnvironment {
                     goal_id,
                     base_branch,
                     on_branch,
+                    None,
                     cx,
                 )
             });
