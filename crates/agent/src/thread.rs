@@ -930,6 +930,8 @@ pub trait ThreadEnvironment {
         profile: Option<agent_settings::AgentProfileId>,
         model: Option<AgentModelId>,
         task_worktree: Option<PathBuf>,
+        working_dir: Option<PathBuf>,
+        repo: Option<PathBuf>,
         cx: &mut App,
     ) -> Result<Rc<dyn SubagentHandle>>;
 
@@ -938,6 +940,8 @@ pub trait ThreadEnvironment {
         _session_id: acp_v2::SessionId,
         _profile: Option<agent_settings::AgentProfileId>,
         _task_worktree: Option<PathBuf>,
+        _working_dir: Option<PathBuf>,
+        _repo: Option<PathBuf>,
         _cx: &mut App,
     ) -> Result<Rc<dyn SubagentHandle>> {
         Err(anyhow::anyhow!(
@@ -952,6 +956,7 @@ pub trait ThreadEnvironment {
         _base_branch: Option<String>,
         _on_branch: Option<String>,
         _worktree_of: Option<String>,
+        _repo_hint: Option<PathBuf>,
         _cx: &mut AsyncApp,
     ) -> Task<Result<PathBuf>> {
         Task::ready(Err(anyhow::anyhow!("not supported")))
@@ -6407,6 +6412,21 @@ impl Thread {
             }
         } else {
             render_default().expect("Invalid template")
+        };
+        // Subagents pinned to a repository or working directory state it
+        // explicitly, so the model does not have to infer it from the worktree
+        // list (which may reflect the parent's context).
+        let system_prompt = if self.subagent_context.is_some() {
+            let mut prompt = system_prompt;
+            if let Some(repo) = self.effective_repo.as_deref() {
+                prompt.push_str(&format!("\n\nWorking repository: `{}`", repo.display()));
+            }
+            if let Some(dir) = self.working_dir.as_deref() {
+                prompt.push_str(&format!("\n\nWorking directory: `{}`", dir.display()));
+            }
+            prompt
+        } else {
+            system_prompt
         };
         let mut messages = vec![LanguageModelRequestMessage {
             role: Role::System,

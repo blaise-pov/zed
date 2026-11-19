@@ -500,6 +500,8 @@ impl crate::ThreadEnvironment for FakeThreadEnvironment {
         _profile: Option<agent_settings::AgentProfileId>,
         model: Option<AgentModelId>,
         task_worktree: Option<PathBuf>,
+        _working_dir: Option<PathBuf>,
+        _repo: Option<PathBuf>,
         _cx: &mut App,
     ) -> Result<Rc<dyn SubagentHandle>> {
         self.subagent_models.borrow_mut().push(model);
@@ -516,6 +518,8 @@ impl crate::ThreadEnvironment for FakeThreadEnvironment {
         _session_id: acp::SessionId,
         _profile: Option<agent_settings::AgentProfileId>,
         task_worktree: Option<PathBuf>,
+        _working_dir: Option<PathBuf>,
+        _repo: Option<PathBuf>,
         _cx: &mut App,
     ) -> Result<Rc<dyn SubagentHandle>> {
         self.subagent_worktrees.borrow_mut().push(task_worktree);
@@ -533,6 +537,7 @@ impl crate::ThreadEnvironment for FakeThreadEnvironment {
         _base_branch: Option<String>,
         _on_branch: Option<String>,
         worktree_of: Option<String>,
+        _repo_hint: Option<PathBuf>,
         _cx: &mut AsyncApp,
     ) -> Task<Result<PathBuf>> {
         if let Some(ref host_id) = worktree_of {
@@ -728,6 +733,8 @@ impl crate::ThreadEnvironment for MultiTerminalEnvironment {
         _profile: Option<agent_settings::AgentProfileId>,
         _model: Option<AgentModelId>,
         _task_worktree: Option<PathBuf>,
+        _working_dir: Option<PathBuf>,
+        _repo: Option<PathBuf>,
         _cx: &mut App,
     ) -> Result<Rc<dyn SubagentHandle>> {
         unimplemented!()
@@ -771,6 +778,8 @@ fn insert_profile(
             terminal_wrapper_command: None,
             task_isolation: agent_settings::TaskIsolation::default(),
             task_worktree_language_servers: None,
+            task_worktree_repo: None,
+            working_dir: None,
         },
     );
     agent_settings::AgentSettings::override_global(settings, cx);
@@ -809,6 +818,8 @@ fn insert_profile_with_delegation(
             terminal_wrapper_command: None,
             task_isolation: agent_settings::TaskIsolation::default(),
             task_worktree_language_servers: None,
+            task_worktree_repo: None,
+            working_dir: None,
         },
     );
     agent_settings::AgentSettings::override_global(settings, cx);
@@ -839,6 +850,8 @@ fn insert_profile_with_isolation(
             terminal_wrapper_command: None,
             task_isolation: isolation,
             task_worktree_language_servers: None,
+            task_worktree_repo: None,
+            working_dir: None,
         },
     );
     agent_settings::AgentSettings::override_global(settings, cx);
@@ -12156,6 +12169,8 @@ async fn test_delegation_chain_budget_exhaustion_blocks_transitive_bypass(cx: &m
                 Some(AgentProfileId("ci_runner".into())),
                 None,
                 None,
+                None,
+                None,
                 cx,
             )
         })
@@ -12187,6 +12202,8 @@ async fn test_delegation_chain_budget_exhaustion_blocks_transitive_bypass(cx: &m
             Some(AgentProfileId("orchestrator".into())),
             None,
             None,
+            None,
+            None,
             cx,
         )
     });
@@ -12205,6 +12222,8 @@ async fn test_delegation_chain_budget_exhaustion_blocks_transitive_bypass(cx: &m
         ci_runner_env.resume_subagent_thread(
             ci_runner_session_id.clone(),
             Some(AgentProfileId("orchestrator".into())),
+            None,
+            None,
             None,
             cx,
         )
@@ -12566,7 +12585,7 @@ async fn test_subagent_auto_compaction(cx: &mut TestAppContext) {
     let handle = cx
         .update(|cx| {
             test.environment
-                .resume_subagent_thread(test.handle.id(), None, None, cx)
+                .resume_subagent_thread(test.handle.id(), None, None, None, None, cx)
         })
         .unwrap();
     assert_eq!(handle.id(), test.handle.id());
@@ -15318,6 +15337,8 @@ async fn test_profile_write_scopes_allowed_and_denied(cx: &mut TestAppContext) {
         terminal_wrapper_command: None,
         task_isolation: agent_settings::TaskIsolation::default(),
         task_worktree_language_servers: None,
+        task_worktree_repo: None,
+        working_dir: None,
     };
 
     // Path inside backend/** write_scope is allowed
@@ -17204,7 +17225,7 @@ impl SubagentCompactionTest {
         };
         let handle = cx
             .update(|cx| {
-                environment.create_subagent_thread("subagent".to_string(), None, None, None, cx)
+                environment.create_subagent_thread("subagent".to_string(), None, None, None, None, None, cx)
             })
             .unwrap();
         let thread = agent.read_with(cx, |agent, _| {

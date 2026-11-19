@@ -786,6 +786,17 @@ fn wsl_zed_release(_cx: &App) -> Option<(String, String)> {
     None
 }
 
+/// Root the terminal defaults to for this call. A task worktree wins; shared
+/// subagents fall back to their frozen working directory.
+fn terminal_worktree_root(event_stream: &ToolCallEventStream, cx: &App) -> Option<PathBuf> {
+    event_stream.task_worktree(cx).or_else(|| {
+        event_stream
+            .thread()
+            .and_then(|thread| thread.upgrade())
+            .and_then(|thread| thread.read(cx).working_dir().map(Path::to_path_buf))
+    })
+}
+
 fn project_root_path(project: &Project, cx: &App) -> Option<PathBuf> {
     project
         .active_project_directory(cx)
@@ -1964,7 +1975,7 @@ async fn run_terminal_tool(
 
     let (working_dir, authorize, sandboxing, is_local_project, wsl_zed_release) =
         cx.update(|cx| {
-            let task_worktree = event_stream.task_worktree(cx);
+            let task_worktree = terminal_worktree_root(&event_stream, cx);
             let working_dir = working_dir(&input.cd, &project, task_worktree.as_deref(), cx)
                 .map_err(|err| err.to_string())?;
 
@@ -2429,7 +2440,7 @@ async fn run_terminal_tool(
             .clone();
         let profile = event_stream.profile_settings(cx);
         let effective = effective_terminal_wrapper(global_wrapper.as_deref(), profile.as_ref());
-        let task_worktree = event_stream.task_worktree(cx);
+        let task_worktree = terminal_worktree_root(&event_stream, cx);
         let root = task_worktree.or_else(|| project_root_path(project.read(cx), cx));
         (effective, root)
     });
@@ -3542,6 +3553,8 @@ mod tests {
             terminal_wrapper_command: None,
             task_isolation: agent_settings::TaskIsolation::default(),
             task_worktree_language_servers: None,
+            task_worktree_repo: None,
+            working_dir: None,
         };
 
         cx.read(|cx| {
@@ -3616,6 +3629,8 @@ mod tests {
             terminal_wrapper_command: None,
             task_isolation: agent_settings::TaskIsolation::default(),
             task_worktree_language_servers: None,
+            task_worktree_repo: None,
+            working_dir: None,
         };
 
         cx.read(|cx| {
@@ -3668,6 +3683,8 @@ mod tests {
             terminal_wrapper_command: None,
             task_isolation: agent_settings::TaskIsolation::default(),
             task_worktree_language_servers: None,
+            task_worktree_repo: None,
+            working_dir: None,
         };
 
         cx.read(|cx| {
@@ -3750,6 +3767,8 @@ mod tests {
             terminal_wrapper_command: None,
             task_isolation: agent_settings::TaskIsolation::default(),
             task_worktree_language_servers: None,
+            task_worktree_repo: None,
+            working_dir: None,
         };
 
         cx.read(|cx| {
@@ -3805,6 +3824,8 @@ mod tests {
             terminal_wrapper_command: None,
             task_isolation: agent_settings::TaskIsolation::default(),
             task_worktree_language_servers: None,
+            task_worktree_repo: None,
+            working_dir: None,
         };
 
         cx.update(|cx| {
@@ -3882,6 +3903,8 @@ mod tests {
             terminal_wrapper_command: None,
             task_isolation: agent_settings::TaskIsolation::default(),
             task_worktree_language_servers: None,
+            task_worktree_repo: None,
+            working_dir: None,
         };
 
         cx.update(|cx| {
@@ -4393,14 +4416,27 @@ mod tests {
             PathBuf::from("/worktrees/zed/agent-task-182")
         };
 
-        fs.insert_tree(root_path, serde_json::json!({})).await;
+        fs.insert_tree(root_path, serde_json::json!({ "repo_b": {} })).await;
         let project = project::Project::test(fs, [root_path.as_ref()], cx).await;
+
+        let shared_working_dir = if cfg!(target_os = "windows") {
+            PathBuf::from("C:\\projects\\zed\\repo_b")
+        } else {
+            PathBuf::from("/projects/zed/repo_b")
+        };
 
         cx.update(|cx| {
             let res_dot = working_dir(".", &project, Some(&task_worktree_path), cx)
                 .expect("cd . should succeed")
                 .expect("should return a path");
             assert_eq!(res_dot, task_worktree_path);
+
+            // A shared subagent with a frozen working directory uses it as the
+            // terminal cwd, exactly like a task worktree root.
+            let res_shared = working_dir(".", &project, Some(&shared_working_dir), cx)
+                .expect("cd . in a shared working dir should succeed")
+                .expect("should return a path");
+            assert_eq!(res_shared, shared_working_dir);
 
             let res_root = working_dir("zed", &project, Some(&task_worktree_path), cx)
                 .expect("cd zed should succeed")
@@ -7745,6 +7781,8 @@ gamma"
             terminal_wrapper_command: Some("profile_rtk".into()),
             task_isolation: agent_settings::TaskIsolation::default(),
             task_worktree_language_servers: None,
+            task_worktree_repo: None,
+            working_dir: None,
         };
         cx.update(|cx| {
             let mut settings = agent_settings::AgentSettings::get_global(cx).clone();
@@ -7790,6 +7828,8 @@ gamma"
             terminal_wrapper_command: Some("".into()),
             task_isolation: agent_settings::TaskIsolation::default(),
             task_worktree_language_servers: None,
+            task_worktree_repo: None,
+            working_dir: None,
         };
         cx.update(|cx| {
             let mut settings = agent_settings::AgentSettings::get_global(cx).clone();
@@ -7839,6 +7879,8 @@ gamma"
             terminal_wrapper_command: None,
             task_isolation: agent_settings::TaskIsolation::default(),
             task_worktree_language_servers: None,
+            task_worktree_repo: None,
+            working_dir: None,
         };
         cx.update(|cx| {
             let mut settings = agent_settings::AgentSettings::get_global(cx).clone();

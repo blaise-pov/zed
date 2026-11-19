@@ -6,7 +6,7 @@ use gpui::{App, SharedString, Task};
 use language_model::LanguageModelToolResultContent;
 use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer, Serialize};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
@@ -252,6 +252,32 @@ fn validate_repo_and_working_dir(
     }
 
     None
+}
+
+/// Resolves a validated `repo`/`working_dir` spawn parameter to an absolute
+/// path against the first visible worktree.
+fn resolve_spawn_path(
+    value: Option<&str>,
+    project: Option<&gpui::Entity<project::Project>>,
+    cx: &App,
+) -> Option<PathBuf> {
+    let value = value?;
+    let project = project?;
+    let base_dir = project.read_with(cx, |project, cx| {
+        project
+            .visible_worktrees(cx)
+            .next()
+            .map(|worktree| worktree.read(cx).abs_path().to_path_buf())
+    });
+    let path = PathBuf::from(value);
+    let path = if path.is_absolute() {
+        path
+    } else if let Some(base_dir) = base_dir {
+        base_dir.join(path)
+    } else {
+        path
+    };
+    Some(util::paths::normalize_lexically(&path).unwrap_or(path))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -763,6 +789,19 @@ impl AgentTool for SpawnAgentTool {
                 });
             }
 
+            let (resolved_working_dir, resolved_repo) = cx.update(|cx| {
+                // Values are frozen at session creation; a resume must not
+                // override them.
+                if input.session_id.is_some() {
+                    return (None, None);
+                }
+                let project = event_stream.project();
+                (
+                    resolve_spawn_path(input.working_dir.as_deref(), project, cx),
+                    resolve_spawn_path(input.repo.as_deref(), project, cx),
+                )
+            });
+
             let task_detail = if let Some(ref task_id) = task_id {
                 let get_fut = self.environment.get_task_registered(task_id, &mut cx);
                 let detail_res = futures::select_biased! {
@@ -946,6 +985,7 @@ impl AgentTool for SpawnAgentTool {
                     input.base_branch.clone(),
                     input.on_branch.clone(),
                     input.worktree_of.clone(),
+                    resolved_repo.clone(),
                     &mut cx,
                 );
                 let worktree_res = futures::select_biased! {
@@ -987,6 +1027,7 @@ impl AgentTool for SpawnAgentTool {
                     input.base_branch.clone(),
                     input.on_branch.clone(),
                     None,
+                    resolved_repo.clone(),
                     &mut cx,
                 );
                 let worktree_res = futures::select_biased! {
@@ -1086,6 +1127,8 @@ impl AgentTool for SpawnAgentTool {
                         session_id,
                         input.profile.clone(),
                         worktree_path.clone(),
+                        None,
+                        None,
                         cx,
                     )
                 } else {
@@ -1094,6 +1137,8 @@ impl AgentTool for SpawnAgentTool {
                         input.profile,
                         input.model.map(AgentModelId::from),
                         worktree_path.clone(),
+                        resolved_working_dir.clone(),
+                        resolved_repo.clone(),
                         cx,
                     )
                 };
@@ -2450,6 +2495,8 @@ Strict Constraints:
             _profile: Option<agent_settings::AgentProfileId>,
             _model: Option<crate::AgentModelId>,
             _task_worktree: Option<std::path::PathBuf>,
+            _working_dir: Option<std::path::PathBuf>,
+            _repo: Option<std::path::PathBuf>,
             _cx: &mut App,
         ) -> Result<Rc<dyn crate::thread::SubagentHandle>> {
             Ok(Rc::new(TestSubagentHandle {
@@ -2465,6 +2512,7 @@ Strict Constraints:
             _base_branch: Option<String>,
             _on_branch: Option<String>,
             _worktree_of: Option<String>,
+            _repo_hint: Option<std::path::PathBuf>,
             cx: &mut gpui::AsyncApp,
         ) -> Task<Result<std::path::PathBuf>> {
             if self.hang_slot_wait {

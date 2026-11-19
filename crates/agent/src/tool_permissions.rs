@@ -2631,6 +2631,8 @@ mod tests {
             terminal_wrapper_command: None,
             task_isolation: agent_settings::TaskIsolation::default(),
             task_worktree_language_servers: None,
+            task_worktree_repo: None,
+            working_dir: None,
         };
 
         let settings = test_agent_settings(ToolPermissions::default());
@@ -2755,6 +2757,8 @@ mod tests {
             terminal_wrapper_command: None,
             task_isolation: agent_settings::TaskIsolation::default(),
             task_worktree_language_servers: None,
+            task_worktree_repo: None,
+            working_dir: None,
         };
 
         // Global Deny takes precedence over profile's allow
@@ -2790,6 +2794,8 @@ mod tests {
             terminal_wrapper_command: None,
             task_isolation: agent_settings::TaskIsolation::default(),
             task_worktree_language_servers: None,
+            task_worktree_repo: None,
+            working_dir: None,
         };
 
         let settings = test_agent_settings(ToolPermissions {
@@ -2826,6 +2832,8 @@ mod tests {
             terminal_wrapper_command: None,
             task_isolation: agent_settings::TaskIsolation::default(),
             task_worktree_language_servers: None,
+            task_worktree_repo: None,
+            working_dir: None,
         };
 
         let settings = test_agent_settings(ToolPermissions::default());
@@ -2864,6 +2872,8 @@ mod tests {
             terminal_wrapper_command: None,
             task_isolation: agent_settings::TaskIsolation::default(),
             task_worktree_language_servers: None,
+            task_worktree_repo: None,
+            working_dir: None,
         };
 
         let settings = test_agent_settings(ToolPermissions::default());
@@ -2897,6 +2907,8 @@ mod tests {
             terminal_wrapper_command: None,
             task_isolation: agent_settings::TaskIsolation::default(),
             task_worktree_language_servers: None,
+            task_worktree_repo: None,
+            working_dir: None,
         };
 
         let settings = test_agent_settings(ToolPermissions {
