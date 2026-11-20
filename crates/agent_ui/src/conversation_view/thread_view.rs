@@ -12013,6 +12013,18 @@ impl ThreadView {
         let status_icon = format!("status-icon-{}", entry_ix);
         let diff_stat_id = format!("subagent-diff-{}", entry_ix);
 
+        let error_message = state.error.clone();
+        let failed_tooltip = error_message
+            .clone()
+            .unwrap_or_else(|| SharedString::from("Subagent Failed"));
+        // A spawn that fails before a session exists has no thread view to expand,
+        // so its error renders directly under the header instead.
+        let standalone_error = if thread_view.is_none() {
+            error_message.clone()
+        } else {
+            None
+        };
+
         let icon =
             h_flex().w_4().justify_center().child(match state.status {
                 SubagentStatus::Running => SpinnerLabel::new()
@@ -12034,7 +12046,7 @@ impl ThreadView {
                             .size(IconSize::Small)
                             .color(Color::Error),
                     )
-                    .tooltip(Tooltip::text("Subagent Failed"))
+                    .tooltip(Tooltip::text(failed_tooltip))
                     .into_any_element(),
                 SubagentStatus::Completed => Icon::new(IconName::Check)
                     .size(IconSize::Small)
@@ -12051,8 +12063,6 @@ impl ThreadView {
         } else {
             "Click to Preview"
         };
-
-        let error_message = state.error.clone();
 
         let title_line = h_flex()
             .min_w_0()
@@ -12423,6 +12433,21 @@ impl ThreadView {
                         .child(fullscreen_toggle)
                     })
                 }
+            })
+            .when_some(standalone_error, |this, message| {
+                this.child(
+                    v_flex()
+                        .debug_selector(|| format!("subagent-error-{}", card_id.0))
+                        .border_t_1()
+                        .border_color(self.tool_card_border_color(cx))
+                        .child(
+                            Callout::new()
+                                .severity(Severity::Error)
+                                .icon(IconName::XCircle)
+                                .title("Subagent Failed")
+                                .description(message),
+                        ),
+                )
             })
             .into_any_element()
     }

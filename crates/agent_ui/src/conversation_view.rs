@@ -7020,12 +7020,13 @@ pub(crate) mod tests {
             .expect("subagent session info should serialize"),
         )]);
 
-        for (id, label, status, output, expected_status, expected_error) in [
+        for (id, label, status, output, has_session_info, expected_status, expected_error) in [
             (
                 "running",
                 "Explore",
                 acp_v2::ToolCallStatus::InProgress,
                 None,
+                true,
                 SubagentStatus::Running,
                 None,
             ),
@@ -7034,6 +7035,7 @@ pub(crate) mod tests {
                 "Find the parser",
                 acp_v2::ToolCallStatus::Completed,
                 Some("Found it"),
+                true,
                 SubagentStatus::Completed,
                 None,
             ),
@@ -7042,14 +7044,25 @@ pub(crate) mod tests {
                 "Fix the build",
                 acp_v2::ToolCallStatus::Failed,
                 Some("Model unavailable"),
+                true,
                 SubagentStatus::Failed,
                 Some("Model unavailable"),
+            ),
+            (
+                "failed-without-session",
+                "Fix the build",
+                acp_v2::ToolCallStatus::Failed,
+                Some("Taskgraph is unreachable"),
+                false,
+                SubagentStatus::Failed,
+                Some("Taskgraph is unreachable"),
             ),
             (
                 "user-canceled",
                 "Explore",
                 acp_v2::ToolCallStatus::Failed,
                 Some("User canceled"),
+                true,
                 SubagentStatus::Canceled,
                 None,
             ),
@@ -7058,14 +7071,15 @@ pub(crate) mod tests {
                 "Explore",
                 acp_v2::ToolCallStatus::Cancelled,
                 None,
+                true,
                 SubagentStatus::Canceled,
                 None,
             ),
         ] {
-            let mut update = acp_v2::ToolCallUpdate::new(id)
-                .title(label)
-                .status(status)
-                .meta(session_info.clone());
+            let mut update = acp_v2::ToolCallUpdate::new(id).title(label).status(status);
+            if has_session_info {
+                update = update.meta(session_info.clone());
+            }
             if let Some(output) = output {
                 update = update.content(vec![output.into()]);
             }
@@ -7089,13 +7103,42 @@ pub(crate) mod tests {
             assert_eq!(state.label.as_deref(), Some(label), "{id}");
             assert_eq!(
                 state.entries,
-                Some(SubagentEntries {
+                has_session_info.then_some(SubagentEntries {
                     start: 2,
                     end: Some(5),
                 }),
                 "{id}"
             );
         }
+    }
+
+    #[gpui::test]
+    async fn test_failed_spawn_without_session_renders_error_callout(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::default_response(), cx).await;
+        add_to_workspace_with_size(conversation_view.clone(), true, cx);
+
+        let root =
+            active_thread(&conversation_view, cx).read_with(cx, |view, _| view.thread.clone());
+        root.update(cx, |thread, cx| {
+            let spawn = acp_v1::ToolCall::new("failed-spawn", "Spawn agent")
+                .name("spawn_agent")
+                .kind(acp_v1::ToolKind::Other)
+                .status(acp_v1::ToolCallStatus::Failed)
+                .content(vec!["Taskgraph is unreachable".into()]);
+            thread
+                .handle_session_update(acp_v1::SessionUpdate::ToolCall(spawn), cx)
+                .expect("failed subagent tool call should be accepted");
+        });
+        cx.run_until_parked();
+
+        let selector: &'static str =
+            Box::leak(format!("subagent-error-{}", "failed-spawn").into_boxed_str());
+        assert!(
+            cx.debug_bounds(selector).is_some(),
+            "a failed spawn without a session should render its error callout"
+        );
     }
 
     #[gpui::test]
