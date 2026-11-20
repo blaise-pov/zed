@@ -245,7 +245,9 @@ fn contracted_checkout_sha(branch: &str) -> Option<String> {
     if task_id.is_empty() {
         return None;
     }
-    task_contracted_sha(&AgentTaskId::from(task_id))
+    task_ref_artifact(&AgentTaskId::from(task_id))
+        .filter(|artifact| artifact.branch == branch)
+        .and_then(|artifact| artifact.head_sha)
 }
 
 pub fn ensure_task_worktree_with_options(
@@ -695,7 +697,7 @@ struct TaskWorktreeRegistry {
     #[cfg(any(test, feature = "test-support"))]
     task_files: HashMap<AgentTaskId, HashMap<PathBuf, Vec<u8>>>,
     goal_tip_shas: HashMap<String, String>,
-    task_contracted_shas: HashMap<AgentTaskId, String>,
+    task_ref_artifacts: HashMap<AgentTaskId, TaskRefArtifact>,
     goal_graduations: HashMap<String, GoalGraduationSummary>,
     task_titles: HashMap<AgentTaskId, String>,
     task_sessions: HashMap<AgentTaskId, String>,
@@ -2143,20 +2145,25 @@ pub fn task_worktree_isolation_details(task_id: &AgentTaskId) -> Option<Subagent
         .and_then(|e| e.isolation_details.clone())
 }
 
-/// Records the sha that `agent-task/{task_id}` is contracted to point at.
+/// Records the task ref artifact for a task branch.
 ///
-/// This mirrors `TaskRefArtifact.head_sha`, which is published from the same
-/// commit details. Unlike the isolation details it survives worktree release,
-/// so a later `on_branch` checkout can be verified against it.
-pub fn record_task_contracted_sha(task_id: &AgentTaskId, sha: String) {
+/// `TaskRefArtifact.head_sha` is the sha published for `agent-task/{task_id}`,
+/// so an `on_branch` checkout of that branch must land exactly on it. The
+/// record survives worktree release so a later checkout can be verified.
+pub fn record_task_ref_artifact(task_id: &AgentTaskId, artifact: TaskRefArtifact) {
     let mut reg = REGISTRY.write();
-    reg.task_contracted_shas.insert(task_id.clone(), sha);
+    reg.task_ref_artifacts.insert(task_id.clone(), artifact);
 }
 
-/// Returns the last sha recorded for `agent-task/{task_id}`, when known.
-pub fn task_contracted_sha(task_id: &AgentTaskId) -> Option<String> {
+/// Returns the recorded task ref artifact for a task, when known.
+pub fn task_ref_artifact(task_id: &AgentTaskId) -> Option<TaskRefArtifact> {
     let reg = REGISTRY.read();
-    reg.task_contracted_shas.get(task_id).cloned()
+    reg.task_ref_artifacts.get(task_id).cloned()
+}
+
+/// Returns the sha recorded in the task ref artifact for a task, when known.
+pub fn task_contracted_sha(task_id: &AgentTaskId) -> Option<String> {
+    task_ref_artifact(task_id).and_then(|artifact| artifact.head_sha)
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -3564,7 +3571,15 @@ pub async fn commit_task_worktree(
     if let Some(ref sha) = head_sha {
         if let Some(branch_task_id) = branch.strip_prefix("agent-task/") {
             if !branch_task_id.is_empty() {
-                record_task_contracted_sha(&AgentTaskId::from(branch_task_id), sha.clone());
+                record_task_ref_artifact(
+                    &AgentTaskId::from(branch_task_id),
+                    TaskRefArtifact {
+                        branch: branch.clone(),
+                        head_sha: Some(sha.clone()),
+                        merged_into: None,
+                        merge_conflict: None,
+                    },
+                );
             }
         }
         if branch.starts_with("agent-goal/") {
@@ -4552,7 +4567,7 @@ pub fn cleanup_graduated_goal(
             reg.goal_graduations.remove(&goal_id);
             for task_id in &tasks_to_cleanup {
                 reg.entries.remove(task_id);
-                reg.task_contracted_shas.remove(task_id);
+                reg.task_ref_artifacts.remove(task_id);
                 #[cfg(any(test, feature = "test-support"))]
                 reg.task_files.remove(task_id);
             }
@@ -6294,11 +6309,15 @@ mod tests {
         // Simulate a reset/rebase window: the branch ref moved away from the
         // sha that was contracted for the task.
         let dot_git = std::path::Path::new(path!("/root/.git"));
-        let branch_ref = format!("refs/heads/agent-task/{}", reviewed.id);
+        let branch = format!("agent-task/{}", reviewed.id);
+        let branch_ref = format!("refs/heads/{branch}");
         fs.with_git_state(dot_git, true, |state| {
             state
                 .refs
                 .insert(branch_ref.clone(), "reset-in-progress-sha".into());
+            state
+                .refs
+                .insert(branch.clone(), "reset-in-progress-sha".into());
         })
         .unwrap();
 
@@ -6311,7 +6330,7 @@ mod tests {
                     &reviewer,
                     None,
                     None,
-                    Some(branch),
+                    Some(branch.clone()),
                     cx,
                 )
             })
