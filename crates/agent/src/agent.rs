@@ -4141,9 +4141,7 @@ impl NativeThreadEnvironment {
                         .map(|summary| summary.goal_id)
                         .or_else(|| {
                             crate::task_worktree::task_worktree_goal_branch(tid)
-                                .as_deref()
-                                .and_then(|b| b.strip_prefix("agent-goal/"))
-                                .map(|g| g.to_string())
+                                .map(|b| crate::task_worktree::normalize_goal_id(&b))
                         })
                 })
                 .or_else(|| {

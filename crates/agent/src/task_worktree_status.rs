@@ -14,7 +14,9 @@ use serde::{Deserialize, Serialize};
 use util::ResultExt as _;
 
 use crate::agent_task::{AgentGoalSummary, AgentTaskId, AgentTaskSummary};
-use crate::task_worktree::{system_git_binary, task_worktree_context, task_worktree_path};
+use crate::task_worktree::{
+    normalize_goal_id, system_git_binary, task_worktree_context, task_worktree_path,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GoalGitState {
@@ -178,8 +180,14 @@ pub fn snapshot_with_cache(
                 .or_else(|| ref_name.strip_prefix("refs/remotes/"))
                 .unwrap_or(ref_name);
             let branch_name = branch_name.strip_prefix("origin/").unwrap_or(branch_name);
-            if let Some(goal_id) = branch_name.strip_prefix("agent-goal/") {
+            if branch_name.starts_with("agent-goal/") {
+                let goal_id = normalize_goal_id(branch_name);
                 let canonical_branch = format!("agent-goal/{goal_id}");
+                if canonical_branch != branch_name {
+                    // Branches with repeated `agent-goal/` prefixes are phantoms
+                    // left by older versions; they are not goal branches.
+                    continue;
+                }
                 let tip_sha = if let Some(commit) = &branch.most_recent_commit {
                     Some(commit.sha.to_string())
                 } else {
@@ -188,7 +196,7 @@ pub fn snapshot_with_cache(
                         .log_err()
                         .flatten()
                 };
-                let entry = existing_goal_branches.entry(goal_id.to_string());
+                let entry = existing_goal_branches.entry(goal_id);
                 match entry {
                     std::collections::hash_map::Entry::Vacant(vacant) => {
                         vacant.insert((canonical_branch, tip_sha));
