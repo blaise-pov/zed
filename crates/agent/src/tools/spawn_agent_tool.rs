@@ -44,6 +44,13 @@ use util::ResultExt as _;
 /// - Do not silently choose a different model when an explicit model is unavailable unless the user allowed fallback.
 /// - A resumed session keeps its existing model, so `model` cannot be combined with `session_id`.
 ///
+/// ### Repository and working directory
+/// - `repo` names the git repository that anchors a dedicated task worktree. It requires `task_id` with dedicated worktree isolation.
+/// - `working_dir` sets the working directory for shared-mode subagent terminals and prompt context. It has no git semantics.
+/// - Precedence: spawn parameter, then profile, then parent thread, then (repo only) a repository derived from `working_dir`, then autodetect.
+/// - Both values freeze on the thread at creation. They cannot be passed on resume, in guest mode (`worktree_of`), or with `working_dir` plus dedicated worktree isolation.
+/// - Paths are validated against the project and must resolve inside a visible worktree.
+///
 /// ### Output
 /// - You will receive only the agent's final message as output.
 /// - Successful calls return a session_id that you can use for follow-up messages.
@@ -98,6 +105,19 @@ pub struct SpawnAgentToolInput {
     /// Omit to preserve default behavior. Cannot be changed when resuming an existing session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Git repository that anchors the task worktree and its branches (§8.2).
+    /// Requires task_id with dedicated worktree isolation. Relative paths resolve
+    /// against the first visible worktree; the path must be inside the project and
+    /// match a repository. Falls back to the profile, then the parent thread, then
+    /// autodetect. Frozen at session creation; forbidden on resume and in guest mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
+    /// Working directory for shared-mode subagent terminals and prompt context.
+    /// No git semantics. Relative paths resolve against the first visible worktree;
+    /// the path must be inside the project. Applies to shared mode only, and is
+    /// frozen at session creation; forbidden on resume and in guest mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_dir: Option<String>,
 }
 
 fn deserialize_session_id<'de, D>(deserializer: D) -> Result<Option<acp_v2::SessionId>, D::Error>
@@ -144,6 +164,99 @@ fn validate_profile(
         profile.as_str(),
         available_profiles
     ))
+}
+
+/// Fail-closed validation for the `repo` and `working_dir` spawn parameters.
+/// Returns a model-facing error message on failure.
+fn validate_repo_and_working_dir(
+    input: &SpawnAgentToolInput,
+    task_id: Option<&str>,
+    wants_worktree: bool,
+    project: Option<&gpui::Entity<project::Project>>,
+    cx: &App,
+) -> Option<String> {
+    let repo = input.repo.as_deref();
+    let working_dir = input.working_dir.as_deref();
+    if repo.is_none() && working_dir.is_none() {
+        return None;
+    }
+
+    if input.session_id.is_some() {
+        return Some(
+            "repo/working_dir are frozen at session creation and cannot be passed on resume"
+                .to_string(),
+        );
+    }
+
+    if input.worktree_of.is_some() {
+        return Some(
+            "repo/working_dir cannot be combined with worktree_of: guest mode borrows the host worktree"
+                .to_string(),
+        );
+    }
+
+    if repo.is_some() && !(task_id.is_some() && wants_worktree) {
+        return Some("repo requires task_id with dedicated worktree isolation".to_string());
+    }
+
+    if working_dir.is_some() && wants_worktree {
+        return Some("working_dir applies to shared mode only".to_string());
+    }
+
+    let project = project?;
+
+    let base_dir = project.read_with(cx, |project, cx| {
+        project
+            .visible_worktrees(cx)
+            .next()
+            .map(|worktree| worktree.read(cx).abs_path().to_path_buf())
+    });
+    let resolve = |value: &str| -> std::path::PathBuf {
+        let path = std::path::PathBuf::from(value);
+        let path = if path.is_absolute() {
+            path
+        } else if let Some(base_dir) = base_dir.as_ref() {
+            base_dir.join(path)
+        } else {
+            path
+        };
+        util::paths::normalize_lexically(&path).unwrap_or(path)
+    };
+    let inside_project = |path: &Path| {
+        project.read_with(cx, |project, cx| {
+            project
+                .visible_worktrees(cx)
+                .any(|worktree| path.starts_with(worktree.read(cx).abs_path()))
+        })
+    };
+
+    if let Some(working_dir) = working_dir {
+        // `.` escapes inheritance and means the project root.
+        if working_dir != "." && !inside_project(&resolve(working_dir)) {
+            return Some(format!("path outside project: {working_dir}"));
+        }
+    }
+
+    if let Some(repo) = repo {
+        // `.` escapes inheritance and means autodetect; it need not name a
+        // repository itself.
+        if repo != "." {
+            let resolved = resolve(repo);
+            if !inside_project(&resolved) {
+                return Some(format!("path outside project: {repo}"));
+            }
+            let matches = project.read_with(cx, |project, cx| {
+                project.repositories(cx).values().any(|repository| {
+                    resolved.starts_with(repository.read(cx).work_directory_abs_path.as_ref())
+                })
+            });
+            if !matches {
+                return Some(format!("no repository matches: {repo}"));
+            }
+        }
+    }
+
+    None
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -637,6 +750,96 @@ impl AgentTool for SpawnAgentTool {
                 });
             }
 
+            if let Some(error) = cx.update(|cx| {
+                validate_repo_and_working_dir(
+                    &input,
+                    task_id.as_deref(),
+                    wants_worktree,
+                    event_stream.project(),
+                    cx,
+                )
+            }) {
+                return Err(SpawnAgentToolOutput::Error {
+                    session_id: input.session_id.clone(),
+                    error,
+                    session_info: None,
+                    isolation: None,
+                    isolation_details: None,
+                });
+            }
+
+            let (resolved_working_dir, resolved_repo) = cx.update(|cx| {
+                // Resolve the effective working directory and repository once,
+                // with full precedence, before any worktree is created. The
+                // same values feed both worktree creation and the child thread.
+                let parent_thread = event_stream.thread().and_then(|thread| thread.upgrade());
+                let parent = parent_thread.as_ref().map(|thread| thread.read(cx));
+                let project = event_stream
+                    .project()
+                    .cloned()
+                    .or_else(|| parent.map(|thread| thread.project().clone()));
+                let settings =
+                    agent_settings::AgentSettings::get(event_stream.settings_location(cx), cx);
+                let child_profile = input
+                    .profile
+                    .clone()
+                    .or_else(|| parent.map(|thread| thread.profile().clone()))
+                    .or_else(|| event_stream.profile_id(cx));
+                let paths = crate::resolve_subagent_paths(
+                    project.as_ref(),
+                    settings,
+                    parent,
+                    child_profile.as_ref(),
+                    crate::PathChoice::from_configured(
+                        input.working_dir.as_deref(),
+                        project.as_ref(),
+                        cx,
+                    ),
+                    crate::PathChoice::from_configured(input.repo.as_deref(), project.as_ref(), cx),
+                    !wants_worktree,
+                    cx,
+                );
+                (paths.working_dir, paths.effective_repo)
+            });
+
+            // Every task under one goal must anchor to the same repository.
+            // The first task establishes it; later tasks reject a different
+            // explicit repo and adopt the established one when unset.
+            let resolved_repo = if let Some(goal_id) = input.goal_id.as_deref() {
+                let anchored = cx.update(|cx| {
+                    let parent_thread = event_stream.thread().and_then(|thread| thread.upgrade());
+                    let project = event_stream.project().cloned().or_else(|| {
+                        parent_thread
+                            .as_ref()
+                            .map(|thread| thread.read(cx).project().clone())
+                    });
+                    let Some(project) = project else {
+                        return anyhow::Ok(resolved_repo);
+                    };
+                    let project = project.read(cx);
+                    crate::task_worktree::anchor_repo_to_goal(
+                        project,
+                        goal_id,
+                        resolved_repo,
+                        cx,
+                    )
+                });
+                match anchored {
+                    Ok(repo) => repo,
+                    Err(error) => {
+                        return Err(SpawnAgentToolOutput::Error {
+                            session_id: input.session_id.clone(),
+                            error: error.to_string(),
+                            session_info: None,
+                            isolation: None,
+                            isolation_details: None,
+                        });
+                    }
+                }
+            } else {
+                resolved_repo
+            };
+
             let task_detail = if let Some(ref task_id) = task_id {
                 let get_fut = self.environment.get_task_registered(task_id, &mut cx);
                 let detail_res = futures::select_biased! {
@@ -820,6 +1023,7 @@ impl AgentTool for SpawnAgentTool {
                     input.base_branch.clone(),
                     input.on_branch.clone(),
                     input.worktree_of.clone(),
+                    resolved_repo.clone(),
                     &mut cx,
                 );
                 let worktree_res = futures::select_biased! {
@@ -861,6 +1065,7 @@ impl AgentTool for SpawnAgentTool {
                     input.base_branch.clone(),
                     input.on_branch.clone(),
                     None,
+                    resolved_repo.clone(),
                     &mut cx,
                 );
                 let worktree_res = futures::select_biased! {
@@ -960,6 +1165,8 @@ impl AgentTool for SpawnAgentTool {
                         session_id,
                         input.profile.clone(),
                         worktree_path.clone(),
+                        None,
+                        None,
                         cx,
                     )
                 } else {
@@ -968,6 +1175,8 @@ impl AgentTool for SpawnAgentTool {
                         input.profile,
                         input.model.map(AgentModelId::from),
                         worktree_path.clone(),
+                        resolved_working_dir.clone(),
+                        resolved_repo.clone(),
                         cx,
                     )
                 };
@@ -2324,6 +2533,8 @@ Strict Constraints:
             _profile: Option<agent_settings::AgentProfileId>,
             _model: Option<crate::AgentModelId>,
             _task_worktree: Option<std::path::PathBuf>,
+            _working_dir: Option<std::path::PathBuf>,
+            _repo: Option<std::path::PathBuf>,
             _cx: &mut App,
         ) -> Result<Rc<dyn crate::thread::SubagentHandle>> {
             Ok(Rc::new(TestSubagentHandle {
@@ -2339,6 +2550,7 @@ Strict Constraints:
             _base_branch: Option<String>,
             _on_branch: Option<String>,
             _worktree_of: Option<String>,
+            _repo_hint: Option<std::path::PathBuf>,
             cx: &mut gpui::AsyncApp,
         ) -> Task<Result<std::path::PathBuf>> {
             if self.hang_slot_wait {
@@ -2591,6 +2803,258 @@ Strict Constraints:
         assert!(
             !crate::task_worktree::has_active_subagent_session(&task_id_typed),
             "session guard must be released so slot wait leaves no holder"
+        );
+    }
+
+    async fn run_spawn_agent_expect_error(
+        cx: &mut gpui::TestAppContext,
+        input: SpawnAgentToolInput,
+    ) -> String {
+        let environment = Rc::new(crate::tests::FakeThreadEnvironment::default());
+        #[allow(clippy::arc_with_non_send_sync)]
+        let tool = Arc::new(SpawnAgentTool::new(environment));
+        let (event_stream, _rx) = crate::thread::ToolCallEventStream::test();
+
+        let result = cx
+            .update(|cx| tool.run(ToolInput::resolved(input), event_stream, cx))
+            .await;
+
+        let Err(SpawnAgentToolOutput::Error { error, .. }) = result else {
+            panic!("expected Err(SpawnAgentToolOutput::Error), got {result:?}");
+        };
+        error
+    }
+
+    #[gpui::test]
+    async fn spawn_agent_rejects_repo_and_working_dir_on_resume(cx: &mut gpui::TestAppContext) {
+        crate::tests::init_test(cx);
+
+        let repo_error = run_spawn_agent_expect_error(
+            cx,
+            SpawnAgentToolInput {
+                label: "task".to_string(),
+                message: "prompt".to_string(),
+                session_id: Some(acp_v2::SessionId::new("subagent-id")),
+                repo: Some("repo_a".to_string()),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(
+            repo_error,
+            "repo/working_dir are frozen at session creation and cannot be passed on resume"
+        );
+
+        let working_dir_error = run_spawn_agent_expect_error(
+            cx,
+            SpawnAgentToolInput {
+                label: "task".to_string(),
+                message: "prompt".to_string(),
+                session_id: Some(acp_v2::SessionId::new("subagent-id")),
+                working_dir: Some("crates/agent".to_string()),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(
+            working_dir_error,
+            "repo/working_dir are frozen at session creation and cannot be passed on resume"
+        );
+    }
+
+    #[gpui::test]
+    async fn spawn_agent_rejects_repo_and_working_dir_in_guest_mode(cx: &mut gpui::TestAppContext) {
+        crate::tests::init_test(cx);
+
+        let repo_error = run_spawn_agent_expect_error(
+            cx,
+            SpawnAgentToolInput {
+                label: "task".to_string(),
+                message: "prompt".to_string(),
+                task_id: Some("TASK-GUEST".to_string()),
+                worktree_of: Some("TASK-HOST".to_string()),
+                repo: Some("repo_a".to_string()),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert!(
+            repo_error.contains("cannot be combined with worktree_of"),
+            "unexpected error: {repo_error}"
+        );
+
+        let working_dir_error = run_spawn_agent_expect_error(
+            cx,
+            SpawnAgentToolInput {
+                label: "task".to_string(),
+                message: "prompt".to_string(),
+                task_id: Some("TASK-GUEST".to_string()),
+                worktree_of: Some("TASK-HOST".to_string()),
+                working_dir: Some("crates/agent".to_string()),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert!(
+            working_dir_error.contains("cannot be combined with worktree_of"),
+            "unexpected error: {working_dir_error}"
+        );
+    }
+
+    #[gpui::test]
+    async fn spawn_agent_rejects_repo_without_dedicated_worktree(cx: &mut gpui::TestAppContext) {
+        crate::tests::init_test(cx);
+
+        // No task_id at all.
+        let error = run_spawn_agent_expect_error(
+            cx,
+            SpawnAgentToolInput {
+                label: "task".to_string(),
+                message: "prompt".to_string(),
+                repo: Some("repo_a".to_string()),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(
+            error,
+            "repo requires task_id with dedicated worktree isolation"
+        );
+
+        // task_id present, but the default optional-isolation profile and no
+        // branch params mean the subagent runs in shared mode.
+        let environment =
+            Rc::new(crate::tests::FakeThreadEnvironment::default().with_task_id("TASK-SHARED"));
+        #[allow(clippy::arc_with_non_send_sync)]
+        let tool = Arc::new(SpawnAgentTool::new(environment));
+        let (event_stream, _rx) = crate::thread::ToolCallEventStream::test();
+        let result = cx
+            .update(|cx| {
+                tool.run(
+                    ToolInput::resolved(SpawnAgentToolInput {
+                        label: "task".to_string(),
+                        message: "prompt".to_string(),
+                        task_id: Some("TASK-SHARED".to_string()),
+                        repo: Some("repo_a".to_string()),
+                        ..Default::default()
+                    }),
+                    event_stream,
+                    cx,
+                )
+            })
+            .await;
+        let Err(SpawnAgentToolOutput::Error { error, .. }) = result else {
+            panic!("expected error for repo in shared mode, got {result:?}");
+        };
+        assert_eq!(
+            error,
+            "repo requires task_id with dedicated worktree isolation"
+        );
+    }
+
+    #[gpui::test]
+    async fn spawn_agent_rejects_working_dir_with_dedicated_worktree(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        crate::tests::init_test(cx);
+
+        let error = run_spawn_agent_expect_error(
+            cx,
+            SpawnAgentToolInput {
+                label: "task".to_string(),
+                message: "prompt".to_string(),
+                task_id: Some("TASK-WORKTREE".to_string()),
+                base_branch: Some("main".to_string()),
+                working_dir: Some("crates/agent".to_string()),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(error, "working_dir applies to shared mode only");
+    }
+
+    /// A project whose root is not itself a repository, but contains `repo_a`
+    /// and `repo_b` subfolders that are.
+    async fn test_multi_repo_project(
+        cx: &mut gpui::TestAppContext,
+    ) -> gpui::Entity<project::Project> {
+        let fs = fs::FakeFs::new(cx.executor());
+        fs.insert_tree(
+            Path::new("/project"),
+            serde_json::json!({
+                "repo_a": {
+                    ".git": {},
+                    "file_a.txt": "content",
+                },
+                "repo_b": {
+                    ".git": {},
+                    "file_b.txt": "content",
+                },
+            }),
+        )
+        .await;
+
+        let project = project::Project::test(fs.clone(), [Path::new("/project")], cx).await;
+        project
+            .update(cx, |project, cx| project.git_scans_complete(cx))
+            .await;
+        cx.run_until_parked();
+        project
+    }
+
+    #[gpui::test]
+    async fn spawn_agent_validates_repo_and_working_dir_paths(cx: &mut gpui::TestAppContext) {
+        crate::tests::init_test(cx);
+        let project = test_multi_repo_project(cx).await;
+
+        let validate =
+            |cx: &mut gpui::TestAppContext, repo: Option<&str>, working_dir: Option<&str>| {
+                let input = SpawnAgentToolInput {
+                    label: "task".to_string(),
+                    message: "prompt".to_string(),
+                    task_id: Some("TASK-PATHS".to_string()),
+                    repo: repo.map(str::to_string),
+                    working_dir: working_dir.map(str::to_string),
+                    ..Default::default()
+                };
+                // Repo validation only runs in dedicated worktree mode, while
+                // working_dir validation only runs in shared mode.
+                let wants_worktree = repo.is_some();
+                cx.update(|cx| {
+                    validate_repo_and_working_dir(
+                        &input,
+                        input.task_id.as_deref(),
+                        wants_worktree,
+                        Some(&project),
+                        cx,
+                    )
+                })
+            };
+
+        assert_eq!(validate(cx, Some("repo_a"), None), None);
+        assert_eq!(validate(cx, None, Some("repo_b")), None);
+
+        // `.` is the escape sentinel for both parameters: accepted without a
+        // repository/path match, and it resolves to autodetect rather than a
+        // literal path (previously it errored with "no repository matches: .").
+        assert_eq!(validate(cx, Some("."), None), None);
+        assert_eq!(validate(cx, None, Some(".")), None);
+        let repo_choice = cx.update(|cx| {
+            crate::PathChoice::from_configured(Some("."), Some(&project), cx)
+        });
+        assert!(matches!(repo_choice, crate::PathChoice::Escape));
+
+        assert_eq!(
+            validate(cx, None, Some("/elsewhere/dir")),
+            Some("path outside project: /elsewhere/dir".to_string())
+        );
+        assert_eq!(
+            validate(cx, Some("repo_c"), None),
+            Some("no repository matches: repo_c".to_string())
+        );
+        assert_eq!(
+            validate(cx, Some("/elsewhere/repo"), None),
+            Some("path outside project: /elsewhere/repo".to_string())
         );
     }
 }

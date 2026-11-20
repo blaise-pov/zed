@@ -32,41 +32,120 @@ use crate::{AgentTaskId, AgentTaskSummary};
 #[error("no git repository found in project")]
 pub struct NoGitRepositoryError;
 
+/// The resolved repository context needed to create, release, or sweep task
+/// worktrees: the repository entity, its main-checkout anchor, path style, the
+/// worktree directory setting, and the file system.
+pub(crate) type TaskWorktreeContext = (Entity<Repository>, PathBuf, PathStyle, String, Arc<dyn Fs>);
+
 pub(crate) fn system_git_binary() -> Option<PathBuf> {
     static CACHED_GIT: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
     CACHED_GIT.get_or_init(|| which::which("git").ok()).clone()
 }
 
+/// Resolves the repository that owns `path`. A repository matches when `path`
+/// starts with its work directory; the deepest match wins, so nested
+/// repositories resolve to the innermost one. Returns `None` when no
+/// repository contains the path.
+pub(crate) fn repository_for_path(
+    project: &Project,
+    path: &Path,
+    cx: &App,
+) -> Option<Entity<Repository>> {
+    project
+        .repositories(cx)
+        .values()
+        .filter_map(|repository| {
+            let snapshot = repository.read(cx).snapshot();
+            let work_directory = snapshot.work_directory_abs_path.as_ref();
+            path.starts_with(work_directory)
+                .then(|| (work_directory.components().count(), repository.clone()))
+        })
+        .max_by_key(|(depth, _)| *depth)
+        .map(|(_, repository)| repository)
+}
+
+/// Resolves the repository that owns a task worktree at `path`. Linked
+/// worktrees live in the repository's worktrees directory rather than inside
+/// its checkout, so this falls back to matching each repository's worktrees
+/// base directory.
+pub(crate) fn repository_for_worktree_path(
+    project: &Project,
+    path: &Path,
+    cx: &App,
+) -> Option<Entity<Repository>> {
+    if let Some(repository) = repository_for_path(project, path, cx) {
+        return Some(repository);
+    }
+    let worktree_setting = ProjectSettings::get_global(cx)
+        .git
+        .worktree_directory
+        .clone();
+    project.repositories(cx).values().find_map(|repository| {
+        let snapshot = repository.read(cx).snapshot();
+        let anchor_path = snapshot
+            .main_worktree_abs_path()
+            .unwrap_or(snapshot.work_directory_abs_path.as_ref());
+        let base =
+            worktrees_directory_for_repo(anchor_path, &worktree_setting, snapshot.path_style)
+                .ok()?;
+        path.starts_with(&base).then(|| repository.clone())
+    })
+}
+
 /// Resolves the repository a task worktree should be linked to, plus the data
-/// needed to compute its path. Deterministic: prefer the repository backing
-/// the project's primary worktree, then any non-linked (main) repository,
-/// then any repository at all.
+/// needed to compute its path.
+///
+/// With `repo_hint`, only the repository containing that path matches; an
+/// unmatched hint is an error so worktrees never land in the wrong repository.
+/// Without a hint: prefer the repository backing the project's primary
+/// worktree, then any non-linked (main) repository, then any repository at all.
 pub(crate) fn task_worktree_context(
     project: &Project,
+    repo_hint: Option<&Path>,
     cx: &App,
-) -> Result<(Entity<Repository>, PathBuf, PathStyle, String, Arc<dyn Fs>)> {
+) -> Result<TaskWorktreeContext> {
+    let repository = match repo_hint {
+        Some(hint) => Some(repository_for_path(project, hint, cx).ok_or_else(|| {
+            anyhow::anyhow!(
+                "no git repository contains the requested path {}",
+                hint.display()
+            )
+        })?),
+        None => None,
+    };
+    worktree_context_for_repository(project, repository, cx)
+}
+
+fn worktree_context_for_repository(
+    project: &Project,
+    repository: Option<Entity<Repository>>,
+    cx: &App,
+) -> Result<TaskWorktreeContext> {
     let file_system = project.fs().clone();
     let repositories: Vec<Entity<Repository>> =
         project.repositories(cx).values().cloned().collect();
 
-    let repository = project
-        .visible_worktrees(cx)
-        .next()
-        .and_then(|worktree| {
-            let primary_root = worktree.read(cx).abs_path();
-            repositories.iter().find(|repository| {
-                let work_directory = repository.read(cx).snapshot().work_directory_abs_path;
-                primary_root.starts_with(work_directory.as_ref())
+    let repository = repository
+        .or_else(|| {
+            project.visible_worktrees(cx).next().and_then(|worktree| {
+                let primary_root = worktree.read(cx).abs_path();
+                repositories
+                    .iter()
+                    .find(|repository| {
+                        let work_directory = repository.read(cx).snapshot().work_directory_abs_path;
+                        primary_root.starts_with(work_directory.as_ref())
+                    })
+                    .cloned()
             })
         })
         .or_else(|| {
             repositories
                 .iter()
                 .find(|repository| !repository.read(cx).snapshot().is_linked_worktree())
+                .cloned()
         })
-        .or_else(|| repositories.first())
-        .ok_or_else(|| anyhow::anyhow!(NoGitRepositoryError))?
-        .clone();
+        .or_else(|| repositories.first().cloned())
+        .ok_or_else(|| anyhow::anyhow!(NoGitRepositoryError))?;
 
     let snapshot = repository.read(cx).snapshot();
     // Anchor the worktrees directory at the main checkout, mirroring
@@ -89,6 +168,98 @@ pub(crate) fn task_worktree_context(
         worktree_setting,
         file_system,
     ))
+}
+
+/// Like [`task_worktree_context`], but derives the repository from the
+/// worktree path recorded in the registry for `task_id`. Callers act on
+/// registry-recorded paths, so the recorded path — not the project shape —
+/// decides which repository the worktree belongs to. Tasks without a recorded
+/// path, or with a path outside every repository, fall back to the default
+/// selection.
+pub(crate) fn task_worktree_context_for_task(
+    project: &Project,
+    task_id: &AgentTaskId,
+    cx: &App,
+) -> Result<TaskWorktreeContext> {
+    let repository = task_worktree_path_for_id(task_id)
+        .and_then(|path| repository_for_worktree_path(project, &path, cx));
+    worktree_context_for_repository(project, repository, cx)
+}
+
+/// Like [`task_worktree_context_for_task`], but for a goal: resolves the
+/// repository from the worktree paths recorded for the goal's tasks. Goals
+/// have no worktree of their own, so the first recorded task worktree decides.
+pub(crate) fn goal_worktree_context(
+    project: &Project,
+    goal_id: &str,
+    cx: &App,
+) -> Result<TaskWorktreeContext> {
+    let repository = goal_anchor_repository(project, goal_id, cx);
+    worktree_context_for_repository(project, repository, cx)
+}
+
+/// Resolves the repository a goal is already anchored to from the task
+/// worktrees recorded for it. Returns `None` before the goal's first task has a
+/// worktree, so the first spawn establishes the anchor.
+pub(crate) fn goal_anchor_repository(
+    project: &Project,
+    goal_id: &str,
+    cx: &App,
+) -> Option<Entity<Repository>> {
+    let goal_branch = format!("agent-goal/{}", goal_id);
+    let recorded_paths: Vec<PathBuf> = {
+        let reg = REGISTRY.read();
+        reg.entries
+            .values()
+            .filter(|entry| {
+                entry.goal_branch.as_deref() == Some(&goal_branch)
+                    || entry.goal_branch.as_deref() == Some(goal_id)
+            })
+            .map(|entry| entry.worktree_path.clone())
+            .filter(|path| !path.as_os_str().is_empty())
+            .collect()
+    };
+    recorded_paths
+        .iter()
+        .find_map(|path| repository_for_worktree_path(project, path, cx))
+}
+
+/// Ensures every task under one goal anchors to the same repository.
+///
+/// `repo` is the effective repository resolved for the spawn. When the goal
+/// already has an established repository, a different explicit `repo` is
+/// rejected, and an unset `repo` adopts the established one. The first task of
+/// a goal establishes the anchor.
+pub(crate) fn anchor_repo_to_goal(
+    project: &Project,
+    goal_id: &str,
+    repo: Option<PathBuf>,
+    cx: &App,
+) -> Result<Option<PathBuf>> {
+    let Some(established) = goal_anchor_repository(project, goal_id, cx) else {
+        return Ok(repo);
+    };
+    let established_root = established
+        .read(cx)
+        .snapshot()
+        .work_directory_abs_path
+        .as_ref()
+        .to_path_buf();
+
+    match repo {
+        Some(repo) => {
+            let candidate = repository_for_path(project, &repo, cx);
+            match candidate {
+                Some(candidate) if candidate.entity_id() == established.entity_id() => Ok(Some(repo)),
+                _ => anyhow::bail!(
+                    "repo '{}' is not the repository already established for goal '{}'; tasks in one goal must share a repository",
+                    repo.display(),
+                    goal_id
+                ),
+            }
+        }
+        None => Ok(Some(established_root)),
+    }
 }
 
 pub(crate) fn task_worktree_path(
@@ -138,13 +309,14 @@ pub async fn resolve_ref_to_sha(
 pub fn ensure_goal_branch(
     project: Entity<Project>,
     goal_id: &str,
+    repo_hint: Option<PathBuf>,
     cx: &mut App,
 ) -> Task<Result<String>> {
     let goal_id = goal_id.to_string();
     cx.spawn(async move |cx| {
         let (repository, anchor_path, _, _, file_system) = project
             .update(cx, |project, cx| {
-                anyhow::Ok(task_worktree_context(project, cx))
+                anyhow::Ok(task_worktree_context(project, repo_hint.as_deref(), cx))
             })??;
         let dot_git = anchor_path.join(".git");
         let git_binary = system_git_binary();
@@ -198,7 +370,7 @@ pub fn ensure_task_worktree(
     task: &AgentTaskSummary,
     cx: &mut App,
 ) -> Task<Result<PathBuf>> {
-    ensure_task_worktree_with_policy(project, task, None, None, None, cx)
+    ensure_task_worktree_with_policy(project, task, None, None, None, None, cx)
 }
 
 pub fn ensure_task_worktree_interactive(
@@ -207,9 +379,19 @@ pub fn ensure_task_worktree_interactive(
     goal_id: Option<String>,
     base_branch: Option<String>,
     on_branch: Option<String>,
+    repo_hint: Option<PathBuf>,
     cx: &mut App,
 ) -> Task<Result<PathBuf>> {
-    ensure_task_worktree_with_options(project, task, goal_id, base_branch, on_branch, true, cx)
+    ensure_task_worktree_with_options(
+        project,
+        task,
+        goal_id,
+        base_branch,
+        on_branch,
+        repo_hint,
+        true,
+        cx,
+    )
 }
 
 pub fn ensure_task_worktree_with_policy(
@@ -218,17 +400,31 @@ pub fn ensure_task_worktree_with_policy(
     goal_id: Option<String>,
     base_branch: Option<String>,
     on_branch: Option<String>,
+    repo_hint: Option<PathBuf>,
     cx: &mut App,
 ) -> Task<Result<PathBuf>> {
-    ensure_task_worktree_with_options(project, task, goal_id, base_branch, on_branch, false, cx)
+    ensure_task_worktree_with_options(
+        project,
+        task,
+        goal_id,
+        base_branch,
+        on_branch,
+        repo_hint,
+        false,
+        cx,
+    )
 }
 
+/// Ensures the task worktree exists in the repository containing `repo_hint`
+/// (usually the main checkout of the target repository). Without a hint the
+/// repository is inferred from the project shape.
 pub fn ensure_task_worktree_with_options(
     project: Entity<Project>,
     task: &AgentTaskSummary,
     goal_id: Option<String>,
     base_branch: Option<String>,
     on_branch: Option<String>,
+    repo_hint: Option<PathBuf>,
     allow_overflow: bool,
     cx: &mut App,
 ) -> Task<Result<PathBuf>> {
@@ -247,7 +443,7 @@ pub fn ensure_task_worktree_with_options(
 
         let (repository, anchor_path, path_style, worktree_setting, file_system) = project
             .update(cx, |project, cx| {
-                anyhow::Ok(task_worktree_context(project, cx))
+                anyhow::Ok(task_worktree_context(project, repo_hint.as_deref(), cx))
             })??;
 
         let dot_git = anchor_path.join(".git");
@@ -256,14 +452,16 @@ pub fn ensure_task_worktree_with_options(
             .open_repo(&dot_git, git_binary.as_deref())
             .with_context(|| format!("opening repo at {}", dot_git.display()))?;
 
+        let goal_anchor_path = Some(anchor_path.clone());
         let (target_checkout_branch, base_ref, base_sha_for_worktree, goal_branch) =
             if let Some(ref on_b) = on_branch {
                 let branch_name = if on_b == "goal" {
                     let g_id = goal_id
                         .as_deref()
                         .ok_or_else(|| anyhow::anyhow!("on_branch 'goal' requires goal_id"))?;
-                    let ensure_task =
-                        project.update(cx, |_, cx| ensure_goal_branch(project.clone(), g_id, cx));
+                    let ensure_task = project.update(cx, |_, cx| {
+                        ensure_goal_branch(project.clone(), g_id, goal_anchor_path.clone(), cx)
+                    });
                     ensure_task.await?
                 } else {
                     on_b.clone()
@@ -284,7 +482,12 @@ pub fn ensure_task_worktree_with_options(
                 let (b_ref, b_sha, g_branch) = if let Some(ref base) = base_branch {
                     if let Some(extracted_goal_id) = base.strip_prefix("agent-goal/") {
                         let ensure_task = project.update(cx, |_, cx| {
-                            ensure_goal_branch(project.clone(), extracted_goal_id, cx)
+                            ensure_goal_branch(
+                                project.clone(),
+                                extracted_goal_id,
+                                goal_anchor_path.clone(),
+                                cx,
+                            )
                         });
                         ensure_task.await?;
                     }
@@ -304,8 +507,9 @@ pub fn ensure_task_worktree_with_options(
                             });
                     (Some(base.clone()), Some(base_sha), g_branch)
                 } else if let Some(ref g_id) = goal_id {
-                    let ensure_task =
-                        project.update(cx, |_, cx| ensure_goal_branch(project.clone(), g_id, cx));
+                    let ensure_task = project.update(cx, |_, cx| {
+                        ensure_goal_branch(project.clone(), g_id, goal_anchor_path.clone(), cx)
+                    });
                     let g_branch = ensure_task.await?;
                     let sha = resolve_ref_to_sha(&git_repo, &g_branch)
                         .await?
@@ -2612,7 +2816,7 @@ fn remove_task_worktree_internal(
     cx.spawn(async move |cx| {
         let (repository, anchor_path, path_style, worktree_setting, file_system) = project
             .update(cx, |project, cx| {
-                anyhow::Ok(task_worktree_context(project, cx))
+                anyhow::Ok(task_worktree_context_for_task(project, &task_id, cx))
             })??;
         let worktree_path =
             task_worktree_path(&anchor_path, &worktree_setting, path_style, &task_id)?;
@@ -2715,13 +2919,22 @@ async fn prune_git_worktrees(anchor_path: &std::path::Path) {
 
 pub fn remove_orphan_worktree(
     project: Entity<Project>,
+    task_id: Option<&AgentTaskId>,
     path: std::path::PathBuf,
     cx: &mut App,
 ) -> Task<Result<()>> {
+    let task_id = task_id.cloned();
     cx.spawn(async move |cx| {
         let (repository, anchor_path, _path_style, _worktree_setting, file_system) = project
             .update(cx, |project, cx| {
-                anyhow::Ok(task_worktree_context(project, cx))
+                anyhow::Ok(match task_id.as_ref() {
+                    Some(task_id) => task_worktree_context_for_task(project, task_id, cx),
+                    None => worktree_context_for_repository(
+                        project,
+                        repository_for_worktree_path(project, &path, cx),
+                        cx,
+                    ),
+                })
             })??;
 
         if file_system.is_dir(&path).await {
@@ -2864,7 +3077,7 @@ pub fn auto_cleanup_task_worktree(
     cx.spawn(async move |cx| {
         let (repository, anchor_path, _path_style, _worktree_setting, file_system) = project
             .update(cx, |project, cx| {
-                anyhow::Ok(task_worktree_context(project, cx))
+                anyhow::Ok(task_worktree_context_for_task(project, &task_id_clone, cx))
             })??;
         let worktree_path =
             task_worktree_path_for_id(&task_id_clone).unwrap_or_else(|| PathBuf::new());
@@ -2905,18 +3118,64 @@ pub fn startup_sweep(
         for task in &tasks {
             record_task_title(&task.id, &task.title);
         }
-        let (repository, anchor_path, path_style, worktree_setting, file_system) = project
-            .update(cx, |project, cx| {
-                anyhow::Ok(task_worktree_context(project, cx))
-            })??;
 
+        // Multi-repository projects keep one anchor per repository. Start with
+        // the no-hint anchor (the single-repo behaviour), then add one anchor
+        // per repository containing a registry-recorded worktree. Unmatched
+        // recorded paths are skipped; the task loop below still resolves them
+        // through the registry. Each anchor carries its resolved repository so
+        // the sweep never re-resolves the main checkout as a repo hint.
+        let mut anchors: Vec<TaskWorktreeContext> = Vec::new();
+        project.update(cx, |project, cx| {
+            if let Ok(context) = task_worktree_context(project, None, cx) {
+                anchors.push(context);
+            }
+            let recorded_paths: Vec<PathBuf> = {
+                let reg = REGISTRY.read();
+                reg.entries
+                    .values()
+                    .map(|entry| entry.worktree_path.clone())
+                    .filter(|path| !path.as_os_str().is_empty())
+                    .collect()
+            };
+            for path in recorded_paths {
+                if let Some(repository) = repository_for_worktree_path(project, &path, cx) {
+                    if let Ok(context) =
+                        worktree_context_for_repository(project, Some(repository), cx)
+                    {
+                        if !anchors.iter().any(|existing| existing.1 == context.1) {
+                            anchors.push(context);
+                        }
+                    }
+                }
+            }
+        });
+        if anchors.is_empty() {
+            return Err(anyhow::anyhow!(NoGitRepositoryError));
+        }
+
+        let mut swept = Vec::new();
+        for context in anchors {
+            swept.extend(sweep_anchor(&project, context, &tasks, cx).await?);
+        }
+        Ok(swept)
+    })
+}
+
+async fn sweep_anchor(
+    project: &Entity<Project>,
+    (repository, anchor_path, path_style, worktree_setting, file_system): TaskWorktreeContext,
+    tasks: &[AgentTaskSummary],
+    cx: &mut AsyncApp,
+) -> Result<Vec<AgentTaskId>> {
+    {
         let base_dir = worktrees_directory_for_repo(&anchor_path, &worktree_setting, path_style)?;
         if !file_system.is_dir(&base_dir).await {
             return Ok(Vec::new());
         }
 
         let mut swept = Vec::new();
-        for task in &tasks {
+        for task in tasks {
             if !task.status.is_terminal() {
                 continue;
             }
@@ -2961,12 +3220,7 @@ pub fn startup_sweep(
             let reg = REGISTRY.read();
             reg.entries
                 .iter()
-                .filter(|(_, state)| {
-                    state
-                        .pool_key
-                        .as_ref()
-                        .map_or(true, |pk| pk == &pool_key)
-                })
+                .filter(|(_, state)| state.pool_key.as_ref().map_or(true, |pk| pk == &pool_key))
                 .map(|(id, state)| {
                     let active = reg.live_active_sessions_count(id);
                     let safety = worktree_release_safety_for_state(id, state, active, &reg);
@@ -2987,7 +3241,7 @@ pub fn startup_sweep(
             }
         }
 
-        for task in &tasks {
+        for task in tasks {
             if seen_ids.contains(&task.id) {
                 continue;
             }
@@ -3004,12 +3258,7 @@ pub fn startup_sweep(
                         entry.worktree_path = worktree_path.clone();
                         entry.last_session_ended_at
                     };
-                    existing_tasks.push((
-                        task.id.clone(),
-                        worktree_path,
-                        safety,
-                        last_ended,
-                    ));
+                    existing_tasks.push((task.id.clone(), worktree_path, safety, last_ended));
                 }
             }
         }
@@ -3035,7 +3284,7 @@ pub fn startup_sweep(
                 }
                 log::info!("Startup sweep: LRU evicting stale worktree for task {candidate_id}");
                 let evict_res = release_stale_task_worktree(
-                    &project,
+                    project,
                     &repository,
                     &file_system,
                     &anchor_path,
@@ -3062,7 +3311,7 @@ pub fn startup_sweep(
         }
 
         Ok(swept)
-    })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -3568,7 +3817,7 @@ pub fn merge_task_branch_into_goal(
 
         let (repository, anchor_path, _, _, file_system) = project
             .update(cx, |project, cx| {
-                anyhow::Ok(task_worktree_context(project, cx))
+                anyhow::Ok(task_worktree_context_for_task(project, &task_id, cx))
             })??;
 
         let dot_git = anchor_path.join(".git");
@@ -4165,7 +4414,7 @@ pub fn prepare_goal_graduation(
     cx.spawn(async move |cx| {
         let (_repository, anchor_path, _, _, file_system) = project
             .update(cx, |project, cx| {
-                anyhow::Ok(task_worktree_context(project, cx))
+                anyhow::Ok(goal_worktree_context(project, &goal_id, cx))
             })??;
         let dot_git = anchor_path.join(".git");
         let git_binary = system_git_binary();
@@ -4343,7 +4592,7 @@ pub fn cleanup_graduated_goal(
     cx.spawn(async move |cx| {
         let (repository, anchor_path, _, _, file_system) = project
             .update(cx, |project, cx| {
-                anyhow::Ok(task_worktree_context(project, cx))
+                anyhow::Ok(goal_worktree_context(project, &goal_id, cx))
             })??;
         let dot_git = anchor_path.join(".git");
         let git_binary = system_git_binary();
@@ -4717,6 +4966,380 @@ mod tests {
         assert!(fs.is_dir("/root".as_ref()).await);
     }
 
+    fn multi_repo_task(id: &str, status: AgentTaskStatus) -> AgentTaskSummary {
+        AgentTaskSummary {
+            id: AgentTaskId::from(id),
+            parent_id: None,
+            goal_id: None,
+            title: format!("Task {id}"),
+            status,
+            attempt: 1,
+            assignee: None,
+            write_scopes: vec![],
+            created_at: None,
+            assigned_profile: None,
+            model: None,
+            session_id: None,
+            metrics: None,
+        }
+    }
+
+    async fn insert_multi_repo_project(
+        fs: &Arc<FakeFs>,
+        cx: &mut TestAppContext,
+    ) -> Entity<Project> {
+        fs.insert_tree(
+            path!("/root/proj"),
+            json!({
+                "repo_a": { ".git": { "HEAD": "ref: refs/heads/main\n" } },
+                "repo_b": { ".git": { "HEAD": "ref: refs/heads/main\n" } },
+                "repo_c": { ".git": { "HEAD": "ref: refs/heads/main\n" } },
+            }),
+        )
+        .await;
+
+        for repo in ["repo_a", "repo_b", "repo_c"] {
+            let dot_git = PathBuf::from(format!("/root/proj/{repo}/.git"));
+            let sha = format!("{repo}-sha");
+            fs.with_git_state(&dot_git, true, |state| {
+                state.refs.insert("refs/heads/main".into(), sha.clone());
+                state.refs.insert("HEAD".into(), sha.clone());
+                state.branches.insert("main".into());
+            })
+            .unwrap();
+        }
+
+        Project::test(fs.clone(), [path!("/root/proj").as_ref()], cx).await
+    }
+
+    fn project_root_path(project: &Entity<Project>, cx: &mut TestAppContext) -> PathBuf {
+        project.read_with(cx, |project, cx| {
+            project
+                .visible_worktrees(cx)
+                .next()
+                .expect("project has a root worktree")
+                .read(cx)
+                .abs_path()
+                .to_path_buf()
+        })
+    }
+
+    #[gpui::test]
+    async fn test_task_worktree_context_repo_hint_resolves_repository(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = insert_multi_repo_project(&fs, cx).await;
+
+        let root = project_root_path(&project, cx);
+        let mut anchors = Vec::new();
+        for repo in ["repo_a", "repo_b", "repo_c"] {
+            let hint = root.join(repo);
+            let (_, anchor_path, _, _, _) = project
+                .read_with(cx, |project, cx| {
+                    task_worktree_context(project, Some(&hint), cx)
+                })
+                .unwrap_or_else(|err| panic!("hint {hint:?} must resolve: {err:#}"));
+            assert!(
+                anchor_path.starts_with(&hint),
+                "anchor {anchor_path:?} must be rooted at the hinted repo {hint:?}"
+            );
+            anchors.push(anchor_path);
+        }
+
+        assert_eq!(anchors.len(), 3);
+        assert_ne!(anchors[0], anchors[1]);
+        assert_ne!(anchors[1], anchors[2]);
+        assert_ne!(anchors[0], anchors[2]);
+
+        let missing = root.join("missing");
+        let error = match project.read_with(cx, |project, cx| {
+            task_worktree_context(project, Some(&missing), cx)
+        }) {
+            Ok(_) => panic!("an unmatched hint must fail closed"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains(&missing.display().to_string()),
+            "error must name the hint path {missing:?}, got: {error}"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_repo_hint_isolates_tasks_per_repository(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = insert_multi_repo_project(&fs, cx).await;
+
+        let root = project_root_path(&project, cx);
+        let task_a = multi_repo_task("TASK-REPO-A", AgentTaskStatus::Ready);
+        let task_b = multi_repo_task("TASK-REPO-B", AgentTaskStatus::Ready);
+
+        let path_a = cx
+            .update(|cx| {
+                ensure_task_worktree_with_policy(
+                    project.clone(),
+                    &task_a,
+                    None,
+                    None,
+                    None,
+                    Some(root.join("repo_a")),
+                    cx,
+                )
+            })
+            .await
+            .expect("worktree in repo_a should be created");
+        let path_b = cx
+            .update(|cx| {
+                ensure_task_worktree_with_policy(
+                    project.clone(),
+                    &task_b,
+                    None,
+                    None,
+                    None,
+                    Some(root.join("repo_b")),
+                    cx,
+                )
+            })
+            .await
+            .expect("worktree in repo_b should be created");
+
+        assert_eq!(
+            path_a.parent().and_then(|parent| parent.file_name()),
+            Some(std::ffi::OsStr::new("repo_a")),
+            "task A worktree {path_a:?} must be grouped under repo_a"
+        );
+        assert_eq!(
+            path_b.parent().and_then(|parent| parent.file_name()),
+            Some(std::ffi::OsStr::new("repo_b")),
+            "task B worktree {path_b:?} must be grouped under repo_b"
+        );
+        assert!(fs.is_dir(&path_a).await);
+        assert!(fs.is_dir(&path_b).await);
+    }
+
+    #[gpui::test]
+    async fn test_startup_sweep_removes_only_terminal_worktrees_across_repos(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = insert_multi_repo_project(&fs, cx).await;
+
+        let root = project_root_path(&project, cx);
+        let terminal_a = multi_repo_task("TASK-SWEEP-A", AgentTaskStatus::Completed);
+        let terminal_b = multi_repo_task("TASK-SWEEP-B", AgentTaskStatus::Completed);
+        let running_c = multi_repo_task("TASK-SWEEP-C", AgentTaskStatus::Running);
+
+        let path_a = cx
+            .update(|cx| {
+                ensure_task_worktree_with_policy(
+                    project.clone(),
+                    &terminal_a,
+                    None,
+                    None,
+                    None,
+                    Some(root.join("repo_a")),
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+        let path_b = cx
+            .update(|cx| {
+                ensure_task_worktree_with_policy(
+                    project.clone(),
+                    &terminal_b,
+                    None,
+                    None,
+                    None,
+                    Some(root.join("repo_b")),
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+        let path_c = cx
+            .update(|cx| {
+                ensure_task_worktree_with_policy(
+                    project.clone(),
+                    &running_c,
+                    None,
+                    None,
+                    None,
+                    Some(root.join("repo_c")),
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+
+        mark_task_terminal(&terminal_a.id);
+        mark_task_terminal(&terminal_b.id);
+
+        let tasks = vec![terminal_a.clone(), terminal_b.clone(), running_c.clone()];
+        let swept = cx
+            .update(|cx| startup_sweep(project.clone(), Some(&tasks), cx))
+            .await
+            .expect("startup_sweep should succeed");
+
+        assert!(swept.contains(&terminal_a.id));
+        assert!(swept.contains(&terminal_b.id));
+        assert!(!swept.contains(&running_c.id));
+        assert!(
+            !fs.is_dir(&path_a).await,
+            "terminal worktree in repo_a must be removed"
+        );
+        assert!(
+            !fs.is_dir(&path_b).await,
+            "terminal worktree in repo_b must be removed"
+        );
+        assert!(
+            fs.is_dir(&path_c).await,
+            "non-terminal worktree in repo_c must be kept"
+        );
+    }
+
+    /// Finding 2: a project opened at a linked worktree anchors its task
+    /// worktrees at the main checkout, which no open repository contains. The
+    /// startup sweep must use the already-resolved repository instead of
+    /// re-resolving the main checkout as a repo hint.
+    #[gpui::test]
+    async fn test_startup_sweep_succeeds_when_project_opened_at_linked_worktree(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/root"),
+            json!({
+                "my-repo": {
+                    ".git": {},
+                    "file.txt": "content",
+                },
+            }),
+        )
+        .await;
+
+        let dot_git = Path::new("/root/my-repo/.git");
+        fs.with_git_state(dot_git, true, |state| {
+            state.refs.insert("refs/heads/main".into(), "main-sha".into());
+            state.refs.insert("HEAD".into(), "main-sha".into());
+            state.branches.insert("main".into());
+        })
+        .unwrap();
+
+        let linked_path = PathBuf::from("/root/my-repo/.zed/worktrees/feature");
+        fs.add_linked_worktree_for_repo(
+            dot_git,
+            false,
+            git::repository::Worktree {
+                path: linked_path.clone(),
+                ref_name: Some("refs/heads/feature".into()),
+                sha: "feature-sha".into(),
+                is_main: false,
+                is_bare: false,
+            },
+        )
+        .await;
+
+        let project = Project::test(fs.clone(), [linked_path.as_path()], cx).await;
+        project
+            .update(cx, |project, cx| project.git_scans_complete(cx))
+            .await;
+        cx.run_until_parked();
+
+        // The anchor is the main checkout, outside every open repository.
+        let (_, anchor_path, _, _, _) = project
+            .read_with(cx, |project, cx| task_worktree_context(project, None, cx))
+            .expect("context must resolve at a linked worktree");
+        assert_eq!(anchor_path, PathBuf::from("/root/my-repo"));
+
+        let terminal = multi_repo_task("TASK-LINKED-SWEEP", AgentTaskStatus::Completed);
+        let worktree_path = cx
+            .update(|cx| {
+                ensure_task_worktree_with_policy(
+                    project.clone(),
+                    &terminal,
+                    None,
+                    None,
+                    None,
+                    None,
+                    cx,
+                )
+            })
+            .await
+            .expect("creating the task worktree should succeed");
+        assert!(fs.is_dir(&worktree_path).await);
+        mark_task_terminal(&terminal.id);
+
+        let tasks = vec![terminal.clone()];
+        let swept = cx
+            .update(|cx| startup_sweep(project.clone(), Some(&tasks), cx))
+            .await
+            .expect("startup sweep must not abort when opened at a linked worktree");
+        assert!(swept.contains(&terminal.id));
+        assert!(
+            !fs.is_dir(&worktree_path).await,
+            "terminal worktree must be removed"
+        );
+    }
+
+    /// Finding 4: tasks under one goal must share a repository. A spawn whose
+    /// explicit repo diverges from the goal's established repository is
+    /// rejected fail-closed instead of anchoring graduation to an arbitrary
+    /// repository.
+    #[gpui::test]
+    async fn test_goal_repo_divergence_is_rejected(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = insert_multi_repo_project(&fs, cx).await;
+
+        let root = project_root_path(&project, cx);
+        let repo_a = root.join("repo_a");
+        let repo_b = root.join("repo_b");
+
+        let goal_id = "GOAL-DIVERGE";
+        let task_a = multi_repo_task("TASK-GOAL-A", AgentTaskStatus::Ready);
+        cx.update(|cx| {
+            ensure_task_worktree_with_policy(
+                project.clone(),
+                &task_a,
+                Some(goal_id.to_string()),
+                None,
+                None,
+                Some(repo_a.clone()),
+                cx,
+            )
+        })
+        .await
+        .expect("the first goal task should anchor repo_a");
+
+        // An unset repo adopts the established repository.
+        let adopted = project
+            .read_with(cx, |project, cx| anchor_repo_to_goal(project, goal_id, None, cx))
+            .expect("adopting the established repository should succeed");
+        assert_eq!(adopted.as_deref(), Some(repo_a.as_path()));
+
+        // The same repository is accepted.
+        let same = project
+            .read_with(cx, |project, cx| {
+                anchor_repo_to_goal(project, goal_id, Some(repo_a.clone()), cx)
+            })
+            .expect("the established repository should be accepted");
+        assert_eq!(same.as_deref(), Some(repo_a.as_path()));
+
+        // A diverging repository is rejected fail-closed.
+        let error = project
+            .read_with(cx, |project, cx| {
+                anchor_repo_to_goal(project, goal_id, Some(repo_b.clone()), cx)
+            })
+            .expect_err("a diverging repository must be rejected");
+        assert!(
+            error.to_string().contains("must share a repository"),
+            "unexpected error: {error}"
+        );
+    }
+
     #[gpui::test]
     async fn test_task_worktree_is_invisible_in_project(cx: &mut TestAppContext) {
         init_test(cx);
@@ -4752,7 +5375,7 @@ mod tests {
 
         let worktree_path = cx
             .update(|cx| {
-                ensure_task_worktree_with_policy(project.clone(), &task, None, None, None, cx)
+                ensure_task_worktree_with_policy(project.clone(), &task, None, None, None, None, cx)
             })
             .await
             .expect("task worktree should be created");
@@ -4850,7 +5473,7 @@ mod tests {
 
         // First call: lazily creates ref without worktree checkout
         let branch = cx
-            .update(|cx| ensure_goal_branch(project.clone(), "GOAL-1", cx))
+            .update(|cx| ensure_goal_branch(project.clone(), "GOAL-1", None, cx))
             .await
             .expect("ensure_goal_branch should succeed");
         assert_eq!(branch, "agent-goal/GOAL-1");
@@ -4876,7 +5499,7 @@ mod tests {
 
         // Second call: idempotent, returns same branch
         let branch2 = cx
-            .update(|cx| ensure_goal_branch(project.clone(), "GOAL-1", cx))
+            .update(|cx| ensure_goal_branch(project.clone(), "GOAL-1", None, cx))
             .await
             .expect("second ensure_goal_branch should succeed");
         assert_eq!(branch2, "agent-goal/GOAL-1");
@@ -4936,6 +5559,7 @@ mod tests {
                     Some("GOAL-42".to_string()),
                     None,
                     None,
+                    None,
                     cx,
                 )
             })
@@ -4974,6 +5598,7 @@ mod tests {
                     &task2,
                     Some("GOAL-42".to_string()),
                     Some("feature-prev".to_string()),
+                    None,
                     None,
                     cx,
                 )
@@ -5014,6 +5639,7 @@ mod tests {
                     None,
                     Some("agent-goal/AUTO-GOAL".to_string()),
                     None,
+                    None,
                     cx,
                 )
             })
@@ -5048,6 +5674,7 @@ mod tests {
                     &task4,
                     None,
                     Some("nonexistent-branch".to_string()),
+                    None,
                     None,
                     cx,
                 )
@@ -5132,6 +5759,7 @@ mod tests {
                     project.clone(),
                     &task,
                     Some("GOAL-FF".to_string()),
+                    None,
                     None,
                     None,
                     cx,
@@ -5242,6 +5870,7 @@ mod tests {
                     Some("GOAL-NFF".to_string()),
                     None,
                     None,
+                    None,
                     cx,
                 )
             })
@@ -5254,6 +5883,7 @@ mod tests {
                     project.clone(),
                     &task_b,
                     Some("GOAL-NFF".to_string()),
+                    None,
                     None,
                     None,
                     cx,
@@ -5375,6 +6005,7 @@ mod tests {
                     Some("GOAL-CONF".to_string()),
                     None,
                     None,
+                    None,
                     cx,
                 )
             })
@@ -5387,6 +6018,7 @@ mod tests {
                     project.clone(),
                     &task_c2,
                     Some("GOAL-CONF".to_string()),
+                    None,
                     None,
                     None,
                     cx,
@@ -5508,6 +6140,7 @@ mod tests {
                     Some("GOAL-INV".to_string()),
                     None,
                     None,
+                    None,
                     cx,
                 )
             })
@@ -5602,6 +6235,7 @@ mod tests {
                     Some("GOAL-E2E".to_string()),
                     None,
                     None,
+                    None,
                     cx,
                 )
             })
@@ -5653,6 +6287,7 @@ mod tests {
                     project.clone(),
                     &task_b,
                     Some("GOAL-E2E".to_string()),
+                    None,
                     None,
                     None,
                     cx,
@@ -5740,6 +6375,7 @@ mod tests {
                     Some("GOAL-REV".to_string()),
                     None,
                     None,
+                    None,
                     cx,
                 )
             })
@@ -5794,6 +6430,7 @@ mod tests {
                     Some("GOAL-REV".to_string()),
                     None,
                     Some("goal".to_string()),
+                    None,
                     cx,
                 )
             })
@@ -5876,6 +6513,7 @@ mod tests {
                     Some("GOAL-INSP".to_string()),
                     None,
                     None,
+                    None,
                     cx,
                 )
             })
@@ -5929,6 +6567,7 @@ mod tests {
                     None,
                     None,
                     Some("agent-task/TASK-X".to_string()),
+                    None,
                     cx,
                 )
             })
@@ -6027,6 +6666,7 @@ mod tests {
                     None,
                     None,
                     Some("shared-branch".to_string()),
+                    None,
                     cx,
                 )
             })
@@ -6043,6 +6683,7 @@ mod tests {
                     None,
                     None,
                     Some("shared-branch".to_string()),
+                    None,
                     cx,
                 )
             })
@@ -6075,6 +6716,7 @@ mod tests {
                     None,
                     None,
                     Some("shared-branch".to_string()),
+                    None,
                     cx,
                 )
             })
@@ -6168,6 +6810,7 @@ mod tests {
                     Some("GOAL-REG".to_string()),
                     None,
                     None,
+                    None,
                     cx,
                 )
             })
@@ -6181,6 +6824,7 @@ mod tests {
                     project.clone(),
                     &task_a,
                     Some("GOAL-REG".to_string()),
+                    None,
                     None,
                     None,
                     cx,
@@ -6237,6 +6881,7 @@ mod tests {
                     None,
                     None,
                     Some(format!("agent-task/{}", task_a.id)),
+                    None,
                     cx,
                 )
             })
@@ -6319,6 +6964,7 @@ mod tests {
                     None,
                     None,
                     Some("branch-c".to_string()),
+                    None,
                     cx,
                 )
             })
@@ -6335,6 +6981,7 @@ mod tests {
                     None,
                     None,
                     Some("branch-c".to_string()),
+                    None,
                     cx,
                 )
             })
@@ -6358,6 +7005,7 @@ mod tests {
                     None,
                     None,
                     Some("branch-c".to_string()),
+                    None,
                     cx,
                 )
             })
@@ -6436,6 +7084,7 @@ mod tests {
                     None,
                     None,
                     Some("branch-d".to_string()),
+                    None,
                     cx,
                 )
             })
@@ -6456,6 +7105,7 @@ mod tests {
                     None,
                     None,
                     Some("branch-d".to_string()),
+                    None,
                     cx,
                 )
             })
@@ -6523,6 +7173,7 @@ mod tests {
                     None,
                     Some("base-b".to_string()),
                     Some("on-b".to_string()),
+                    None,
                     cx,
                 )
             })
@@ -6539,6 +7190,7 @@ mod tests {
                     None,
                     None,
                     Some("goal".to_string()),
+                    None,
                     cx,
                 )
             })
@@ -6555,6 +7207,7 @@ mod tests {
                     None,
                     None,
                     Some("nonexistent-branch".to_string()),
+                    None,
                     cx,
                 )
             })
@@ -6615,6 +7268,7 @@ mod tests {
                     Some("GOAL-DIRECT".to_string()),
                     None,
                     Some("goal".to_string()),
+                    None,
                     cx,
                 )
             })
@@ -6770,6 +7424,7 @@ mod tests {
                     project.clone(),
                     &task,
                     Some("GOAL-GRAD-1".to_string()),
+                    None,
                     None,
                     None,
                     cx,
@@ -7992,6 +8647,7 @@ mod tests {
                     None,
                     None,
                     None,
+                    None,
                     true,
                     cx,
                 )
@@ -8007,7 +8663,9 @@ mod tests {
             let task3 = task3.clone();
             |cx| async move {
                 cx.update(|cx| {
-                    ensure_task_worktree_with_options(project, &task3, None, None, None, false, cx)
+                    ensure_task_worktree_with_options(
+                        project, &task3, None, None, None, None, false, cx,
+                    )
                 })
                 .await
             }
@@ -8094,6 +8752,7 @@ mod tests {
                 ensure_task_worktree_with_options(
                     project.clone(),
                     &task,
+                    None,
                     None,
                     None,
                     None,
@@ -9499,7 +10158,7 @@ mod tests {
         fs.set_remove_dir_error(&path, "permanent removal failure".to_string());
 
         let (repository, anchor_path, _, _, _) = project
-            .update(cx, |project, cx| task_worktree_context(project, cx))
+            .update(cx, |project, cx| task_worktree_context(project, None, cx))
             .unwrap();
 
         let fs_trait: Arc<dyn Fs> = fs.clone();
@@ -9649,7 +10308,7 @@ mod tests {
         fs.set_remove_dir_error(&path, "sharing violation: file locked".to_string());
 
         let (repository, anchor_path, _, _, _) = project
-            .update(cx, |project, cx| task_worktree_context(project, cx))
+            .update(cx, |project, cx| task_worktree_context(project, None, cx))
             .unwrap();
 
         // Spawn background task to clear error after two failed attempts (50ms + 100ms backoff)
@@ -10523,6 +11182,7 @@ mod tests {
                     Some("GOAL-NO-REF-PUB".to_string()),
                     None,
                     None,
+                    None,
                     cx,
                 )
             })
@@ -10577,6 +11237,7 @@ mod tests {
                     project.clone(),
                     &task2,
                     Some("GOAL-NO-REF-PUB".to_string()),
+                    None,
                     None,
                     None,
                     cx,
@@ -11063,6 +11724,7 @@ mod tests {
                     Some("GOAL-10".to_string()),
                     None,
                     None,
+                    None,
                     cx,
                 )
             })
@@ -11112,6 +11774,7 @@ mod tests {
                     Some("GOAL-10".to_string()),
                     None,
                     Some("agent-goal/GOAL-10".to_string()),
+                    None,
                     cx,
                 )
             })
@@ -11207,6 +11870,7 @@ mod tests {
                     None,
                     Some("main".to_string()),
                     Some("main".to_string()),
+                    None,
                     cx,
                 )
             })
@@ -11242,6 +11906,7 @@ mod tests {
                     None,
                     None,
                     Some("nonexistent-branch".to_string()),
+                    None,
                     cx,
                 )
             })

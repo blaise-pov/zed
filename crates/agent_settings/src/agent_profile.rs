@@ -124,6 +124,12 @@ impl AgentProfile {
         let task_worktree_language_servers = base_profile
             .as_ref()
             .and_then(|profile| profile.task_worktree_language_servers);
+        let task_worktree_repo = base_profile
+            .as_ref()
+            .and_then(|profile| profile.task_worktree_repo.clone());
+        let working_dir = base_profile
+            .as_ref()
+            .and_then(|profile| profile.working_dir.clone());
 
         let profile_settings = AgentProfileSettings {
             name: name.into(),
@@ -142,6 +148,8 @@ impl AgentProfile {
             terminal_wrapper_command,
             task_isolation,
             task_worktree_language_servers,
+            task_worktree_repo,
+            working_dir,
         };
 
         match &origin {
@@ -229,6 +237,20 @@ pub struct AgentProfileSettings {
     pub terminal_wrapper_command: Option<SharedString>,
     pub task_isolation: TaskIsolation,
     pub task_worktree_language_servers: Option<bool>,
+    /// Git repository that receives task worktrees and `agent-task/`/`agent-goal/`
+    /// branches for this profile.
+    ///
+    /// Tri-state: unset inherits from the parent thread, `.` escapes inheritance
+    /// and uses the project root or an autodetected repository, any other string
+    /// is used as the repository path.
+    pub task_worktree_repo: Option<SharedString>,
+    /// Working directory for shared-mode subagents using this profile. Affects
+    /// the terminal working directory and prompt context. Has no git semantics.
+    ///
+    /// Tri-state: unset inherits from the parent thread, `.` escapes inheritance
+    /// and uses the project root or an autodetected directory, any other string
+    /// is used as the directory path.
+    pub working_dir: Option<SharedString>,
 }
 
 /// Which sub-agents a profile may spawn, and how deeply they may nest.
@@ -390,6 +412,8 @@ impl AgentProfileSettings {
                     .map(|s| s.to_string()),
                 task_isolation: Some(self.task_isolation),
                 task_worktree_language_servers: self.task_worktree_language_servers,
+                task_worktree_repo: self.task_worktree_repo.clone().map(|s| s.into()),
+                working_dir: self.working_dir.clone().map(|s| s.into()),
             },
         );
 
@@ -578,6 +602,8 @@ impl From<AgentProfileContent> for AgentProfileSettings {
             terminal_wrapper_command,
             task_isolation,
             task_worktree_language_servers,
+            task_worktree_repo,
+            working_dir,
         } = content;
 
         let custom_prompt_path_shared = custom_prompt_path
@@ -604,6 +630,8 @@ impl From<AgentProfileContent> for AgentProfileSettings {
             terminal_wrapper_command: terminal_wrapper_command.map(SharedString::from),
             task_isolation: task_isolation.unwrap_or_default(),
             task_worktree_language_servers,
+            task_worktree_repo: task_worktree_repo.map(SharedString::from),
+            working_dir: working_dir.map(SharedString::from),
         }
     }
 }
@@ -656,6 +684,8 @@ mod tests {
             terminal_wrapper_command: None,
             task_isolation: TaskIsolation::default(),
             task_worktree_language_servers: None,
+            task_worktree_repo: None,
+            working_dir: None,
         }
     }
 
@@ -916,6 +946,49 @@ mod tests {
         assert_eq!(content_unset.terminal_wrapper_command, None);
         let settings_unset = AgentProfileSettings::from(content_unset);
         assert_eq!(settings_unset.terminal_wrapper_command, None);
+    }
+
+    #[test]
+    fn test_agent_profile_task_worktree_repo_and_working_dir() {
+        let json_unset = r#"{
+            "name": "Custom Agent"
+        }"#;
+        let content_unset: AgentProfileContent = serde_json::from_str(json_unset).unwrap();
+        assert_eq!(content_unset.task_worktree_repo, None);
+        assert_eq!(content_unset.working_dir, None);
+        let settings_unset = AgentProfileSettings::from(content_unset);
+        assert_eq!(settings_unset.task_worktree_repo, None);
+        assert_eq!(settings_unset.working_dir, None);
+
+        let json_escape = r#"{
+            "name": "Custom Agent",
+            "task_worktree_repo": ".",
+            "working_dir": "."
+        }"#;
+        let content_escape: AgentProfileContent = serde_json::from_str(json_escape).unwrap();
+        assert_eq!(content_escape.task_worktree_repo.as_deref(), Some("."));
+        assert_eq!(content_escape.working_dir.as_deref(), Some("."));
+        let settings_escape = AgentProfileSettings::from(content_escape);
+        assert_eq!(settings_escape.task_worktree_repo.as_deref(), Some("."));
+        assert_eq!(settings_escape.working_dir.as_deref(), Some("."));
+
+        let json_paths = r#"{
+            "name": "Custom Agent",
+            "task_worktree_repo": "repos/backend",
+            "working_dir": "services/api"
+        }"#;
+        let content_paths: AgentProfileContent = serde_json::from_str(json_paths).unwrap();
+        assert_eq!(
+            content_paths.task_worktree_repo.as_deref(),
+            Some("repos/backend")
+        );
+        assert_eq!(content_paths.working_dir.as_deref(), Some("services/api"));
+        let settings_paths = AgentProfileSettings::from(content_paths);
+        assert_eq!(
+            settings_paths.task_worktree_repo.as_deref(),
+            Some("repos/backend")
+        );
+        assert_eq!(settings_paths.working_dir.as_deref(), Some("services/api"));
     }
 
     #[test]

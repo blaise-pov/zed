@@ -92,6 +92,15 @@ pub struct DbThread {
     pub task_id: Option<String>,
     #[serde(default)]
     pub goal_id: Option<String>,
+    /// Repository anchor used when creating task worktrees. Resolved once at
+    /// thread creation; persisted so reloaded threads keep it.
+    #[serde(default)]
+    pub effective_repo: Option<PathBuf>,
+    /// Directory used as the terminal cwd and prompt context for shared-mode
+    /// subagents. Resolved once at thread creation; persisted so reloaded
+    /// threads keep it.
+    #[serde(default)]
+    pub working_dir: Option<PathBuf>,
 }
 
 /// Serialized form of the sandbox permissions the user granted "for the rest of
@@ -177,6 +186,8 @@ impl SharedThread {
             sandbox_grants: DbSandboxGrants::default(),
             task_id: None,
             goal_id: None,
+            effective_repo: None,
+            working_dir: None,
         }
     }
 
@@ -366,6 +377,8 @@ impl DbThread {
             sandbox_grants: DbSandboxGrants::default(),
             task_id: None,
             goal_id: None,
+            effective_repo: None,
+            working_dir: None,
         })
     }
 }
@@ -1013,6 +1026,8 @@ mod tests {
             sandbox_grants: DbSandboxGrants::default(),
             task_id: None,
             goal_id: None,
+            effective_repo: None,
+            working_dir: None,
         }
     }
 
@@ -1599,5 +1614,50 @@ mod tests {
 
         let thread: DbThread = serde_json::from_str(json).unwrap();
         assert_eq!(thread.goal_id, None);
+    }
+
+    #[test]
+    fn test_working_dir_and_effective_repo_default_to_none_for_legacy_json() {
+        let json = r#"{
+            "title": "Legacy Thread",
+            "messages": [],
+            "updated_at": "2024-01-01T00:00:00Z"
+        }"#;
+
+        let thread: DbThread = serde_json::from_str(json).unwrap();
+        assert_eq!(thread.working_dir, None);
+        assert_eq!(thread.effective_repo, None);
+    }
+
+    #[gpui::test]
+    async fn test_working_dir_and_effective_repo_roundtrip_through_save_load(
+        cx: &mut TestAppContext,
+    ) {
+        let database = ThreadsDatabase::new(cx.executor()).unwrap();
+
+        let thread_id = session_id("working-dir-thread");
+        let mut thread = make_thread(
+            "Working Dir Thread",
+            Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap(),
+        );
+        thread.working_dir = Some(PathBuf::from("/repo/crates/agent"));
+        thread.effective_repo = Some(PathBuf::from("/repo"));
+
+        database
+            .save_thread(thread_id.clone(), thread, PathList::default())
+            .await
+            .unwrap();
+
+        let loaded = database
+            .load_thread(thread_id)
+            .await
+            .unwrap()
+            .expect("thread should exist");
+
+        assert_eq!(
+            loaded.working_dir,
+            Some(PathBuf::from("/repo/crates/agent"))
+        );
+        assert_eq!(loaded.effective_repo, Some(PathBuf::from("/repo")));
     }
 }

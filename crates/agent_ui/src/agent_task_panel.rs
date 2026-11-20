@@ -1333,6 +1333,7 @@ impl AgentTaskPanel {
                                         goal_id_for_open_thread.clone(),
                                         None,
                                         None,
+                                        None,
                                         true,
                                         cx,
                                     );
@@ -1441,6 +1442,7 @@ impl AgentTaskPanel {
                                             project.clone(),
                                             &task,
                                             goal_id.clone(),
+                                            None,
                                             None,
                                             None,
                                             true,
@@ -2032,7 +2034,7 @@ impl AgentTaskPanel {
                     let task_id_hint_for_async = task_id_hint.clone();
                     let workspace = this.workspace.clone();
                     let remove_task =
-                        agent::task_worktree::remove_orphan_worktree(project, path, cx);
+                        agent::task_worktree::remove_orphan_worktree(project, None, path, cx);
                     cx.spawn(async move |this, cx| {
                         if let Err(e) = remove_task.await {
                             log::warn!(

@@ -436,6 +436,8 @@ impl PickerDelegate for ToolPickerDelegate {
                         .map(|s| s.to_string()),
                     task_isolation: Some(default_profile.task_isolation),
                     task_worktree_language_servers: default_profile.task_worktree_language_servers,
+                    task_worktree_repo: None,
+                    working_dir: None,
                 });
 
             match item {

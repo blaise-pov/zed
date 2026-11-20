@@ -136,10 +136,21 @@ pub fn snapshot_with_cache(
     let project = project.clone();
 
     cx.spawn(async move |cx| {
+        // The snapshot reflects the repository holding the recorded task
+        // worktrees; fall back to the project-wide context when none is known.
+        let recorded_task_id = tasks
+            .iter()
+            .find(|task| crate::task_worktree::task_worktree_path_for_id(&task.id).is_some())
+            .map(|task| task.id.clone());
         let (anchor_path, path_style, worktree_setting, file_system) =
             project.update(cx, |project, cx| {
                 let (_repository, anchor_path, path_style, worktree_setting, file_system) =
-                    task_worktree_context(project, cx)?;
+                    match recorded_task_id.as_ref() {
+                        Some(task_id) => crate::task_worktree::task_worktree_context_for_task(
+                            project, task_id, cx,
+                        )?,
+                        None => task_worktree_context(project, None, cx)?,
+                    };
                 anyhow::Ok((anchor_path, path_style, worktree_setting, file_system))
             })?;
 
@@ -369,7 +380,7 @@ impl TaskWorktreeStatus {
 
     pub fn cached_repo(&self, cx: &App) -> Option<Arc<dyn GitRepository>> {
         let (_repository, anchor_path, _path_style, _worktree_setting, file_system) =
-            task_worktree_context(self.project.read(cx), cx).log_err()?;
+            task_worktree_context(self.project.read(cx), None, cx).log_err()?;
         let dot_git = anchor_path.join(".git");
         let cache_key = RepoCacheKey::new(&dot_git, &file_system);
         get_cached_repo(&cache_key)

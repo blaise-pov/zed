@@ -978,6 +978,25 @@ pub struct AgentProfileContent {
     /// Override for whether language servers should be started for task worktrees
     /// created by this profile. When unset, inherits `agent.task_worktree_language_servers`.
     pub task_worktree_language_servers: Option<bool>,
+    /// Git repository that receives task worktrees and `agent-task/`/`agent-goal/`
+    /// branches for this profile. Relative paths resolve against the project root.
+    ///
+    /// Tri-state:
+    /// - Unset: inherit from the parent thread. When nothing is inherited, the
+    ///   project root or an autodetected repository is used.
+    /// - `.`: escape inheritance; use the project root or autodetected repository.
+    /// - Any other string: use this repository path.
+    pub task_worktree_repo: Option<Arc<str>>,
+    /// Working directory for shared-mode subagents using this profile. Affects the
+    /// terminal working directory and prompt context. This field has no git
+    /// semantics; it never selects a repository.
+    ///
+    /// Tri-state:
+    /// - Unset: inherit from the parent thread. When nothing is inherited, the
+    ///   project root or an autodetected directory is used.
+    /// - `.`: escape inheritance; use the project root or autodetected directory.
+    /// - Any other string: use this directory path.
+    pub working_dir: Option<Arc<str>>,
 }
 
 #[with_fallible_options]

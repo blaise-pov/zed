@@ -3784,6 +3784,180 @@ pub struct NativeThreadEnvironment {
     acp_thread: WeakEntity<AcpThread>,
 }
 
+/// A path value in the resolve-once chain for subagent working directories and
+/// repositories. Mirrors the tri-state of the profile settings: unset inherits,
+/// `.` escapes inheritance, and a value is used as a resolved absolute path.
+#[derive(Clone, Debug)]
+pub(crate) enum PathChoice {
+    Unset,
+    Escape,
+    Value(PathBuf),
+}
+
+impl PathChoice {
+    /// Builds a choice from a raw configured value, resolving relative paths
+    /// against the first visible worktree.
+    pub(crate) fn from_configured(
+        value: Option<&str>,
+        project: Option<&Entity<Project>>,
+        cx: &App,
+    ) -> Self {
+        match value {
+            None => Self::Unset,
+            Some(".") => Self::Escape,
+            Some(value) => Self::Value(resolve_path_against_project(value, project, cx)),
+        }
+    }
+}
+
+/// Resolves a configured path against the first visible worktree when it is
+/// relative.
+pub(crate) fn resolve_path_against_project(
+    value: &str,
+    project: Option<&Entity<Project>>,
+    cx: &App,
+) -> PathBuf {
+    let base_dir = project.and_then(|project| {
+        project.read_with(cx, |project, cx| {
+            project
+                .visible_worktrees(cx)
+                .next()
+                .map(|worktree| worktree.read(cx).abs_path().to_path_buf())
+        })
+    });
+    let path = PathBuf::from(value);
+    let path = if path.is_absolute() {
+        path
+    } else if let Some(base_dir) = base_dir {
+        base_dir.join(path)
+    } else {
+        path
+    };
+    util::paths::normalize_lexically(&path).unwrap_or(path)
+}
+
+/// The resolved values frozen on a subagent thread.
+pub(crate) struct SubagentPaths {
+    pub working_dir: Option<PathBuf>,
+    pub effective_repo: Option<PathBuf>,
+}
+
+enum PathOutcome {
+    Value(PathBuf),
+    Escaped,
+    Unset,
+}
+
+impl PathOutcome {
+    fn from_choice(choice: &PathChoice) -> Self {
+        match choice {
+            PathChoice::Unset => Self::Unset,
+            PathChoice::Escape => Self::Escaped,
+            PathChoice::Value(path) => Self::Value(path.clone()),
+        }
+    }
+
+    fn into_option(self) -> Option<PathBuf> {
+        match self {
+            Self::Value(path) => Some(path),
+            Self::Escaped | Self::Unset => None,
+        }
+    }
+}
+
+fn resolve_path_chain(
+    spawn: &PathChoice,
+    profile: &PathChoice,
+    inherited: Option<PathBuf>,
+) -> PathOutcome {
+    match PathOutcome::from_choice(spawn) {
+        PathOutcome::Unset => {}
+        outcome => return outcome,
+    }
+    match PathOutcome::from_choice(profile) {
+        PathOutcome::Unset => {}
+        outcome => return outcome,
+    }
+    match inherited {
+        Some(path) => PathOutcome::Value(path),
+        None => PathOutcome::Unset,
+    }
+}
+
+/// Resolves `working_dir` and `effective_repo` once for a subagent.
+///
+/// Precedence, highest first: spawn parameter, profile setting, the parent
+/// thread's frozen value, then (repository only) a repository derived from the
+/// resolved working directory. Callers pass the result to both worktree
+/// creation and thread creation so the two never disagree.
+///
+/// `allow_working_dir` is false for dedicated worktree isolation, where the
+/// task worktree pins the root and `working_dir` does not apply.
+pub(crate) fn resolve_subagent_paths(
+    project: Option<&Entity<Project>>,
+    settings: &agent_settings::AgentSettings,
+    parent: Option<&Thread>,
+    child_profile: Option<&agent_settings::AgentProfileId>,
+    spawn_working_dir: PathChoice,
+    spawn_repo: PathChoice,
+    allow_working_dir: bool,
+    cx: &App,
+) -> SubagentPaths {
+    let profile_settings = child_profile.and_then(|id| settings.profiles.get(id));
+    let profile_working_dir = if allow_working_dir {
+        PathChoice::from_configured(
+            profile_settings.and_then(|profile| profile.working_dir.as_deref()),
+            project,
+            cx,
+        )
+    } else {
+        PathChoice::Unset
+    };
+    let profile_repo = PathChoice::from_configured(
+        profile_settings.and_then(|profile| profile.task_worktree_repo.as_deref()),
+        project,
+        cx,
+    );
+
+    let working_dir = resolve_path_chain(
+        &spawn_working_dir,
+        &profile_working_dir,
+        parent
+            .and_then(|thread| thread.working_dir())
+            .map(Path::to_path_buf),
+    )
+    .into_option();
+
+    let effective_repo = match resolve_path_chain(
+        &spawn_repo,
+        &profile_repo,
+        parent
+            .and_then(|thread| thread.effective_repo())
+            .map(Path::to_path_buf),
+    ) {
+        PathOutcome::Value(repo) => Some(repo),
+        // `.` escapes inheritance and means the project root / autodetect.
+        PathOutcome::Escaped => None,
+        PathOutcome::Unset => working_dir.as_deref().and_then(|working_dir| {
+            project.and_then(|project| {
+                crate::task_worktree::repository_for_path(project.read(cx), working_dir, cx)
+            })
+        }).map(|repository| {
+            repository
+                .read(cx)
+                .snapshot()
+                .work_directory_abs_path
+                .as_ref()
+                .to_path_buf()
+        }),
+    };
+
+    SubagentPaths {
+        working_dir,
+        effective_repo,
+    }
+}
+
 impl NativeThreadEnvironment {
     pub(crate) fn create_subagent_thread(
         &self,
@@ -3791,6 +3965,8 @@ impl NativeThreadEnvironment {
         profile: Option<agent_settings::AgentProfileId>,
         model: Option<AgentModelId>,
         task_worktree: Option<PathBuf>,
+        working_dir: Option<PathBuf>,
+        repo: Option<PathBuf>,
         cx: &mut App,
     ) -> Result<Rc<dyn SubagentHandle>> {
         let model = if let Some(model_id) = model {
@@ -3809,6 +3985,10 @@ impl NativeThreadEnvironment {
         let Some(parent_thread_entity) = self.thread.upgrade() else {
             anyhow::bail!("Parent thread no longer exists".to_string());
         };
+
+        // `working_dir` and `repo` are already resolved with full precedence by
+        // the caller (`resolve_subagent_paths`) and frozen here as-is, so
+        // worktree creation and the thread agree on the same repository.
         let nested = parent_thread_entity
             .read(cx)
             .agent_settings(cx)
@@ -3876,6 +4056,8 @@ impl NativeThreadEnvironment {
                 profile,
                 model.as_ref(),
                 task_worktree.clone(),
+                working_dir.clone(),
+                repo.clone(),
                 cx,
             );
             let title = if depth > 1 {
@@ -3962,6 +4144,8 @@ impl NativeThreadEnvironment {
         session_id: acp_v2::SessionId,
         profile: Option<agent_settings::AgentProfileId>,
         task_worktree: Option<PathBuf>,
+        _working_dir: Option<PathBuf>,
+        _repo: Option<PathBuf>,
         cx: &mut App,
     ) -> Result<Rc<dyn SubagentHandle>> {
         let (subagent_thread, acp_thread) = self.agent.update(cx, |agent, cx| {
@@ -4421,9 +4605,19 @@ impl ThreadEnvironment for NativeThreadEnvironment {
         profile: Option<agent_settings::AgentProfileId>,
         model: Option<AgentModelId>,
         task_worktree: Option<PathBuf>,
+        working_dir: Option<PathBuf>,
+        repo: Option<PathBuf>,
         cx: &mut App,
     ) -> Result<Rc<dyn SubagentHandle>> {
-        self.create_subagent_thread(label, profile, model, task_worktree, cx)
+        self.create_subagent_thread(
+            label,
+            profile,
+            model,
+            task_worktree,
+            working_dir,
+            repo,
+            cx,
+        )
     }
 
     fn resume_subagent(
@@ -4431,9 +4625,11 @@ impl ThreadEnvironment for NativeThreadEnvironment {
         session_id: acp_v2::SessionId,
         profile: Option<agent_settings::AgentProfileId>,
         task_worktree: Option<PathBuf>,
+        working_dir: Option<PathBuf>,
+        repo: Option<PathBuf>,
         cx: &mut App,
     ) -> Result<Rc<dyn SubagentHandle>> {
-        self.resume_subagent_thread(session_id, profile, task_worktree, cx)
+        self.resume_subagent_thread(session_id, profile, task_worktree, working_dir, repo, cx)
     }
 
     fn ensure_subagent_worktree(
@@ -4443,11 +4639,15 @@ impl ThreadEnvironment for NativeThreadEnvironment {
         base_branch: Option<String>,
         on_branch: Option<String>,
         worktree_of: Option<String>,
+        repo_hint: Option<PathBuf>,
         cx: &mut AsyncApp,
     ) -> Task<Result<PathBuf>> {
         let Some(parent_thread_entity) = self.thread.upgrade() else {
             return Task::ready(Err(anyhow!("Parent thread no longer exists")));
         };
+        // `repo_hint` is the effective repository resolved once by the caller
+        // (spawn parameter > profile > parent > derived); `None` means
+        // autodetect and must not fall back to the parent here.
         if let Some(ref host_id) = worktree_of {
             let host_task_id = crate::AgentTaskId::from(host_id.clone());
             if let Some(path) = crate::task_worktree::task_worktree_path_for_id(&host_task_id) {
@@ -4502,6 +4702,7 @@ impl ThreadEnvironment for NativeThreadEnvironment {
                     goal_id,
                     base_branch,
                     on_branch,
+                    repo_hint,
                     cx,
                 )
             });
@@ -5691,6 +5892,8 @@ mod internal_tests {
                     "subagent".to_string(),
                     None,
                     Some(AgentModelId::from("fake-corp/subagent-model".to_string())),
+                    None,
+                    None,
                     None,
                     cx,
                 )
@@ -9116,8 +9319,9 @@ mod internal_tests {
 
         // Build the subagent thread the same way
         // `NativeThreadEnvironment::create_subagent_thread` does.
-        let subagent_thread =
-            cx.update(|cx| cx.new(|cx| Thread::new_subagent(&parent_thread, None, None, None, cx)));
+        let subagent_thread = cx.update(|cx| {
+            cx.new(|cx| Thread::new_subagent(&parent_thread, None, None, None, None, None, cx))
+        });
 
         // Run the subagent through the production registration path.
         // This is what installs the `SkillTool` on the thread.
@@ -10928,6 +11132,8 @@ mod internal_tests {
                     Some(agent_settings::AgentProfileId("write".into())),
                     None,
                     None,
+                    None,
+                    None,
                     cx,
                 )
             })
@@ -10937,6 +11143,8 @@ mod internal_tests {
                 environment.create_subagent_thread(
                     "second".to_string(),
                     Some(agent_settings::AgentProfileId("write".into())),
+                    None,
+                    None,
                     None,
                     None,
                     cx,
@@ -11028,7 +11236,7 @@ mod internal_tests {
 
         let subagent_handle = cx
             .update(|cx| {
-                environment.create_subagent_thread("worker".to_string(), None, None, None, cx)
+                environment.create_subagent_thread("worker".to_string(), None, None, None, None, None, cx)
             })
             .unwrap();
         let subagent_session_id = subagent_handle.id();
@@ -11185,7 +11393,7 @@ mod internal_tests {
 
         let subagent_handle = cx
             .update(|cx| {
-                environment.create_subagent_thread("worker".to_string(), None, None, None, cx)
+                environment.create_subagent_thread("worker".to_string(), None, None, None, None, None, cx)
             })
             .unwrap();
         let subagent_session_id = subagent_handle.id();
@@ -11287,7 +11495,7 @@ mod internal_tests {
         // 5. Test resume_subagent_thread with restored in-memory session
         let resumed = cx
             .update(|cx| {
-                environment.resume_subagent_thread(subagent_session_id.clone(), None, None, cx)
+                environment.resume_subagent_thread(subagent_session_id.clone(), None, None, None, None, cx)
             })
             .unwrap();
         assert_eq!(resumed.id(), subagent_session_id);
@@ -11316,7 +11524,7 @@ mod internal_tests {
 
         let direct_resumed = cx
             .update(|cx| {
-                environment.resume_subagent_thread(subagent_session_id.clone(), None, None, cx)
+                environment.resume_subagent_thread(subagent_session_id.clone(), None, None, None, None, cx)
             })
             .unwrap();
         assert_eq!(direct_resumed.id(), subagent_session_id);
@@ -11370,16 +11578,16 @@ mod internal_tests {
 
         let child = cx
             .update(|cx| {
-                environment.create_subagent_thread("child".to_string(), None, None, None, cx)
+                environment.create_subagent_thread("child".to_string(), None, None, None, None, None, cx)
             })
             .unwrap();
-        cx.update(|cx| environment.resume_subagent_thread(child.id(), None, None, cx))
+        cx.update(|cx| environment.resume_subagent_thread(child.id(), None, None, None, None, cx))
             .expect("resume the child");
         // Resuming a session the parent did not create, including itself, must not make
         // the parent own it: that would be a reference cycle or a self-update.
-        cx.update(|cx| environment.resume_subagent_thread(unrelated_session_id, None, None, cx))
+        cx.update(|cx| environment.resume_subagent_thread(unrelated_session_id, None, None, None, None, cx))
             .expect("resume an unrelated live session");
-        cx.update(|cx| environment.resume_subagent_thread(parent_session_id, None, None, cx))
+        cx.update(|cx| environment.resume_subagent_thread(parent_session_id, None, None, None, None, cx))
             .expect("resume the parent's own session");
 
         parent.read_with(cx, |parent, cx| {
@@ -11444,7 +11652,7 @@ mod internal_tests {
 
         let subagent_handle = cx
             .update(|cx| {
-                environment.create_subagent_thread("worker".to_string(), None, None, None, cx)
+                environment.create_subagent_thread("worker".to_string(), None, None, None, None, None, cx)
             })
             .unwrap();
         let subagent_session_id = subagent_handle.id();
@@ -11469,7 +11677,7 @@ mod internal_tests {
         // Resume subagent thread - should restore goal_id from task's goal branch
         let _resumed = cx
             .update(|cx| {
-                environment.resume_subagent_thread(subagent_session_id.clone(), None, None, cx)
+                environment.resume_subagent_thread(subagent_session_id.clone(), None, None, None, None, cx)
             })
             .unwrap();
 
@@ -11481,7 +11689,7 @@ mod internal_tests {
         // 2. Also test restoring from worktree path with agent-goal prefix
         let subagent_handle2 = cx
             .update(|cx| {
-                environment.create_subagent_thread("worker2".to_string(), None, None, None, cx)
+                environment.create_subagent_thread("worker2".to_string(), None, None, None, None, None, cx)
             })
             .unwrap();
         let subagent_session_id2 = subagent_handle2.id();
@@ -11506,6 +11714,8 @@ mod internal_tests {
                     Some(std::path::PathBuf::from(
                         "/worktrees/agent-goal-GOAL-WORKTREE-2",
                     )),
+                    None,
+                    None,
                     cx,
                 )
             })
@@ -12301,6 +12511,8 @@ mod internal_tests {
             _profile: Option<agent_settings::AgentProfileId>,
             _model: Option<acp_thread::AgentModelId>,
             _task_worktree: Option<std::path::PathBuf>,
+            _working_dir: Option<std::path::PathBuf>,
+            _repo: Option<std::path::PathBuf>,
             _cx: &mut App,
         ) -> anyhow::Result<Rc<dyn crate::SubagentHandle>> {
             Ok(Rc::new(TestSubagentHandle {
@@ -12313,6 +12525,8 @@ mod internal_tests {
             _session_id: acp_v2::SessionId,
             _profile: Option<agent_settings::AgentProfileId>,
             _task_worktree: Option<std::path::PathBuf>,
+            _working_dir: Option<std::path::PathBuf>,
+            _repo: Option<std::path::PathBuf>,
             _cx: &mut App,
         ) -> anyhow::Result<Rc<dyn crate::SubagentHandle>> {
             Ok(Rc::new(TestSubagentHandle {
@@ -12327,6 +12541,7 @@ mod internal_tests {
             _base_branch: Option<String>,
             _on_branch: Option<String>,
             _worktree_of: Option<String>,
+            _repo_hint: Option<std::path::PathBuf>,
             _cx: &mut gpui::AsyncApp,
         ) -> Task<anyhow::Result<std::path::PathBuf>> {
             Task::ready(Ok(std::path::PathBuf::from(format!(
@@ -12733,7 +12948,7 @@ mod internal_tests {
 
         // 1. Ensure a task worktree for an isolated agent.
         let worktree_path = environment
-            .ensure_subagent_worktree("TASK-101", None, None, None, None, &mut cx.to_async())
+            .ensure_subagent_worktree("TASK-101", None, None, None, None, None, &mut cx.to_async())
             .await
             .expect("ensuring task worktree should succeed");
 
@@ -12753,6 +12968,8 @@ mod internal_tests {
                     None,
                     None,
                     Some(worktree_path.clone()),
+                    None,
+                    None,
                     cx,
                 )
             })
@@ -12773,6 +12990,8 @@ mod internal_tests {
             .update(|cx| {
                 environment.create_subagent_thread(
                     "interactive-worker".to_string(),
+                    None,
+                    None,
                     None,
                     None,
                     None,
@@ -12857,6 +13076,8 @@ mod internal_tests {
                     subagent_handle.id(),
                     None,
                     Some(worktree_path.clone()),
+                    None,
+                    None,
                     cx,
                 )
             })
@@ -12930,7 +13151,7 @@ mod internal_tests {
 
         let task_id = "TASK-COLD-RESUME";
         let worktree_path = environment
-            .ensure_subagent_worktree(task_id, None, None, None, None, &mut cx.to_async())
+            .ensure_subagent_worktree(task_id, None, None, None, None, None, &mut cx.to_async())
             .await
             .expect("ensuring task worktree should succeed");
 
@@ -12949,6 +13170,8 @@ mod internal_tests {
                     None,
                     None,
                     Some(worktree_path.clone()),
+                    None,
+                    None,
                     cx,
                 )
             })
@@ -12979,7 +13202,7 @@ mod internal_tests {
 
         // Cold resume: caller passes task_worktree: None
         let resumed_handle = cx
-            .update(|cx| environment.resume_subagent_thread(subagent_handle.id(), None, None, cx))
+            .update(|cx| environment.resume_subagent_thread(subagent_handle.id(), None, None, None, None, cx))
             .expect("cold-resuming isolated subagent should succeed");
         cx.run_until_parked();
 
@@ -13022,6 +13245,508 @@ mod internal_tests {
             !resumed_prompt.contains("HOST RULES"),
             "cold-resumed thread system prompt must NOT contain host rules"
         );
+    }
+
+    /// Resolve-once precedence for `effective_repo` and `working_dir`:
+    /// spawn parameter > profile setting > parent thread > derived repository.
+    #[gpui::test]
+    async fn test_subagent_resolves_repo_and_working_dir_once(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/root/proj"),
+            json!({
+                "repo_a": { ".git": { "HEAD": "ref: refs/heads/main\n" } },
+                "repo_b": { ".git": { "HEAD": "ref: refs/heads/main\n" } },
+            }),
+        )
+        .await;
+        for repo in ["repo_a", "repo_b"] {
+            let dot_git = std::path::PathBuf::from(format!("/root/proj/{repo}/.git"));
+            fs.with_git_state(&dot_git, true, |state| {
+                state.refs.insert("refs/heads/main".into(), repo.to_string());
+                state.refs.insert("HEAD".into(), repo.to_string());
+                state.branches.insert("main".into());
+            })
+            .unwrap();
+        }
+
+        let project = Project::test(fs.clone(), [path!("/root/proj").as_ref()], cx).await;
+        cx.run_until_parked();
+        let root_path = project.read_with(cx, |project, cx| {
+            project
+                .visible_worktrees(cx)
+                .next()
+                .expect("project has a root worktree")
+                .read(cx)
+                .abs_path()
+                .to_path_buf()
+        });
+        let repo_a = root_path.join("repo_a");
+        let repo_b = root_path.join("repo_b");
+
+        let thread_store = cx.new(|cx| ThreadStore::new(cx));
+        let agent =
+            cx.update(|cx| NativeAgent::new(thread_store, Templates::new(), fs.clone(), cx));
+        let connection = Rc::new(NativeAgentConnection(agent.clone()));
+        let provider = Arc::new(FakeLanguageModelProvider::new(
+            LanguageModelProviderId::from("fake-corp".to_string()),
+            LanguageModelProviderName::from("Fake Corp".to_string()),
+        ));
+        let model = provider.update_model("test-model", |model| {
+            model.name = LanguageModelName::from("Test Model".to_string());
+        });
+        cx.update(|cx| {
+            LanguageModelRegistry::global(cx).update(cx, |registry, cx| {
+                registry.register_provider(provider, cx);
+                registry.set_default_model(Some(model), cx);
+            });
+        });
+
+        let repo_child_id = agent_settings::AgentProfileId("repo_child".into());
+        let escape_child_id = agent_settings::AgentProfileId("escape_child".into());
+        cx.update(|cx| {
+            let mut settings = agent_settings::AgentSettings::get_global(cx).clone();
+            let default_profile = settings.default_profile.clone();
+            if let Some(profile) = settings.profiles.get_mut(&default_profile) {
+                profile.tools.insert(Arc::from("spawn_agent"), true);
+                profile.delegation = Some(agent_settings::Delegation {
+                    allowed: vec![
+                        default_profile.clone(),
+                        repo_child_id.clone(),
+                        escape_child_id.clone(),
+                    ],
+                    max_depth: 5,
+                });
+            }
+
+            let profile = |id: &str| agent_settings::AgentProfileSettings {
+                name: id.into(),
+                origin: Default::default(),
+                tools: [("read_file", true)]
+                    .into_iter()
+                    .map(|(name, enabled)| (Arc::from(name), enabled))
+                    .collect(),
+                enable_all_context_servers: false,
+                context_servers: collections::IndexMap::default(),
+                default_model: None,
+                custom_prompt_path: None,
+                system_prompt_template: None,
+                description: None,
+                skills: None,
+                delegation: None,
+                tool_permissions: None,
+                permission_mode: None,
+                terminal_wrapper_command: None,
+                task_isolation: agent_settings::TaskIsolation::default(),
+                task_worktree_language_servers: None,
+                task_worktree_repo: None,
+                working_dir: None,
+            };
+            let mut repo_child = profile("repo_child");
+            repo_child.task_worktree_repo = Some("repo_b".into());
+            settings.profiles.insert(repo_child_id.clone(), repo_child);
+            let mut escape_child = profile("escape_child");
+            escape_child.task_worktree_repo = Some(".".into());
+            escape_child.working_dir = Some(".".into());
+            settings
+                .profiles
+                .insert(escape_child_id.clone(), escape_child);
+            settings.nested_sub_agents = agent_settings::NestedSubAgentsSettings {
+                enabled: true,
+                max_depth: 5,
+                max_concurrent: 16,
+            };
+            agent_settings::AgentSettings::override_global(settings, cx);
+        });
+
+        cx.run_until_parked();
+        let acp_thread = cx
+            .update(|cx| {
+                connection.new_session(project.clone(), PathList::new(&[Path::new("")]), cx)
+            })
+            .await
+            .unwrap();
+        let parent_session_id = acp_thread.read_with(cx, |thread, _| thread.session_id().clone());
+        let parent_thread =
+            cx.update(|cx| native_thread_for_session(&agent, &parent_session_id, cx));
+        let root_env = NativeThreadEnvironment {
+            agent: agent.downgrade(),
+            thread: parent_thread.downgrade(),
+            acp_thread: acp_thread.downgrade(),
+        };
+
+        let thread_for = |cx: &mut TestAppContext, handle: &Rc<dyn SubagentHandle>| -> Entity<Thread> {
+            agent.read_with(cx, |agent, _| {
+                agent.sessions.get(&handle.id()).unwrap().thread.clone()
+            })
+        };
+        let env_for = |cx: &mut TestAppContext, session_id: &acp_v2::SessionId| {
+            let (thread, acp) = agent.read_with(cx, |agent, _| {
+                let session = agent.sessions.get(session_id).unwrap();
+                (session.thread.clone(), session.acp_thread.clone())
+            });
+            NativeThreadEnvironment {
+                agent: agent.downgrade(),
+                thread: thread.downgrade(),
+                acp_thread: acp,
+            }
+        };
+
+        let resolve_for = |cx: &mut TestAppContext,
+                           parent: &Entity<Thread>,
+                           profile: Option<&agent_settings::AgentProfileId>,
+                           spawn_working_dir: Option<PathBuf>,
+                           spawn_repo: Option<PathBuf>,
+                           allow_working_dir: bool|
+         -> (Option<PathBuf>, Option<PathBuf>) {
+            cx.update(|cx| {
+                let parent_thread = parent.read(cx);
+                let project = parent_thread.project().clone();
+                let paths = resolve_subagent_paths(
+                    Some(&project),
+                    parent_thread.agent_settings(cx),
+                    Some(parent_thread),
+                    profile,
+                    spawn_working_dir
+                        .map(PathChoice::Value)
+                        .unwrap_or(PathChoice::Unset),
+                    spawn_repo
+                        .map(PathChoice::Value)
+                        .unwrap_or(PathChoice::Unset),
+                    allow_working_dir,
+                    cx,
+                );
+                (paths.working_dir, paths.effective_repo)
+            })
+        };
+
+        // AC7: a frozen working_dir with no repository derives the repository
+        // that contains it.
+        let (wd, wd_repo) =
+            resolve_for(cx, &parent_thread, None, Some(repo_b.clone()), None, true);
+        let wd_handle = cx
+            .update(|cx| {
+                root_env.create_subagent_thread(
+                    "wd".into(),
+                    None,
+                    None,
+                    None,
+                    wd,
+                    wd_repo,
+                    cx,
+                )
+            })
+            .expect("shared subagent with working_dir should be created");
+        cx.run_until_parked();
+        let wd_thread = thread_for(cx, &wd_handle);
+        wd_thread.read_with(cx, |thread, cx| {
+            assert_eq!(thread.working_dir(), Some(repo_b.as_path()));
+            assert_eq!(thread.effective_repo(), Some(repo_b.as_path()));
+            assert_eq!(
+                thread.worktree_root_path(cx).as_deref(),
+                Some(repo_b.as_path()),
+                "terminal cwd for a shared subagent must be its working_dir"
+            );
+        });
+        let wd_prompt = wd_thread.read_with(cx, |thread, cx| {
+            thread.build_request_messages(Vec::new(), cx)[0].string_contents()
+        });
+        assert!(
+            wd_prompt.contains(&*repo_b.to_string_lossy()),
+            "system prompt must name the working directory, got:\n{wd_prompt}"
+        );
+        assert!(
+            wd_prompt.contains("Working directory:"),
+            "system prompt must state the working directory, got:\n{wd_prompt}"
+        );
+
+        // AC3: a depth-1 thread frozen on repo_a hands it to a parameterless
+        // depth-2 child.
+        let (d1_wd, d1_repo) =
+            resolve_for(cx, &parent_thread, None, None, Some(repo_a.clone()), true);
+        let d1_handle = cx
+            .update(|cx| {
+                root_env.create_subagent_thread(
+                    "d1".into(),
+                    None,
+                    None,
+                    None,
+                    d1_wd,
+                    d1_repo,
+                    cx,
+                )
+            })
+            .expect("depth-1 subagent should be created");
+        cx.run_until_parked();
+        let d1_thread = thread_for(cx, &d1_handle);
+        d1_thread.read_with(cx, |thread, _| {
+            assert_eq!(thread.effective_repo(), Some(repo_a.as_path()));
+        });
+        d1_thread.update(cx, |thread, _| {
+            thread.set_working_dir(Some(repo_a.clone()));
+        });
+        let d1_env = env_for(cx, &d1_handle.id());
+
+        let (d2_wd, d2_repo) = resolve_for(cx, &d1_thread, None, None, None, true);
+        let d2_handle = cx
+            .update(|cx| {
+                d1_env.create_subagent_thread(
+                    "d2".into(),
+                    None,
+                    None,
+                    None,
+                    d2_wd,
+                    d2_repo,
+                    cx,
+                )
+            })
+            .expect("inheriting depth-2 subagent should be created");
+        cx.run_until_parked();
+        thread_for(cx, &d2_handle).read_with(cx, |thread, _| {
+            assert_eq!(
+                thread.effective_repo(),
+                Some(repo_a.as_path()),
+                "depth-2 subagent must inherit the parent's frozen repository"
+            );
+            assert_eq!(thread.working_dir(), Some(repo_a.as_path()));
+        });
+
+        // A spawn parameter overrides the inherited repository.
+        let (override_wd, override_repo) =
+            resolve_for(cx, &d1_thread, None, None, Some(repo_b.clone()), true);
+        let override_handle = cx
+            .update(|cx| {
+                d1_env.create_subagent_thread(
+                    "override".into(),
+                    None,
+                    None,
+                    None,
+                    override_wd,
+                    override_repo,
+                    cx,
+                )
+            })
+            .expect("spawn-override subagent should be created");
+        cx.run_until_parked();
+        thread_for(cx, &override_handle).read_with(cx, |thread, _| {
+            assert_eq!(thread.effective_repo(), Some(repo_b.as_path()));
+        });
+
+        // A profile setting overrides the inherited repository.
+        let (profile_wd, profile_repo) =
+            resolve_for(cx, &d1_thread, Some(&repo_child_id), None, None, true);
+        let profile_handle = cx
+            .update(|cx| {
+                d1_env.create_subagent_thread(
+                    "profile".into(),
+                    Some(repo_child_id.clone()),
+                    None,
+                    None,
+                    profile_wd,
+                    profile_repo,
+                    cx,
+                )
+            })
+            .expect("profile-override subagent should be created");
+        cx.run_until_parked();
+        thread_for(cx, &profile_handle).read_with(cx, |thread, _| {
+            assert_eq!(
+                thread.effective_repo(),
+                Some(repo_b.as_path()),
+                "profile task_worktree_repo must override the inherited repository"
+            );
+        });
+
+        // `.` in a profile escapes inheritance instead of inheriting it.
+        let (escape_wd, escape_repo) =
+            resolve_for(cx, &d1_thread, Some(&escape_child_id), None, None, true);
+        let escape_handle = cx
+            .update(|cx| {
+                d1_env.create_subagent_thread(
+                    "escape".into(),
+                    Some(escape_child_id.clone()),
+                    None,
+                    None,
+                    escape_wd,
+                    escape_repo,
+                    cx,
+                )
+            })
+            .expect("escaping subagent should be created");
+        cx.run_until_parked();
+        thread_for(cx, &escape_handle).read_with(cx, |thread, _| {
+            assert_eq!(thread.effective_repo(), None);
+            assert_eq!(thread.working_dir(), None);
+        });
+    }
+
+    /// Finding 1: a profile-level `task_worktree_repo` must anchor the task
+    /// worktree itself, not only the child thread. The repository is resolved
+    /// once with full precedence, and that single value drives worktree
+    /// creation so the worktree and its branch land in the profile repository.
+    #[gpui::test]
+    async fn test_profile_task_worktree_repo_anchors_dedicated_worktree(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/root/proj"),
+            json!({
+                "repo_a": { ".git": { "HEAD": "ref: refs/heads/main\n" } },
+                "repo_b": { ".git": { "HEAD": "ref: refs/heads/main\n" } },
+            }),
+        )
+        .await;
+        for repo in ["repo_a", "repo_b"] {
+            let dot_git = std::path::PathBuf::from(format!("/root/proj/{repo}/.git"));
+            fs.with_git_state(&dot_git, true, |state| {
+                state.refs.insert("refs/heads/main".into(), repo.to_string());
+                state.refs.insert("HEAD".into(), repo.to_string());
+                state.branches.insert("main".into());
+            })
+            .unwrap();
+        }
+
+        let project = Project::test(fs.clone(), [path!("/root/proj").as_ref()], cx).await;
+        cx.run_until_parked();
+        let root_path = project.read_with(cx, |project, cx| {
+            project
+                .visible_worktrees(cx)
+                .next()
+                .expect("project has a root worktree")
+                .read(cx)
+                .abs_path()
+                .to_path_buf()
+        });
+        let repo_a = root_path.join("repo_a");
+        let repo_b = root_path.join("repo_b");
+
+        let thread_store = cx.new(|cx| ThreadStore::new(cx));
+        let agent =
+            cx.update(|cx| NativeAgent::new(thread_store, Templates::new(), fs.clone(), cx));
+        let connection = Rc::new(NativeAgentConnection(agent.clone()));
+        let provider = Arc::new(FakeLanguageModelProvider::new(
+            LanguageModelProviderId::from("fake-corp".to_string()),
+            LanguageModelProviderName::from("Fake Corp".to_string()),
+        ));
+        let model = provider.update_model("test-model", |model| {
+            model.name = LanguageModelName::from("Test Model".to_string());
+        });
+        cx.update(|cx| {
+            LanguageModelRegistry::global(cx).update(cx, |registry, cx| {
+                registry.register_provider(provider, cx);
+                registry.set_default_model(Some(model), cx);
+            });
+        });
+
+        let profile_id = agent_settings::AgentProfileId("profile_repo".into());
+        cx.update(|cx| {
+            let mut settings = agent_settings::AgentSettings::get_global(cx).clone();
+            settings.profiles.insert(
+                profile_id.clone(),
+                agent_settings::AgentProfileSettings {
+                    name: "profile_repo".into(),
+                    origin: Default::default(),
+                    tools: [("read_file", true)]
+                        .into_iter()
+                        .map(|(name, enabled)| (Arc::from(name), enabled))
+                        .collect(),
+                    enable_all_context_servers: false,
+                    context_servers: collections::IndexMap::default(),
+                    default_model: None,
+                    custom_prompt_path: None,
+                    system_prompt_template: None,
+                    description: None,
+                    skills: None,
+                    delegation: None,
+                    tool_permissions: None,
+                    permission_mode: None,
+                    terminal_wrapper_command: None,
+                    task_isolation: agent_settings::TaskIsolation::Required,
+                    task_worktree_language_servers: None,
+                    task_worktree_repo: Some("repo_b".into()),
+                    working_dir: None,
+                },
+            );
+            agent_settings::AgentSettings::override_global(settings, cx);
+        });
+        cx.run_until_parked();
+
+        let acp_thread = cx
+            .update(|cx| {
+                connection.new_session(project.clone(), PathList::new(&[Path::new("")]), cx)
+            })
+            .await
+            .unwrap();
+        let parent_session_id = acp_thread.read_with(cx, |thread, _| thread.session_id().clone());
+        let parent_thread =
+            cx.update(|cx| native_thread_for_session(&agent, &parent_session_id, cx));
+        let environment = NativeThreadEnvironment {
+            agent: agent.downgrade(),
+            thread: parent_thread.downgrade(),
+            acp_thread: acp_thread.downgrade(),
+        };
+
+        // Resolve once with full precedence; the profile repository wins.
+        let resolved_repo = cx.update(|cx| {
+            let parent_thread = parent_thread.read(cx);
+            let project = parent_thread.project().clone();
+            resolve_subagent_paths(
+                Some(&project),
+                parent_thread.agent_settings(cx),
+                Some(parent_thread),
+                Some(&profile_id),
+                PathChoice::Unset,
+                PathChoice::Unset,
+                false,
+                cx,
+            )
+            .effective_repo
+        });
+        assert_eq!(
+            resolved_repo.as_deref(),
+            Some(repo_b.as_path()),
+            "profile task_worktree_repo must resolve to repo_b"
+        );
+
+        // The same resolved repository anchors worktree creation.
+        let worktree_path = environment
+            .ensure_subagent_worktree(
+                "TASK-PROFILE-REPO",
+                None,
+                None,
+                None,
+                None,
+                resolved_repo,
+                &mut cx.to_async(),
+            )
+            .await
+            .expect("dedicated worktree should be created in the profile repository");
+        assert_eq!(
+            worktree_path.parent().and_then(|parent| parent.file_name()),
+            repo_b.file_name(),
+            "worktree {worktree_path:?} must be grouped under the profile repository"
+        );
+        assert!(fs.is_dir(&worktree_path).await);
+
+        // The task branch must live in repo_b, not the autodetected repo_a.
+        let branch = "agent-task/TASK-PROFILE-REPO";
+        let repo_b_has_branch = fs
+            .with_git_state(&repo_b.join(".git"), false, |state| {
+                state.branches.contains(branch)
+                    || state.refs.contains_key(&format!("refs/heads/{branch}"))
+            })
+            .unwrap();
+        let repo_a_has_branch = fs
+            .with_git_state(&repo_a.join(".git"), false, |state| {
+                state.branches.contains(branch)
+                    || state.refs.contains_key(&format!("refs/heads/{branch}"))
+            })
+            .unwrap();
+        assert!(repo_b_has_branch, "task branch must exist in repo_b");
+        assert!(!repo_a_has_branch, "task branch must not leak into repo_a");
     }
 }
 
