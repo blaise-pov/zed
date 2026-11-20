@@ -405,8 +405,10 @@ impl Session {
     }
 
     fn can_skip_save_while_streaming(&self, cx: &App) -> bool {
-        // Streaming notifies the thread once per chunk, but `to_db` doesn't
-        // include the streaming message, so those notifies have nothing new to save.
+        // Streaming notifies the thread once per chunk, but the streaming
+        // save key only changes at meaningful boundaries (message count, a
+        // tool call starting or finishing, ...), so per-chunk notifies have
+        // nothing new to save.
         let thread = self.thread.read(cx);
         thread.is_streaming_message()
             && self
@@ -3938,18 +3940,21 @@ pub(crate) fn resolve_subagent_paths(
         PathOutcome::Value(repo) => Some(repo),
         // `.` escapes inheritance and means the project root / autodetect.
         PathOutcome::Escaped => None,
-        PathOutcome::Unset => working_dir.as_deref().and_then(|working_dir| {
-            project.and_then(|project| {
-                crate::task_worktree::repository_for_path(project.read(cx), working_dir, cx)
+        PathOutcome::Unset => working_dir
+            .as_deref()
+            .and_then(|working_dir| {
+                project.and_then(|project| {
+                    crate::task_worktree::repository_for_path(project.read(cx), working_dir, cx)
+                })
             })
-        }).map(|repository| {
-            repository
-                .read(cx)
-                .snapshot()
-                .work_directory_abs_path
-                .as_ref()
-                .to_path_buf()
-        }),
+            .map(|repository| {
+                repository
+                    .read(cx)
+                    .snapshot()
+                    .work_directory_abs_path
+                    .as_ref()
+                    .to_path_buf()
+            }),
     };
 
     SubagentPaths {
@@ -4609,15 +4614,7 @@ impl ThreadEnvironment for NativeThreadEnvironment {
         repo: Option<PathBuf>,
         cx: &mut App,
     ) -> Result<Rc<dyn SubagentHandle>> {
-        self.create_subagent_thread(
-            label,
-            profile,
-            model,
-            task_worktree,
-            working_dir,
-            repo,
-            cx,
-        )
+        self.create_subagent_thread(label, profile, model, task_worktree, working_dir, repo, cx)
     }
 
     fn resume_subagent(
@@ -6317,7 +6314,14 @@ mod internal_tests {
                 .expect("persisted thread");
             assert_eq!(persisted.title, saved_before_result.title);
             assert!(persisted.detailed_summary.is_none());
-            assert_eq!(persisted.messages.len(), saved_before_result.messages.len());
+            // The in-flight successor message is now part of every snapshot
+            // (crash resilience), so a late save may carry one extra message:
+            // the streaming partial.
+            assert!(
+                persisted.messages.len() == saved_before_result.messages.len()
+                    || persisted.messages.len() == saved_before_result.messages.len() + 1,
+                "only the streaming partial may be appended between snapshots"
+            );
             assert!(
                 completion.clone().now_or_never().is_none(),
                 "the successor must remain pending during the database check"
@@ -11236,7 +11240,15 @@ mod internal_tests {
 
         let subagent_handle = cx
             .update(|cx| {
-                environment.create_subagent_thread("worker".to_string(), None, None, None, None, None, cx)
+                environment.create_subagent_thread(
+                    "worker".to_string(),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    cx,
+                )
             })
             .unwrap();
         let subagent_session_id = subagent_handle.id();
@@ -11393,7 +11405,15 @@ mod internal_tests {
 
         let subagent_handle = cx
             .update(|cx| {
-                environment.create_subagent_thread("worker".to_string(), None, None, None, None, None, cx)
+                environment.create_subagent_thread(
+                    "worker".to_string(),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    cx,
+                )
             })
             .unwrap();
         let subagent_session_id = subagent_handle.id();
@@ -11495,7 +11515,14 @@ mod internal_tests {
         // 5. Test resume_subagent_thread with restored in-memory session
         let resumed = cx
             .update(|cx| {
-                environment.resume_subagent_thread(subagent_session_id.clone(), None, None, None, None, cx)
+                environment.resume_subagent_thread(
+                    subagent_session_id.clone(),
+                    None,
+                    None,
+                    None,
+                    None,
+                    cx,
+                )
             })
             .unwrap();
         assert_eq!(resumed.id(), subagent_session_id);
@@ -11524,7 +11551,14 @@ mod internal_tests {
 
         let direct_resumed = cx
             .update(|cx| {
-                environment.resume_subagent_thread(subagent_session_id.clone(), None, None, None, None, cx)
+                environment.resume_subagent_thread(
+                    subagent_session_id.clone(),
+                    None,
+                    None,
+                    None,
+                    None,
+                    cx,
+                )
             })
             .unwrap();
         assert_eq!(direct_resumed.id(), subagent_session_id);
@@ -11578,17 +11612,29 @@ mod internal_tests {
 
         let child = cx
             .update(|cx| {
-                environment.create_subagent_thread("child".to_string(), None, None, None, None, None, cx)
+                environment.create_subagent_thread(
+                    "child".to_string(),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    cx,
+                )
             })
             .unwrap();
         cx.update(|cx| environment.resume_subagent_thread(child.id(), None, None, None, None, cx))
             .expect("resume the child");
         // Resuming a session the parent did not create, including itself, must not make
         // the parent own it: that would be a reference cycle or a self-update.
-        cx.update(|cx| environment.resume_subagent_thread(unrelated_session_id, None, None, None, None, cx))
-            .expect("resume an unrelated live session");
-        cx.update(|cx| environment.resume_subagent_thread(parent_session_id, None, None, None, None, cx))
-            .expect("resume the parent's own session");
+        cx.update(|cx| {
+            environment.resume_subagent_thread(unrelated_session_id, None, None, None, None, cx)
+        })
+        .expect("resume an unrelated live session");
+        cx.update(|cx| {
+            environment.resume_subagent_thread(parent_session_id, None, None, None, None, cx)
+        })
+        .expect("resume the parent's own session");
 
         parent.read_with(cx, |parent, cx| {
             assert_eq!(
@@ -11652,7 +11698,15 @@ mod internal_tests {
 
         let subagent_handle = cx
             .update(|cx| {
-                environment.create_subagent_thread("worker".to_string(), None, None, None, None, None, cx)
+                environment.create_subagent_thread(
+                    "worker".to_string(),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    cx,
+                )
             })
             .unwrap();
         let subagent_session_id = subagent_handle.id();
@@ -11677,7 +11731,14 @@ mod internal_tests {
         // Resume subagent thread - should restore goal_id from task's goal branch
         let _resumed = cx
             .update(|cx| {
-                environment.resume_subagent_thread(subagent_session_id.clone(), None, None, None, None, cx)
+                environment.resume_subagent_thread(
+                    subagent_session_id.clone(),
+                    None,
+                    None,
+                    None,
+                    None,
+                    cx,
+                )
             })
             .unwrap();
 
@@ -11689,7 +11750,15 @@ mod internal_tests {
         // 2. Also test restoring from worktree path with agent-goal prefix
         let subagent_handle2 = cx
             .update(|cx| {
-                environment.create_subagent_thread("worker2".to_string(), None, None, None, None, None, cx)
+                environment.create_subagent_thread(
+                    "worker2".to_string(),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    cx,
+                )
             })
             .unwrap();
         let subagent_session_id2 = subagent_handle2.id();
@@ -11864,8 +11933,8 @@ mod internal_tests {
         cx.run_until_parked();
         assert_eq!(
             turn.saved_markdown().await,
-            "## User\n\nhello\n\n## Assistant\n\nfirst message\n",
-            "a completed message must be saved even while the next one streams"
+            "## User\n\nhello\n\n## Assistant\n\nfirst message\n\n## Assistant\n\nsecond mess\n",
+            "a completed message and the streaming partial are both saved, so a crash mid-stream loses neither"
         );
 
         turn.fake.send_last_text(&turn.model, "age");
@@ -13202,7 +13271,9 @@ mod internal_tests {
 
         // Cold resume: caller passes task_worktree: None
         let resumed_handle = cx
-            .update(|cx| environment.resume_subagent_thread(subagent_handle.id(), None, None, None, None, cx))
+            .update(|cx| {
+                environment.resume_subagent_thread(subagent_handle.id(), None, None, None, None, cx)
+            })
             .expect("cold-resuming isolated subagent should succeed");
         cx.run_until_parked();
 
@@ -13264,7 +13335,9 @@ mod internal_tests {
         for repo in ["repo_a", "repo_b"] {
             let dot_git = std::path::PathBuf::from(format!("/root/proj/{repo}/.git"));
             fs.with_git_state(&dot_git, true, |state| {
-                state.refs.insert("refs/heads/main".into(), repo.to_string());
+                state
+                    .refs
+                    .insert("refs/heads/main".into(), repo.to_string());
                 state.refs.insert("HEAD".into(), repo.to_string());
                 state.branches.insert("main".into());
             })
@@ -13376,11 +13449,12 @@ mod internal_tests {
             acp_thread: acp_thread.downgrade(),
         };
 
-        let thread_for = |cx: &mut TestAppContext, handle: &Rc<dyn SubagentHandle>| -> Entity<Thread> {
-            agent.read_with(cx, |agent, _| {
-                agent.sessions.get(&handle.id()).unwrap().thread.clone()
-            })
-        };
+        let thread_for =
+            |cx: &mut TestAppContext, handle: &Rc<dyn SubagentHandle>| -> Entity<Thread> {
+                agent.read_with(cx, |agent, _| {
+                    agent.sessions.get(&handle.id()).unwrap().thread.clone()
+                })
+            };
         let env_for = |cx: &mut TestAppContext, session_id: &acp_v2::SessionId| {
             let (thread, acp) = agent.read_with(cx, |agent, _| {
                 let session = agent.sessions.get(session_id).unwrap();
@@ -13423,19 +13497,10 @@ mod internal_tests {
 
         // AC7: a frozen working_dir with no repository derives the repository
         // that contains it.
-        let (wd, wd_repo) =
-            resolve_for(cx, &parent_thread, None, Some(repo_b.clone()), None, true);
+        let (wd, wd_repo) = resolve_for(cx, &parent_thread, None, Some(repo_b.clone()), None, true);
         let wd_handle = cx
             .update(|cx| {
-                root_env.create_subagent_thread(
-                    "wd".into(),
-                    None,
-                    None,
-                    None,
-                    wd,
-                    wd_repo,
-                    cx,
-                )
+                root_env.create_subagent_thread("wd".into(), None, None, None, wd, wd_repo, cx)
             })
             .expect("shared subagent with working_dir should be created");
         cx.run_until_parked();
@@ -13467,15 +13532,7 @@ mod internal_tests {
             resolve_for(cx, &parent_thread, None, None, Some(repo_a.clone()), true);
         let d1_handle = cx
             .update(|cx| {
-                root_env.create_subagent_thread(
-                    "d1".into(),
-                    None,
-                    None,
-                    None,
-                    d1_wd,
-                    d1_repo,
-                    cx,
-                )
+                root_env.create_subagent_thread("d1".into(), None, None, None, d1_wd, d1_repo, cx)
             })
             .expect("depth-1 subagent should be created");
         cx.run_until_parked();
@@ -13491,15 +13548,7 @@ mod internal_tests {
         let (d2_wd, d2_repo) = resolve_for(cx, &d1_thread, None, None, None, true);
         let d2_handle = cx
             .update(|cx| {
-                d1_env.create_subagent_thread(
-                    "d2".into(),
-                    None,
-                    None,
-                    None,
-                    d2_wd,
-                    d2_repo,
-                    cx,
-                )
+                d1_env.create_subagent_thread("d2".into(), None, None, None, d2_wd, d2_repo, cx)
             })
             .expect("inheriting depth-2 subagent should be created");
         cx.run_until_parked();
@@ -13586,9 +13635,7 @@ mod internal_tests {
     /// once with full precedence, and that single value drives worktree
     /// creation so the worktree and its branch land in the profile repository.
     #[gpui::test]
-    async fn test_profile_task_worktree_repo_anchors_dedicated_worktree(
-        cx: &mut TestAppContext,
-    ) {
+    async fn test_profile_task_worktree_repo_anchors_dedicated_worktree(cx: &mut TestAppContext) {
         init_test(cx);
         let fs = FakeFs::new(cx.executor());
         fs.insert_tree(
@@ -13602,7 +13649,9 @@ mod internal_tests {
         for repo in ["repo_a", "repo_b"] {
             let dot_git = std::path::PathBuf::from(format!("/root/proj/{repo}/.git"));
             fs.with_git_state(&dot_git, true, |state| {
-                state.refs.insert("refs/heads/main".into(), repo.to_string());
+                state
+                    .refs
+                    .insert("refs/heads/main".into(), repo.to_string());
                 state.refs.insert("HEAD".into(), repo.to_string());
                 state.branches.insert("main".into());
             })

@@ -1541,7 +1541,7 @@ impl From<&ThreadModel> for Option<DbLanguageModel> {
 /// The parts of `to_db` that are worth saving while a message streams. Token
 /// usage and scroll position are left out because they can change on every
 /// streamed chunk or scroll, and some fields never change after creation.
-#[derive(PartialEq)]
+#[derive(Debug, PartialEq)]
 pub(crate) struct StreamingSaveKey {
     message_count: usize,
     retained_history_revision: usize,
@@ -1556,6 +1556,12 @@ pub(crate) struct StreamingSaveKey {
     sandbox_grants: crate::db::DbSandboxGrants,
     task_id: Option<String>,
     goal_id: Option<String>,
+    /// Fingerprint of the in-flight `pending_message`: tool-call count and
+    /// tool-result count. It changes when a tool call starts or finishes, so
+    /// the thread is saved at those boundaries, but stays constant while
+    /// plain text or thinking streams in (keeping per-chunk saves skipped).
+    pending_tool_uses: usize,
+    pending_tool_results: usize,
 }
 
 pub struct Thread {
@@ -2601,12 +2607,21 @@ impl Thread {
     }
 
     /// A field added here must also go in `StreamingSaveKey`, unless saving it
-    /// can wait until the response finishes streaming.
+    /// can wait until the response finishes streaming. The in-flight
+    /// `pending_message` is deliberately included: a crash mid-turn (for
+    /// example while subagents run) still leaves the tool calls on disk, and
+    /// `from_db` finalizes dangling tool uses with synthetic canceled results.
     pub fn to_db(&self, cx: &App) -> Task<DbThread> {
         let initial_project_snapshot = self.initial_project_snapshot.clone();
+        let mut messages = self.messages.clone();
+        if let Some(pending) = &self.pending_message
+            && !pending.content.is_empty()
+        {
+            messages.push(Arc::new(Message::Agent(pending.clone())));
+        }
         let mut thread = DbThread {
             title: self.title().unwrap_or_default(),
-            messages: self.messages.clone(),
+            messages,
             updated_at: self.updated_at,
             detailed_summary: self.summary.clone(),
             initial_project_snapshot: None,
@@ -2659,6 +2674,17 @@ impl Thread {
             sandbox_grants: self.sandbox_grants.borrow().to_db(),
             task_id: self.task_id.clone(),
             goal_id: self.goal_id.clone(),
+            pending_tool_uses: self.pending_message.as_ref().map_or(0, |message| {
+                message
+                    .content
+                    .iter()
+                    .filter(|content| matches!(content, AgentMessageContent::ToolUse(_)))
+                    .count()
+            }),
+            pending_tool_results: self
+                .pending_message
+                .as_ref()
+                .map_or(0, |message| message.tool_results.len()),
         }
     }
 
@@ -10001,6 +10027,56 @@ mod tests {
             text.as_str(),
             "The previous conversation was compacted. Use this summary as context:\n\nOlder context"
         );
+    }
+
+    #[gpui::test]
+    async fn test_to_db_includes_pending_message_and_streaming_key_tracks_it(
+        cx: &mut TestAppContext,
+    ) {
+        let (thread, _, _) = setup_thread_for_test(cx).await;
+
+        let key_before = thread.read_with(cx, |thread, _| thread.streaming_save_key());
+
+        let tool_use = LanguageModelToolUse {
+            id: LanguageModelToolUseId::from("call_pending_1"),
+            name: "spawn_agent".into(),
+            input: language_model::LanguageModelToolUseInput::Json(
+                json!({"label": "Worker", "message": "Do work"}),
+            ),
+            raw_input: "{\"label\":\"Worker\",\"message\":\"Do work\"}".into(),
+            is_input_complete: true,
+            thought_signature: None,
+        };
+
+        let db_task = thread.update(cx, |thread, cx| {
+            let mut pending = AgentMessage::default();
+            pending
+                .content
+                .push(AgentMessageContent::ToolUse(tool_use.clone()));
+            thread.pending_message = Some(pending);
+            thread.to_db(cx)
+        });
+        let db_thread = db_task.await;
+
+        // The in-flight tool call must be part of the persisted snapshot, so a
+        // crash mid-subagent still leaves the launch record on disk.
+        let last = db_thread
+            .messages
+            .last()
+            .expect("pending message must be saved");
+        let Message::Agent(agent_message) = last.as_ref() else {
+            panic!("expected agent message");
+        };
+        assert!(agent_message.content.iter().any(|content| matches!(
+            content,
+            AgentMessageContent::ToolUse(tool_use)
+                if tool_use.name.as_ref() == "spawn_agent"
+        )));
+
+        // The streaming save key must change when the pending message gains
+        // a tool call, so mid-tool saves are not skipped.
+        let key_after = thread.read_with(cx, |thread, _| thread.streaming_save_key());
+        assert_ne!(key_before, key_after);
     }
 
     #[gpui::test]
