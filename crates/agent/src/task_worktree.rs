@@ -1678,6 +1678,50 @@ async fn release_stale_task_worktree(
     perform_release.await
 }
 
+/// Sweeps guards whose owning thread is still alive but has no running turn.
+///
+/// A turn whose driving future is dropped mid-flight can leave its id in the
+/// global running-turns registry. `is_owner_alive` then reports a live session
+/// forever, so the task's pool slot can never be released or evicted. When the
+/// thread entity still upgrades but reports no running turn, its guards are
+/// stale and can be swept.
+fn sweep_guards_for_idle_threads(cx: &mut AsyncApp, current_task_id: &AgentTaskId) {
+    // Collect candidates under the registry lock, then probe threads outside it,
+    // because reading an entity touches the app.
+    let candidates: Vec<(acp::SessionId, WeakEntity<crate::Thread>)> = {
+        let reg = REGISTRY.read();
+        reg.active_guards
+            .iter()
+            // Never sweep the current task's own guards: its turn may not have
+            // started yet even though the session is live.
+            .filter(|(task_id, _)| *task_id != current_task_id)
+            .flat_map(|(_, guards)| guards.values())
+            .filter(|owner| is_owner_alive(owner))
+            .filter_map(|owner| {
+                let thread = owner.thread.clone()?;
+                Some((owner.thread_id.clone(), thread))
+            })
+            .collect()
+    };
+
+    let mut stale_threads = collections::HashSet::default();
+    for (thread_id, thread) in candidates {
+        // Treat an unreadable thread as running: `is_owner_alive` would already
+        // report it dead, so sweeping here would be redundant.
+        let turn_running = thread
+            .read_with(cx, |thread, _| thread.is_turn_running())
+            .unwrap_or(true);
+        if !turn_running {
+            stale_threads.insert(thread_id);
+        }
+    }
+
+    for thread_id in stale_threads {
+        log::info!("Sweeping stale session guards for idle thread {thread_id}");
+        sweep_guards_for_thread(&thread_id);
+    }
+}
+
 async fn acquire_task_worktree_slot(
     project: &Entity<Project>,
     repository: &Entity<Repository>,
@@ -1693,6 +1737,10 @@ async fn acquire_task_worktree_slot(
     let mut notified_guard: Option<NotifiedWaiterGuard> = None;
 
     loop {
+        // Heal guards left behind by turn futures dropped mid-flight before
+        // measuring pool occupancy, otherwise leaked sessions pin slots forever.
+        sweep_guards_for_idle_threads(cx, current_task_id);
+
         let (limit, cleanup_enabled) = project.read_with(cx, |project, cx| {
             let settings = agent_settings::AgentSettings::get_for_project(project, cx);
             if REGISTRY.read().retention_timeout.is_none() {
@@ -4851,10 +4899,12 @@ pub fn goal_branch_summary_for_task(task_id: &AgentTaskId) -> Option<GoalBranchS
 mod tests {
     use super::*;
     use crate::AgentTaskStatus;
+    use acp_thread::ClientUserMessageId;
     use context_server::{ContextServer, ContextServerCommand, ContextServerId};
     use fs::FakeFs;
     use futures::{StreamExt as _, channel::mpsc};
-    use gpui::{BorrowAppContext, TestAppContext};
+    use gpui::{AppContext as _, BorrowAppContext, TestAppContext};
+    use language_model::LanguageModelRegistry;
     use project::project_settings::ProjectSettings;
     use serde_json::json;
     use settings::SettingsStore;
@@ -12274,6 +12324,251 @@ mod tests {
         assert!(!has_active_subagent_session(&task_a));
         assert_eq!(active_guards_count(&task_b), 1);
         assert!(has_active_subagent_session(&task_b));
+    }
+
+    struct TurnPoolTest {
+        thread: Entity<crate::Thread>,
+        project: Entity<Project>,
+        fs: Arc<FakeFs>,
+    }
+
+    /// Sets up a git-backed project plus a thread driven by the fake model, so
+    /// tests can run real turns against the task worktree pool.
+    async fn setup_turn_pool_test(cx: &mut TestAppContext, limit: usize) -> TurnPoolTest {
+        init_test(cx);
+        let model = cx.update(|cx| LanguageModelRegistry::test(cx).model("fake"));
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/root"),
+            json!({
+                ".git": {
+                    "HEAD": "ref: refs/heads/main\n"
+                }
+            }),
+        )
+        .await;
+
+        let dot_git = std::path::Path::new(path!("/root/.git"));
+        fs.with_git_state(dot_git, true, |state| {
+            state
+                .refs
+                .insert("refs/heads/main".into(), "main-sha-turn-pool".into());
+            state
+                .refs
+                .insert("HEAD".into(), "main-sha-turn-pool".into());
+            state.branches.insert("main".into());
+        })
+        .expect("git state setup");
+
+        let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
+
+        cx.update(|cx| {
+            cx.update_global(|store: &mut SettingsStore, cx| {
+                store
+                    .set_user_settings(
+                        &format!(r#"{{ "agent": {{ "task_worktree_limit": {limit} }} }}"#),
+                        cx,
+                    )
+                    .expect("settings update");
+            });
+        });
+
+        let templates = crate::Templates::new();
+        let thread = cx.update(|cx| {
+            let project_context = cx.new(|_cx| prompt_store::ProjectContext::default());
+            let context_server_store = project.read(cx).context_server_store();
+            let context_server_registry =
+                cx.new(|cx| crate::ContextServerRegistry::new(context_server_store, cx));
+            cx.new(|cx| {
+                crate::Thread::new(
+                    project.clone(),
+                    project_context,
+                    context_server_registry,
+                    templates,
+                    Some(model),
+                    cx,
+                )
+            })
+        });
+
+        TurnPoolTest {
+            thread,
+            project,
+            fs,
+        }
+    }
+
+    fn task_summary(task_id: &str) -> AgentTaskSummary {
+        AgentTaskSummary {
+            id: AgentTaskId::from(task_id),
+            parent_id: None,
+            goal_id: None,
+            title: task_id.to_string(),
+            status: AgentTaskStatus::Running,
+            attempt: 1,
+            assignee: None,
+            write_scopes: vec![],
+            created_at: None,
+            assigned_profile: None,
+            model: None,
+            session_id: None,
+            metrics: None,
+        }
+    }
+
+    /// Registers a subagent session guard owned by `thread`, like the
+    /// `spawn_agent` tool does for a subagent task.
+    fn register_thread_session_guard(
+        thread: &Entity<crate::Thread>,
+        task_id: &AgentTaskId,
+        cx: &mut TestAppContext,
+    ) -> SubagentSessionGuard {
+        let thread_id = thread.read_with(cx, |thread, _| thread.id().clone());
+        SubagentSessionGuard::new(
+            task_id.clone(),
+            SubagentSessionOwner {
+                thread_id,
+                tool_use_id: LanguageModelToolUseId::from(format!("tool-{task_id}").as_str()),
+                thread: Some(thread.downgrade()),
+                is_test_live: false,
+            },
+        )
+    }
+
+    /// Starts a real turn on `thread` and leaves it waiting on the model.
+    fn start_turn(cx: &mut TestAppContext, thread: &Entity<crate::Thread>) {
+        thread
+            .update(cx, |thread, cx| {
+                thread.send(ClientUserMessageId::new(), ["work"], cx)
+            })
+            .expect("turn must start");
+        cx.run_until_parked();
+    }
+
+    /// Tears a turn down the way a subagent session teardown does: the driving
+    /// future is dropped without going through `Thread::cancel`.
+    fn drop_turn_future(cx: &mut TestAppContext, thread: &Entity<crate::Thread>) {
+        let turn_task = thread
+            .update(cx, |thread, _| thread.test_take_running_turn_task())
+            .expect("turn must be running");
+        drop(turn_task);
+        cx.run_until_parked();
+    }
+
+    /// Regression test for the pool slot leak: repeatedly running subagent turn
+    /// lifecycles that are torn down without cancelling must not pin slots.
+    #[gpui::test]
+    async fn test_turn_teardown_releases_pool_slots(cx: &mut TestAppContext) {
+        let test = setup_turn_pool_test(cx, 2).await;
+        let thread_id = test.thread.read_with(cx, |thread, _| thread.id().clone());
+
+        // These guards are never dropped: turn cleanup must sweep them.
+        let mut guards = Vec::new();
+        for index in 0..3 {
+            let task = task_summary(&format!("TASK-TURN-POOL-{index}"));
+
+            start_turn(cx, &test.thread);
+            assert!(crate::thread::is_thread_turn_running(&thread_id));
+
+            guards.push(register_thread_session_guard(&test.thread, &task.id, cx));
+            assert!(has_active_subagent_session(&task.id));
+
+            let path = cx
+                .update(|cx| ensure_task_worktree(test.project.clone(), &task, cx))
+                .await
+                .expect("task worktree slot must be available");
+            assert!(test.fs.is_dir(&path).await);
+
+            drop_turn_future(cx, &test.thread);
+
+            assert!(
+                !test.thread.read_with(cx, |thread, _| thread.is_turn_running()),
+                "running_turn must be cleared when the turn future is dropped"
+            );
+            assert!(
+                !crate::thread::is_thread_turn_running(&thread_id),
+                "thread must not stay registered as running"
+            );
+            assert_eq!(
+                active_guards_count(&task.id),
+                0,
+                "session guards must be swept so the slot can be released"
+            );
+        }
+
+        // The pool limit is still 2; a fourth task must still get a slot.
+        let next_task = task_summary("TASK-TURN-POOL-NEXT");
+        let next_path = cx
+            .update(|cx| ensure_task_worktree(test.project.clone(), &next_task, cx))
+            .await
+            .expect("new task must acquire a slot without raising the limit");
+        assert!(test.fs.is_dir(&next_path).await);
+
+        drop(guards);
+    }
+
+    /// Dropping the driving future (not `Thread::cancel`) must clear the turn,
+    /// drop the thread from the running set, and sweep its session guards.
+    #[gpui::test]
+    async fn test_dropped_turn_future_sweeps_session_guards(cx: &mut TestAppContext) {
+        let test = setup_turn_pool_test(cx, 1).await;
+        let thread_id = test.thread.read_with(cx, |thread, _| thread.id().clone());
+        let task = task_summary("TASK-DROP-FUTURE");
+
+        start_turn(cx, &test.thread);
+        let guard = register_thread_session_guard(&test.thread, &task.id, cx);
+        assert!(has_active_subagent_session(&task.id));
+
+        drop_turn_future(cx, &test.thread);
+
+        assert!(
+            !test.thread.read_with(cx, |thread, _| thread.is_turn_running()),
+            "running_turn must be None after the future is dropped"
+        );
+        assert!(
+            !crate::thread::is_thread_turn_running(&thread_id),
+            "thread must no longer be registered as running"
+        );
+        assert_eq!(active_guards_count(&task.id), 0);
+        assert!(!has_active_subagent_session(&task.id));
+
+        drop(guard);
+    }
+
+    /// A guard left behind by a turn that leaked before the fix must not pin a
+    /// slot: acquiring a slot heals threads that upgrade but have no turn.
+    #[gpui::test]
+    async fn test_acquire_sweeps_guards_of_idle_threads(cx: &mut TestAppContext) {
+        let test = setup_turn_pool_test(cx, 1).await;
+        let thread_id = test.thread.read_with(cx, |thread, _| thread.id().clone());
+
+        // Reproduce the leaked state: the thread id is registered as running,
+        // but the thread itself has no running turn.
+        let leaked_running_turn = crate::thread::register_running_turn_for_tests(thread_id.clone());
+        let stale_task = task_summary("TASK-IDLE-THREAD-STALE");
+        let stale_guard = register_thread_session_guard(&test.thread, &stale_task.id, cx);
+        assert!(has_active_subagent_session(&stale_task.id));
+        assert!(!test.thread.read_with(cx, |thread, _| thread.is_turn_running()));
+
+        let stale_path = cx
+            .update(|cx| ensure_task_worktree(test.project.clone(), &stale_task, cx))
+            .await
+            .expect("stale task worktree");
+        assert!(test.fs.is_dir(&stale_path).await);
+
+        // The limit is 1, so the new task only gets a slot if the idle thread's
+        // guards are swept and its worktree becomes evictable.
+        let next_task = task_summary("TASK-IDLE-THREAD-NEXT");
+        let next_path = cx
+            .update(|cx| ensure_task_worktree(test.project.clone(), &next_task, cx))
+            .await
+            .expect("acquire must heal the leaked session and evict the stale worktree");
+        assert!(test.fs.is_dir(&next_path).await);
+        assert!(!test.fs.is_dir(&stale_path).await);
+
+        drop(stale_guard);
+        drop(leaked_running_turn);
     }
 
     #[gpui::test]
