@@ -11872,12 +11872,7 @@ impl ThreadView {
                     if let Some(branch) =
                         agent::task_worktree::task_worktree_goal_branch(&task_id_typed)
                     {
-                        return Some(
-                            branch
-                                .strip_prefix("agent-goal/")
-                                .unwrap_or(&branch)
-                                .to_string(),
-                        );
+                        return Some(agent::task_worktree::normalize_goal_id(&branch));
                     }
                 }
                 None
