@@ -1708,6 +1708,50 @@ impl Thread {
         self.running_turn.is_some()
     }
 
+    /// Clears `running_turn` when it still belongs to `turn_id`.
+    ///
+    /// A turn that was replaced by a newer one must not clear the newer turn.
+    fn finish_turn(&mut self, turn_id: u64) {
+        if self
+            .running_turn
+            .as_ref()
+            .is_some_and(|turn| turn.turn_id == turn_id)
+        {
+            self.running_turn.take();
+        }
+    }
+
+    /// Returns a sender whose drop clears `running_turn` if it is still the
+    /// turn identified by `turn_id`.
+    ///
+    /// The turn's driving future owns the sender, so the cleanup runs whether
+    /// the future completes, fails, returns early on cancellation, or is
+    /// dropped mid-flight (for example when a subagent session is torn down).
+    /// Without it, a dropped future leaves `running_turn` set, which keeps the
+    /// thread id in `RUNNING_TURNS` and pins task worktree pool slots forever.
+    fn spawn_turn_cleanup_supervisor(cx: &mut Context<Self>, turn_id: u64) -> oneshot::Sender<()> {
+        let (cleanup_tx, cleanup_rx) = oneshot::channel::<()>();
+        cx.spawn(async move |this, cx| {
+            // An error means the sender was dropped without sending, which is
+            // exactly the "turn future is gone" signal we need.
+            let _ = cleanup_rx.await;
+            this.update(cx, |this, _| this.finish_turn(turn_id)).ok();
+        })
+        .detach();
+        cleanup_tx
+    }
+
+    /// Removes the turn's driving task without signalling cancellation.
+    ///
+    /// Dropping the returned task drops the turn future, mirroring a session
+    /// teardown that abandons a turn mid-flight.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn test_take_running_turn_task(&mut self) -> Option<Task<()>> {
+        self.running_turn
+            .as_mut()
+            .and_then(|turn| turn._task.take())
+    }
+
     pub fn retry_waiting(&self) -> bool {
         if let Some(running_turn) = &self.running_turn {
             running_turn.retry_now_tx.lock().send(()).ok();
@@ -3498,10 +3542,14 @@ impl Thread {
         let cancellation_tx = Arc::new(parking_lot::Mutex::new(cancellation_tx));
         let (retry_now_tx, _) = watch::channel(());
         let retry_now_tx = Arc::new(parking_lot::Mutex::new(retry_now_tx));
+        let turn_id = next_turn_id();
+        let turn_cleanup_tx = Self::spawn_turn_cleanup_supervisor(cx, turn_id);
         let task = cx.spawn({
             let prompt_id = self.prompt_id.clone();
             let event_stream = event_stream.clone();
             async move |this, cx| {
+                // Dropped when this future completes or is dropped mid-flight.
+                let _turn_cleanup = turn_cleanup_tx;
                 let result = if let Some((model, request)) = compaction {
                     Self::stream_compaction(
                         &this,
@@ -3554,12 +3602,13 @@ impl Thread {
                     }
                 }
 
-                _ = this.update(cx, |this, _| this.running_turn.take());
+                _ = this.update(cx, |this, _| this.finish_turn(turn_id));
             }
         });
         let (watchdog_handle, _activity_rx) = WatchdogHandle::new();
         self.running_turn = Some(RunningTurn::new(
             self.id.clone(),
+            turn_id,
             event_stream,
             BTreeMap::default(),
             cancellation_tx,
@@ -3905,6 +3954,8 @@ impl Thread {
         let (watchdog_handle, mut activity_rx) = WatchdogHandle::new();
         event_stream.set_watchdog_handle(watchdog_handle.clone());
         let timeout = self.watchdog_timeout;
+        let turn_id = next_turn_id();
+        let turn_cleanup_tx = Self::spawn_turn_cleanup_supervisor(cx, turn_id);
 
         let watchdog_task = cx.spawn({
             let watchdog_handle = watchdog_handle.clone();
@@ -3964,6 +4015,8 @@ impl Thread {
             let user_message_id = self.last_user_message_id();
             let event_stream = event_stream.clone();
             async move |this, cx| {
+                // Dropped when this future completes or is dropped mid-flight.
+                let _turn_cleanup = turn_cleanup_tx;
                 log::debug!("Starting agent turn execution");
 
                 let turn_result = Self::run_turn_internal(
@@ -4032,11 +4085,12 @@ impl Thread {
                     }
                 }
 
-                _ = this.update(cx, |this, _| this.running_turn.take());
+                _ = this.update(cx, |this, _| this.finish_turn(turn_id));
             }
         });
         self.running_turn = Some(RunningTurn::new(
             self.id.clone(),
+            turn_id,
             event_stream,
             tools,
             cancellation_tx,
@@ -7041,6 +7095,14 @@ impl WatchdogHandle {
 static RUNNING_TURNS: std::sync::LazyLock<parking_lot::RwLock<HashSet<acp::SessionId>>> =
     std::sync::LazyLock::new(|| parking_lot::RwLock::new(HashSet::default()));
 
+/// Monotonic identifier for turn instances. Late cleanup from a dropped turn
+/// future uses it to avoid clearing a newer turn that replaced it.
+static NEXT_TURN_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn next_turn_id() -> u64 {
+    NEXT_TURN_ID.fetch_add(1, Ordering::Relaxed)
+}
+
 pub fn is_thread_turn_running(thread_id: &acp::SessionId) -> bool {
     RUNNING_TURNS.read().contains(thread_id)
 }
@@ -7055,6 +7117,7 @@ pub fn register_running_turn_for_tests(thread_id: acp::SessionId) -> impl Drop {
 
 struct RunningTurn {
     thread_id: acp::SessionId,
+    turn_id: u64,
     /// Holds the task that handles agent interaction until the end of the turn.
     /// Survives across multiple requests as the model performs tool calls and
     /// we run tools, report their results.
@@ -7079,6 +7142,7 @@ struct RunningTurn {
 impl RunningTurn {
     fn new(
         thread_id: acp::SessionId,
+        turn_id: u64,
         event_stream: ThreadEventStream,
         tools: BTreeMap<SharedString, Arc<dyn AnyAgentTool>>,
         cancellation_tx: Arc<parking_lot::Mutex<watch::Sender<bool>>>,
@@ -7090,6 +7154,7 @@ impl RunningTurn {
         RUNNING_TURNS.write().insert(thread_id.clone());
         Self {
             thread_id,
+            turn_id,
             _task: Some(task),
             _watchdog_task: watchdog_task,
             event_stream,
@@ -10523,6 +10588,7 @@ mod tests {
         thread.update(cx, |thread, _cx| {
             thread.running_turn = Some(RunningTurn::new(
                 thread.id.clone(),
+                next_turn_id(),
                 event_stream.clone(),
                 tools,
                 cancellation_tx,
