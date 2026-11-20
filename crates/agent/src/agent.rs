@@ -3778,10 +3778,21 @@ impl acp_thread::AgentSessionSetTitle for NativeAgentSessionSetTitle {
     }
 }
 
+#[derive(Clone)]
 pub struct NativeThreadEnvironment {
     agent: WeakEntity<NativeAgent>,
     thread: WeakEntity<Thread>,
     acp_thread: WeakEntity<AcpThread>,
+}
+
+/// State assembled synchronously while resuming a subagent thread, before the
+/// (async) check that the restored task worktree still exists.
+struct PreparedSubagentResume {
+    subagent_thread: Entity<Thread>,
+    acp_thread: Entity<AcpThread>,
+    slot_guard: SubagentSlotGuard,
+    effective_task_worktree: Option<PathBuf>,
+    found_task_id: Option<crate::AgentTaskId>,
 }
 
 impl NativeThreadEnvironment {
@@ -3963,7 +3974,23 @@ impl NativeThreadEnvironment {
         profile: Option<agent_settings::AgentProfileId>,
         task_worktree: Option<PathBuf>,
         cx: &mut App,
-    ) -> Result<Rc<dyn SubagentHandle>> {
+    ) -> Task<Result<Rc<dyn SubagentHandle>>> {
+        let prepared = self.prepare_subagent_resume(session_id.clone(), profile, task_worktree, cx);
+        let environment = self.clone();
+        cx.spawn(async move |cx| {
+            environment
+                .finish_subagent_resume(session_id, prepared, cx)
+                .await
+        })
+    }
+
+    fn prepare_subagent_resume(
+        &self,
+        session_id: acp_v2::SessionId,
+        profile: Option<agent_settings::AgentProfileId>,
+        task_worktree: Option<PathBuf>,
+        cx: &mut App,
+    ) -> Result<PreparedSubagentResume> {
         let (subagent_thread, acp_thread) = self.agent.update(cx, |agent, cx| {
             if let Some(session) = agent.sessions.get(&session_id) {
                 if let Some(acp_thread) = session.acp_thread.upgrade() {
@@ -4156,26 +4183,60 @@ impl NativeThreadEnvironment {
                 subagent_thread.update(cx, |t, _| t.set_goal_id(Some(goal_id)));
             }
         }
-        if let Some(task_worktree) = effective_task_worktree {
-            subagent_thread.update(cx, |thread, _cx| {
-                thread.set_task_worktree(Some(task_worktree.clone()));
+        Ok(PreparedSubagentResume {
+            subagent_thread,
+            acp_thread,
+            slot_guard,
+            effective_task_worktree,
+            found_task_id,
+        })
+    }
+
+    async fn finish_subagent_resume(
+        &self,
+        session_id: acp_v2::SessionId,
+        prepared: Result<PreparedSubagentResume>,
+        cx: &mut AsyncApp,
+    ) -> Result<Rc<dyn SubagentHandle>> {
+        let PreparedSubagentResume {
+            subagent_thread,
+            acp_thread,
+            slot_guard,
+            effective_task_worktree,
+            found_task_id,
+        } = prepared?;
+
+        if let Some(task_worktree) = self
+            .restore_resume_worktree(
+                &subagent_thread,
+                &acp_thread,
+                effective_task_worktree,
+                found_task_id.as_ref(),
+                cx,
+            )
+            .await?
+        {
+            cx.update(|cx| {
+                subagent_thread.update(cx, |thread, _cx| {
+                    thread.set_task_worktree(Some(task_worktree.clone()));
+                });
+                if let Some(parent_thread_entity) = self.thread.upgrade() {
+                    self.setup_isolated_project_context(
+                        &subagent_thread,
+                        &task_worktree,
+                        &parent_thread_entity,
+                        cx,
+                    );
+                }
             });
-            if let Some(parent_thread_entity) = self.thread.upgrade() {
-                self.setup_isolated_project_context(
-                    &subagent_thread,
-                    &task_worktree,
-                    &parent_thread_entity,
-                    cx,
-                );
-            }
         }
 
-        let depth = subagent_thread.read(cx).depth();
+        let depth = subagent_thread.read_with(cx, |thread, _| thread.depth());
 
         if let Some(parent_thread_entity) = self.thread.upgrade() {
             telemetry::event!(
                 "Subagent Started",
-                session = parent_thread_entity.read(cx).id().to_string(),
+                session = parent_thread_entity.read_with(cx, |thread, _| thread.id().to_string()),
                 subagent_session = session_id.to_string(),
                 depth,
                 is_resumed = true,
@@ -4183,6 +4244,101 @@ impl NativeThreadEnvironment {
         }
 
         self.prompt_subagent(session_id, subagent_thread, acp_thread, slot_guard)
+    }
+
+    /// Confirms that a resumed thread's task worktree still exists on disk.
+    ///
+    /// LRU cleanup can evict a worktree while the thread state (or the
+    /// registry) still points at it. Handing that dead path to the agent makes
+    /// every terminal call fail with `os error 267`, so recreate the checkout
+    /// from its branch, or drop isolation entirely when that is not possible.
+    async fn restore_resume_worktree(
+        &self,
+        subagent_thread: &Entity<Thread>,
+        acp_thread: &Entity<AcpThread>,
+        restored: Option<PathBuf>,
+        task_id: Option<&crate::AgentTaskId>,
+        cx: &mut AsyncApp,
+    ) -> Result<Option<PathBuf>> {
+        let Some(restored) = restored else {
+            return Ok(None);
+        };
+        let Some(parent_thread) = self.thread.upgrade() else {
+            anyhow::bail!("Parent thread no longer exists");
+        };
+        let (project, file_system) = {
+            let project = parent_thread.read_with(cx, |thread, _| thread.project().clone());
+            let file_system = project.read_with(cx, |project, _| project.fs().clone());
+            (project, file_system)
+        };
+        if file_system.is_dir(&restored).await {
+            return Ok(Some(restored));
+        }
+
+        let task_id = task_id.cloned().or_else(|| {
+            restored
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(|name| name.strip_prefix("agent-task-"))
+                .map(|id| crate::AgentTaskId::from(id.to_string()))
+        });
+        let goal_id = subagent_thread.read_with(cx, |thread, _| thread.goal_id().map(String::from));
+        let recreated = match task_id {
+            Some(task_id) => {
+                let branch = crate::task_worktree::task_worktree_checkout_target(&task_id)
+                    .unwrap_or_else(|| format!("agent-task/{task_id}"));
+                let task = crate::AgentTaskSummary {
+                    id: task_id.clone(),
+                    goal_id: goal_id.clone(),
+                    title: format!("agent-task/{task_id}"),
+                    status: crate::AgentTaskStatus::Ready,
+                    attempt: 1,
+                    ..Default::default()
+                };
+                let ensure = cx.update(|cx| {
+                    crate::task_worktree::ensure_task_worktree_with_options(
+                        project.clone(),
+                        &task,
+                        goal_id,
+                        None,
+                        Some(branch),
+                        false,
+                        cx,
+                    )
+                });
+                ensure.await.with_context(|| {
+                    format!(
+                        "failed to recreate task worktree at {}",
+                        restored.display()
+                    )
+                })
+            }
+            None => Err(anyhow!(
+                "worktree {} no longer exists and no task is associated with it",
+                restored.display()
+            )),
+        };
+
+        match recreated {
+            Ok(path) => Ok(Some(path)),
+            Err(error) => {
+                // Never keep the dead path: drop isolation and tell the user why.
+                let message = format!(
+                    "Task worktree {} no longer exists and could not be recreated: {error}. Continuing without worktree isolation.",
+                    restored.display()
+                );
+                cx.update(|cx| {
+                    subagent_thread.update(cx, |thread, _cx| thread.set_task_worktree(None));
+                    acp_thread.update(cx, |thread, cx| {
+                        thread.push_notice(
+                            acp_v2::Notice::new(acp_v2::NoticeSeverity::Warning, message),
+                            cx,
+                        );
+                    });
+                });
+                Ok(None)
+            }
+        }
     }
 
     fn setup_isolated_project_context(
@@ -4430,7 +4586,7 @@ impl ThreadEnvironment for NativeThreadEnvironment {
         profile: Option<agent_settings::AgentProfileId>,
         task_worktree: Option<PathBuf>,
         cx: &mut App,
-    ) -> Result<Rc<dyn SubagentHandle>> {
+    ) -> Task<Result<Rc<dyn SubagentHandle>>> {
         self.resume_subagent_thread(session_id, profile, task_worktree, cx)
     }
 
@@ -11287,6 +11443,7 @@ mod internal_tests {
             .update(|cx| {
                 environment.resume_subagent_thread(subagent_session_id.clone(), None, None, cx)
             })
+            .await
             .unwrap();
         assert_eq!(resumed.id(), subagent_session_id);
 
@@ -11316,6 +11473,7 @@ mod internal_tests {
             .update(|cx| {
                 environment.resume_subagent_thread(subagent_session_id.clone(), None, None, cx)
             })
+            .await
             .unwrap();
         assert_eq!(direct_resumed.id(), subagent_session_id);
         agent.read_with(cx, |agent, cx| {
@@ -11372,12 +11530,15 @@ mod internal_tests {
             })
             .unwrap();
         cx.update(|cx| environment.resume_subagent_thread(child.id(), None, None, cx))
+            .await
             .expect("resume the child");
         // Resuming a session the parent did not create, including itself, must not make
         // the parent own it: that would be a reference cycle or a self-update.
         cx.update(|cx| environment.resume_subagent_thread(unrelated_session_id, None, None, cx))
+            .await
             .expect("resume an unrelated live session");
         cx.update(|cx| environment.resume_subagent_thread(parent_session_id, None, None, cx))
+            .await
             .expect("resume the parent's own session");
 
         parent.read_with(cx, |parent, cx| {
@@ -11469,6 +11630,7 @@ mod internal_tests {
             .update(|cx| {
                 environment.resume_subagent_thread(subagent_session_id.clone(), None, None, cx)
             })
+            .await
             .unwrap();
 
         assert_eq!(
@@ -11507,6 +11669,7 @@ mod internal_tests {
                     cx,
                 )
             })
+            .await
             .unwrap();
 
         assert_eq!(
@@ -12312,10 +12475,10 @@ mod internal_tests {
             _profile: Option<agent_settings::AgentProfileId>,
             _task_worktree: Option<std::path::PathBuf>,
             _cx: &mut App,
-        ) -> anyhow::Result<Rc<dyn crate::SubagentHandle>> {
-            Ok(Rc::new(TestSubagentHandle {
+        ) -> Task<anyhow::Result<Rc<dyn crate::SubagentHandle>>> {
+            Task::ready(Ok(Rc::new(TestSubagentHandle {
                 id: self.session_id.clone(),
-            }))
+            })))
         }
 
         fn ensure_subagent_worktree(
@@ -12858,6 +13021,7 @@ mod internal_tests {
                     cx,
                 )
             })
+            .await
             .expect("resuming isolated subagent should succeed");
         cx.run_until_parked();
 
@@ -12978,6 +13142,7 @@ mod internal_tests {
         // Cold resume: caller passes task_worktree: None
         let resumed_handle = cx
             .update(|cx| environment.resume_subagent_thread(subagent_handle.id(), None, None, cx))
+            .await
             .expect("cold-resuming isolated subagent should succeed");
         cx.run_until_parked();
 
@@ -13019,6 +13184,203 @@ mod internal_tests {
         assert!(
             !resumed_prompt.contains("HOST RULES"),
             "cold-resumed thread system prompt must NOT contain host rules"
+        );
+    }
+
+    /// Shared setup for the worktree-recovery resume tests: a parent thread on
+    /// a fake git repository, plus the thread environment used to resume.
+    ///
+    /// The parent and ACP thread entities are returned so the caller keeps them
+    /// alive for the duration of the test (the environment only holds weak refs).
+    async fn setup_worktree_resume_test(
+        cx: &mut TestAppContext,
+    ) -> (
+        Arc<FakeFs>,
+        Entity<NativeAgent>,
+        Entity<Thread>,
+        Entity<AcpThread>,
+        NativeThreadEnvironment,
+    ) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/host"),
+            json!({
+                ".git": {},
+                ".rules": "HOST RULES"
+            }),
+        )
+        .await;
+
+        let project = Project::test(fs.clone(), [path!("/host").as_ref()], cx).await;
+        let thread_store = cx.new(|cx| ThreadStore::new(cx));
+        let agent = cx.update(|cx| NativeAgent::new(thread_store, Templates::new(), fs.clone(), cx));
+        let connection = Rc::new(NativeAgentConnection(agent.clone()));
+        let provider = Arc::new(FakeLanguageModelProvider::new(
+            LanguageModelProviderId::from("fake-corp".to_string()),
+            LanguageModelProviderName::from("Fake Corp".to_string()),
+        ));
+        let model = provider.update_model("test-model", |model| {
+            model.name = LanguageModelName::from("Test Model".to_string());
+        });
+        cx.update(|cx| {
+            LanguageModelRegistry::global(cx).update(cx, |registry, cx| {
+                registry.register_provider(provider, cx);
+                registry.set_default_model(Some(model), cx);
+            });
+        });
+        cx.run_until_parked();
+
+        let acp_thread = cx
+            .update(|cx| {
+                connection.new_session(project.clone(), PathList::new(&[Path::new("")]), cx)
+            })
+            .await
+            .unwrap();
+        let parent_session_id = acp_thread.read_with(cx, |thread, _| thread.session_id().clone());
+        let parent_thread =
+            cx.update(|cx| native_thread_for_session(&agent, &parent_session_id, cx));
+        let environment = NativeThreadEnvironment {
+            agent: agent.downgrade(),
+            thread: parent_thread.downgrade(),
+            acp_thread: acp_thread.downgrade(),
+        };
+        (fs, agent, parent_thread, acp_thread, environment)
+    }
+
+    #[gpui::test]
+    async fn test_resume_recreates_missing_task_worktree(cx: &mut TestAppContext) {
+        let (fs, agent, _parent_thread, _acp_thread, environment) =
+            setup_worktree_resume_test(cx).await;
+
+        let task_id = "TASK-RESUME-RECREATE";
+        let worktree_path = environment
+            .ensure_subagent_worktree(task_id, None, None, None, None, &mut cx.to_async())
+            .await
+            .expect("ensuring task worktree should succeed");
+        assert!(fs.is_dir(&worktree_path).await);
+
+        let subagent_handle = cx
+            .update(|cx| {
+                environment.create_subagent_thread(
+                    "isolated-worker".to_string(),
+                    None,
+                    None,
+                    Some(worktree_path.clone()),
+                    cx,
+                )
+            })
+            .expect("creating isolated subagent should succeed");
+        cx.run_until_parked();
+
+        let subagent_thread = agent.read_with(cx, |agent, _| {
+            agent
+                .sessions
+                .get(&subagent_handle.id())
+                .unwrap()
+                .thread
+                .clone()
+        });
+        subagent_thread.update(cx, |thread, _cx| {
+            thread.set_task_id(Some(task_id.to_string()));
+        });
+
+        // LRU cleanup evicts the checkout but leaves the task branch behind.
+        fs.remove_dir(
+            &worktree_path,
+            fs::RemoveOptions {
+                recursive: true,
+                ignore_if_not_exists: true,
+            },
+        )
+        .await
+        .expect("evicting the worktree should succeed");
+        assert!(!fs.is_dir(&worktree_path).await);
+
+        let resumed = cx
+            .update(|cx| environment.resume_subagent_thread(subagent_handle.id(), None, None, cx))
+            .await
+            .expect("resuming with a missing worktree should recreate it");
+
+        assert!(
+            fs.is_dir(&worktree_path).await,
+            "resume must recreate the evicted worktree from its task branch"
+        );
+        let resumed_thread = agent.read_with(cx, |agent, _| {
+            agent.sessions.get(&resumed.id()).unwrap().thread.clone()
+        });
+        assert_eq!(
+            resumed_thread.read_with(cx, |thread, _| thread.task_worktree()
+                .map(Path::to_path_buf)),
+            Some(worktree_path),
+            "resumed thread must point at the recreated worktree"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_resume_clears_isolation_when_worktree_recreation_fails(
+        cx: &mut TestAppContext,
+    ) {
+        let (fs, agent, _parent_thread, _acp_thread, environment) =
+            setup_worktree_resume_test(cx).await;
+
+        let task_id = "TASK-RESUME-GONE";
+        let missing_worktree = PathBuf::from(path!("/host/.worktrees/agent-task-TASK-RESUME-GONE"));
+        assert!(!fs.is_dir(&missing_worktree).await);
+
+        let subagent_handle = cx
+            .update(|cx| {
+                environment.create_subagent_thread(
+                    "isolated-worker".to_string(),
+                    None,
+                    None,
+                    None,
+                    cx,
+                )
+            })
+            .expect("creating subagent should succeed");
+        cx.run_until_parked();
+
+        let subagent_thread = agent.read_with(cx, |agent, _| {
+            agent
+                .sessions
+                .get(&subagent_handle.id())
+                .unwrap()
+                .thread
+                .clone()
+        });
+        subagent_thread.update(cx, |thread, _cx| {
+            thread.set_task_worktree(Some(missing_worktree.clone()));
+            thread.set_task_id(Some(task_id.to_string()));
+        });
+
+        let resumed = cx
+            .update(|cx| environment.resume_subagent_thread(subagent_handle.id(), None, None, cx))
+            .await
+            .expect("resume must survive an unrecoverable worktree by dropping isolation");
+        assert_eq!(resumed.id(), subagent_handle.id());
+
+        assert!(
+            subagent_thread.read_with(cx, |thread, _| thread.task_worktree().is_none()),
+            "a failed recreation must clear isolation instead of keeping a dead path"
+        );
+        let acp_thread = agent.read_with(cx, |agent, _| {
+            agent
+                .sessions
+                .get(&subagent_handle.id())
+                .unwrap()
+                .acp_thread
+                .upgrade()
+                .expect("subagent acp thread")
+        });
+        let notices = acp_thread.read_with(cx, |thread, _| thread.notices().to_vec());
+        assert!(
+            notices.iter().any(|(_, notice)| {
+                notice.severity == acp_v2::NoticeSeverity::Warning
+                    && notice.title.contains("could not be recreated")
+                    && notice.title.contains(task_id)
+            }),
+            "resume must surface the failure as an explicit session warning, got: {notices:?}"
         );
     }
 }
