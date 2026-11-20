@@ -32,6 +32,11 @@ use crate::{AgentTaskId, AgentTaskSummary};
 #[error("no git repository found in project")]
 pub struct NoGitRepositoryError;
 
+/// The resolved repository context needed to create, release, or sweep task
+/// worktrees: the repository entity, its main-checkout anchor, path style, the
+/// worktree directory setting, and the file system.
+pub(crate) type TaskWorktreeContext = (Entity<Repository>, PathBuf, PathStyle, String, Arc<dyn Fs>);
+
 pub(crate) fn system_git_binary() -> Option<PathBuf> {
     static CACHED_GIT: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
     CACHED_GIT.get_or_init(|| which::which("git").ok()).clone()
@@ -98,7 +103,7 @@ pub(crate) fn task_worktree_context(
     project: &Project,
     repo_hint: Option<&Path>,
     cx: &App,
-) -> Result<(Entity<Repository>, PathBuf, PathStyle, String, Arc<dyn Fs>)> {
+) -> Result<TaskWorktreeContext> {
     let repository = match repo_hint {
         Some(hint) => Some(repository_for_path(project, hint, cx).ok_or_else(|| {
             anyhow::anyhow!(
@@ -115,7 +120,7 @@ fn worktree_context_for_repository(
     project: &Project,
     repository: Option<Entity<Repository>>,
     cx: &App,
-) -> Result<(Entity<Repository>, PathBuf, PathStyle, String, Arc<dyn Fs>)> {
+) -> Result<TaskWorktreeContext> {
     let file_system = project.fs().clone();
     let repositories: Vec<Entity<Repository>> =
         project.repositories(cx).values().cloned().collect();
@@ -175,7 +180,7 @@ pub(crate) fn task_worktree_context_for_task(
     project: &Project,
     task_id: &AgentTaskId,
     cx: &App,
-) -> Result<(Entity<Repository>, PathBuf, PathStyle, String, Arc<dyn Fs>)> {
+) -> Result<TaskWorktreeContext> {
     let repository = task_worktree_path_for_id(task_id)
         .and_then(|path| repository_for_worktree_path(project, &path, cx));
     worktree_context_for_repository(project, repository, cx)
@@ -188,7 +193,19 @@ pub(crate) fn goal_worktree_context(
     project: &Project,
     goal_id: &str,
     cx: &App,
-) -> Result<(Entity<Repository>, PathBuf, PathStyle, String, Arc<dyn Fs>)> {
+) -> Result<TaskWorktreeContext> {
+    let repository = goal_anchor_repository(project, goal_id, cx);
+    worktree_context_for_repository(project, repository, cx)
+}
+
+/// Resolves the repository a goal is already anchored to from the task
+/// worktrees recorded for it. Returns `None` before the goal's first task has a
+/// worktree, so the first spawn establishes the anchor.
+pub(crate) fn goal_anchor_repository(
+    project: &Project,
+    goal_id: &str,
+    cx: &App,
+) -> Option<Entity<Repository>> {
     let goal_branch = format!("agent-goal/{}", goal_id);
     let recorded_paths: Vec<PathBuf> = {
         let reg = REGISTRY.read();
@@ -202,10 +219,47 @@ pub(crate) fn goal_worktree_context(
             .filter(|path| !path.as_os_str().is_empty())
             .collect()
     };
-    let repository = recorded_paths
+    recorded_paths
         .iter()
-        .find_map(|path| repository_for_worktree_path(project, path, cx));
-    worktree_context_for_repository(project, repository, cx)
+        .find_map(|path| repository_for_worktree_path(project, path, cx))
+}
+
+/// Ensures every task under one goal anchors to the same repository.
+///
+/// `repo` is the effective repository resolved for the spawn. When the goal
+/// already has an established repository, a different explicit `repo` is
+/// rejected, and an unset `repo` adopts the established one. The first task of
+/// a goal establishes the anchor.
+pub(crate) fn anchor_repo_to_goal(
+    project: &Project,
+    goal_id: &str,
+    repo: Option<PathBuf>,
+    cx: &App,
+) -> Result<Option<PathBuf>> {
+    let Some(established) = goal_anchor_repository(project, goal_id, cx) else {
+        return Ok(repo);
+    };
+    let established_root = established
+        .read(cx)
+        .snapshot()
+        .work_directory_abs_path
+        .as_ref()
+        .to_path_buf();
+
+    match repo {
+        Some(repo) => {
+            let candidate = repository_for_path(project, &repo, cx);
+            match candidate {
+                Some(candidate) if candidate.entity_id() == established.entity_id() => Ok(Some(repo)),
+                _ => anyhow::bail!(
+                    "repo '{}' is not the repository already established for goal '{}'; tasks in one goal must share a repository",
+                    repo.display(),
+                    goal_id
+                ),
+            }
+        }
+        None => Ok(Some(established_root)),
+    }
 }
 
 pub(crate) fn task_worktree_path(
@@ -3069,11 +3123,12 @@ pub fn startup_sweep(
         // the no-hint anchor (the single-repo behaviour), then add one anchor
         // per repository containing a registry-recorded worktree. Unmatched
         // recorded paths are skipped; the task loop below still resolves them
-        // through the registry.
-        let mut anchors: Vec<PathBuf> = Vec::new();
+        // through the registry. Each anchor carries its resolved repository so
+        // the sweep never re-resolves the main checkout as a repo hint.
+        let mut anchors: Vec<TaskWorktreeContext> = Vec::new();
         project.update(cx, |project, cx| {
-            if let Ok((_, anchor_path, _, _, _)) = task_worktree_context(project, None, cx) {
-                anchors.push(anchor_path);
+            if let Ok(context) = task_worktree_context(project, None, cx) {
+                anchors.push(context);
             }
             let recorded_paths: Vec<PathBuf> = {
                 let reg = REGISTRY.read();
@@ -3085,13 +3140,12 @@ pub fn startup_sweep(
             };
             for path in recorded_paths {
                 if let Some(repository) = repository_for_worktree_path(project, &path, cx) {
-                    let snapshot = repository.read(cx).snapshot();
-                    let anchor = snapshot
-                        .main_worktree_abs_path()
-                        .unwrap_or(snapshot.work_directory_abs_path.as_ref())
-                        .to_path_buf();
-                    if !anchors.contains(&anchor) {
-                        anchors.push(anchor);
+                    if let Ok(context) =
+                        worktree_context_for_repository(project, Some(repository), cx)
+                    {
+                        if !anchors.iter().any(|existing| existing.1 == context.1) {
+                            anchors.push(context);
+                        }
                     }
                 }
             }
@@ -3101,8 +3155,8 @@ pub fn startup_sweep(
         }
 
         let mut swept = Vec::new();
-        for anchor_path in anchors {
-            swept.extend(sweep_anchor(&project, &anchor_path, &tasks, cx).await?);
+        for context in anchors {
+            swept.extend(sweep_anchor(&project, context, &tasks, cx).await?);
         }
         Ok(swept)
     })
@@ -3110,17 +3164,12 @@ pub fn startup_sweep(
 
 async fn sweep_anchor(
     project: &Entity<Project>,
-    anchor_path: &PathBuf,
+    (repository, anchor_path, path_style, worktree_setting, file_system): TaskWorktreeContext,
     tasks: &[AgentTaskSummary],
     cx: &mut AsyncApp,
 ) -> Result<Vec<AgentTaskId>> {
     {
-        let (repository, _, path_style, worktree_setting, file_system) = project
-            .update(cx, |project, cx| {
-                anyhow::Ok(task_worktree_context(project, Some(anchor_path), cx))
-            })??;
-
-        let base_dir = worktrees_directory_for_repo(anchor_path, &worktree_setting, path_style)?;
+        let base_dir = worktrees_directory_for_repo(&anchor_path, &worktree_setting, path_style)?;
         if !file_system.is_dir(&base_dir).await {
             return Ok(Vec::new());
         }
@@ -3140,7 +3189,7 @@ async fn sweep_anchor(
             }
 
             let worktree_path =
-                task_worktree_path(anchor_path, &worktree_setting, path_style, task_id)?;
+                task_worktree_path(&anchor_path, &worktree_setting, path_style, task_id)?;
             if file_system.is_dir(&worktree_path).await {
                 let remove_task = project.update(cx, |_, cx| {
                     remove_task_worktree_internal(project.clone(), task_id, false, cx)
@@ -3154,7 +3203,7 @@ async fn sweep_anchor(
             }
         }
 
-        let pool_key = ProjectPoolKey::new(anchor_path, &file_system);
+        let pool_key = ProjectPoolKey::new(&anchor_path, &file_system);
         let limit = project.read_with(cx, |project, cx| {
             agent_settings::AgentSettings::get_for_project(project, cx).task_worktree_limit
         });
@@ -3197,7 +3246,7 @@ async fn sweep_anchor(
                 continue;
             }
             if let Ok(worktree_path) =
-                task_worktree_path(anchor_path, &worktree_setting, path_style, &task.id)
+                task_worktree_path(&anchor_path, &worktree_setting, path_style, &task.id)
             {
                 if file_system.is_dir(&worktree_path).await {
                     seen_ids.insert(task.id.clone());
@@ -3238,7 +3287,7 @@ async fn sweep_anchor(
                     project,
                     &repository,
                     &file_system,
-                    anchor_path,
+                    &anchor_path,
                     &candidate_id,
                     &candidate_path,
                     "startup sweep LRU eviction",
@@ -5147,6 +5196,147 @@ mod tests {
         assert!(
             fs.is_dir(&path_c).await,
             "non-terminal worktree in repo_c must be kept"
+        );
+    }
+
+    /// Finding 2: a project opened at a linked worktree anchors its task
+    /// worktrees at the main checkout, which no open repository contains. The
+    /// startup sweep must use the already-resolved repository instead of
+    /// re-resolving the main checkout as a repo hint.
+    #[gpui::test]
+    async fn test_startup_sweep_succeeds_when_project_opened_at_linked_worktree(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/root"),
+            json!({
+                "my-repo": {
+                    ".git": {},
+                    "file.txt": "content",
+                },
+            }),
+        )
+        .await;
+
+        let dot_git = Path::new("/root/my-repo/.git");
+        fs.with_git_state(dot_git, true, |state| {
+            state.refs.insert("refs/heads/main".into(), "main-sha".into());
+            state.refs.insert("HEAD".into(), "main-sha".into());
+            state.branches.insert("main".into());
+        })
+        .unwrap();
+
+        let linked_path = PathBuf::from("/root/my-repo/.zed/worktrees/feature");
+        fs.add_linked_worktree_for_repo(
+            dot_git,
+            false,
+            git::repository::Worktree {
+                path: linked_path.clone(),
+                ref_name: Some("refs/heads/feature".into()),
+                sha: "feature-sha".into(),
+                is_main: false,
+                is_bare: false,
+            },
+        )
+        .await;
+
+        let project = Project::test(fs.clone(), [linked_path.as_path()], cx).await;
+        project
+            .update(cx, |project, cx| project.git_scans_complete(cx))
+            .await;
+        cx.run_until_parked();
+
+        // The anchor is the main checkout, outside every open repository.
+        let (_, anchor_path, _, _, _) = project
+            .read_with(cx, |project, cx| task_worktree_context(project, None, cx))
+            .expect("context must resolve at a linked worktree");
+        assert_eq!(anchor_path, PathBuf::from("/root/my-repo"));
+
+        let terminal = multi_repo_task("TASK-LINKED-SWEEP", AgentTaskStatus::Completed);
+        let worktree_path = cx
+            .update(|cx| {
+                ensure_task_worktree_with_policy(
+                    project.clone(),
+                    &terminal,
+                    None,
+                    None,
+                    None,
+                    None,
+                    cx,
+                )
+            })
+            .await
+            .expect("creating the task worktree should succeed");
+        assert!(fs.is_dir(&worktree_path).await);
+        mark_task_terminal(&terminal.id);
+
+        let tasks = vec![terminal.clone()];
+        let swept = cx
+            .update(|cx| startup_sweep(project.clone(), Some(&tasks), cx))
+            .await
+            .expect("startup sweep must not abort when opened at a linked worktree");
+        assert!(swept.contains(&terminal.id));
+        assert!(
+            !fs.is_dir(&worktree_path).await,
+            "terminal worktree must be removed"
+        );
+    }
+
+    /// Finding 4: tasks under one goal must share a repository. A spawn whose
+    /// explicit repo diverges from the goal's established repository is
+    /// rejected fail-closed instead of anchoring graduation to an arbitrary
+    /// repository.
+    #[gpui::test]
+    async fn test_goal_repo_divergence_is_rejected(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = insert_multi_repo_project(&fs, cx).await;
+
+        let root = project_root_path(&project, cx);
+        let repo_a = root.join("repo_a");
+        let repo_b = root.join("repo_b");
+
+        let goal_id = "GOAL-DIVERGE";
+        let task_a = multi_repo_task("TASK-GOAL-A", AgentTaskStatus::Ready);
+        cx.update(|cx| {
+            ensure_task_worktree_with_policy(
+                project.clone(),
+                &task_a,
+                Some(goal_id.to_string()),
+                None,
+                None,
+                Some(repo_a.clone()),
+                cx,
+            )
+        })
+        .await
+        .expect("the first goal task should anchor repo_a");
+
+        // An unset repo adopts the established repository.
+        let adopted = project
+            .read_with(cx, |project, cx| anchor_repo_to_goal(project, goal_id, None, cx))
+            .expect("adopting the established repository should succeed");
+        assert_eq!(adopted.as_deref(), Some(repo_a.as_path()));
+
+        // The same repository is accepted.
+        let same = project
+            .read_with(cx, |project, cx| {
+                anchor_repo_to_goal(project, goal_id, Some(repo_a.clone()), cx)
+            })
+            .expect("the established repository should be accepted");
+        assert_eq!(same.as_deref(), Some(repo_a.as_path()));
+
+        // A diverging repository is rejected fail-closed.
+        let error = project
+            .read_with(cx, |project, cx| {
+                anchor_repo_to_goal(project, goal_id, Some(repo_b.clone()), cx)
+            })
+            .expect_err("a diverging repository must be rejected");
+        assert!(
+            error.to_string().contains("must share a repository"),
+            "unexpected error: {error}"
         );
     }
 

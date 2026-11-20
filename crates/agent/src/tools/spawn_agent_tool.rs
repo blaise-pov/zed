@@ -6,7 +6,7 @@ use gpui::{App, SharedString, Task};
 use language_model::LanguageModelToolResultContent;
 use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer, Serialize};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
@@ -231,53 +231,32 @@ fn validate_repo_and_working_dir(
     };
 
     if let Some(working_dir) = working_dir {
-        if !inside_project(&resolve(working_dir)) {
+        // `.` escapes inheritance and means the project root.
+        if working_dir != "." && !inside_project(&resolve(working_dir)) {
             return Some(format!("path outside project: {working_dir}"));
         }
     }
 
     if let Some(repo) = repo {
-        let resolved = resolve(repo);
-        if !inside_project(&resolved) {
-            return Some(format!("path outside project: {repo}"));
-        }
-        let matches = project.read_with(cx, |project, cx| {
-            project.repositories(cx).values().any(|repository| {
-                resolved.starts_with(repository.read(cx).work_directory_abs_path.as_ref())
-            })
-        });
-        if !matches {
-            return Some(format!("no repository matches: {repo}"));
+        // `.` escapes inheritance and means autodetect; it need not name a
+        // repository itself.
+        if repo != "." {
+            let resolved = resolve(repo);
+            if !inside_project(&resolved) {
+                return Some(format!("path outside project: {repo}"));
+            }
+            let matches = project.read_with(cx, |project, cx| {
+                project.repositories(cx).values().any(|repository| {
+                    resolved.starts_with(repository.read(cx).work_directory_abs_path.as_ref())
+                })
+            });
+            if !matches {
+                return Some(format!("no repository matches: {repo}"));
+            }
         }
     }
 
     None
-}
-
-/// Resolves a validated `repo`/`working_dir` spawn parameter to an absolute
-/// path against the first visible worktree.
-fn resolve_spawn_path(
-    value: Option<&str>,
-    project: Option<&gpui::Entity<project::Project>>,
-    cx: &App,
-) -> Option<PathBuf> {
-    let value = value?;
-    let project = project?;
-    let base_dir = project.read_with(cx, |project, cx| {
-        project
-            .visible_worktrees(cx)
-            .next()
-            .map(|worktree| worktree.read(cx).abs_path().to_path_buf())
-    });
-    let path = PathBuf::from(value);
-    let path = if path.is_absolute() {
-        path
-    } else if let Some(base_dir) = base_dir {
-        base_dir.join(path)
-    } else {
-        path
-    };
-    Some(util::paths::normalize_lexically(&path).unwrap_or(path))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -790,17 +769,76 @@ impl AgentTool for SpawnAgentTool {
             }
 
             let (resolved_working_dir, resolved_repo) = cx.update(|cx| {
-                // Values are frozen at session creation; a resume must not
-                // override them.
-                if input.session_id.is_some() {
-                    return (None, None);
-                }
-                let project = event_stream.project();
-                (
-                    resolve_spawn_path(input.working_dir.as_deref(), project, cx),
-                    resolve_spawn_path(input.repo.as_deref(), project, cx),
-                )
+                // Resolve the effective working directory and repository once,
+                // with full precedence, before any worktree is created. The
+                // same values feed both worktree creation and the child thread.
+                let parent_thread = event_stream.thread().and_then(|thread| thread.upgrade());
+                let parent = parent_thread.as_ref().map(|thread| thread.read(cx));
+                let project = event_stream
+                    .project()
+                    .cloned()
+                    .or_else(|| parent.map(|thread| thread.project().clone()));
+                let settings =
+                    agent_settings::AgentSettings::get(event_stream.settings_location(cx), cx);
+                let child_profile = input
+                    .profile
+                    .clone()
+                    .or_else(|| parent.map(|thread| thread.profile().clone()))
+                    .or_else(|| event_stream.profile_id(cx));
+                let paths = crate::resolve_subagent_paths(
+                    project.as_ref(),
+                    settings,
+                    parent,
+                    child_profile.as_ref(),
+                    crate::PathChoice::from_configured(
+                        input.working_dir.as_deref(),
+                        project.as_ref(),
+                        cx,
+                    ),
+                    crate::PathChoice::from_configured(input.repo.as_deref(), project.as_ref(), cx),
+                    !wants_worktree,
+                    cx,
+                );
+                (paths.working_dir, paths.effective_repo)
             });
+
+            // Every task under one goal must anchor to the same repository.
+            // The first task establishes it; later tasks reject a different
+            // explicit repo and adopt the established one when unset.
+            let resolved_repo = if let Some(goal_id) = input.goal_id.as_deref() {
+                let anchored = cx.update(|cx| {
+                    let parent_thread = event_stream.thread().and_then(|thread| thread.upgrade());
+                    let project = event_stream.project().cloned().or_else(|| {
+                        parent_thread
+                            .as_ref()
+                            .map(|thread| thread.read(cx).project().clone())
+                    });
+                    let Some(project) = project else {
+                        return anyhow::Ok(resolved_repo);
+                    };
+                    let project = project.read(cx);
+                    crate::task_worktree::anchor_repo_to_goal(
+                        project,
+                        goal_id,
+                        resolved_repo,
+                        cx,
+                    )
+                });
+                match anchored {
+                    Ok(repo) => repo,
+                    Err(error) => {
+                        return Err(SpawnAgentToolOutput::Error {
+                            session_id: input.session_id.clone(),
+                            error: error.to_string(),
+                            session_info: None,
+                            isolation: None,
+                            isolation_details: None,
+                        });
+                    }
+                }
+            } else {
+                resolved_repo
+            };
 
             let task_detail = if let Some(ref task_id) = task_id {
                 let get_fut = self.environment.get_task_registered(task_id, &mut cx);
@@ -2995,6 +3033,16 @@ Strict Constraints:
 
         assert_eq!(validate(cx, Some("repo_a"), None), None);
         assert_eq!(validate(cx, None, Some("repo_b")), None);
+
+        // `.` is the escape sentinel for both parameters: accepted without a
+        // repository/path match, and it resolves to autodetect rather than a
+        // literal path (previously it errored with "no repository matches: .").
+        assert_eq!(validate(cx, Some("."), None), None);
+        assert_eq!(validate(cx, None, Some(".")), None);
+        let repo_choice = cx.update(|cx| {
+            crate::PathChoice::from_configured(Some("."), Some(&project), cx)
+        });
+        assert!(matches!(repo_choice, crate::PathChoice::Escape));
 
         assert_eq!(
             validate(cx, None, Some("/elsewhere/dir")),

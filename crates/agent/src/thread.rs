@@ -1768,6 +1768,13 @@ impl Thread {
         effective_repo: Option<PathBuf>,
         cx: &mut Context<Self>,
     ) -> Self {
+        // A task worktree pins the child's root; `working_dir` applies to
+        // shared-mode children only, so never freeze both.
+        let working_dir = if task_worktree.is_some() {
+            None
+        } else {
+            working_dir
+        };
         let project = parent_thread.read(cx).project.clone();
         let project_context = if let Some(ref worktree_path) = task_worktree {
             let parent_skills = parent_thread
@@ -9924,6 +9931,39 @@ mod tests {
 
             (thread, event_stream, fake)
         })
+    }
+
+    /// Finding 5: a task worktree pins the child's root, so a profile-set
+    /// `working_dir` must not be frozen alongside it; it would otherwise
+    /// misreport the cwd in the system prompt.
+    #[gpui::test]
+    async fn test_new_subagent_clears_working_dir_when_task_worktree_is_set(
+        cx: &mut TestAppContext,
+    ) {
+        let (parent, _, _) = setup_thread_for_test(cx).await;
+        let task_worktree = PathBuf::from("/root/task-worktree");
+        let working_dir = PathBuf::from("/root/shared-working-dir");
+        let subagent = cx.update(|cx| {
+            cx.new(|cx| {
+                Thread::new_subagent(
+                    &parent,
+                    None,
+                    None,
+                    Some(task_worktree.clone()),
+                    Some(working_dir),
+                    None,
+                    cx,
+                )
+            })
+        });
+        subagent.read_with(cx, |thread, _| {
+            assert_eq!(thread.task_worktree(), Some(task_worktree.as_path()));
+            assert_eq!(
+                thread.working_dir(),
+                None,
+                "working_dir must be cleared when a task worktree pins the root"
+            );
+        });
     }
 
     fn set_auto_compact_settings(cx: &mut App, auto_compact: agent_settings::AutoCompactSettings) {
