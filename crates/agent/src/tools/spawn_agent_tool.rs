@@ -1850,15 +1850,31 @@ impl AgentTool for SpawnAgentTool {
                         && crate::task_worktree::task_worktree_merge_conflict(&task_id_typed).is_none()
                     {
                         self.environment.flush_diff_stats(&mut cx).await.log_err();
-                        let cleanup_fut = self
+                        let cleanup_work = self
                             .environment
                             .auto_cleanup_subagent_worktree(task_id, &mut cx);
+                        // Detach the cleanup from the tool result: dropping the
+                        // task when the step timeout fires cancels a
+                        // half-finished worktree removal and leaks cleanup
+                        // state. The step below only reports progress; the
+                        // work always runs to completion in the background.
+                        let (done_tx, done_rx) = futures::channel::oneshot::channel();
+                        cx.spawn(async move |_cx| {
+                            let result = cleanup_work.await;
+                            let _ = done_tx.send(result);
+                        })
+                        .detach();
+                        let step_fut = async {
+                            done_rx
+                                .await
+                                .unwrap_or_else(|_| Err(anyhow::anyhow!("cleanup worker dropped")))
+                        };
                         let step_fut = timeout_step(
                             Some(task_id),
                             "cleanup",
                             step_timeouts.cleanup,
                             &cx,
-                            cleanup_fut,
+                            step_fut,
                         );
                         let step_res = futures::select_biased! {
                             _ = event_stream.cancelled_by_user().fuse() => {
@@ -1878,8 +1894,8 @@ impl AgentTool for SpawnAgentTool {
                                 log::error!("auto cleanup failed for subagent task {task_id}: {err:?}");
                             }
                             StepOutcome::Timeout => {
-                                log::error!(
-                                    "cleanup timed out after {}s for subagent task {task_id}",
+                                log::warn!(
+                                    "cleanup still running in background after {}s for subagent task {task_id}",
                                     step_timeouts.cleanup.as_secs()
                                 );
                             }
@@ -3039,9 +3055,8 @@ Strict Constraints:
         // literal path (previously it errored with "no repository matches: .").
         assert_eq!(validate(cx, Some("."), None), None);
         assert_eq!(validate(cx, None, Some(".")), None);
-        let repo_choice = cx.update(|cx| {
-            crate::PathChoice::from_configured(Some("."), Some(&project), cx)
-        });
+        let repo_choice =
+            cx.update(|cx| crate::PathChoice::from_configured(Some("."), Some(&project), cx));
         assert!(matches!(repo_choice, crate::PathChoice::Escape));
 
         assert_eq!(

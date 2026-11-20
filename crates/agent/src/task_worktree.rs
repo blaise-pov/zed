@@ -250,7 +250,9 @@ pub(crate) fn anchor_repo_to_goal(
         Some(repo) => {
             let candidate = repository_for_path(project, &repo, cx);
             match candidate {
-                Some(candidate) if candidate.entity_id() == established.entity_id() => Ok(Some(repo)),
+                Some(candidate) if candidate.entity_id() == established.entity_id() => {
+                    Ok(Some(repo))
+                }
                 _ => anyhow::bail!(
                     "repo '{}' is not the repository already established for goal '{}'; tasks in one goal must share a repository",
                     repo.display(),
@@ -1545,6 +1547,21 @@ async fn remove_worktree_from_git_and_fs(
     Ok(())
 }
 
+/// Resets `is_cleaning` for a task's registry entry on drop. Cleanup futures
+/// can be dropped mid-release (for example when the caller's step timeout
+/// fires); without this guard a leaked `is_cleaning` permanently blocks any
+/// future cleanup attempt for that worktree.
+struct CleaningResetGuard<'a>(&'a AgentTaskId);
+
+impl Drop for CleaningResetGuard<'_> {
+    fn drop(&mut self) {
+        let mut reg = REGISTRY.write();
+        if let Some(entry) = reg.entries.get_mut(self.0) {
+            entry.is_cleaning = false;
+        }
+    }
+}
+
 async fn release_stale_task_worktree(
     project: &Entity<Project>,
     repository: &Entity<Repository>,
@@ -1570,6 +1587,7 @@ async fn release_stale_task_worktree(
             entry.is_cleaning = true;
         }
     }
+    let _cleaning_reset = CleaningResetGuard(stale_task_id);
 
     let perform_release = async {
         if !stale_path.as_os_str().is_empty() {
@@ -1655,14 +1673,9 @@ async fn release_stale_task_worktree(
         Ok(())
     };
 
-    let result = perform_release.await;
-    if result.is_err() {
-        let mut reg = REGISTRY.write();
-        if let Some(entry) = reg.entries.get_mut(stale_task_id) {
-            entry.is_cleaning = false;
-        }
-    }
-    result
+    // `is_cleaning` is reset by `CleaningResetGuard` on every exit path,
+    // including cancellation of this future mid-release.
+    perform_release.await
 }
 
 async fn acquire_task_worktree_slot(
@@ -4448,94 +4461,21 @@ pub fn prepare_goal_graduation(
     })
 }
 
+/// TGS artifacts are strictly task-scoped: `artifact_publish` validates
+/// `task_id` against `^TASK-\d+$` and rejects `GOAL-*` ids with a
+/// non-retryable `INVALID_ARGUMENT`. There is no goal-scoped artifact API,
+/// so graduation summaries stay local (`REGISTRY.goal_graduations`) and this
+/// is a deliberate no-op kept for call-site compatibility.
 pub fn publish_goal_ref_artifact_to_tgs(
-    project: Entity<Project>,
+    _project: Entity<Project>,
     goal_id: &str,
-    summary: &GoalGraduationSummary,
-    cx: &mut App,
+    _summary: &GoalGraduationSummary,
+    _cx: &mut App,
 ) -> Task<Result<Option<String>>> {
-    let goal_id_str = goal_id.to_string();
-    let content = match serde_json::to_string(summary) {
-        Ok(c) => c,
-        Err(e) => {
-            return Task::ready(Err(anyhow::anyhow!(
-                "failed to serialize GoalGraduationSummary: {e}"
-            )));
-        }
-    };
-
-    let server_store = project.read(cx).context_server_store();
-    let server_id = agent_settings::AgentSettings::get_for_project(project.read(cx), cx)
-        .task_graph_server_id
-        .clone();
-    let server = server_store
-        .read(cx)
-        .get_running_server(&context_server::ContextServerId(server_id.clone().into()));
-
-    let Some(server) = server else {
-        return Task::ready(Err(anyhow::anyhow!(
-            "No running task graph server found with ID '{server_id}' to publish GoalGraduationSummary for {goal_id_str}"
-        )));
-    };
-
-    cx.spawn(async move |_cx| {
-        let Some(client) = server.client() else {
-            return Err(anyhow::anyhow!(
-                "Task graph server '{server_id}' has no client connected to publish GoalGraduationSummary for {goal_id_str}"
-            ));
-        };
-
-        let mut args = serde_json::Map::new();
-        args.insert(
-            "task_id".to_string(),
-            serde_json::Value::String(goal_id_str.clone()),
-        );
-        args.insert(
-            "goal_id".to_string(),
-            serde_json::Value::String(goal_id_str.clone()),
-        );
-        args.insert(
-            "kind".to_string(),
-            serde_json::Value::String("goal_ref".to_string()),
-        );
-        args.insert(
-            "summary".to_string(),
-            serde_json::Value::String(format!("Goal ref graduation summary for {goal_id_str}")),
-        );
-        args.insert("content".to_string(), serde_json::Value::String(content));
-
-        let response = client
-            .request::<context_server::types::requests::CallTool>(
-                context_server::types::CallToolParams {
-                    name: "artifact_publish".into(),
-                    arguments: Some(serde_json::Value::Object(args)),
-                    meta: None,
-                },
-            )
-            .await;
-
-        match response {
-            Ok(resp) => {
-                if resp.is_error == Some(true) {
-                    let err_msg: String = resp.content.iter().filter_map(|c| c.text()).collect();
-                    log::warn!(
-                        "TGS artifact_publish returned error for goal {goal_id_str}: {err_msg}"
-                    );
-                    Err(anyhow::anyhow!(
-                        "TGS artifact_publish returned error for goal {goal_id_str}: {err_msg}"
-                    ))
-                } else {
-                    let text: String = resp.content.iter().filter_map(|c| c.text()).collect();
-                    log::info!("Published GoalRefArtifact for {goal_id_str}: {text}");
-                    Ok(Some(text))
-                }
-            }
-            Err(e) => {
-                log::warn!("Failed to publish GoalRefArtifact for {goal_id_str}: {e}");
-                Err(e)
-            }
-        }
-    })
+    log::info!(
+        "Skipping TGS publication of goal graduation summary for {goal_id}: TGS artifacts are task-scoped"
+    );
+    Task::ready(Ok(None))
 }
 
 pub fn prepare_and_publish_goal_graduation(
@@ -4574,6 +4514,98 @@ pub fn goal_has_active_tasks(goal_id: &str) -> bool {
         }
     }
     false
+}
+
+/// Remove worktrees whose checked-out branch is one of `branches`, so those
+/// branches can be deleted: git refuses to delete a branch that a worktree
+/// still uses. Best-effort: failures are logged and branch deletion still
+/// runs afterwards. The main worktree is never removed.
+async fn unpin_branches_by_removing_worktrees(
+    repository: &Entity<Repository>,
+    file_system: &Arc<dyn Fs>,
+    anchor_path: &Path,
+    branches: &[String],
+    cx: &mut AsyncApp,
+) {
+    if file_system.is_fake() {
+        return;
+    }
+    let Some(git_binary) = system_git_binary() else {
+        return;
+    };
+    let mut command = util::command::new_command(git_binary);
+    command.args(["worktree", "list", "--porcelain"]);
+    command.current_dir(anchor_path);
+    let output = match command.output().await {
+        Ok(output) if output.status.success() => output,
+        Ok(output) => {
+            log::warn!(
+                "git worktree list failed ({}); skipping worktree unpin",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+            return;
+        }
+        Err(err) => {
+            log::warn!("failed to run git worktree list: {err}");
+            return;
+        }
+    };
+
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut entries: Vec<(PathBuf, String)> = Vec::new();
+    let mut path: Option<PathBuf> = None;
+    let mut branch: Option<String> = None;
+    let flush = |path: &mut Option<PathBuf>,
+                 branch: &mut Option<String>,
+                 entries: &mut Vec<(PathBuf, String)>| {
+        if let (Some(path), Some(branch)) = (path.take(), branch.take()) {
+            entries.push((path, branch));
+        }
+    };
+    for line in text.lines() {
+        if let Some(p) = line.strip_prefix("worktree ") {
+            flush(&mut path, &mut branch, &mut entries);
+            path = Some(PathBuf::from(p));
+        } else if let Some(b) = line.strip_prefix("branch ") {
+            branch = Some(b.strip_prefix("refs/heads/").unwrap_or(b).to_string());
+        } else if line.is_empty() {
+            flush(&mut path, &mut branch, &mut entries);
+        }
+    }
+    flush(&mut path, &mut branch, &mut entries);
+
+    for (worktree_path, branch_name) in entries {
+        if !branches.contains(&branch_name) {
+            continue;
+        }
+        if worktree_path == anchor_path {
+            log::warn!(
+                "branch {branch_name} is checked out in the main worktree; leaving it pinned"
+            );
+            continue;
+        }
+        log::info!(
+            "Removing worktree {} that pins branch {branch_name}",
+            worktree_path.display()
+        );
+        if let Err(err) = remove_worktree_from_git_and_fs(
+            repository,
+            file_system,
+            &worktree_path,
+            anchor_path,
+            true,
+            "graduation branch unpin",
+            cx,
+        )
+        .await
+        {
+            log::warn!(
+                "Failed to remove worktree {} pinning branch {branch_name}: {err:#}",
+                worktree_path.display()
+            );
+        }
+    }
+    prune_git_worktrees(anchor_path).await;
 }
 
 pub fn cleanup_graduated_goal(
@@ -4654,6 +4686,20 @@ pub fn cleanup_graduated_goal(
         branches_to_delete.dedup();
         skipped_branches.sort();
         skipped_branches.dedup();
+
+        // A branch checked out in a worktree cannot be deleted (git refuses
+        // with "used by worktree"), so remove agent worktrees that pin any
+        // branch about to be deleted before attempting the deletion itself.
+        if !branches_to_delete.is_empty() {
+            unpin_branches_by_removing_worktrees(
+                &repository,
+                &file_system,
+                &anchor_path,
+                &branches_to_delete,
+                cx,
+            )
+            .await;
+        }
 
         let mut deleted_branches = Vec::new();
         let mut failed_branches = Vec::new();
@@ -5222,7 +5268,9 @@ mod tests {
 
         let dot_git = Path::new("/root/my-repo/.git");
         fs.with_git_state(dot_git, true, |state| {
-            state.refs.insert("refs/heads/main".into(), "main-sha".into());
+            state
+                .refs
+                .insert("refs/heads/main".into(), "main-sha".into());
             state.refs.insert("HEAD".into(), "main-sha".into());
             state.branches.insert("main".into());
         })
@@ -5316,7 +5364,9 @@ mod tests {
 
         // An unset repo adopts the established repository.
         let adopted = project
-            .read_with(cx, |project, cx| anchor_repo_to_goal(project, goal_id, None, cx))
+            .read_with(cx, |project, cx| {
+                anchor_repo_to_goal(project, goal_id, None, cx)
+            })
             .expect("adopting the established repository should succeed");
         assert_eq!(adopted.as_deref(), Some(repo_a.as_path()));
 
@@ -7480,24 +7530,18 @@ mod tests {
         assert_eq!(task_args["task_id"], "TASK-GRAD-1");
         assert_eq!(task_args["kind"], "task_ref");
 
-        // Verify goal_ref artifact was published from goal graduation
-        let goal_call = tool_calls_rx
-            .next()
-            .await
-            .expect("must receive goal artifact_publish call");
-        assert_eq!(goal_call.name, "artifact_publish");
-        let goal_args = goal_call.arguments.expect("must have goal tool arguments");
-        assert_eq!(goal_args["task_id"], "GOAL-GRAD-1");
-        assert_eq!(goal_args["kind"], "goal_ref");
-        let content_str = goal_args["content"]
-            .as_str()
-            .expect("must have content string");
-        let published_summary: GoalGraduationSummary = serde_json::from_str(content_str).unwrap();
-        assert_eq!(published_summary.goal_id, "GOAL-GRAD-1");
-        assert_eq!(
-            published_summary.merged_tasks,
-            vec!["TASK-GRAD-1".to_string()]
-        );
+        // Goal-level publication is intentionally skipped: TGS artifacts are
+        // task-scoped and `artifact_publish` rejects GOAL-* ids with a
+        // non-retryable INVALID_ARGUMENT.
+        match tool_calls_rx.try_recv() {
+            Err(_) => {}
+            Ok(call) => {
+                panic!(
+                    "expected no goal-level artifact_publish call, got {}",
+                    call.name
+                )
+            }
+        }
 
         // Verify summary stored in registry
         let stored = get_goal_graduation_summary("GOAL-GRAD-1");
