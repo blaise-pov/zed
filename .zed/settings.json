@@ -557,7 +557,8 @@
               "task_create": true,
               "task_update": true,
               "task_graph": true,
-              "task_get": true
+              "task_get": true,
+              "task_ready": true
             }
           }
         },
@@ -621,7 +622,7 @@
               "default": "deny",
               "always_allow": [
                 {
-                  "pattern": "^([A-Z_]+=\\S+\\s+)*git\\s+(-C\\s+\\S+\\s+)?(--no-pager\\s+|--no-optional-locks\\s+)*(status|diff|log|rev-parse|branch)\\b.*"
+                  "pattern": "^([A-Z_]+=\\S+\\s+)*git\\s+(-C\\s+\\S+\\s+)?(--no-pager\\s+|--no-optional-locks\\s+)*(status|diff|log|rev-parse|branch|worktree\\s+list)\\b.*"
                 }
               ]
             },
@@ -647,6 +648,9 @@
               "default": "allow"
             },
             "mcp:taskgraph:task_get": {
+              "default": "allow"
+            },
+            "mcp:taskgraph:task_ready": {
               "default": "allow"
             }
           }
@@ -1571,6 +1575,12 @@
                 {
                   "pattern": "^([A-Z_]+=\\S+\\s+)*git\\s+(-C\\s+\\S+\\s+)?(--no-pager\\s+|--no-optional-locks\\s+)*(status|diff|add|restore|commit|log|rev-parse|show|branch)\\b.*"
                 }
+              ],
+              "write_scopes": [
+                ".zed/**",
+                ".github/**",
+                ".rules",
+                ".gitignore"
               ]
             },
             "mcp:agent-bus:send_feedback": {
