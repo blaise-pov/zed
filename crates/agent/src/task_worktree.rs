@@ -37,6 +37,19 @@ pub(crate) fn system_git_binary() -> Option<PathBuf> {
     CACHED_GIT.get_or_init(|| which::which("git").ok()).clone()
 }
 
+/// Strips every leading `agent-goal/` segment from a stored branch name or goal id.
+///
+/// Goal branches are composed as `agent-goal/{goal_id}`. Stripping a single
+/// prefix and then re-composing compounds it (`agent-goal/agent-goal/GOAL-1`),
+/// so always normalize before composing a branch name.
+pub fn normalize_goal_id(raw: &str) -> String {
+    let mut id = raw;
+    while let Some(rest) = id.strip_prefix("agent-goal/") {
+        id = rest;
+    }
+    id.to_string()
+}
+
 /// Resolves the repository a task worktree should be linked to, plus the data
 /// needed to compute its path. Deterministic: prefer the repository backing
 /// the project's primary worktree, then any non-linked (main) repository,
@@ -140,7 +153,7 @@ pub fn ensure_goal_branch(
     goal_id: &str,
     cx: &mut App,
 ) -> Task<Result<String>> {
-    let goal_id = goal_id.to_string();
+    let goal_id = normalize_goal_id(goal_id);
     cx.spawn(async move |cx| {
         let (repository, anchor_path, _, _, file_system) = project
             .update(cx, |project, cx| {
@@ -273,35 +286,37 @@ pub fn ensure_task_worktree_with_options(
                 let sha = sha.ok_or_else(|| anyhow::anyhow!("branch not found: {branch_name}"))?;
 
                 let g_branch = if branch_name.starts_with("agent-goal/") {
-                    Some(branch_name.clone())
+                    Some(format!("agent-goal/{}", normalize_goal_id(&branch_name)))
                 } else {
-                    goal_id.as_ref().map(|g| format!("agent-goal/{g}"))
+                    goal_id
+                        .as_deref()
+                        .map(|g| format!("agent-goal/{}", normalize_goal_id(g)))
                 };
 
                 (Some(branch_name), None, Some(sha), g_branch)
             } else {
                 // Base selection priority: explicit base_branch > goal-tip > HEAD main
                 let (b_ref, b_sha, g_branch) = if let Some(ref base) = base_branch {
-                    if let Some(extracted_goal_id) = base.strip_prefix("agent-goal/") {
+                    if base.starts_with("agent-goal/") {
+                        let extracted_goal_id = normalize_goal_id(base);
                         let ensure_task = project.update(cx, |_, cx| {
-                            ensure_goal_branch(project.clone(), extracted_goal_id, cx)
+                            ensure_goal_branch(project.clone(), &extracted_goal_id, cx)
                         });
                         ensure_task.await?;
                     }
                     let sha = resolve_ref_to_sha(&git_repo, base).await?;
                     let base_sha =
                         sha.ok_or_else(|| anyhow::anyhow!("branch not found: {base}"))?;
-                    let g_branch =
-                        goal_id
-                            .as_ref()
-                            .map(|g| format!("agent-goal/{g}"))
-                            .or_else(|| {
-                                if base.starts_with("agent-goal/") {
-                                    Some(base.clone())
-                                } else {
-                                    None
-                                }
-                            });
+                    let g_branch = goal_id
+                        .as_deref()
+                        .map(|g| format!("agent-goal/{}", normalize_goal_id(g)))
+                        .or_else(|| {
+                            if base.starts_with("agent-goal/") {
+                                Some(format!("agent-goal/{}", normalize_goal_id(base)))
+                            } else {
+                                None
+                            }
+                        });
                     (Some(base.clone()), Some(base_sha), g_branch)
                 } else if let Some(ref g_id) = goal_id {
                     let ensure_task =
@@ -541,10 +556,8 @@ pub fn ensure_task_worktree_with_options(
             let mut initial_files = HashMap::new();
             if let Some(ref target_branch) = target_checkout_branch {
                 if target_branch.starts_with("agent-goal/") {
-                    let g_id = target_branch
-                        .strip_prefix("agent-goal/")
-                        .unwrap_or(target_branch);
-                    initial_files = get_goal_files(g_id);
+                    let g_id = normalize_goal_id(target_branch);
+                    initial_files = get_goal_files(&g_id);
                 } else if let Some(stripped) = target_branch.strip_prefix("agent-task/") {
                     let tid = AgentTaskId::from(stripped);
                     initial_files = get_task_recorded_files(&tid);
@@ -575,8 +588,8 @@ pub fn ensure_task_worktree_with_options(
                 if !recorded.is_empty() {
                     initial_files = recorded;
                 } else if let Some(ref g_branch) = goal_branch {
-                    let g_id = g_branch.strip_prefix("agent-goal/").unwrap_or(g_branch);
-                    initial_files = get_goal_files(g_id);
+                    let g_id = normalize_goal_id(g_branch);
+                    initial_files = get_goal_files(&g_id);
                 }
             }
 
@@ -3361,8 +3374,8 @@ pub async fn commit_task_worktree(
         if !files_snapshot.is_empty() {
             record_task_recorded_files(&task_id_typed, files_snapshot.clone());
             if is_checkout && branch.starts_with("agent-goal/") {
-                let g_id = branch.strip_prefix("agent-goal/").unwrap_or(&branch);
-                store_goal_files(g_id, files_snapshot);
+                let g_id = normalize_goal_id(&branch);
+                store_goal_files(&g_id, files_snapshot);
             }
         }
     }
@@ -3492,8 +3505,8 @@ pub async fn commit_task_worktree(
     }
 
     if let Some(ref sha) = head_sha {
-        if let Some(goal_id) = branch.strip_prefix("agent-goal/") {
-            record_goal_tip_sha(goal_id, sha.clone());
+        if branch.starts_with("agent-goal/") {
+            record_goal_tip_sha(&normalize_goal_id(&branch), sha.clone());
         }
     }
 
@@ -3558,10 +3571,7 @@ pub fn merge_task_branch_into_goal(
             return Ok(MergeOutcome::NoGoal);
         };
 
-        let goal_id = goal_branch
-            .strip_prefix("agent-goal/")
-            .unwrap_or(&goal_branch)
-            .to_string();
+        let goal_id = normalize_goal_id(&goal_branch);
 
         let goal_lock = get_goal_merge_lock(&goal_id);
         let _guard = goal_lock.lock().await;
@@ -4039,6 +4049,13 @@ pub fn assert_safe_graduation_ref(ref_or_branch: &str) -> Result<()> {
     if clean.contains("..") {
         anyhow::bail!("ref '{ref_or_branch}' cannot contain path traversals");
     }
+    if let Some(rest) = clean.strip_prefix("agent-goal/") {
+        if rest.starts_with("agent-goal/") {
+            anyhow::bail!(
+                "ref '{ref_or_branch}' contains a repeated 'agent-goal/' prefix"
+            );
+        }
+    }
     if !(clean.starts_with("agent-goal/") || clean.starts_with("agent-task/")) {
         anyhow::bail!(
             "ref '{ref_or_branch}' is not a valid agent branch (must start with agent-goal/ or agent-task/)"
@@ -4495,11 +4512,7 @@ pub fn goal_branch_summary_for_task(task_id: &AgentTaskId) -> Option<GoalBranchS
 
     let goal_id = entry
         .and_then(|e| e.goal_branch.as_ref())
-        .map(|gb| {
-            gb.strip_prefix("agent-goal/")
-                .unwrap_or(gb.as_str())
-                .to_string()
-        })
+        .map(|gb| normalize_goal_id(gb))
         .or_else(|| {
             let task_str = task_id.to_string();
             if reg.goal_history.contains_key(&task_str) || reg.goal_tip_shas.contains_key(&task_str)
@@ -4880,6 +4893,122 @@ mod tests {
             .await
             .expect("second ensure_goal_branch should succeed");
         assert_eq!(branch2, "agent-goal/GOAL-1");
+    }
+
+    #[test]
+    fn test_normalize_goal_id_and_graduation_ref_guard() {
+        reset_registry_for_tests();
+
+        assert_eq!(normalize_goal_id("GOAL-1"), "GOAL-1");
+        assert_eq!(normalize_goal_id("agent-goal/GOAL-1"), "GOAL-1");
+        assert_eq!(normalize_goal_id("agent-goal/agent-goal/GOAL-1"), "GOAL-1");
+        assert_eq!(
+            normalize_goal_id("agent-goal/agent-goal/agent-goal/GOAL-1"),
+            "GOAL-1"
+        );
+        assert_eq!(normalize_goal_id("agent-task/TASK-1"), "agent-task/TASK-1");
+
+        assert!(assert_safe_graduation_ref("agent-goal/GOAL-1").is_ok());
+        assert!(assert_safe_graduation_ref("refs/heads/agent-goal/GOAL-1").is_ok());
+        assert!(assert_safe_graduation_ref("agent-goal/agent-goal/GOAL-1").is_err());
+        assert!(
+            assert_safe_graduation_ref("refs/heads/agent-goal/agent-goal/GOAL-1").is_err()
+        );
+    }
+
+    #[gpui::test]
+    async fn test_resume_nested_goal_branch_normalizes_fork_base(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            "/root",
+            json!({
+                ".git": {
+                    "HEAD": "ref: refs/heads/main\n"
+                }
+            }),
+        )
+        .await;
+
+        let project = Project::test(fs.clone(), ["/root".as_ref()], cx).await;
+        let dot_git = std::path::Path::new("/root/.git");
+        fs.with_git_state(dot_git, true, |state| {
+            state
+                .refs
+                .insert("refs/heads/main".into(), "main-sha-nested".into());
+            state.refs.insert("HEAD".into(), "main-sha-nested".into());
+            state.branches.insert("main".into());
+        })
+        .unwrap();
+
+        // Persisted state left behind by a version that compounded the prefix.
+        let task_id = AgentTaskId::from("TASK-NESTED-GOAL");
+        register_task_worktree_policy(
+            &task_id,
+            PathBuf::from("/root/agent-task-TASK-NESTED-GOAL"),
+            Some("agent-goal/agent-goal/GOAL-X".to_string()),
+            Some("agent-goal/agent-goal/GOAL-X".to_string()),
+            None,
+            None,
+        );
+        let stored = task_worktree_goal_branch(&task_id).expect("stored goal branch");
+        assert_eq!(stored, "agent-goal/agent-goal/GOAL-X");
+
+        // Resume re-ensures the goal branch from the stored value.
+        let goal_branch = cx
+            .update(|cx| ensure_goal_branch(project.clone(), &stored, cx))
+            .await
+            .expect("ensure goal branch");
+        assert_eq!(goal_branch, "agent-goal/GOAL-X");
+
+        let task = AgentTaskSummary {
+            id: task_id.clone(),
+            parent_id: None,
+            goal_id: None,
+            title: "Resumed task".to_string(),
+            status: AgentTaskStatus::Ready,
+            attempt: 1,
+            assignee: None,
+            write_scopes: vec![],
+            created_at: None,
+            assigned_profile: None,
+            model: None,
+            session_id: None,
+            metrics: None,
+        };
+        let path = cx
+            .update(|cx| {
+                ensure_task_worktree_with_policy(project.clone(), &task, Some(stored), None, None, cx)
+            })
+            .await
+            .expect("ensure task worktree");
+        assert!(fs.is_dir(&path).await);
+
+        assert_eq!(
+            task_worktree_goal_branch(&task_id),
+            Some("agent-goal/GOAL-X".to_string())
+        );
+        assert_eq!(
+            task_worktree_base_ref(&task_id),
+            Some("agent-goal/GOAL-X".to_string())
+        );
+
+        fs.with_git_state(dot_git, false, |state| {
+            assert!(state.branches.contains("agent-goal/GOAL-X"));
+            assert!(
+                !state.branches.contains("agent-goal/agent-goal/GOAL-X"),
+                "nested branch must not be created"
+            );
+            assert!(state.refs.contains_key("refs/heads/agent-goal/GOAL-X"));
+            assert!(
+                !state
+                    .refs
+                    .keys()
+                    .any(|r| r.contains("agent-goal/agent-goal/")),
+                "phantom nested ref must not be created"
+            );
+        })
+        .unwrap();
     }
 
     #[gpui::test]
