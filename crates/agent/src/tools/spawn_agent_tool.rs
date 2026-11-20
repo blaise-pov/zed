@@ -937,7 +937,7 @@ impl AgentTool for SpawnAgentTool {
             let explicit_model_str = input.model.clone();
             let is_initial_turn = input.session_id.is_none();
 
-            let (subagent, mut session_info, resolved_model) = cx.update(|cx| {
+            cx.update(|cx| {
                 if let Some(ref path) = worktree_path {
                     if let Some(project) = event_stream.project() {
                         let worktree_id = project.read_with(cx, |project, cx| {
@@ -955,21 +955,32 @@ impl AgentTool for SpawnAgentTool {
                         }
                     }
                 }
-                let subagent = if let Some(session_id) = input.session_id.clone() {
+            });
+
+            let resumed_subagent = if let Some(session_id) = input.session_id.clone() {
+                let resume_task = cx.update(|cx| {
                     self.environment.resume_subagent(
                         session_id,
                         input.profile.clone(),
                         worktree_path.clone(),
                         cx,
                     )
-                } else {
-                    self.environment.create_subagent(
+                });
+                Some(resume_task.await)
+            } else {
+                None
+            };
+
+            let (subagent, mut session_info, resolved_model) = cx.update(|cx| {
+                let subagent = match resumed_subagent {
+                    Some(resumed) => resumed,
+                    None => self.environment.create_subagent(
                         input.label.clone(),
-                        input.profile,
-                        input.model.map(AgentModelId::from),
+                        input.profile.clone(),
+                        input.model.clone().map(AgentModelId::from),
                         worktree_path.clone(),
                         cx,
-                    )
+                    ),
                 };
                 let subagent = subagent.map_err(|err| SpawnAgentToolOutput::Error {
                     session_id: None,

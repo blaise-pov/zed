@@ -517,13 +517,13 @@ impl crate::ThreadEnvironment for FakeThreadEnvironment {
         _profile: Option<agent_settings::AgentProfileId>,
         task_worktree: Option<PathBuf>,
         _cx: &mut App,
-    ) -> Result<Rc<dyn SubagentHandle>> {
+    ) -> Task<Result<Rc<dyn SubagentHandle>>> {
         self.subagent_worktrees.borrow_mut().push(task_worktree);
-        Ok(self
+        Task::ready(Ok(self
             .subagent_handle
             .clone()
             .expect("Subagent handle not available on FakeThreadEnvironment")
-            as Rc<dyn SubagentHandle>)
+            as Rc<dyn SubagentHandle>))
     }
 
     fn ensure_subagent_worktree(
@@ -12166,14 +12166,16 @@ async fn test_delegation_chain_budget_exhaustion_blocks_transitive_bypass(cx: &m
     );
 
     // Also verify profile switch on resume is rejected under the same budget check
-    let resume_result = cx.update(|cx| {
-        ci_runner_env.resume_subagent_thread(
-            ci_runner_session_id.clone(),
-            Some(AgentProfileId("orchestrator".into())),
-            None,
-            cx,
-        )
-    });
+    let resume_result = cx
+        .update(|cx| {
+            ci_runner_env.resume_subagent_thread(
+                ci_runner_session_id.clone(),
+                Some(AgentProfileId("orchestrator".into())),
+                None,
+                cx,
+            )
+        })
+        .await;
 
     let resume_err = match resume_result {
         Err(err) => err.to_string(),
@@ -12533,6 +12535,7 @@ async fn test_subagent_auto_compaction(cx: &mut TestAppContext) {
             test.environment
                 .resume_subagent_thread(test.handle.id(), None, None, cx)
         })
+        .await
         .unwrap();
     assert_eq!(handle.id(), test.handle.id());
     let send = cx.update(|cx| handle.send("follow-up task".to_string(), &cx.to_async()));
