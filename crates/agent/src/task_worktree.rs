@@ -236,6 +236,20 @@ pub fn ensure_task_worktree_with_policy(
     ensure_task_worktree_with_options(project, task, goal_id, base_branch, on_branch, false, cx)
 }
 
+/// Returns the sha that a checkout target is contracted to be at, when known.
+///
+/// `TaskRefArtifact.head_sha` is published from the commit details of the task
+/// branch, so an `agent-task/{id}` checkout must land exactly on that sha.
+fn contracted_checkout_sha(branch: &str) -> Option<String> {
+    let task_id = branch.strip_prefix("agent-task/")?;
+    if task_id.is_empty() {
+        return None;
+    }
+    task_ref_artifact(&AgentTaskId::from(task_id))
+        .filter(|artifact| artifact.branch == branch)
+        .and_then(|artifact| artifact.head_sha)
+}
+
 pub fn ensure_task_worktree_with_options(
     project: Entity<Project>,
     task: &AgentTaskSummary,
@@ -481,6 +495,34 @@ pub fn ensure_task_worktree_with_options(
             }
         }
 
+        // A worktree checked out on a branch must start exactly at the sha that
+        // branch was contracted at. Resolve the branch again after checkout:
+        // another task's reset or rebase can move the ref between the earlier
+        // resolution and the checkout, which would otherwise let a reviewer
+        // silently review code without the changes under review.
+        if let Some(ref branch_name) = target_checkout_branch {
+            if let Some(expected_sha) = contracted_checkout_sha(branch_name) {
+                let actual_sha = resolve_ref_to_sha(&git_repo, branch_name).await?;
+                if actual_sha.as_deref() != Some(expected_sha.as_str()) {
+                    if !path_exists {
+                        let remove_task = repository.update(cx, |repository, _| {
+                            repository.remove_worktree(worktree_path.clone(), true)
+                        });
+                        remove_task.await.log_err();
+                    }
+                    unregister_task_worktree(&task_id);
+                    log::error!(
+                        "Refusing to start task {task_id}: worktree base != contracted sha for {branch_name} (expected {expected_sha}, found {})",
+                        actual_sha.as_deref().unwrap_or("<missing>")
+                    );
+                    anyhow::bail!(
+                        "worktree base != contracted sha for {branch_name}: expected {expected_sha}, found {}",
+                        actual_sha.as_deref().unwrap_or("<missing>")
+                    );
+                }
+            }
+        }
+
         let find_task = project.update(cx, |project, cx| {
             project.find_or_create_worktree(&worktree_path, false, cx)
         });
@@ -655,6 +697,7 @@ struct TaskWorktreeRegistry {
     #[cfg(any(test, feature = "test-support"))]
     task_files: HashMap<AgentTaskId, HashMap<PathBuf, Vec<u8>>>,
     goal_tip_shas: HashMap<String, String>,
+    task_ref_artifacts: HashMap<AgentTaskId, TaskRefArtifact>,
     goal_graduations: HashMap<String, GoalGraduationSummary>,
     task_titles: HashMap<AgentTaskId, String>,
     task_sessions: HashMap<AgentTaskId, String>,
@@ -2102,6 +2145,27 @@ pub fn task_worktree_isolation_details(task_id: &AgentTaskId) -> Option<Subagent
         .and_then(|e| e.isolation_details.clone())
 }
 
+/// Records the task ref artifact for a task branch.
+///
+/// `TaskRefArtifact.head_sha` is the sha published for `agent-task/{task_id}`,
+/// so an `on_branch` checkout of that branch must land exactly on it. The
+/// record survives worktree release so a later checkout can be verified.
+pub fn record_task_ref_artifact(task_id: &AgentTaskId, artifact: TaskRefArtifact) {
+    let mut reg = REGISTRY.write();
+    reg.task_ref_artifacts.insert(task_id.clone(), artifact);
+}
+
+/// Returns the recorded task ref artifact for a task, when known.
+pub fn task_ref_artifact(task_id: &AgentTaskId) -> Option<TaskRefArtifact> {
+    let reg = REGISTRY.read();
+    reg.task_ref_artifacts.get(task_id).cloned()
+}
+
+/// Returns the sha recorded in the task ref artifact for a task, when known.
+pub fn task_contracted_sha(task_id: &AgentTaskId) -> Option<String> {
+    task_ref_artifact(task_id).and_then(|artifact| artifact.head_sha)
+}
+
 #[cfg(any(test, feature = "test-support"))]
 pub fn store_goal_files(goal_id: &str, files: HashMap<PathBuf, Vec<u8>>) {
     let mut reg = REGISTRY.write();
@@ -3505,6 +3569,19 @@ pub async fn commit_task_worktree(
     }
 
     if let Some(ref sha) = head_sha {
+        if let Some(branch_task_id) = branch.strip_prefix("agent-task/") {
+            if !branch_task_id.is_empty() {
+                record_task_ref_artifact(
+                    &AgentTaskId::from(branch_task_id),
+                    TaskRefArtifact {
+                        branch: branch.clone(),
+                        head_sha: Some(sha.clone()),
+                        merged_into: None,
+                        merge_conflict: None,
+                    },
+                );
+            }
+        }
         if branch.starts_with("agent-goal/") {
             record_goal_tip_sha(&normalize_goal_id(&branch), sha.clone());
         }
@@ -4490,6 +4567,7 @@ pub fn cleanup_graduated_goal(
             reg.goal_graduations.remove(&goal_id);
             for task_id in &tasks_to_cleanup {
                 reg.entries.remove(task_id);
+                reg.task_ref_artifacts.remove(task_id);
                 #[cfg(any(test, feature = "test-support"))]
                 reg.task_files.remove(task_id);
             }
@@ -6083,6 +6161,203 @@ mod tests {
         assert_eq!(details_insp.branch, "agent-task/TASK-X");
         assert_eq!(details_insp.base_branch, None);
         assert_eq!(details_insp.merged_into, None);
+    }
+
+    fn contracted_test_task(id: &str, title: &str) -> AgentTaskSummary {
+        AgentTaskSummary {
+            id: AgentTaskId::from(id),
+            parent_id: None,
+            goal_id: None,
+            title: title.to_string(),
+            status: AgentTaskStatus::Ready,
+            attempt: 1,
+            assignee: None,
+            write_scopes: vec![],
+            created_at: None,
+            assigned_profile: None,
+            model: None,
+            session_id: None,
+            metrics: None,
+        }
+    }
+
+    fn expected_task_worktree_path(
+        cx: &mut TestAppContext,
+        project: &Entity<Project>,
+        task_id: &AgentTaskId,
+    ) -> PathBuf {
+        cx.update(|cx| {
+            let (_, anchor_path, path_style, worktree_setting, _) =
+                task_worktree_context(project.read(cx), cx).unwrap();
+            worktrees_directory_for_repo(&anchor_path, &worktree_setting, path_style)
+                .unwrap()
+                .join(format!("agent-task-{}", task_id))
+        })
+    }
+
+    /// Commits a task branch, releases its worktree, and returns the sha the
+    /// branch is contracted at.
+    async fn setup_contracted_task_branch(
+        cx: &mut TestAppContext,
+    ) -> (Entity<Project>, Arc<FakeFs>, AgentTaskSummary, String) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/root"),
+            json!({
+                ".git": {
+                    "HEAD": "ref: refs/heads/main\n"
+                }
+            }),
+        )
+        .await;
+
+        let dot_git = std::path::Path::new(path!("/root/.git"));
+        fs.with_git_state(dot_git, true, |state| {
+            state
+                .refs
+                .insert("refs/heads/main".into(), "main-sha-contract".into());
+            state.refs.insert("HEAD".into(), "main-sha-contract".into());
+            state.branches.insert("main".into());
+        })
+        .unwrap();
+
+        let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
+        let task = contracted_test_task("TASK-CONTRACT", "Contracted Task");
+
+        let path = cx
+            .update(|cx| {
+                ensure_task_worktree_with_policy(project.clone(), &task, None, None, None, cx)
+            })
+            .await
+            .unwrap();
+        fs.save(
+            &path.join("contracted.txt"),
+            &"contracted content".into(),
+            text::LineEnding::Unix,
+        )
+        .await
+        .unwrap();
+
+        let details = cx
+            .update(|cx| commit_and_merge_task_worktree(project.clone(), &task.id, false, cx))
+            .await
+            .unwrap();
+        let contracted_sha = details
+            .head_sha
+            .clone()
+            .expect("a committed task branch must record a head sha");
+        assert_eq!(task_contracted_sha(&task.id), Some(contracted_sha.clone()));
+
+        // Release the worktree so a reviewer may claim the branch.
+        set_task_worktree_retention_timeout(Some(Duration::ZERO));
+        mark_task_terminal(&task.id);
+        let cleaned = cx
+            .update(|cx| auto_cleanup_task_worktree(project.clone(), &task.id, cx))
+            .await
+            .unwrap();
+        assert!(cleaned);
+        assert_eq!(
+            task_contracted_sha(&task.id),
+            Some(contracted_sha.clone()),
+            "the contracted sha must survive worktree release"
+        );
+
+        (project, fs, task, contracted_sha)
+    }
+
+    #[gpui::test]
+    async fn test_on_branch_worktree_matching_contracted_sha_succeeds(
+        cx: &mut TestAppContext,
+    ) {
+        let (project, fs, reviewed, _contracted_sha) = setup_contracted_task_branch(cx).await;
+
+        let reviewer = contracted_test_task("TASK-CONTRACT-REV", "Reviewer");
+        let branch = format!("agent-task/{}", reviewed.id);
+        let path = cx
+            .update(|cx| {
+                ensure_task_worktree_with_policy(
+                    project.clone(),
+                    &reviewer,
+                    None,
+                    None,
+                    Some(branch.clone()),
+                    cx,
+                )
+            })
+            .await
+            .expect("a checkout at the contracted sha must succeed");
+
+        assert_eq!(
+            path,
+            expected_task_worktree_path(cx, &project, &reviewer.id)
+        );
+        assert!(fs.is_dir(&path).await);
+        assert!(
+            fs.is_file(&path.join("contracted.txt")).await,
+            "the reviewer must see the reviewed branch content"
+        );
+        assert_eq!(task_worktree_checkout_target(&reviewer.id), Some(branch));
+    }
+
+    #[gpui::test]
+    async fn test_on_branch_worktree_mismatched_contracted_sha_fails(
+        cx: &mut TestAppContext,
+    ) {
+        let (project, fs, reviewed, contracted_sha) = setup_contracted_task_branch(cx).await;
+
+        // Simulate a reset/rebase window: the branch ref moved away from the
+        // sha that was contracted for the task.
+        let dot_git = std::path::Path::new(path!("/root/.git"));
+        let branch = format!("agent-task/{}", reviewed.id);
+        let branch_ref = format!("refs/heads/{branch}");
+        fs.with_git_state(dot_git, true, |state| {
+            state
+                .refs
+                .insert(branch_ref.clone(), "reset-in-progress-sha".into());
+            state
+                .refs
+                .insert(branch.clone(), "reset-in-progress-sha".into());
+        })
+        .unwrap();
+
+        let reviewer = contracted_test_task("TASK-CONTRACT-REV", "Reviewer");
+        let branch = format!("agent-task/{}", reviewed.id);
+        let error = cx
+            .update(|cx| {
+                ensure_task_worktree_with_policy(
+                    project.clone(),
+                    &reviewer,
+                    None,
+                    None,
+                    Some(branch.clone()),
+                    cx,
+                )
+            })
+            .await
+            .expect_err("a checkout off the contracted sha must fail");
+
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("worktree base != contracted sha"),
+            "unexpected error: {message}"
+        );
+        assert!(
+            message.contains(&contracted_sha),
+            "the error must name the contracted sha: {message}"
+        );
+
+        let reviewer_path = expected_task_worktree_path(cx, &project, &reviewer.id);
+        assert!(
+            !fs.is_dir(&reviewer_path).await,
+            "the rejected worktree must not be left on disk"
+        );
+        assert_eq!(
+            task_worktree_path_for_id(&reviewer.id),
+            None,
+            "the task worktree must not be started"
+        );
+        assert_eq!(task_worktree_checkout_target(&reviewer.id), None);
     }
 
     #[gpui::test]
