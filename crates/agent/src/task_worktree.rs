@@ -3585,6 +3585,163 @@ fn is_path_in_write_scopes(path: &RepoPath, scopes: &[String]) -> bool {
     false
 }
 
+/// Placeholder segment substituted for wildcards when turning a write-scope
+/// glob into a concrete probe path.
+const WRITE_SCOPE_PROBE_SEGMENT: &str = "__preflight_probe__";
+
+fn expand_first_brace_alternative(component: &str) -> String {
+    let Some(open) = component.find('{') else {
+        return component.to_string();
+    };
+    let Some(close_offset) = component[open + 1..].find('}') else {
+        return component.to_string();
+    };
+    let close = open + 1 + close_offset;
+    let alternatives = &component[open + 1..close];
+    let first = alternatives
+        .split(',')
+        .next()
+        .unwrap_or(alternatives)
+        .trim();
+    format!("{}{}{}", &component[..open], first, &component[close + 1..])
+}
+
+fn literalize_scope_component(component: &str) -> String {
+    let component = expand_first_brace_alternative(component);
+    if !component.contains(['*', '?', '[']) {
+        return component;
+    }
+
+    let mut literal = String::with_capacity(component.len());
+    let mut chars = component.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '*' => literal.push_str(WRITE_SCOPE_PROBE_SEGMENT),
+            '?' => literal.push('p'),
+            '[' => {
+                for ch in chars.by_ref() {
+                    if ch == ']' {
+                        break;
+                    }
+                }
+                literal.push_str(WRITE_SCOPE_PROBE_SEGMENT);
+            }
+            _ => literal.push(ch),
+        }
+    }
+    literal
+}
+
+/// Builds a concrete path that stands in for a write-scope glob so it can be
+/// matched against another scope set. Wildcards become a literal placeholder
+/// segment and brace alternations use their first alternative.
+fn write_scope_probe_path(scope: &str) -> Option<RepoPath> {
+    let trimmed = scope
+        .trim()
+        .trim_start_matches("./")
+        .trim_start_matches('/');
+    let mut segments: Vec<String> = Vec::new();
+    for segment in trimmed.split('/') {
+        let segment = segment.trim();
+        if segment.is_empty() || segment == "." {
+            continue;
+        }
+        if segment == "**" {
+            segments.push(WRITE_SCOPE_PROBE_SEGMENT.to_string());
+        } else {
+            let literal = literalize_scope_component(segment);
+            if !literal.is_empty() {
+                segments.push(literal);
+            }
+        }
+    }
+    if segments.is_empty() {
+        return None;
+    }
+    RepoPath::new(&segments.join("/")).ok()
+}
+
+/// True when the paths described by `scope` are writable under
+/// `profile_scopes`. The check probes the scope root and one descendant, so it
+/// can only report a mismatch; it never widens permissions.
+fn write_scope_is_covered(scope: &str, profile_scopes: &[String]) -> bool {
+    let Some(probe) = write_scope_probe_path(scope) else {
+        return true;
+    };
+    let patterns: Vec<Arc<str>> = profile_scopes
+        .iter()
+        .map(|scope| scope.trim())
+        .filter(|scope| !scope.is_empty())
+        .map(Arc::from)
+        .collect();
+    let Ok(write_scopes) = agent_settings::WriteScopes::new(patterns) else {
+        return false;
+    };
+    if write_scopes.is_match(&probe) {
+        return true;
+    }
+    // A bare directory scope (for example `src/`) describes everything below
+    // it, so also probe one descendant path.
+    let descendant = format!(
+        "{}/{WRITE_SCOPE_PROBE_SEGMENT}",
+        probe.as_unix_str().trim_end_matches('/')
+    );
+    let Ok(descendant) = RepoPath::new(&descendant) else {
+        return false;
+    };
+    write_scopes.is_match(&descendant)
+}
+
+/// Collects the write-scope globs that gate `edit_file` and `write_file` on
+/// `profile`. Returns `None` when the profile does not restrict writes for
+/// those tools (unrestricted mode, no tool permissions, or no scopes).
+pub fn profile_write_scope_patterns(
+    profile: &agent_settings::AgentProfileSettings,
+) -> Option<Vec<String>> {
+    if profile.effective_permission_mode() == agent_settings::AgentPermissionMode::Unrestricted {
+        return None;
+    }
+    let tool_permissions = profile.tool_permissions.as_ref()?;
+    let mut patterns: Vec<String> = Vec::new();
+    for tool_name in ["edit_file", "write_file"] {
+        let Some(rules) = tool_permissions.tools.get(tool_name) else {
+            continue;
+        };
+        let Some(write_scopes) = rules.write_scopes.as_ref() else {
+            continue;
+        };
+        for scope in &write_scopes.scopes {
+            let scope = scope.trim();
+            if !scope.is_empty() && !patterns.iter().any(|existing| existing == scope) {
+                patterns.push(scope.to_string());
+            }
+        }
+    }
+    if patterns.is_empty() {
+        None
+    } else {
+        Some(patterns)
+    }
+}
+
+/// Returns the task write scopes that the profile's `edit_file`/`write_file`
+/// scopes do not cover. Detection only: the caller fails fast and never widens
+/// the profile scopes.
+pub fn uncovered_task_write_scopes(
+    task_scopes: &[String],
+    profile_scopes: &[String],
+) -> Vec<String> {
+    if profile_scopes.is_empty() {
+        return Vec::new();
+    }
+    task_scopes
+        .iter()
+        .filter(|scope| !scope.trim().is_empty())
+        .filter(|scope| !write_scope_is_covered(scope, profile_scopes))
+        .cloned()
+        .collect()
+}
+
 pub const GIT_LOCK_RETRY_DELAY: Duration = Duration::from_millis(500);
 pub const GIT_LOCK_MAX_RETRIES: usize = 3;
 

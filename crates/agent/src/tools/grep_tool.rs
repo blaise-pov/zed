@@ -440,7 +440,7 @@ mod tests {
     use crate::ToolCallEventStream;
 
     use super::*;
-    use gpui::{TestAppContext, UpdateGlobal};
+    use gpui::{AppContext as _, TestAppContext, UpdateGlobal};
     use project::{FakeFs, Project};
     use serde_json::json;
     use settings::{SettingsStore, SplicingVec};
@@ -1764,6 +1764,106 @@ mod tests {
         );
     }
 
+    #[gpui::test]
+    async fn test_grep_tool_isolated_task_worktree_via_thread(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.executor().allow_parking();
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/host-main"),
+            json!({
+                "shared.rs": "const SHARED: &str = \"needle_shared_host\";\n",
+                "host_only.rs": "const HOST: &str = \"needle_host_only\";\n",
+            }),
+        )
+        .await;
+        fs.insert_tree(
+            path!("/task-worktree"),
+            json!({
+                "shared.rs": "const SHARED: &str = \"needle_shared_task\";\n",
+                "task_only.rs": "const TASK: &str = \"needle_task_only\";\n",
+            }),
+        )
+        .await;
+
+        let project = Project::test(fs.clone(), [path!("/host-main").as_ref()], cx).await;
+        let (task_worktree, _) = project
+            .update(cx, |p, cx| {
+                p.find_or_create_worktree(path!("/task-worktree"), false, cx)
+            })
+            .await
+            .unwrap();
+        let _ = task_worktree
+            .read_with(cx, |w, _| w.as_local().unwrap().scan_complete())
+            .await;
+
+        let task_worktree_path = PathBuf::from(path!("/task-worktree"));
+        let thread = cx.update(|cx| {
+            let project_context = cx.new(|_cx| crate::ProjectContext::default());
+            let context_server_store = project.read(cx).context_server_store();
+            let context_server_registry =
+                cx.new(|cx| crate::tools::ContextServerRegistry::new(context_server_store, cx));
+            cx.new(|cx| {
+                let mut t = crate::Thread::new(
+                    project.clone(),
+                    project_context,
+                    context_server_registry,
+                    crate::Templates::new(),
+                    None,
+                    cx,
+                );
+                t.set_task_worktree(Some(task_worktree_path.clone()));
+                t
+            })
+        });
+
+        // A thread with a task_worktree set sees the task worktree version of a shared file.
+        let (event_stream, _) = ToolCallEventStream::test_with_thread(&thread);
+        let result = run_grep_tool_with_stream(
+            GrepToolInput {
+                regex: "needle_shared".to_string(),
+                include_pattern: None,
+                offset: 0,
+                case_sensitive: false,
+                max_ancestor_lines: default_max_ancestor_lines(),
+                context_lines: default_context_lines(),
+            },
+            project.clone(),
+            event_stream,
+            cx,
+        )
+        .await;
+        assert!(
+            result.contains("needle_shared_task"),
+            "expected task worktree content, got: {result}"
+        );
+        assert!(
+            !result.contains("needle_shared_host"),
+            "must not leak main checkout content, got: {result}"
+        );
+
+        // ...and does not see files that only exist in the main checkout.
+        let (event_stream, _) = ToolCallEventStream::test_with_thread(&thread);
+        let result = run_grep_tool_with_stream(
+            GrepToolInput {
+                regex: "needle_host_only".to_string(),
+                include_pattern: None,
+                offset: 0,
+                case_sensitive: false,
+                max_ancestor_lines: default_max_ancestor_lines(),
+                context_lines: default_context_lines(),
+            },
+            project.clone(),
+            event_stream,
+            cx,
+        )
+        .await;
+        assert_eq!(
+            result, "No matches found",
+            "thread with task_worktree must not see main checkout files"
+        );
+    }
 
     #[gpui::test]
     async fn test_grep_tool_isolated_nested_task_worktree(cx: &mut TestAppContext) {

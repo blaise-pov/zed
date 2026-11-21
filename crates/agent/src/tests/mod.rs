@@ -857,6 +857,83 @@ fn insert_profile_with_isolation(
     agent_settings::AgentSettings::override_global(settings, cx);
 }
 
+/// Gives a profile `edit_file`/`write_file` rules with explicit write scopes,
+/// so spawn preflight tests can assert scope containment.
+fn insert_profile_with_write_scopes(cx: &mut App, profile_id: &str, scopes: &[&str]) {
+    let write_scopes = agent_settings::WriteScopes::new(
+        scopes
+            .iter()
+            .map(|scope| Arc::from(*scope))
+            .collect::<Vec<_>>(),
+    )
+    .expect("test write scopes should compile");
+    let tool_rules = agent_settings::ToolRules {
+        default: Some(settings::ToolPermissionMode::Allow),
+        always_allow: Vec::new(),
+        always_deny: Vec::new(),
+        always_confirm: Vec::new(),
+        write_scopes: Some(write_scopes),
+        invalid_patterns: Vec::new(),
+    };
+    let mut tools = collections::HashMap::default();
+    tools.insert(Arc::from("edit_file"), tool_rules.clone());
+    tools.insert(Arc::from("write_file"), tool_rules);
+
+    let mut settings = agent_settings::AgentSettings::get_global(cx).clone();
+    settings.profiles.insert(
+        AgentProfileId(profile_id.into()),
+        agent_settings::AgentProfileSettings {
+            name: profile_id.into(),
+            origin: Default::default(),
+            tools: ["read_file", "edit_file", "write_file"]
+                .iter()
+                .map(|tool| (Arc::from(*tool), true))
+                .collect::<IndexMap<_, _>>(),
+            enable_all_context_servers: false,
+            context_servers: IndexMap::default(),
+            default_model: None,
+            custom_prompt_path: None,
+            system_prompt_template: None,
+            description: None,
+            skills: None,
+            delegation: None,
+            tool_permissions: Some(agent_settings::ToolPermissions {
+                default: settings::ToolPermissionMode::Deny,
+                tools,
+            }),
+            permission_mode: None,
+            terminal_wrapper_command: None,
+            task_isolation: agent_settings::TaskIsolation::default(),
+            task_worktree_language_servers: None,
+            task_worktree_repo: None,
+            working_dir: None,
+        },
+    );
+    agent_settings::AgentSettings::override_global(settings, cx);
+}
+
+fn task_detail_with(
+    task_id: &str,
+    status: crate::AgentTaskStatus,
+    write_scopes: Vec<String>,
+    session_id: Option<String>,
+) -> crate::AgentTaskDetail {
+    crate::AgentTaskDetail {
+        summary: crate::AgentTaskSummary {
+            id: crate::AgentTaskId::from(task_id),
+            title: task_id.to_string(),
+            status,
+            attempt: 1,
+            write_scopes,
+            session_id,
+            ..Default::default()
+        },
+        description: String::new(),
+        acceptance_criteria: Vec::new(),
+        events_tail: Vec::new(),
+    }
+}
+
 /// Gives the default profile a delegation block so tests can spawn
 /// subagents under the fork's per-profile delegation rules. The default
 /// profile delegates to itself, so subagents run with the same toolset the
@@ -8273,7 +8350,7 @@ async fn test_spawn_agent_status_validation_new_sessions(cx: &mut TestAppContext
 
     let cases = vec![
         (crate::AgentTaskStatus::Blocked, "blocked"),
-        (crate::AgentTaskStatus::Running, "running"),
+        // `Running` is handled by stale-claim takeover tests below.
         (crate::AgentTaskStatus::Completed, "completed"),
         (crate::AgentTaskStatus::Failed, "failed"),
         (crate::AgentTaskStatus::Review, "review"),
@@ -8366,6 +8443,346 @@ async fn test_spawn_agent_status_validation_new_sessions(cx: &mut TestAppContext
         .await;
 
     assert!(matches!(result, Ok(SpawnAgentToolOutput::Success { .. })));
+}
+
+#[gpui::test]
+async fn test_spawn_agent_preflight_rejects_task_scopes_outside_profile(cx: &mut TestAppContext) {
+    init_test(cx);
+    cx.update(|cx| {
+        insert_profile_with_write_scopes(
+            cx,
+            "scoped_engineer",
+            &["crates/agent/**", ".zed/prompts/**"],
+        )
+    });
+
+    let task_id = "TASK-PREFLIGHT-MISMATCH".to_string();
+    let detail = task_detail_with(
+        &task_id,
+        crate::AgentTaskStatus::Ready,
+        vec![
+            "crates/agent/**".to_string(),
+            "crates/agent_ui/**".to_string(),
+        ],
+        None,
+    );
+    let environment = Rc::new(
+        FakeThreadEnvironment::default()
+            .with_task_detail(&task_id, detail)
+            .with_subagent(FakeSubagentHandle::new(
+                acp::SessionId::new("subagent-preflight"),
+                Task::ready("done".to_string()).shared(),
+                None,
+            )),
+    );
+    #[allow(clippy::arc_with_non_send_sync)]
+    let tool = Arc::new(SpawnAgentTool::new(environment.clone()));
+    let (event_stream, _rx) = ToolCallEventStream::test();
+
+    let result = cx
+        .update(|cx| {
+            tool.run(
+                ToolInput::resolved(SpawnAgentToolInput {
+                    label: "task".to_string(),
+                    message: "prompt".to_string(),
+                    task_id: Some(task_id.clone()),
+                    profile: Some(AgentProfileId("scoped_engineer".into())),
+                    ..Default::default()
+                }),
+                event_stream,
+                cx,
+            )
+        })
+        .await;
+
+    let Err(SpawnAgentToolOutput::Error {
+        error, session_id, ..
+    }) = result
+    else {
+        panic!("expected preflight error, got {result:?}");
+    };
+    assert!(
+        session_id.is_none(),
+        "no session may be created before write-scope preflight"
+    );
+    assert!(
+        error.contains("crates/agent_ui/**"),
+        "error must list the offending path, got: {error}"
+    );
+    assert!(
+        error.contains("scoped_engineer"),
+        "error must name the target profile, got: {error}"
+    );
+    assert!(
+        !error.contains("crates/agent/**,"),
+        "covered scopes must not be reported as offenders, got: {error}"
+    );
+    assert!(
+        environment.ensure_worktree_calls().is_empty(),
+        "preflight must run before worktree creation"
+    );
+    assert!(
+        environment.task_status_transitions().is_empty(),
+        "preflight must not mutate the task"
+    );
+}
+
+#[gpui::test]
+async fn test_spawn_agent_preflight_allows_covered_scopes_and_never_unions(
+    cx: &mut TestAppContext,
+) {
+    init_test(cx);
+    cx.update(|cx| insert_profile_with_write_scopes(cx, "scoped_engineer", &["crates/agent/**"]));
+
+    let task_id = "TASK-PREFLIGHT-COVERED".to_string();
+    let detail = task_detail_with(
+        &task_id,
+        crate::AgentTaskStatus::Ready,
+        vec!["crates/agent/src/**".to_string()],
+        None,
+    );
+    let environment = Rc::new(
+        FakeThreadEnvironment::default()
+            .with_task_detail(&task_id, detail)
+            .with_subagent(FakeSubagentHandle::new(
+                acp::SessionId::new("subagent-covered"),
+                Task::ready("done".to_string()).shared(),
+                None,
+            )),
+    );
+    #[allow(clippy::arc_with_non_send_sync)]
+    let tool = Arc::new(SpawnAgentTool::new(environment.clone()));
+    let (event_stream, _rx) = ToolCallEventStream::test();
+
+    let result = cx
+        .update(|cx| {
+            tool.run(
+                ToolInput::resolved(SpawnAgentToolInput {
+                    label: "task".to_string(),
+                    message: "prompt".to_string(),
+                    task_id: Some(task_id.clone()),
+                    profile: Some(AgentProfileId("scoped_engineer".into())),
+                    ..Default::default()
+                }),
+                event_stream,
+                cx,
+            )
+        })
+        .await;
+
+    assert!(
+        matches!(result, Ok(SpawnAgentToolOutput::Success { .. })),
+        "covered task scopes must spawn successfully, got {result:?}"
+    );
+
+    // Detection only: the profile write scopes must stay untouched.
+    let profile_scopes = cx.update(|cx| {
+        let profile = agent_settings::AgentSettings::get_global(cx)
+            .profiles
+            .get(&AgentProfileId("scoped_engineer".into()))
+            .cloned()
+            .expect("profile should exist");
+        crate::task_worktree::profile_write_scope_patterns(&profile)
+    });
+    assert_eq!(profile_scopes, Some(vec!["crates/agent/**".to_string()]));
+}
+
+#[gpui::test]
+async fn test_spawn_agent_preflight_uses_calling_thread_profile(cx: &mut TestAppContext) {
+    let fake = init_test(cx);
+    cx.update(|cx| insert_profile_with_write_scopes(cx, "scoped_engineer", &["docs/**"]));
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(path!("/test"), json!({})).await;
+    let project = Project::test(fs, [path!("/test").as_ref()], cx).await;
+    let project_context = cx.new(|_cx| ProjectContext::default());
+    let context_server_store = project.read_with(cx, |project, _| project.context_server_store());
+    let context_server_registry =
+        cx.new(|cx| ContextServerRegistry::new(context_server_store.clone(), cx));
+    let model = fake.model("fake");
+
+    let tools_environment: Rc<dyn crate::ThreadEnvironment> =
+        Rc::new(FakeThreadEnvironment::default());
+    let parent_thread = cx.new(|cx| {
+        let mut thread = Thread::new(
+            project,
+            project_context,
+            context_server_registry,
+            Templates::new(),
+            Some(model),
+            cx,
+        );
+        thread.set_profile(AgentProfileId("scoped_engineer".into()), cx);
+        thread.add_default_tools(tools_environment.clone(), cx);
+        thread
+    });
+
+    let task_id = "TASK-PREFLIGHT-THREAD-PROFILE".to_string();
+    let detail = task_detail_with(
+        &task_id,
+        crate::AgentTaskStatus::Ready,
+        vec!["crates/agent/**".to_string()],
+        None,
+    );
+    let environment = Rc::new(
+        FakeThreadEnvironment::default()
+            .with_task_detail(&task_id, detail)
+            .with_subagent(FakeSubagentHandle::new(
+                acp::SessionId::new("subagent-thread-profile"),
+                Task::ready("done".to_string()).shared(),
+                None,
+            )),
+    );
+    #[allow(clippy::arc_with_non_send_sync)]
+    let tool = Arc::new(SpawnAgentTool::new(environment.clone()));
+    let (event_stream, _rx) = ToolCallEventStream::test_with_thread(&parent_thread);
+
+    let result = cx
+        .update(|cx| {
+            tool.run(
+                ToolInput::resolved(SpawnAgentToolInput {
+                    label: "task".to_string(),
+                    message: "prompt".to_string(),
+                    task_id: Some(task_id.clone()),
+                    // No explicit profile: the calling thread's profile applies.
+                    ..Default::default()
+                }),
+                event_stream,
+                cx,
+            )
+        })
+        .await;
+
+    let Err(SpawnAgentToolOutput::Error { error, .. }) = result else {
+        panic!("preflight must validate the calling thread's profile, got {result:?}");
+    };
+    assert!(
+        error.contains("scoped_engineer"),
+        "error must name the calling thread's profile, got: {error}"
+    );
+    assert!(
+        error.contains("crates/agent/**"),
+        "error must list the offending path, got: {error}"
+    );
+    assert!(
+        environment.ensure_worktree_calls().is_empty(),
+        "preflight must run before worktree creation"
+    );
+}
+
+#[gpui::test]
+async fn test_spawn_agent_takes_over_stale_running_claim(cx: &mut TestAppContext) {
+    init_test(cx);
+
+    let task_id = "TASK-STALE-CLAIM".to_string();
+    let detail = task_detail_with(
+        &task_id,
+        crate::AgentTaskStatus::Running,
+        Vec::new(),
+        Some("dead-session".to_string()),
+    );
+    let environment = Rc::new(
+        FakeThreadEnvironment::default()
+            .with_task_detail(&task_id, detail)
+            .with_subagent(FakeSubagentHandle::new(
+                acp::SessionId::new("fresh-subagent"),
+                Task::ready("done".to_string()).shared(),
+                None,
+            )),
+    );
+    #[allow(clippy::arc_with_non_send_sync)]
+    let tool = Arc::new(SpawnAgentTool::new(environment.clone()));
+    let (event_stream, _rx) = ToolCallEventStream::test();
+
+    let result = cx
+        .update(|cx| {
+            tool.run(
+                ToolInput::resolved(SpawnAgentToolInput {
+                    label: "task".to_string(),
+                    message: "prompt".to_string(),
+                    task_id: Some(task_id.clone()),
+                    ..Default::default()
+                }),
+                event_stream,
+                cx,
+            )
+        })
+        .await;
+
+    assert!(
+        matches!(result, Ok(SpawnAgentToolOutput::Success { .. })),
+        "stale running claim must be taken over, got {result:?}"
+    );
+    assert_eq!(
+        environment.task_status_transitions().first(),
+        Some(&(task_id.clone(), crate::AgentTaskStatus::Running)),
+        "takeover must reassert running status for the new session"
+    );
+    assert!(
+        environment
+            .updated_task_metadata()
+            .iter()
+            .any(|(updated_task, _, _, session_id)| {
+                updated_task == &task_id && session_id.as_deref() == Some("fresh-subagent")
+            }),
+        "takeover must claim the task for the new session, got {:?}",
+        environment.updated_task_metadata()
+    );
+}
+
+#[gpui::test]
+async fn test_spawn_agent_keeps_live_running_claim(cx: &mut TestAppContext) {
+    init_test(cx);
+
+    let task_id = "TASK-LIVE-CLAIM".to_string();
+    let detail = task_detail_with(
+        &task_id,
+        crate::AgentTaskStatus::Running,
+        Vec::new(),
+        Some("live-session".to_string()),
+    );
+    let environment = Rc::new(
+        FakeThreadEnvironment::default()
+            .with_task_detail(&task_id, detail)
+            .with_subagent(FakeSubagentHandle::new(
+                acp::SessionId::new("second-subagent"),
+                Task::ready("done".to_string()).shared(),
+                None,
+            )),
+    );
+    let _live_guard = crate::task_worktree::SubagentSessionGuard::test_new(
+        crate::AgentTaskId::from(task_id.clone()),
+    );
+    #[allow(clippy::arc_with_non_send_sync)]
+    let tool = Arc::new(SpawnAgentTool::new(environment.clone()));
+    let (event_stream, _rx) = ToolCallEventStream::test();
+
+    let result = cx
+        .update(|cx| {
+            tool.run(
+                ToolInput::resolved(SpawnAgentToolInput {
+                    label: "task".to_string(),
+                    message: "prompt".to_string(),
+                    task_id: Some(task_id.clone()),
+                    ..Default::default()
+                }),
+                event_stream,
+                cx,
+            )
+        })
+        .await;
+
+    let Err(SpawnAgentToolOutput::Error { error, .. }) = result else {
+        panic!("a live claim must not be taken over, got {result:?}");
+    };
+    assert!(
+        error.contains("status is 'running', expected 'ready'"),
+        "unexpected error: {error}"
+    );
+    assert!(
+        environment.ensure_worktree_calls().is_empty(),
+        "no worktree may be created for a live claim"
+    );
 }
 
 #[gpui::test]

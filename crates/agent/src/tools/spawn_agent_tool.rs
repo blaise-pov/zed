@@ -350,6 +350,15 @@ pub(crate) fn log_lifecycle_step(
     );
 }
 
+/// A running task whose claiming session is dead can be taken over: no live
+/// session in this process holds the task and its worktree state allows a
+/// claim-time takeover. The taskgraph server cannot revert terminal statuses,
+/// so this is a local takeover of a non-terminal claim.
+fn stale_running_claim_takeover_allowed(task_id: &crate::AgentTaskId) -> bool {
+    !crate::task_worktree::has_active_subagent_session(task_id)
+        && crate::task_worktree::worktree_release_safety(task_id).is_claim_takeover_safe()
+}
+
 pub(crate) fn maybe_timer(
     executor: &gpui::BackgroundExecutor,
     timeout: Duration,
@@ -872,6 +881,61 @@ impl AgentTool for SpawnAgentTool {
                 None
             };
 
+            // Fail fast when the task's write scopes exceed the target
+            // profile's edit_file/write_file scopes. Each mismatch would
+            // otherwise burn a whole session on PolicyDenied. Detection only:
+            // task scopes are never merged into profile permissions.
+            if input.session_id.is_none()
+                && let (Some(task_id), Some(task_detail)) =
+                    (task_id.as_ref(), task_detail.as_ref())
+                && !task_detail.summary.write_scopes.is_empty()
+            {
+                // Mirror the child session's profile resolution so the
+                // preflight validates the profile the child actually uses:
+                // explicit profile, then the parent thread's profile, then the
+                // calling thread's profile, then the configured default.
+                let target_profile = cx.update(|cx| {
+                    let settings = agent_settings::AgentSettings::get(
+                        event_stream.settings_location(cx),
+                        cx,
+                    );
+                    let parent_thread = event_stream.thread().and_then(|thread| thread.upgrade());
+                    let target_profile_id = input
+                        .profile
+                        .clone()
+                        .or_else(|| {
+                            parent_thread
+                                .as_ref()
+                                .map(|thread| thread.read(cx).profile().clone())
+                        })
+                        .or_else(|| event_stream.profile_id(cx))
+                        .unwrap_or_else(|| settings.default_profile.clone());
+                    let profile_scopes = settings
+                        .profiles
+                        .get(&target_profile_id)
+                        .and_then(crate::task_worktree::profile_write_scope_patterns);
+                    profile_scopes.map(|scopes| (target_profile_id, scopes))
+                });
+                if let Some((target_profile_id, profile_scopes)) = target_profile {
+                    let offenders = crate::task_worktree::uncovered_task_write_scopes(
+                        &task_detail.summary.write_scopes,
+                        &profile_scopes,
+                    );
+                    if !offenders.is_empty() {
+                        return Err(SpawnAgentToolOutput::Error {
+                            session_id: input.session_id.clone(),
+                            error: format!(
+                                "Cannot spawn agent for task '{task_id}': task write scopes not covered by profile '{target_profile_id}' write scopes: {}. Widen the profile's edit_file/write_file write_scopes or narrow the task write scopes; task scopes are never unioned into profile permissions.",
+                                offenders.join(", ")
+                            ),
+                            session_info: None,
+                            isolation: None,
+                            isolation_details: None,
+                        });
+                    }
+                }
+            }
+
             let task_status_str = task_detail
                 .as_ref()
                 .map(|d| format!("{:?}", d.summary.status))
@@ -896,16 +960,26 @@ impl AgentTool for SpawnAgentTool {
                     let status = &task_detail.summary.status;
                     if input.session_id.is_none() {
                         if *status != crate::AgentTaskStatus::Ready {
-                            return Err(SpawnAgentToolOutput::Error {
-                                session_id: input.session_id.clone(),
-                                error: format!(
-                                    "Cannot spawn agent for task '{task_id}': status is '{}', expected 'ready'. Resolve dependencies first or update status via task_update.",
-                                    status.as_str()
-                                ),
-                                session_info: None,
-                                isolation: None,
-                                isolation_details: None,
-                            });
+                            let task_id_typed = crate::AgentTaskId::from(task_id.clone());
+                            let takeover = *status == crate::AgentTaskStatus::Running
+                                && stale_running_claim_takeover_allowed(&task_id_typed);
+                            if takeover {
+                                log::warn!(
+                                    "taskgraph: taking over stale running claim for task {task_id} (recorded session {:?} has no live session)",
+                                    task_detail.summary.session_id
+                                );
+                            } else {
+                                return Err(SpawnAgentToolOutput::Error {
+                                    session_id: input.session_id.clone(),
+                                    error: format!(
+                                        "Cannot spawn agent for task '{task_id}': status is '{}', expected 'ready'. Resolve dependencies first or update status via task_update.",
+                                        status.as_str()
+                                    ),
+                                    session_info: None,
+                                    isolation: None,
+                                    isolation_details: None,
+                                });
+                            }
                         }
                     } else {
                         match status {
@@ -2274,6 +2348,133 @@ mod tests {
         assert!(
             error.starts_with("Unknown profile 'nonexistent'."),
             "unexpected error: {error}"
+        );
+    }
+
+    fn test_profile_with_scopes(scopes: &[&str]) -> agent_settings::AgentProfileSettings {
+        let write_scopes =
+            agent_settings::WriteScopes::new(scopes.iter().map(|s| Arc::from(*s)).collect())
+                .expect("test scopes should compile");
+        let rules = agent_settings::ToolRules {
+            default: Some(settings::ToolPermissionMode::Allow),
+            always_allow: Vec::new(),
+            always_deny: Vec::new(),
+            always_confirm: Vec::new(),
+            write_scopes: Some(write_scopes),
+            invalid_patterns: Vec::new(),
+        };
+        let mut tools = collections::HashMap::default();
+        tools.insert(Arc::from("edit_file"), rules.clone());
+        tools.insert(Arc::from("write_file"), rules);
+        agent_settings::AgentProfileSettings {
+            name: "scoped".into(),
+            origin: Default::default(),
+            tools: collections::IndexMap::default(),
+            enable_all_context_servers: false,
+            context_servers: collections::IndexMap::default(),
+            default_model: None,
+            custom_prompt_path: None,
+            system_prompt_template: None,
+            description: None,
+            skills: None,
+            delegation: None,
+            tool_permissions: Some(agent_settings::ToolPermissions {
+                default: settings::ToolPermissionMode::Deny,
+                tools,
+            }),
+            permission_mode: None,
+            terminal_wrapper_command: None,
+            task_isolation: agent_settings::TaskIsolation::default(),
+            task_worktree_language_servers: None,
+            task_worktree_repo: None,
+            working_dir: None,
+        }
+    }
+
+    #[test]
+    fn write_scope_preflight_reports_uncovered_scopes() {
+        let profile = test_profile_with_scopes(&["crates/agent/**", ".zed/prompts/**"]);
+        let patterns = crate::task_worktree::profile_write_scope_patterns(&profile)
+            .expect("profile restricts writes");
+        assert_eq!(patterns, vec!["crates/agent/**", ".zed/prompts/**"]);
+
+        assert!(
+            crate::task_worktree::uncovered_task_write_scopes(
+                &[
+                    "crates/agent/**".to_string(),
+                    "crates/agent/src/tools/spawn_agent_tool.rs".to_string(),
+                    ".zed/prompts/**".to_string(),
+                ],
+                &patterns,
+            )
+            .is_empty(),
+            "covered task scopes must not be reported"
+        );
+
+        let offenders = crate::task_worktree::uncovered_task_write_scopes(
+            &[
+                "crates/agent/**".to_string(),
+                "crates/agent_ui/**".to_string(),
+                "README.md".to_string(),
+            ],
+            &patterns,
+        );
+        assert_eq!(
+            offenders,
+            vec!["crates/agent_ui/**".to_string(), "README.md".to_string()]
+        );
+    }
+
+    #[test]
+    fn write_scope_preflight_skips_unrestricted_profiles() {
+        let mut profile = test_profile_with_scopes(&["docs/**"]);
+        profile.tool_permissions = None;
+        assert_eq!(
+            crate::task_worktree::profile_write_scope_patterns(&profile),
+            None
+        );
+
+        let mut unrestricted = test_profile_with_scopes(&["docs/**"]);
+        unrestricted.permission_mode = Some(agent_settings::AgentPermissionMode::Unrestricted);
+        assert_eq!(
+            crate::task_worktree::profile_write_scope_patterns(&unrestricted),
+            None
+        );
+    }
+
+    #[test]
+    fn write_scope_preflight_handles_trailing_slashes_wildcards_and_directories() {
+        let patterns = vec!["src/**".to_string()];
+        assert!(
+            crate::task_worktree::uncovered_task_write_scopes(&["src/".to_string()], &patterns)
+                .is_empty()
+        );
+        assert!(
+            crate::task_worktree::uncovered_task_write_scopes(
+                &["src/lib.rs".to_string()],
+                &patterns
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            crate::task_worktree::uncovered_task_write_scopes(&["tests/**".to_string()], &patterns),
+            vec!["tests/**".to_string()]
+        );
+
+        let patterns = vec!["crates/*/src/**".to_string()];
+        assert!(
+            crate::task_worktree::uncovered_task_write_scopes(
+                &["crates/agent/src/lib.rs".to_string()],
+                &patterns
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            crate::task_worktree::uncovered_task_write_scopes(
+                &["crates/agent/tests/**".to_string()],
+                &patterns
+            ),
+            vec!["crates/agent/tests/**".to_string()]
         );
     }
 

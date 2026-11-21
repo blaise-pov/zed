@@ -392,6 +392,7 @@ fn check_commands(
     let mut any_matched_confirm = false;
     let mut all_matched_allow = true;
     let mut had_any_commands = false;
+    let mut first_unmatched_command: Option<String> = None;
 
     for command in commands {
         had_any_commands = true;
@@ -409,9 +410,13 @@ fn check_commands(
             any_matched_confirm = true;
         }
 
-        // ALLOW: track if all commands match at least one allow pattern
+        // ALLOW: track if all commands match at least one allow pattern, and
+        // keep the first command that failed so a denial can name it.
         if !rules.always_allow.iter().any(|r| r.is_match(&command)) {
             all_matched_allow = false;
+            if first_unmatched_command.is_none() {
+                first_unmatched_command = Some(command);
+            }
         }
     }
 
@@ -426,7 +431,31 @@ fn check_commands(
 
     match rules.default.unwrap_or(global_default) {
         ToolPermissionMode::Deny => {
-            ToolPermissionDecision::Deny(format!("{} tool is disabled", tool_name))
+            // Distinguish a genuinely disabled tool from an enabled tool that
+            // only allows an allowlist of commands. In the latter case the
+            // denial must name the rejected command and the allowed set;
+            // otherwise it reads as "tool is disabled" and sends agents (and
+            // humans) chasing a configuration that is not actually broken.
+            match first_unmatched_command.filter(|_| !rules.always_allow.is_empty()) {
+                Some(command) => {
+                    let allowed_patterns = rules
+                        .always_allow
+                        .iter()
+                        .map(|rule| rule.pattern.as_str())
+                        .collect::<Vec<_>>()
+                        .join("|");
+                    let request_kind = if tool_name == TerminalTool::NAME {
+                        "command"
+                    } else {
+                        "input"
+                    };
+                    ToolPermissionDecision::Deny(format!(
+                        "{} {} '{}' not allowlisted (allowed patterns: {})",
+                        tool_name, request_kind, command, allowed_patterns
+                    ))
+                }
+                None => ToolPermissionDecision::Deny(format!("{} tool is disabled", tool_name)),
+            }
         }
         ToolPermissionMode::Allow => ToolPermissionDecision::Allow,
         ToolPermissionMode::Confirm => ToolPermissionDecision::Confirm,
@@ -1103,6 +1132,76 @@ mod tests {
     fn default_deny() {
         t("python x.py").mode(ToolPermissionMode::Deny).is_deny();
     }
+
+    #[test]
+    fn default_deny_names_unallowlisted_command_and_allowed_patterns() {
+        let decision = t("git worktree list")
+            .allow(&[r"^git\s+status(\s|$)", r"^git\s+diff(\s|$)"])
+            .mode(ToolPermissionMode::Deny)
+            .run();
+        match decision {
+            ToolPermissionDecision::Deny(message) => {
+                assert!(
+                    message.contains("not allowlisted"),
+                    "expected an allowlist mismatch message, got: {message}"
+                );
+                assert!(
+                    message.contains("'git worktree list'"),
+                    "message should name the rejected command, got: {message}"
+                );
+                assert!(
+                    message.contains(r"^git\s+status(\s|$)")
+                        && message.contains(r"^git\s+diff(\s|$)"),
+                    "message should list the allowed patterns, got: {message}"
+                );
+                assert!(
+                    !message.contains("tool is disabled"),
+                    "an allowlist mismatch must not claim the tool is disabled, got: {message}"
+                );
+            }
+            other => panic!("expected Deny, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn default_deny_names_first_unallowlisted_subcommand_in_compound_command() {
+        let decision = t("git status && git worktree list")
+            .allow(&[r"^git\s+status(\s|$)"])
+            .mode(ToolPermissionMode::Deny)
+            .run();
+        match decision {
+            ToolPermissionDecision::Deny(message) => {
+                assert!(
+                    message.contains("'git worktree list'"),
+                    "message should name the offending sub-command, got: {message}"
+                );
+                assert!(
+                    !message.contains("'git status'"),
+                    "message should not name the allowed sub-command, got: {message}"
+                );
+            }
+            other => panic!("expected Deny, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn default_deny_without_allow_patterns_still_reports_disabled_tool() {
+        let decision = t("git worktree list").mode(ToolPermissionMode::Deny).run();
+        match decision {
+            ToolPermissionDecision::Deny(message) => {
+                assert!(
+                    message.contains("tool is disabled"),
+                    "a truly disabled tool should keep the distinct message, got: {message}"
+                );
+                assert!(
+                    !message.contains("not allowlisted"),
+                    "a disabled tool must not look like an allowlist mismatch, got: {message}"
+                );
+            }
+            other => panic!("expected Deny, got {other:?}"),
+        }
+    }
+
     // Tool-specific default takes precedence over global default
     #[test]
     fn tool_default_deny_overrides_global_allow() {
@@ -2682,16 +2781,33 @@ mod tests {
         ));
 
         // Denied commands (not in allowlist) - autonomous mode fail-closed
-        assert!(matches!(
-            decide_permission_for_profile(
-                TerminalTool::NAME,
-                &["cargo build".to_string()],
-                &settings,
-                Some(&profile),
-                ShellKind::Posix,
-            ),
-            ToolPermissionDecision::Deny(_)
-        ));
+        match decide_permission_for_profile(
+            TerminalTool::NAME,
+            &["cargo build".to_string()],
+            &settings,
+            Some(&profile),
+            ShellKind::Posix,
+        ) {
+            ToolPermissionDecision::Deny(message) => {
+                assert!(
+                    message.contains("'cargo build'"),
+                    "denial should name the rejected command, got: {message}"
+                );
+                assert!(
+                    message.contains("not allowlisted"),
+                    "denial should describe an allowlist mismatch, got: {message}"
+                );
+                assert!(
+                    message.contains("backend_engineer"),
+                    "denial should name the profile, got: {message}"
+                );
+                assert!(
+                    !message.contains("tool is disabled"),
+                    "an allowlist mismatch must not claim the tool is disabled, got: {message}"
+                );
+            }
+            other => panic!("expected Deny, got {other:?}"),
+        }
 
         // Hardcoded critical security denial
         assert!(matches!(
