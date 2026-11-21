@@ -521,13 +521,13 @@ impl crate::ThreadEnvironment for FakeThreadEnvironment {
         _working_dir: Option<PathBuf>,
         _repo: Option<PathBuf>,
         _cx: &mut App,
-    ) -> Result<Rc<dyn SubagentHandle>> {
+    ) -> Task<Result<Rc<dyn SubagentHandle>>> {
         self.subagent_worktrees.borrow_mut().push(task_worktree);
-        Ok(self
+        Task::ready(Ok(self
             .subagent_handle
             .clone()
             .expect("Subagent handle not available on FakeThreadEnvironment")
-            as Rc<dyn SubagentHandle>)
+            as Rc<dyn SubagentHandle>))
     }
 
     fn ensure_subagent_worktree(
@@ -8525,13 +8525,13 @@ async fn test_spawn_agent_status_validation_skips_and_guest_mode(cx: &mut TestAp
     });
 
     // 2. Skip when task_id is None
-    let environment = Rc::new(
-        FakeThreadEnvironment::default().with_subagent(FakeSubagentHandle::new(
+    let environment = Rc::new(FakeThreadEnvironment::default().with_subagent(
+        FakeSubagentHandle::new(
             acp::SessionId::new("subagent-no-task"),
             Task::ready("done".to_string()).shared(),
             None,
-        )),
-    );
+        ),
+    ));
     #[allow(clippy::arc_with_non_send_sync)]
     let tool = Arc::new(SpawnAgentTool::new(environment));
     let (event_stream, _rx) = ToolCallEventStream::test();
@@ -12218,16 +12218,18 @@ async fn test_delegation_chain_budget_exhaustion_blocks_transitive_bypass(cx: &m
     );
 
     // Also verify profile switch on resume is rejected under the same budget check
-    let resume_result = cx.update(|cx| {
-        ci_runner_env.resume_subagent_thread(
-            ci_runner_session_id.clone(),
-            Some(AgentProfileId("orchestrator".into())),
-            None,
-            None,
-            None,
-            cx,
-        )
-    });
+    let resume_result = cx
+        .update(|cx| {
+            ci_runner_env.resume_subagent_thread(
+                ci_runner_session_id.clone(),
+                Some(AgentProfileId("orchestrator".into())),
+                None,
+                None,
+                None,
+                cx,
+            )
+        })
+        .await;
 
     let resume_err = match resume_result {
         Err(err) => err.to_string(),
@@ -12587,6 +12589,7 @@ async fn test_subagent_auto_compaction(cx: &mut TestAppContext) {
             test.environment
                 .resume_subagent_thread(test.handle.id(), None, None, None, None, cx)
         })
+        .await
         .unwrap();
     assert_eq!(handle.id(), test.handle.id());
     let send = cx.update(|cx| handle.send("follow-up task".to_string(), &cx.to_async()));
@@ -17225,7 +17228,15 @@ impl SubagentCompactionTest {
         };
         let handle = cx
             .update(|cx| {
-                environment.create_subagent_thread("subagent".to_string(), None, None, None, None, None, cx)
+                environment.create_subagent_thread(
+                    "subagent".to_string(),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    cx,
+                )
             })
             .unwrap();
         let thread = agent.read_with(cx, |agent, _| {

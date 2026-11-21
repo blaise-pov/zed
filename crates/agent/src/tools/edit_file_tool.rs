@@ -2138,12 +2138,29 @@ mod tests {
                 "Path with .. that goes outside of root directory",
             ),
             (
+                "project/../new_file.rs",
+                true,
+                "Root-escaping path with a create-mode leaf",
+            ),
+            (
+                "../outside.rs",
+                true,
+                "Bare parent-relative path outside the project",
+            ),
+            (
                 "project/./src/file.rs",
                 false,
                 "Path with . should work normally",
             ),
+            (
+                "project/src/../file.rs",
+                false,
+                "In-root path using .. should work normally",
+            ),
             #[cfg(target_os = "windows")]
             ("C:\\Windows\\System32\\hosts", true, "Windows system path"),
+            #[cfg(target_os = "windows")]
+            ("project\\..\\other", true, "Windows-style path with .. that escapes the root"),
             #[cfg(target_os = "windows")]
             ("project\\src\\main.rs", false, "Windows-style project path"),
         ];
@@ -2155,7 +2172,24 @@ mod tests {
             cx.run_until_parked();
 
             if should_confirm {
-                stream_rx.expect_authorization().await;
+                // Race the confirmation event against the authorize future so that a
+                // silent `Ok(())` (no event) fails fast with a diagnostic instead of
+                // hanging the suite forever inside `expect_authorization`.
+                match futures::future::select(
+                    stream_rx.expect_authorization().boxed(),
+                    auth.boxed(),
+                )
+                .await
+                {
+                    futures::future::Either::Left((_, _pending_auth)) => {}
+                    futures::future::Either::Right((result, _pending_event)) => {
+                        panic!(
+                            "Failed for case: {} - path: {} - authorize() returned {:?} \
+                             without requesting confirmation",
+                            description, path, result
+                        )
+                    }
+                }
             } else {
                 assert!(
                     stream_rx.try_recv().is_err(),

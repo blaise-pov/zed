@@ -30,9 +30,4 @@ if ($needAddWorkspace)
 }
 $clippyArgs += @("--release", "--all-targets", "--all-features", "--", "--deny", "warnings")
 
-# Route through rtk (compact output proxy) when it's on PATH; an explicit $env:CARGO bypasses it.
-if ($Cargo -eq "cargo" -and (Get-Command "rtk" -ErrorAction SilentlyContinue)) {
-    rtk cargo clippy @clippyArgs
-} else {
-    & $Cargo clippy @clippyArgs
-}
+& $Cargo clippy @clippyArgs

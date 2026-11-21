@@ -943,10 +943,10 @@ pub trait ThreadEnvironment {
         _working_dir: Option<PathBuf>,
         _repo: Option<PathBuf>,
         _cx: &mut App,
-    ) -> Result<Rc<dyn SubagentHandle>> {
-        Err(anyhow::anyhow!(
+    ) -> Task<Result<Rc<dyn SubagentHandle>>> {
+        Task::ready(Err(anyhow::anyhow!(
             "Resuming subagent sessions is not supported"
-        ))
+        )))
     }
 
     fn ensure_subagent_worktree(

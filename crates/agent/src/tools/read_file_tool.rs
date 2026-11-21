@@ -4,12 +4,13 @@ use anyhow::{Context as _, Result, anyhow};
 use futures::FutureExt as _;
 use gpui::{App, Entity, SharedString, Task};
 use indoc::formatdoc;
-use language::Point;
+use language::{DiskState, Point};
 use language_model::{LanguageModelImage, LanguageModelImageExt, LanguageModelToolResultContent};
 use project::{AgentLocation, ImageItem, Project, WorktreeSettings, image_store};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use settings::Settings;
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
 use util::markdown::MarkdownCodeBlock;
@@ -415,6 +416,43 @@ impl AgentTool for ReadFileTool {
                 return Err(tool_content_err(format!("{file_path} not found")));
             }
 
+            // `open_buffer` returns the cached buffer for files that are already
+            // open, and buffers only reload in response to file watcher events.
+            // If the watcher misses an external write (e.g. `git checkout` on
+            // Windows), the buffer would keep serving the pre-change content.
+            // Re-stat the file and reload through the project when the buffer's
+            // known on-disk state no longer matches.
+            let disk_state = fs
+                .metadata(&abs_path)
+                .await
+                .map_err(tool_content_err)?
+                .map(|metadata| DiskState::Present {
+                    mtime: metadata.mtime,
+                    size: metadata.len,
+                });
+            if let Some(disk_state) = disk_state {
+                // Dirty buffers hold user edits that a reload would discard, so
+                // only reload clean buffers; this mirrors `Buffer::file_updated`.
+                let is_stale = buffer.read_with(cx, |buffer, _| {
+                    !buffer.is_dirty()
+                        && buffer
+                            .file()
+                            .is_some_and(|file| file.disk_state() != disk_state)
+                });
+                if is_stale {
+                    project
+                        .update(cx, |project, cx| {
+                            project.reload_buffers(
+                                HashSet::from_iter([buffer.clone()]),
+                                false,
+                                cx,
+                            )
+                        })
+                        .await
+                        .map_err(tool_content_err)?;
+                }
+            }
+
             let mut anchor = None;
             let mut is_outline_response = false;
 
@@ -641,6 +679,73 @@ mod test {
             result.unwrap(),
             "     1\tThis is a small file content".into()
         );
+    }
+
+    // `open_buffer` returns cached buffers, and buffers only reload when the
+    // file watcher reports a change. If the watcher misses an external write
+    // (e.g. `git checkout` on Windows), the tool must still return disk content.
+    #[gpui::test]
+    async fn test_read_file_reflects_disk_changes_missed_by_watcher(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/root"),
+            json!({
+                "file.txt": "old content"
+            }),
+        )
+        .await;
+        let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
+
+        // Open the buffer so the tool would otherwise serve its cached contents.
+        let project_path = project.read_with(cx, |project, cx| {
+            project
+                .find_project_path("root/file.txt", cx)
+                .expect("file should resolve to a project path")
+        });
+        let buffer = project
+            .update(cx, |project, cx| project.open_buffer(project_path, cx))
+            .await
+            .expect("buffer should open");
+        cx.executor().run_until_parked();
+        buffer.read_with(cx, |buffer, _| {
+            assert_eq!(buffer.text(), "old content");
+            assert!(!buffer.is_dirty());
+        });
+
+        // Rewrite the file without delivering watcher events, mimicking an
+        // external tool whose change Zed never observes.
+        fs.pause_events();
+        fs.write(path!("/root/file.txt").as_ref(), b"new content")
+            .await
+            .expect("file should be written");
+        cx.executor().run_until_parked();
+        // The buffer must still hold the old contents here; otherwise the test
+        // would not be exercising a missed watcher event.
+        buffer.read_with(cx, |buffer, _| {
+            assert_eq!(buffer.text(), "old content");
+        });
+
+        let action_log = cx.new(|_| ActionLog::new(project.clone()));
+        let tool = Arc::new(ReadFileTool::new(project, action_log, true));
+        let result = cx
+            .update(|cx| {
+                let input = ReadFileToolInput {
+                    path: "root/file.txt".into(),
+                    start_line: None,
+                    end_line: None,
+                };
+                tool.run(
+                    ToolInput::resolved(input),
+                    ToolCallEventStream::test().0,
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(result, "     1\tnew content".into());
     }
 
     #[gpui::test]
