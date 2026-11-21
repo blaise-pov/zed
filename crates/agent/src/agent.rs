@@ -12,7 +12,7 @@ pub mod task_worktree_status;
 mod templates;
 #[cfg(test)]
 mod tests;
-mod thread;
+pub mod thread;
 mod thread_store;
 mod tool_permissions;
 mod tools;

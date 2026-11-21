@@ -7133,6 +7133,11 @@ pub fn is_thread_turn_running(thread_id: &acp::SessionId) -> bool {
     RUNNING_TURNS.read().contains(thread_id)
 }
 
+/// Returns true when any agent session currently has a running turn.
+pub fn any_thread_turn_running() -> bool {
+    !RUNNING_TURNS.read().is_empty()
+}
+
 #[cfg(any(test, feature = "test-support"))]
 pub fn register_running_turn_for_tests(thread_id: acp::SessionId) -> impl Drop {
     RUNNING_TURNS.write().insert(thread_id.clone());
@@ -9702,6 +9707,14 @@ mod tests {
     use serde_json::json;
     use settings::LanguageModelProviderSetting;
     use std::sync::Arc;
+
+    #[test]
+    fn test_any_thread_turn_running_true_while_guard_alive() {
+        let session_id =
+            acp::SessionId::new(Arc::<str>::from("session-any-thread-turn-running"));
+        let _guard = register_running_turn_for_tests(session_id);
+        assert!(any_thread_turn_running());
+    }
 
     #[gpui::test]
     async fn test_tool_call_events_preserve_opaque_id_storage(cx: &mut TestAppContext) {
