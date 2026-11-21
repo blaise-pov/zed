@@ -1756,7 +1756,13 @@ fn quit(_: &Quit, cx: &mut App) {
         return;
     }
 
-    let should_confirm = WorkspaceSettings::get_global(cx).confirm_quit;
+    let has_running_sessions = agent::thread::any_thread_turn_running();
+    let should_confirm = has_running_sessions || WorkspaceSettings::get_global(cx).confirm_quit;
+    let confirm_message = if has_running_sessions {
+        "Agent sessions are still running. Quit Zed anyway?"
+    } else {
+        "Are you sure you want to quit?"
+    };
     cx.spawn(async move |cx| {
         let mut workspace_windows: Vec<WindowHandle<MultiWorkspace>> = cx.update(|cx| {
             cx.windows()
@@ -1776,7 +1782,7 @@ fn quit(_: &Quit, cx: &mut App) {
                 .update(cx, |_, window, cx| {
                     window.prompt(
                         PromptLevel::Info,
-                        "Are you sure you want to quit?",
+                        confirm_message,
                         None,
                         &["Quit", "Cancel"],
                         cx,
