@@ -51,7 +51,7 @@ Popular servers available as an extension include:
 ### As Custom Servers
 
 Creating an extension is not the only way to use MCP servers in Zed.
-You can connect both local and remote MCP servers from **[Settings → AI → MCP Servers](./agent-settings.md)** (also accessible via the {#action agent::OpenSettings} action, then selecting `MCP Servers`). Click `Add Server` in the page header, then choose `Add Local Server` or `Add Remote Server`. Your specified configuration will create entries in your settings file (which you can open with {#action zed::OpenSettingsFile}) similar to the ones below:
+You can connect both local and remote MCP servers from **Settings → AI → MCP Servers** (also accessible via the {#action agent::OpenSettings} action, then selecting `MCP Servers`). Click `Add Server` in the page header, then choose `Add Local Server` or `Add Remote Server`. Your specified configuration will create entries in your settings file (which you can open with {#action zed::OpenSettingsFile}) similar to the ones below:
 
 ```json [settings]
 {
@@ -59,18 +59,7 @@ You can connect both local and remote MCP servers from **[Settings → AI → MC
     "local-mcp-server": {
       "command": "some-command",
       "args": ["arg-1", "arg-2"],
-      "env": {},
-      "platforms": {
-        "windows": {
-          "command": ".\\bin\\mcp-win.exe"
-        },
-        "darwin-arm64": {
-          "command": "./bin/mcp-darwin-arm64"
-        },
-        "linux-x64": {
-          "command": "./bin/mcp-linux-x64"
-        }
-      }
+      "env": {}
     },
     "remote-mcp-server": {
       "url": "https://example.com/mcp",
@@ -82,13 +71,6 @@ You can connect both local and remote MCP servers from **[Settings → AI → MC
   }
 }
 ```
-
-The optional `platforms` object allows specifying platform-specific overrides for `command`, `args`, `env`, and `timeout`.
-
-- **Precedence:** Target matches are checked in order: exact `<os>-<arch>` (e.g. `darwin-arm64`, `linux-x64`, `windows-x64`) → OS alias (e.g. `darwin`, `macos`, `windows`, `linux`) → root base configuration.
-- **Normalization:** Common aliases are automatically mapped (`macos` ↔ `darwin`, `windows` ↔ `win32`, `x86_64` ↔ `x64` ↔ `amd64`, `aarch64` ↔ `arm64`).
-- **Merge semantics:** When a platform override matches, its `command`, `args`, and `timeout` replace the base values, while `env` variables extend and override keys from the base `env`.
-- **Optional base command:** If `platforms` defines commands for your target platforms, the root-level `command` can be omitted.
 
 > Note: When a remote MCP server has no configured `"Authorization"` header, Zed will prompt you to authenticate yourself against the MCP server using the standard MCP OAuth flow.
 

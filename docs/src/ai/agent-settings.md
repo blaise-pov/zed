@@ -107,42 +107,6 @@ By default, context compaction (both `/compact` and auto-compaction) uses the th
 
 - The configured model should have a context window at least as large as the thread's primary model for predictable behavior.
 
-## Terminal Watchdog {#terminal-watchdog}
-
-The terminal watchdog monitors commands executed by the agent terminal tool for hangs (such as waiting for interactive input, a pager, or a stalled network/resource) and runaway execution.
-
-The watchdog applies two independent mechanisms:
-- **Idle detection**: Stops a command when there is simultaneously no terminal output, no process tree CPU activity, and no disk IO across the idle window.
-- **Hard cap**: Stops runaway execution when `timeout_ms` was not set by the model.
-
-If a command is stopped, the agent receives captured output and remediation guidance to self-correct.
-
-The watchdog is configurable globally in `settings.json` or per-project in `.zed/settings.json` (project settings override user settings for free via Zed's layering):
-
-```json [settings]
-{
-  "agent": {
-    "terminal_watchdog": {
-      "enabled": true,
-      "idle_timeout_ms": 300000,
-      "idle_cpu_threshold_percent": 5.0,
-      "hard_timeout_ms": 3600000,
-      "poll_interval_ms": 5000,
-      "idle_timeout_no_probe_ms": 600000
-    }
-  }
-}
-```
-
-| Setting | Default | Meaning |
-| --- | --- | --- |
-| `enabled` | `true` | Master switch enabling or disabling the terminal watchdog. |
-| `idle_timeout_ms` | `300000` (5m) | Idle duration before stopping an inactive command. Set to `null` to disable idle detection. |
-| `idle_cpu_threshold_percent` | `5.0` | Process tree CPU percentage below which execution is considered idle. |
-| `hard_timeout_ms` | `3600000` (1h) | Maximum runtime cap when `timeout_ms` was not specified in the tool call. Set to `null` to disable the cap. |
-| `poll_interval_ms` | `5000` (5s) | Sampling interval for checking activity signals (PTY output, CPU, disk IO). |
-| `idle_timeout_no_probe_ms` | `600000` (10m) | Fallback idle duration based on output alone when CPU/IO probing is unavailable (e.g., WSL or remote projects). |
-
 ## External Agents {#external-agents}
 
 The External Agents section configures ACP-integrated agents.
@@ -260,77 +224,6 @@ Zed checks matching entries from last to first. An entry can omit `provider` or
 `model` to apply more broadly. For provider-specific model configuration such as
 custom model entries, context windows, or gateway routing, see
 [LLM Providers](./llm-providers.md) and the provider setup pages.
-
-## Per-model System Prompts {#per-model-system-prompts}
-
-You can customize the agent system prompt per provider, per model, or for a specific provider/model pair by adding `system_prompt_template` or `custom_instructions` to `agent.model_parameters`:
-
-- `system_prompt_template`: path to a custom Handlebars template file (`.hbs`) that fully replaces the built-in agent system prompt for matching models.
-- `custom_instructions`: inline text appended to the custom instructions section of the system prompt (preserving the built-in prompt and tool definitions).
-
-When resolving system prompt templates, Zed follows this precedence chain:
-
-1. Active profile template (`agent.profiles.<id>.system_prompt_template`)
-2. Per-model template in `agent.model_parameters` (exact provider and model match)
-3. Per-provider template in `agent.model_parameters` (provider-only match)
-4. Global template (`agent.system_prompt_template`)
-5. Built-in system prompt (`system_prompt.hbs`)
-
-For `model_parameters`, entries are evaluated from last to first (the last matching entry wins), so a later provider-only entry takes precedence over an earlier exact-match one. If a matching entry omits a field, Zed skips it and continues searching for an earlier matching entry that sets that field. If a custom template file is missing or fails to render, Zed logs a warning and falls back to the built-in system prompt.
-
-When `custom_instructions` is set in `model_parameters`, it is appended to any profile custom instructions (separated by two newlines) and made available to both the built-in prompt and custom templates via the `custom_instructions` template variable.
-
-```json [settings]
-{
-  "agent": {
-    "model_parameters": [
-      {
-        "provider": "anthropic",
-        "system_prompt_template": "~/prompts/anthropic.hbs"
-      },
-      {
-        "provider": "anthropic",
-        "model": "claude-sonnet-4-5",
-        "system_prompt_template": "~/prompts/sonnet.hbs",
-        "custom_instructions": "Prefer concise explanations and prioritize correctness over speed."
-      }
-    ]
-  }
-}
-```
-
-## Prompt Includes and Profile Prompt Templates {#prompt-includes}
-
-Templates rendered by the agent — custom system prompt templates and profile prompt files — support including other prompt files as Handlebars partials:
-
-```handlebars
-{{> coding-style}}
-```
-
-- The partial name is the file name without extension. Prompt files are resolved from:
-  1. `prompts/` in your Zed config directory (for example `~/.config/zed/prompts/`)
-  2. `.zed/prompts/` in the worktree root, which takes precedence when both define the same name
-- Only top-level `.md` and `.hbs` files are registered; subdirectories are not scanned.
-- Included content is itself rendered as a template: variables and nested `{{> ...}}` includes work inside included files. Built-in templates can be included too — for example, `{{> system_prompt.hbs}}` starts a custom system prompt template from the default prompt so you can extend it.
-- Partials are re-read from disk on every render, so edits to prompt files apply to new requests without restarting Zed.
-
-Profile prompt files (`custom_prompt_path`, or the conventional `.zed/prompts/<profile_id>.md` and `prompts/<profile_id>.md` in the config directory) are rendered as Handlebars templates with the same data as the system prompt:
-
-| Variable | Description |
-| --- | --- |
-| `os`, `arch`, `shell` | Platform information |
-| `date` | Today's date (`YYYY-MM-DD`) |
-| `worktrees` | Project root directories (`abs_path`, `root_name`, `rules_file`) |
-| `available_tools` | Tools available to the agent in this thread |
-| `model_name` | Name of the active language model |
-| `skills`, `has_skills` | Available agent skills |
-| `has_rules`, `user_agents_md` | Personal and project instructions |
-| `sandboxing`, `is_linux`, `is_windows` | Terminal sandbox state and platform |
-| `available_agents`, `subagent_delegation_note` | Delegation catalog and notes |
-
-A `contains` helper is available for conditionals over lists: `{{#if (contains available_tools 'grep')}}`. `custom_instructions` is empty while a profile prompt itself is being rendered; per-model `custom_instructions` from `model_parameters` is appended as plain text after the profile prompt is rendered and is not templated.
-
-Templates are rendered in strict mode: referencing an unknown variable, a missing partial, a partial that participates in an include cycle, or invalid template syntax fails the render. Zed then logs a warning and falls back — profile prompts fall back to their raw unrendered text, and custom system prompt templates fall back to the built-in system prompt.
 
 ## Rules, Skills, and Instructions {#rules-skills-instructions}
 
