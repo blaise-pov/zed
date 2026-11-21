@@ -1125,6 +1125,7 @@
                 "crates/fs/**",
                 "crates/open_router/**",
                 "crates/util/**",
+                "crates/zed/**",
                 "docs/**"
               ]
             },
@@ -1149,6 +1150,7 @@
                 "crates/fs/**",
                 "crates/open_router/**",
                 "crates/util/**",
+                "crates/zed/**",
                 "docs/**"
               ]
             },
@@ -1639,7 +1641,7 @@
               "default": "deny",
               "always_allow": [
                 {
-                  "pattern": "^([A-Z_]+=\\S+\\s+)*git\\s+(-C\\s+\\S+\\s+)?(--no-pager\\s+|--no-optional-locks\\s+)*(status|diff|add|log|show|branch|rev-parse|merge-base|switch|merge|reset|commit|checkout|restore|worktree)\\b.*"
+                  "pattern": "^([A-Z_]+=\\S+\\s+)*git\\s+(-C\\s+\\S+\\s+)?(--no-pager\\s+|--no-optional-locks\\s+)*(status|diff|add|log|show|branch|rev-parse|merge-base|switch|merge|reset|revert|rm|commit|checkout|restore|worktree)\\b.*"
                 }
               ]
             },
