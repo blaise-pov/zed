@@ -4484,6 +4484,11 @@ impl NativeThreadEnvironment {
                     attempt: 1,
                     ..Default::default()
                 };
+                // Reuse the repository anchor frozen at thread creation so the
+                // recreated checkout lands in the same repository, mirroring the
+                // spawn path that forwards `effective_repo` as the repo hint.
+                let repo_hint = subagent_thread
+                    .read_with(cx, |thread, _| thread.effective_repo().map(Path::to_path_buf));
                 let ensure = cx.update(|cx| {
                     crate::task_worktree::ensure_task_worktree_with_options(
                         project.clone(),
@@ -4491,6 +4496,7 @@ impl NativeThreadEnvironment {
                         goal_id,
                         None,
                         Some(branch),
+                        repo_hint,
                         false,
                         cx,
                     )
