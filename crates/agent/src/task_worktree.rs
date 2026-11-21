@@ -5910,7 +5910,7 @@ mod tests {
 
         // Resume re-ensures the goal branch from the stored value.
         let goal_branch = cx
-            .update(|cx| ensure_goal_branch(project.clone(), &stored, cx))
+            .update(|cx| ensure_goal_branch(project.clone(), &stored, None, cx))
             .await
             .expect("ensure goal branch");
         assert_eq!(goal_branch, "agent-goal/GOAL-X");
@@ -5936,6 +5936,7 @@ mod tests {
                     project.clone(),
                     &task,
                     Some(stored),
+                    None,
                     None,
                     None,
                     cx,
@@ -7087,7 +7088,7 @@ mod tests {
     ) -> PathBuf {
         cx.update(|cx| {
             let (_, anchor_path, path_style, worktree_setting, _) =
-                task_worktree_context(project.read(cx), cx).unwrap();
+                task_worktree_context(project.read(cx), None, cx).unwrap();
             worktrees_directory_for_repo(&anchor_path, &worktree_setting, path_style)
                 .unwrap()
                 .join(format!("agent-task-{}", task_id))
@@ -7126,7 +7127,7 @@ mod tests {
 
         let path = cx
             .update(|cx| {
-                ensure_task_worktree_with_policy(project.clone(), &task, None, None, None, cx)
+                ensure_task_worktree_with_policy(project.clone(), &task, None, None, None, None, cx)
             })
             .await
             .unwrap();
@@ -7179,6 +7180,7 @@ mod tests {
                     None,
                     None,
                     Some(branch.clone()),
+                    None,
                     cx,
                 )
             })
@@ -7226,6 +7228,7 @@ mod tests {
                     None,
                     None,
                     Some(branch.clone()),
+                    None,
                     cx,
                 )
             })
