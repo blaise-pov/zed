@@ -622,7 +622,7 @@
               "default": "deny",
               "always_allow": [
                 {
-                  "pattern": "^([A-Z_]+=\\S+\\s+)*git\\s+(-C\\s+\\S+\\s+)?(--no-pager\\s+|--no-optional-locks\\s+)*(status|diff|log|rev-parse|branch|worktree\\s+list)\\b.*"
+                  "pattern": "^([A-Z_]+=\\S+\\s+)*git\\s+(-C\\s+\\S+\\s+)?(--no-pager\\s+|--no-optional-locks\\s+)*(status|diff|log|show|blame|reflog|shortlog|rev-parse|rev-list|describe|merge-base|name-rev|ls-files|cat-file|stash\\s+list|tag\\s+(-l\\b|--list\\b)|branch\\s+(-a\\b|-l\\b|--list\\b|-v+\\b|--show-current\\b|--contains\\b)|worktree\\s+list)\\b.*"
                 }
               ]
             },
@@ -1748,7 +1748,7 @@
               "default": "deny",
               "always_allow": [
                 {
-                  "pattern": "^([A-Z_]+=\\S+\\s+)*git\\s+(-C\\s+\\S+\\s+)?(--no-pager\\s+|--no-optional-locks\\s+)*(status|diff|log|show|branch|rev-parse|ls-files|merge-base|merge|checkout|add|commit|reset|restore)\\b.*"
+                  "pattern": "^([A-Z_]+=\\S+\\s+)*git\\s+(-C\\s+\\S+\\s+)?(--no-pager\\s+|--no-optional-locks\\s+)*(status|diff|log|show|branch|rev-parse|ls-files|merge-base|merge|checkout|add|commit|reset|restore|worktree\\s+(list|remove|prune))\\b.*"
                 },
                 {
                   "pattern": "^cargo\\s+check\\b.*"
@@ -1926,7 +1926,7 @@
               "default": "deny",
               "always_allow": [
                 {
-                  "pattern": "^([A-Z_]+=\\S+\\s+)*git\\s+(-C\\s+\\S+\\s+)?(--no-pager\\s+|--no-optional-locks\\s+)*(push|fetch|ls-remote|rev-parse|status|log|branch)\\b.*"
+                  "pattern": "^([A-Z_]+=\\S+\\s+)*git\\s+(-C\\s+\\S+\\s+)?(--no-pager\\s+|--no-optional-locks\\s+)*(push|fetch|ls-remote|rev-parse|status|log|show|diff|grep|blame|ls-files|branch)\\b.*"
                 },
                 {
                   "pattern": "^([A-Z_]+=\\S+\\s+)*gh\\s+.*"
