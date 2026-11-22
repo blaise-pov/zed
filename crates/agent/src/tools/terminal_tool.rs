@@ -6078,10 +6078,12 @@ gamma"
             .await
             .expect_err("different env-var value should not match allow pattern");
         assert!(
-            error.contains("could not be approved")
-                || error.contains("denied")
-                || error.contains("disabled"),
-            "expected denial for mismatched env value, got: {error}"
+            error.contains("not allowlisted"),
+            "expected an allowlist mismatch message, got: {error}"
+        );
+        assert!(
+            error.contains("'PAGER=other git log'"),
+            "message should name the rejected command, got: {error}"
         );
         assert!(
             environment.terminal_creation_count() == 0,
