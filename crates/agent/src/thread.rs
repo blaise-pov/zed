@@ -13406,6 +13406,45 @@ mod tests {
     }
 
     #[test]
+    fn test_retry_strategy_parks_model_busy_gateway_error() {
+        // A gateway may report overload in the message with an unknown error
+        // type and a 500 status. It should park, not fail the turn.
+        let error = LanguageModelCompletionError::from_http_status(
+            language_model::ANTHROPIC_PROVIDER_NAME,
+            http_client::StatusCode::INTERNAL_SERVER_ERROR,
+            "The model is busy right now — please try again in a moment. Retry in 47s."
+                .to_string(),
+            None,
+        );
+
+        assert_eq!(
+            Thread::retry_strategy_for(&error, parking_policy()),
+            Some(RetryStrategy::ParkedPolling {
+                policy: parking_policy(),
+            })
+        );
+    }
+
+    #[test]
+    fn test_retry_strategy_parks_overloaded_busy_message() {
+        let error = LanguageModelCompletionError::from_provider_response(
+            language_model::ANTHROPIC_PROVIDER_NAME,
+            None,
+            Some("gateway_error".to_string()),
+            "Модель сейчас занята — повторите запрос чуть позже.".to_string(),
+            None,
+            language_model::ProviderErrorCategory::Overloaded,
+        );
+
+        assert_eq!(
+            Thread::retry_strategy_for(&error, parking_policy()),
+            Some(RetryStrategy::ParkedPolling {
+                policy: parking_policy(),
+            })
+        );
+    }
+
+    #[test]
     fn test_retry_strategy_parks_stream_errors() {
         // Connection and stream failures surface to the user as
         // "The connection to <provider>'s API was interrupted"; they should
