@@ -1445,6 +1445,9 @@ fn completion_error_from_anthropic_api_with_status(
         Some(TimeoutError) => ProviderErrorCategory::Timeout,
         Some(ApiError) => ProviderErrorCategory::InternalServer,
         Some(OverloadedError) => ProviderErrorCategory::Overloaded,
+        None if language_model_core::is_overloaded_message(&error.message) => {
+            ProviderErrorCategory::Overloaded
+        }
         None => ProviderErrorCategory::Other,
     };
     Error::from_provider_response(
@@ -1671,6 +1674,26 @@ mod tests {
                 category: language_model_core::ProviderErrorCategory::PromptTooLarge {
                     tokens: Some(1_500_000),
                 },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn maps_busy_gateway_error_to_overloaded() {
+        let error = completion_error_from_anthropic_api(
+            ApiError {
+                error_type: "gateway_error".to_string(),
+                message: "The model is busy right now — please try again in a moment. Retry in 47s."
+                    .to_string(),
+            },
+            language_model_core::ANTHROPIC_PROVIDER_NAME,
+        );
+
+        assert!(matches!(
+            error,
+            language_model_core::LanguageModelCompletionError::ProviderRejection {
+                category: language_model_core::ProviderErrorCategory::Overloaded,
                 ..
             }
         ));

@@ -165,12 +165,25 @@ pub fn is_upstream_network_failure(message: &str) -> bool {
         || message.contains("网关诊断")
 }
 
+/// Returns whether the message reports that the upstream model is temporarily
+/// busy, as some gateways signal overload in the message rather than in the
+/// error type or HTTP status.
+pub fn is_overloaded_message(message: &str) -> bool {
+    // `to_ascii_lowercase` leaves Cyrillic untouched, so the Russian phrase
+    // needs Unicode lowercasing to match its sentence-initial capital.
+    message.to_ascii_lowercase().contains("model is busy")
+        || message.to_lowercase().contains("модель сейчас занята")
+}
+
 impl ProviderErrorCategory {
     /// Classifies a rejection from an HTTP status that the provider actually
     /// returned, with message inspection for ambiguous bad-request responses.
     pub fn from_http_status(status: StatusCode, message: &str) -> Self {
         if is_upstream_network_failure(message) {
             return Self::Timeout;
+        }
+        if is_overloaded_message(message) {
+            return Self::Overloaded;
         }
 
         match status {
@@ -1412,5 +1425,68 @@ mod tests {
         ));
         assert!(other_err.is_transient());
         assert_eq!(other_err.retry_delay(1), Some(Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn test_from_http_status_maps_busy_message_to_overloaded() {
+        let error = LanguageModelCompletionError::from_http_status(
+            ANTHROPIC_PROVIDER_NAME,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "The model is busy right now — please try again in a moment. Retry in 47s."
+                .to_string(),
+            None,
+        );
+        assert!(matches!(
+            error,
+            LanguageModelCompletionError::ProviderRejection {
+                category: ProviderErrorCategory::Overloaded,
+                ..
+            }
+        ));
+
+        let error = LanguageModelCompletionError::from_http_status(
+            ANTHROPIC_PROVIDER_NAME,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Модель сейчас занята — повторите запрос чуть позже.".to_string(),
+            None,
+        );
+        assert!(matches!(
+            error,
+            LanguageModelCompletionError::ProviderRejection {
+                category: ProviderErrorCategory::Overloaded,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_from_http_status_without_busy_message_is_not_overloaded() {
+        let error = LanguageModelCompletionError::from_http_status(
+            ANTHROPIC_PROVIDER_NAME,
+            StatusCode::TOO_MANY_REQUESTS,
+            "Rate limit exceeded".to_string(),
+            None,
+        );
+        assert!(matches!(
+            error,
+            LanguageModelCompletionError::ProviderRejection {
+                category: ProviderErrorCategory::RateLimit,
+                ..
+            }
+        ));
+
+        let error = LanguageModelCompletionError::from_http_status(
+            ANTHROPIC_PROVIDER_NAME,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Internal server error".to_string(),
+            None,
+        );
+        assert!(matches!(
+            error,
+            LanguageModelCompletionError::ProviderRejection {
+                category: ProviderErrorCategory::InternalServer,
+                ..
+            }
+        ));
     }
 }

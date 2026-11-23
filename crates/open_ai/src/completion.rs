@@ -8,7 +8,8 @@ use language_model_core::{
     LanguageModelProviderId, LanguageModelRequest, LanguageModelRequestMessage,
     LanguageModelRequestToolInput, LanguageModelToolChoice, LanguageModelToolResultContent,
     LanguageModelToolUse, LanguageModelToolUseId, LanguageModelToolUseInput, MessageContent,
-    ProviderErrorCategory, Role, StopReason, TokenUsage, provider_name_for_id,
+    ProviderErrorCategory, Role, StopReason, TokenUsage, is_overloaded_message,
+    provider_name_for_id,
     util::{fix_streamed_json, parse_tool_arguments},
 };
 use std::pin::Pin;
@@ -1402,9 +1403,11 @@ pub(crate) fn response_error_category(
     code.and_then(response_error_category_from_discriminator)
         .or_else(|| error_type.and_then(response_error_category_from_discriminator))
         .unwrap_or_else(|| {
-            status
-                .map(|status| ProviderErrorCategory::from_http_status(status, message))
-                .unwrap_or(ProviderErrorCategory::Other)
+            match status {
+                Some(status) => ProviderErrorCategory::from_http_status(status, message),
+                None if is_overloaded_message(message) => ProviderErrorCategory::Overloaded,
+                None => ProviderErrorCategory::Other,
+            }
         })
 }
 
@@ -3235,6 +3238,19 @@ mod tests {
                 "{code}"
             );
         }
+    }
+
+    #[test]
+    fn response_error_category_maps_busy_message_to_overloaded_without_status() {
+        assert_eq!(
+            response_error_category(
+                None,
+                None,
+                None,
+                "Модель сейчас занята — повторите запрос чуть позже.",
+            ),
+            ProviderErrorCategory::Overloaded
+        );
     }
 
     #[test]
